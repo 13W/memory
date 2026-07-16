@@ -1,0 +1,3 @@
+# `cargo xtask ci` runs the single full-check command (see CONTRIBUTING.md).
+[alias]
+xtask = "run --package xtask --"

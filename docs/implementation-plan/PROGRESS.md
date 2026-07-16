@@ -7,7 +7,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 ## 00 — Контракт разработки и baseline
 
 - [x] T00-01 Импортировать v1 behavioral fixtures и зафиксировать baseline inventory
-- [ ] T00-02 Создать Rust workspace, quality commands и CI smoke
+- [x] T00-02 Создать Rust workspace, quality commands и CI smoke
 - [ ] T00-03 Создать общий fixture/failpoint test harness
 - [ ] G00 Сверка foundations и testing contract
 
@@ -201,6 +201,19 @@ Gate следующей группы нельзя начинать до `PASS` �
 | ID | Commit/PR | Проверки | Результат/артефакт | Исполнитель/дата |
 | --- | --- | --- | --- | --- |
 | T00-01 | не коммичено | `python3 fixtures/tooling/validate.py` exit 0 (stdlib); тот же скрипт под venv `jsonschema==4.23.0` exit 0; негативный self-test PASS (denylist/schema/49-count/dup-id); live v1 бенчмарк без ошибок | `fixtures/` — 6 семейств, 114 уникальных id; `search/corpus.json` = 49 запросов; baseline снят (embeddinggemma:300m, code-only): MRR 0.696, Hit@1 0.592, Hit@3 0.796, Hit@5 0.837, 544 чанка; gap-register GAP-01..06; пороги = TBD | Claude Opus 4.8 / 2026-07-16 |
+| T00-02 | коммит `T00-02: scaffold Rust workspace + xtask quality gate + CI` (хэш в git-логе; строка edet в том же коммите) | `cargo build --workspace` OK; каждый бинарник `version` → `<имя> 0.0.0`, неизвестная команда exit 2; `cargo xtask ci` (fmt --check → clippy `-D warnings` → test --workspace → doc --no-deps) = all checks passed; offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; 12 значимых тестов (3×2 CLI-smoke, 2 core unit, 2 core doctests, 2 xtask ci_config) | Workspace: 6 либ (`core/store/index/projection/memory/protocol`) + 3 продуктовых бинарника (`local-rag`, `local-rag-proxy`, `local-rag-hook`) + dev-only `xtask`; toolchain pin 1.96.1 (`rust-toolchain.toml`), edition 2024, MSRV 1.96; `CONTRIBUTING.md` (единая команда `cargo xtask ci` + dependency policy); `.github/workflows/ci.yml` (ubuntu-latest); `Cargo.lock` без внешних зависимостей (0 registry sources) | Claude Opus 4.8 / 2026-07-16 |
+
+Примечания к T00-02:
+
+- Три бинарника соответствуют spec 13 §1 (`local-rag` = daemon+CLI, `local-rag-proxy` = stdio
+  MCP proxy, `local-rag-hook` = spool writer); бизнес-логики нет — единственная команда `version`.
+- Единый full-check = `cargo xtask ci` (dev-only крейт `xtask`, `.cargo/config.toml` alias); тот же
+  command вызывает CI. `xtask` исключён из `default-members`, но покрыт `cargo test --workspace`.
+- CI config lint реализован как `xtask/tests/ci_config.rs`: текстовые проверки, что
+  `.github/workflows/ci.yml` вызывает `cargo xtask ci` на одном host, а toolchain запинен на 1.96.1.
+- Deferred scope не заведён: нет dense/model SDK, tree-sitter, rusqlite и сетевых крейтов.
+  Мультиплексирование бинарников через argv0 (spec 13 §1) отложено до дистрибуции (T17).
+- Отклонений не обнаружено; DEVIATIONS.md без изменений.
 
 Примечания к T00-01:
 
