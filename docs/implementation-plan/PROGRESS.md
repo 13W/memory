@@ -9,7 +9,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [x] T00-01 Импортировать v1 behavioral fixtures и зафиксировать baseline inventory
 - [x] T00-02 Создать Rust workspace, quality commands и CI smoke
 - [x] T00-03 Создать общий fixture/failpoint test harness
-- [ ] G00 Сверка foundations и testing contract
+- [x] G00 Сверка foundations и testing contract
 
 ## 01 — Миграции и SQLite foundation
 
@@ -175,7 +175,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 | Gate | Результат | Ссылка на evidence/report |
 | --- | --- | --- |
-| G00 | — | — |
+| G00 | PASS | строка G00 в «Task evidence» + трейс «G00 — трейс требование → artifact/test» ниже |
 | G01 | — | — |
 | G02 | — | — |
 | G03 | — | — |
@@ -203,6 +203,67 @@ Gate следующей группы нельзя начинать до `PASS` �
 | T00-01 | не коммичено | `python3 fixtures/tooling/validate.py` exit 0 (stdlib); тот же скрипт под venv `jsonschema==4.23.0` exit 0; негативный self-test PASS (denylist/schema/49-count/dup-id); live v1 бенчмарк без ошибок | `fixtures/` — 6 семейств, 114 уникальных id; `search/corpus.json` = 49 запросов; baseline снят (embeddinggemma:300m, code-only): MRR 0.696, Hit@1 0.592, Hit@3 0.796, Hit@5 0.837, 544 чанка; gap-register GAP-01..06; пороги = TBD | Claude Opus 4.8 / 2026-07-16 |
 | T00-02 | коммит `T00-02: scaffold Rust workspace + xtask quality gate + CI` (хэш в git-логе; строка edet в том же коммите) | `cargo build --workspace` OK; каждый бинарник `version` → `<имя> 0.0.0`, неизвестная команда exit 2; `cargo xtask ci` (fmt --check → clippy `-D warnings` → test --workspace → doc --no-deps) = all checks passed; offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; 12 значимых тестов (3×2 CLI-smoke, 2 core unit, 2 core doctests, 2 xtask ci_config) | Workspace: 6 либ (`core/store/index/projection/memory/protocol`) + 3 продуктовых бинарника (`local-rag`, `local-rag-proxy`, `local-rag-hook`) + dev-only `xtask`; toolchain pin 1.96.1 (`rust-toolchain.toml`), edition 2024, MSRV 1.96; `CONTRIBUTING.md` (единая команда `cargo xtask ci` + dependency policy); `.github/workflows/ci.yml` (ubuntu-latest); `Cargo.lock` без внешних зависимостей (0 registry sources) | Claude Opus 4.8 / 2026-07-16 |
 | T00-03 | коммит `T00-03: shared fixture/failpoint test harness` (хэш в git-логе; строка evidence в том же коммите) | `cargo test -p local-rag-test-support` OK (8 integration + 5 unit + 6 doctests); `cargo test -p local-rag --test harness_smoke` OK; `cargo xtask ci` = all checks passed; offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; `cargo doc` без warnings; ручная проверка bundle: `status.txt=signal: 6 (SIGABRT)` + command/stdout/stderr сохранены вне temp home, temp homes подчищены на Drop | Dev-only crate `crates/test-support` (`local-rag-test-support`, в `members`, не в `default-members`): `TempHome` (temp `LOCAL_RAG_HOME` под `env::temp_dir()`, RAII-cleanup, `.command()` ставит env только в дочерний процесс), `Clock`/`FixedClock`/`ManualClock`, `IdSource`/`SeqUuids`, `subprocess::run_capturing` + artifact bundle, `Failpoints` + `fail_point!` (registry-strict: неизвестное имя → `FailpointError::Unknown`; `Action::Abort` = crash-точка F/S-матриц), `fixtures` (root/read, std-only). Приёмка: smoke в `local-rag` (dev-dependency); `$HOME` не читается (страж-тест). `Cargo.lock` по-прежнему 0 внешних источников. GAP-06 механизм закрыт; строки F1–F12/S1–S8 остаются за T07-05/T13-06 | Claude Opus 4.8 / 2026-07-16 |
+| G00 | этот коммит (строка evidence в том же коммите; изменён только `PROGRESS.md`) | `python3 fixtures/tooling/validate.py` exit 0 (built-in subset validator; 6 семейств, 114 уникальных id, 20 matrix-строк, no-backend-keys); `cargo xtask ci` = all checks passed; offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed (fmt --check → clippy `-D warnings` → test --workspace → doc --no-deps; прогнаны все group-тесты: test-support 7 unit + 8 integration + 6 doctests, `harness_smoke`, три пары `cli_version`, `xtask ci_config`, core doctests); аудит `Cargo.lock` = 0 строк `source=`/`checksum=`, 11 пакетов; grep всех `Cargo.toml` по dense/model/tree-sitter/sqlite/сеть = NONE; 10/10 baseline-порогов = `"TBD"`; manifest families = ровно 6, gaps = GAP-01..06 (все `blocking:false`) | Сверка G00: перечитаны spec 01/14/15, каждый маркер `[FIXED]`/`[SPEC]`/`[OPEN]` сопоставлен с as-built (трейс ниже). Fixture families 1–6 учтены (spec 14 §1), deferred scope в workspace отсутствует (spec 15 §3, 01 §2 O1), gaps GAP-01..06 видимы в `manifest.json`. Ни один `[OPEN]` (O1 backend, O2 пороги, O4 языки, O8 split) не закрыт молча. Отклонений не обнаружено → `DEVIATIONS.md` без изменений, D-NNN не заводился. `jsonschema==4.23.0` вариант validate.py — сетезависим (в системе не установлен), авторитетно подтверждён ещё в T00-01; для G00 сетенезависимым путём выступает built-in валидатор | Claude Opus 4.8 / 2026-07-16 |
+
+### G00 — трейс требование → artifact/test
+
+Дата 2026-07-16, исполнитель Claude Opus 4.8. Все команды воспроизводимы из README-плана,
+раздел «Проверка». `отложено` = требование нормативно, но реализуется позже по плану; на G00
+проверено лишь отсутствие преждевременного нарушения/coupling.
+
+Spec 01 — Overview:
+
+| Требование (маркер) | Artifact / Test | Статус на G00 |
+| --- | --- | --- |
+| Rust impl `[FIXED]` 01§1 | Rust workspace `Cargo.toml` (9 default-members, edition 2024, MSRV 1.96) | as-built |
+| npm distribution `[FIXED]` 01§1 | packaging → T17; `manifest.json → deferred[]` фиксирует границы | отложено, не нарушено |
+| No mandatory external daemons `[FIXED]` 01§1 | `Cargo.lock` 0 внешних источников; нет qdrant/ollama SDK | as-built |
+| Claude Code only harness `[FIXED]` 01§2 | нет multi-harness кода; multi-harness в `deferred[]` | as-built |
+| Spool-only hook ingestion `[FIXED]` 01§2 | бинарник `local-rag-hook` (seam) → логика G13 | отложено, seam есть |
+| Platform targets; win32-arm64/FreeBSD deferred `[FIXED]` 01§2 | CI single host (T17 добавит остальные); `deferred[]` | as-built |
+| Dense backend выбирается на step 11 `[OPEN]` 01§2 / O1 | нет backend-крейтов (`Cargo.lock`, grep Cargo.toml); только план `ProjectionStore` | не закрыт молча |
+| No process-global current project `[FIXED]` 01§3 | кода маршрутизации ещё нет → G02/G15 | отложено, не нарушено |
+| No in-place re-embed/migration `[FIXED]` 01§3 | → G11 | отложено |
+| `non_rebuildable` отвергается `[FIXED]` 01§3 | → G03 | отложено |
+| Correctness budget `[FIXED]` 01§4 | fixtures `memory/`+`fault/` кодируют ожидания; harness `Failpoints` | mechanism готов; реализация G07/G13/G14 |
+| Two identity ladders + audit rule `[FIXED]` 01§5 | `validate.py` denylist (no payload/backend поля в fixtures); schema-lint DDL → G01+ | fixtures neutral; DDL позже |
+| v1 behavioral contract `[FIXED]` 01§7 | fixtures импортированы implementation-neutral (6 семейств, 114 id) | as-built |
+
+Spec 14 — Acceptance & Testing:
+
+| Требование (маркер) | Artifact / Test | Статус на G00 |
+| --- | --- | --- |
+| 6 fixture families, implementation-neutral `[FIXED]` 14§1 | `fixtures/{parser,reconcile,search,memory,adversarial,fault}`; `validate.py` форсит множество семейств | учтены (parser gap-only) |
+| Acceptance gates existence/shape `[FIXED set]` 14§2 | `fault/matrix.json` (F1–F12/S1–S8 декларативно); пороги `TBD` | shape зафиксирован |
+| Baseline numbers `[BASELINE]`/`[OPEN]` 14§2–3 / O2 | `manifest.baseline`: метрики сняты, 10/10 порогов = `"TBD"` | O2 соблюдён |
+| Fault-injection harness `[FIXED]`+`[SPEC]` 14§3 | `test-support::Failpoints`/`fail_point!`; `harness.rs` (8); `matrix.json` | mechanism (GAP-06 закрыт); скрипты → T07-05/T13-06 |
+| Consistency tests `[SPEC mechanics]` 14§4 | → G07/G08/G09 | отложено |
+| Determinism (parser/ids/addlContext/schema-lint) 14§5 `[FIXED]` | `validate.py` denylist; `Clock`/`SeqUuids` в harness; schema-lint → G01+ | partial |
+| Adversarial `[FIXED]` 14§6 | `adversarial/index.json` (12); v2-spec injection round-trip → GAP-05 | импортирован subset + gap |
+| 49-query benchmark `[FIXED]` 14§7 | `search/corpus.json` (49); `manifest.baseline` снят на v1 | as-built |
+| Step-11 spike matrix `[FIXED]` 14§7 | → T10 | отложено |
+
+Spec 15 — Roadmap:
+
+| Требование (маркер) | Artifact / Test | Статус на G00 |
+| --- | --- | --- |
+| Implementation order `[FIXED]` 15§1 | порядок групп 00→17 в `PROGRESS.md` | соблюдён |
+| Backend fixed at step 11 `[FIXED]` 15§1 | нет backend coupling (см. O1) | соблюдён |
+| Steps 1–7 без open question `[FIXED]` 15§1 | foundations без hardcoded `[OPEN]` | соблюдён |
+| MVP v0 scope `[FIXED]` 15§2 | план покрывает; tree-sitter 2–3 языка `[OPEN which]` → GAP-01/O4 | соблюдён |
+| Deferred (all additive) `[FIXED]` 15§3 | `manifest.deferred[]`; grep `Cargo.toml` = deferred SDK NONE | не в workspace |
+| Open questions O1–O8 `[OPEN]` 15§4 | O1→нет coupling; O2→пороги `TBD`; O4→GAP-01; O8 (`split now [FIXED]`)→state/cache split запланирован T01-05 | ни один не закрыт молча |
+
+Заметки G00 (не отклонения):
+
+- Имена директорий `fixtures/{memory,adversarial,fault}` — слаги; spec 14 §1 называет семейства
+  «Memory-quality», «Adversarial recall», «Fault-injection scripts». Покрытие соответствует;
+  недостающая часть каждого явно висит как GAP (rev6 memory-quality op-корпус → GAP-04 → T14-07;
+  v2 injection round-trip → GAP-05 → T14-08/T16-04). Это не spec↔code mismatch, D-NNN не требуется.
+- Строка evidence `T00-01` выше гласит «не коммичено», хотя задача фактически отгружена в коммите
+  `055a27a` (`T00-01: import v1 behavioral fixtures and baseline inventory`); правило «коммить
+  каждую задачу» появилось позже (`6d0546d`). Историческое evidence не переписывается (CLAUDE.md,
+  «Repository hygiene») — фиксирую факт здесь.
 
 Примечания к T00-03:
 
