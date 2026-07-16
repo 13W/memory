@@ -3,8 +3,11 @@
 //! Vendored in pure `std` — no external crate — mirroring the vendored-UUID
 //! precedent in `test-support` (`ids.rs`). It exists so the Windows named-pipe
 //! endpoint name (`sha256(user SID)[..12]`, spec 02 §2.1) can be computed and
-//! tested on every platform, including the POSIX CI host. This is a stable
-//! namespacing digest, not security-critical cryptography.
+//! tested on every platform, including the POSIX CI host, and so migration
+//! runners can checksum migration SQL (spec 13 §3). Both are stable namespacing
+//! / drift-detection digests, not security-critical cryptography — and neither
+//! is a spec 03 §1.2 content hash (those are domain-separated BLAKE3, a separate
+//! concern introduced later).
 
 const H0: [u32; 8] = [
     0x6a09_e667,
@@ -85,7 +88,7 @@ const K: [u32; 64] = [
 ];
 
 /// Lowercase hex SHA-256 digest of `bytes` (64 hex characters).
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = sha256(bytes);
     let mut hex = String::with_capacity(64);

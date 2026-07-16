@@ -18,7 +18,6 @@
 //! `$LOCAL_RAG_HOME/config` — a sibling of the store root
 //! `$LOCAL_RAG_HOME/local-rag`, keeping a container fully self-contained.
 
-mod hash;
 mod perms;
 
 pub use perms::{ensure_dir, ensure_file_0600, verify_owner};
@@ -258,6 +257,12 @@ impl StoreLayout {
         self.root.join("store.lock")
     }
 
+    /// `migration.lock` — L1, the schema-migration lock (spec 02 §5). Created on
+    /// demand (0600) by the migration runner, not by [`ensure`](Self::ensure).
+    pub fn migration_lock(&self) -> PathBuf {
+        self.root.join("migration.lock")
+    }
+
     /// `state.sqlite` — the canonical source of truth.
     pub fn state_db(&self) -> PathBuf {
         self.root.join("state.sqlite")
@@ -380,7 +385,7 @@ pub enum Endpoint {
 /// assert_eq!(name.len(), prefix.len() + 12);
 /// ```
 pub fn pipe_name(sid: &str) -> String {
-    let digest = hash::sha256_hex(sid.as_bytes());
+    let digest = crate::hash::sha256_hex(sid.as_bytes());
     format!(r"\\.\pipe\local-rag-{}", &digest[..12])
 }
 
@@ -542,6 +547,10 @@ mod tests {
     fn store_layout_maps_every_path() {
         let layout = StoreLayout::new(PathBuf::from("/s/local-rag"));
         assert_eq!(layout.store_lock(), Path::new("/s/local-rag/store.lock"));
+        assert_eq!(
+            layout.migration_lock(),
+            Path::new("/s/local-rag/migration.lock")
+        );
         assert_eq!(layout.state_db(), Path::new("/s/local-rag/state.sqlite"));
         assert_eq!(layout.cache_db(), Path::new("/s/local-rag/cache.sqlite"));
         assert_eq!(

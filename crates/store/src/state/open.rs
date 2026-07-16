@@ -26,6 +26,10 @@ pub enum OpenError {
     JournalMode(String),
     /// The writer thread could not be spawned (e.g. resource exhaustion).
     Spawn(std::io::Error),
+    /// The migration framework failed while opening the store (spec 13 §3):
+    /// incompatible/newer store, checksum drift, a lock failure, or a failing
+    /// migration. Boxed to keep [`OpenError`] small.
+    Migration(Box<crate::migrate::MigrationError>),
 }
 
 impl From<rusqlite::Error> for OpenError {
@@ -45,6 +49,7 @@ impl fmt::Display for OpenError {
                 )
             }
             OpenError::Spawn(e) => write!(f, "could not spawn the state writer thread: {e}"),
+            OpenError::Migration(e) => write!(f, "state store migration failed: {e}"),
         }
     }
 }
@@ -55,6 +60,7 @@ impl std::error::Error for OpenError {
             OpenError::Sqlite(e) => Some(e),
             OpenError::JournalMode(_) => None,
             OpenError::Spawn(e) => Some(e),
+            OpenError::Migration(e) => Some(e),
         }
     }
 }

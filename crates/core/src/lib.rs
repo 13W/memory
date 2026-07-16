@@ -2,8 +2,10 @@
 //!
 //! Beyond the shared version string, this crate hosts the [`paths`] platform
 //! abstraction (store/config directory resolution, layout, endpoint, and
-//! permission primitives) that every binary shares.
+//! permission primitives) that every binary shares, plus the vendored [`hash`]
+//! digest used for stable namespacing and migration checksums.
 
+pub mod hash;
 pub mod paths;
 
 /// The workspace version, shared by every `local-rag` binary.
