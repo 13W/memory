@@ -1,0 +1,80 @@
+{
+  "family": "search",
+  "version": "1.0.0",
+  "description": "The v1 49-query code-search benchmark corpus, imported implementation-neutrally. Query strings and ground-truth targets are kept VERBATIM from v1 so the benchmark stays comparable (baseline on v1, gate on v2 — 14 §7 [FIXED]). Matching semantics: file = substring of the target file path; symbol = substring of the target symbol name; symbol=null means file-level match (any symbol).",
+  "provenance": {
+    "source": "scripts/benchmark.ts",
+    "ref": "const QUERIES: BenchQuery[] (lines 56-133); scoring in evaluateModel (lines 438-453)",
+    "note": "v1 schema {query, expectedFile, expectedName} -> {query, expected.file, expected.symbol}. expectedName === '' -> symbol=null. Single relevant target per query; no graded relevance judgments (registered gap)."
+  },
+  "relevance": {
+    "kind": "single-relevant",
+    "graded": false,
+    "judgments_per_query": 1
+  },
+  "metrics": ["hit@1", "hit@3", "hit@5", "mrr"],
+  "queries": [
+    { "id": "sc-01", "group": "embedder", "query": "embed batch of text strings", "expected": { "file": "embedder", "symbol": "embedBatch", "match": "substring" } },
+    { "id": "sc-02", "group": "embedder", "query": "embed single text string to vector", "expected": { "file": "embedder", "symbol": "embedOne", "match": "substring" } },
+    { "id": "sc-03", "group": "embedder", "query": "call Ollama embed API and parse embeddings response", "expected": { "file": "embedder", "symbol": "embedOllama", "match": "substring" } },
+    { "id": "sc-04", "group": "embedder", "query": "call OpenAI embeddings API with bearer auth", "expected": { "file": "embedder", "symbol": "embedOpenAI", "match": "substring" } },
+    { "id": "sc-05", "group": "embedder", "query": "call Voyage AI embeddings API", "expected": { "file": "embedder", "symbol": "embedVoyage", "match": "substring" } },
+    { "id": "sc-06", "group": "embedder", "query": "retry embedding request on failure with backoff", "expected": { "file": "embedder", "symbol": "embedBatchAttempt", "match": "substring" } },
+    { "id": "sc-07", "group": "embedder", "query": "generate 1-2 sentence LLM description for code chunk", "expected": { "file": "embedder", "symbol": "generateDescription", "match": "substring" } },
+    { "id": "sc-08", "group": "embedder", "query": "filter memory candidates by LLM relevance scoring", "expected": { "file": "embedder", "symbol": "llmFilter", "match": "substring" } },
+    { "id": "sc-09", "group": "embedder", "query": "call LLM via Ollama generate endpoint", "expected": { "file": "embedder", "symbol": "callLlmOllama", "match": "substring" } },
+    { "id": "sc-10", "group": "embedder", "query": "resolve base URL for embedding provider", "expected": { "file": "embedder", "symbol": "resolveEmbedUrl", "match": "substring" } },
+
+    { "id": "sc-11", "group": "search_code", "query": "hybrid RRF search over code and description vectors", "expected": { "file": "search_code", "symbol": "searchCodeTool", "match": "substring" } },
+    { "id": "sc-12", "group": "search_code", "query": "semantic code search with file path substring filter", "expected": { "file": "search_code", "symbol": "searchCodeTool", "match": "substring" } },
+    { "id": "sc-13", "group": "search_code", "query": "interface for search_code tool parameters", "expected": { "file": "search_code", "symbol": "SearchCodeArgs", "match": "substring" } },
+
+    { "id": "sc-14", "group": "indexer", "query": "index all source files in directory into Qdrant", "expected": { "file": "indexer/indexer", "symbol": "indexAll", "match": "substring" } },
+    { "id": "sc-15", "group": "indexer", "query": "index single file and upsert code chunks to Qdrant", "expected": { "file": "indexer/indexer", "symbol": "indexFile", "match": "substring" } },
+    { "id": "sc-16", "group": "indexer", "query": "build embed context string from code chunk fields", "expected": { "file": "indexer/indexer", "symbol": "buildEmbedContext", "match": "substring" } },
+    { "id": "sc-17", "group": "indexer", "query": "collect indexable files respecting gitignore rules", "expected": { "file": "indexer/indexer", "symbol": "collectFiles", "match": "substring" } },
+    { "id": "sc-18", "group": "indexer", "query": "code indexer class with Qdrant client and description generation", "expected": { "file": "indexer/indexer", "symbol": "CodeIndexer", "match": "substring" } },
+
+    { "id": "sc-19", "group": "parser", "query": "parse TypeScript file into code chunks using tree-sitter", "expected": { "file": "indexer/parser", "symbol": "parseFile", "match": "substring" } },
+    { "id": "sc-20", "group": "parser", "query": "walk AST and extract symbol nodes into CodeChunks", "expected": { "file": "indexer/parser", "symbol": "walkTree", "match": "substring" } },
+    { "id": "sc-21", "group": "parser", "query": "extract JSDoc comment block preceding a code node", "expected": { "file": "indexer/parser", "symbol": "extractDoc", "match": "substring" } },
+    { "id": "sc-22", "group": "parser", "query": "parse YAML file into document chunks", "expected": { "file": "indexer/parser", "symbol": "parseYaml", "match": "substring" } },
+    { "id": "sc-23", "group": "parser", "query": "parse JSON file into code chunks by top-level keys", "expected": { "file": "indexer/parser", "symbol": "parseJsonFile", "match": "substring" } },
+    { "id": "sc-24", "group": "parser", "query": "extract import statements from source file AST", "expected": { "file": "indexer/parser", "symbol": "extractImports", "match": "substring" } },
+
+    { "id": "sc-25", "group": "types", "query": "interface for code chunk with filePath language and chunkType", "expected": { "file": "types", "symbol": "CodeChunk", "match": "substring" } },
+    { "id": "sc-26", "group": "types", "query": "Qdrant payload interface for indexed code chunk with description", "expected": { "file": "types", "symbol": "CodeChunkPayload", "match": "substring" } },
+
+    { "id": "sc-27", "group": "qdrant", "query": "create code_chunks collection with named vectors code_vector and description_vector", "expected": { "file": "qdrant", "symbol": "ensureCodeChunks", "match": "substring" } },
+    { "id": "sc-28", "group": "qdrant", "query": "named vector constant identifiers for code and description", "expected": { "file": "qdrant", "symbol": "CODE_VECTORS", "match": "substring" } },
+    { "id": "sc-29", "group": "qdrant", "query": "ensure all required Qdrant collections exist", "expected": { "file": "qdrant", "symbol": "ensureCollections", "match": "substring" } },
+
+    { "id": "sc-30", "group": "config", "query": "frozen config object with Qdrant URL Ollama URL embed model", "expected": { "file": "config", "symbol": "cfg", "match": "substring" } },
+
+    { "id": "sc-31", "group": "storage", "query": "get direct import dependencies of a file from Qdrant", "expected": { "file": "storage", "symbol": "getDeps", "match": "substring" } },
+    { "id": "sc-32", "group": "storage", "query": "get reverse dependencies - files that import this file", "expected": { "file": "storage", "symbol": "getReverseDeps", "match": "substring" } },
+    { "id": "sc-33", "group": "storage", "query": "find memory entry metadata by ID across collections", "expected": { "file": "storage", "symbol": "getMemoryMeta", "match": "substring" } },
+    { "id": "sc-34", "group": "storage", "query": "top files ranked by number of reverse dependencies", "expected": { "file": "storage", "symbol": "topFilesByRevDeps", "match": "substring" } },
+
+    { "id": "sc-35", "group": "server", "query": "dispatch MCP tool call by tool name to handler", "expected": { "file": "server", "symbol": "dispatchTool", "match": "substring" } },
+    { "id": "sc-36", "group": "server", "query": "array of all registered MCP tool schema definitions", "expected": { "file": "server", "symbol": "TOOLS", "match": "substring" } },
+
+    { "id": "sc-37", "group": "tools", "query": "store memory entry with type scope importance and TTL", "expected": { "file": "remember", "symbol": "rememberTool", "match": "substring" } },
+    { "id": "sc-38", "group": "tools", "query": "semantic search across memory with time decay and LLM reranking", "expected": { "file": "recall", "symbol": "recallTool", "match": "substring" } },
+    { "id": "sc-39", "group": "tools", "query": "read source file and return lines around named symbol", "expected": { "file": "get_file_context", "symbol": "getFileContextTool", "match": "substring" } },
+    { "id": "sc-40", "group": "tools", "query": "get import and reverse dependency graph for a file", "expected": { "file": "get_dependencies", "symbol": "getDependenciesTool", "match": "substring" } },
+    { "id": "sc-41", "group": "tools", "query": "generate project directory tree with language stats", "expected": { "file": "project_overview", "symbol": "projectOverviewTool", "match": "substring" } },
+    { "id": "sc-42", "group": "tools", "query": "count points across all memory and code collections", "expected": { "file": "stats", "symbol": "statsTool", "match": "substring" } },
+    { "id": "sc-43", "group": "tools", "query": "delete memory entry by ID from Qdrant collection", "expected": { "file": "forget", "symbol": "forgetTool", "match": "substring" } },
+
+    { "id": "sc-44", "group": "util", "query": "store memory in Qdrant with content hash deduplication", "expected": { "file": "util", "symbol": "storeMemory", "match": "substring" } },
+    { "id": "sc-45", "group": "util", "query": "map memory type string to Qdrant collection name", "expected": { "file": "util", "symbol": "colForType", "match": "substring" } },
+
+    { "id": "sc-46", "group": "scoring", "query": "combine cosine similarity time decay and importance into relevance score", "expected": { "file": "scoring", "symbol": "finalScore", "match": "substring" } },
+    { "id": "sc-47", "group": "scoring", "query": "exponential time decay based on memory age and half-life", "expected": { "file": "scoring", "symbol": "timeDecay", "match": "substring" } },
+
+    { "id": "sc-48", "group": "indexer_cli", "query": "expand root paths and resolve project roots for indexing", "expected": { "file": "indexer/cli", "symbol": "expandRoots", "match": "substring" } },
+
+    { "id": "sc-49", "group": "bin", "query": "top-level CLI entry point routing to serve init or index commands", "expected": { "file": "bin", "symbol": null, "match": "substring" } }
+  ]
+}

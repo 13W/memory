@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Machine-local Claude Code configuration (never committed)
+.claude/settings.local.json
+
+# local-rag store artifacts — canonical/rebuildable data must never be committed
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/store/
+spool/
+models/
+quarantine/
+
+# Logs and local scratch
+*.log
+/logs/
+
+# OS cruft
+.DS_Store
+
+# NOTE: Cargo.lock IS committed (workspace with binaries / dependency policy).

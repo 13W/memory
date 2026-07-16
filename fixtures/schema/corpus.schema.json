@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-rag.dev/fixtures/corpus.schema.json",
+  "title": "Search benchmark corpus (49-query)",
+  "description": "The v1 49-query code-search benchmark corpus, imperatively neutral: query -> single ground-truth target. Metric thresholds are NOT stored here; see manifest baseline.",
+  "type": "object",
+  "required": ["family", "version", "provenance", "relevance", "metrics", "queries"],
+  "additionalProperties": false,
+  "properties": {
+    "family": { "const": "search" },
+    "version": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "provenance": {
+      "type": "object",
+      "required": ["source"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "ref": { "type": "string" },
+        "note": { "type": "string" }
+      }
+    },
+    "relevance": {
+      "type": "object",
+      "required": ["kind", "graded", "judgments_per_query"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "single-relevant" },
+        "graded": { "const": false },
+        "judgments_per_query": { "const": 1 }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "queries": {
+      "type": "array",
+      "minItems": 49,
+      "maxItems": 49,
+      "items": {
+        "type": "object",
+        "required": ["id", "query", "expected"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$" },
+          "query": { "type": "string", "minLength": 1 },
+          "group": { "type": "string" },
+          "expected": {
+            "type": "object",
+            "required": ["file", "symbol", "match"],
+            "additionalProperties": false,
+            "properties": {
+              "file": { "type": "string", "minLength": 1 },
+              "symbol": {
+                "type": ["string", "null"],
+                "description": "null = file-level match, any symbol accepted (v1 expectedName === '')."
+              },
+              "match": { "const": "substring" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

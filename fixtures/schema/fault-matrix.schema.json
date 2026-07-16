@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-rag.dev/fixtures/fault-matrix.schema.json",
+  "title": "Declarative fault / kill matrices",
+  "description": "Declarative capture of the [FIXED] fault-detection matrix (05 §10, F1-F12) and spool kill matrix (07 §7, S1-S8). Shape is fixed now; executable failpoint scripts are a registered gap.",
+  "type": "object",
+  "required": ["family", "version", "matrices"],
+  "additionalProperties": false,
+  "properties": {
+    "family": { "const": "fault" },
+    "version": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "matrices": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "spec_ref", "property", "status", "rows"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Z]$" },
+          "name": { "type": "string", "minLength": 1 },
+          "spec_ref": { "type": "string", "minLength": 1 },
+          "property": { "type": "string", "minLength": 1 },
+          "status": {
+            "enum": ["declarative"],
+            "description": "declarative = row shape captured; executable failpoint script is a registered gap."
+          },
+          "gap": { "type": "string" },
+          "rows": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["id", "injected_fault", "expected_signal"],
+              "additionalProperties": false,
+              "properties": {
+                "id": { "type": "string", "pattern": "^[A-Z][0-9]+$" },
+                "injected_fault": { "type": "string", "minLength": 1 },
+                "expected_signal": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

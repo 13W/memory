@@ -1,0 +1,119 @@
+{
+  "family": "fault",
+  "version": "1.0.0",
+  "description": "Behavioral fault-handling imported from v1: LLM retry/backoff and rate-limit queue semantics, plus rejection safety. The [FIXED] projection fault matrix (F1-F12) and spool kill matrix (S1-S8) are captured declaratively in matrix.json; their executable failpoint scripts are a registered gap (GAP-06).",
+  "cases": [
+    {
+      "id": "fault.llm.retry-500",
+      "title": "Retries on HTTP 500 and returns the eventual success body",
+      "status": "active",
+      "provenance": { "source": "src/llm-client.test.ts", "ref": "retries on 500 and returns the eventual success body" },
+      "input": { "responses": ["status:500", "status:200 body:ok"], "max_attempts": 4 },
+      "expected": { "result": "ok", "attempts": 2, "retried": true }
+    },
+    {
+      "id": "fault.llm.retry-503-retry-after",
+      "title": "Retries on 503 and honors the Retry-After header (seconds)",
+      "status": "active",
+      "provenance": { "source": "src/llm-client.test.ts", "ref": "retries on 503 and honours Retry-After header (seconds)" },
+      "input": { "responses": ["status:503 retry-after:0", "status:200 body:back"], "max_attempts": 4 },
+      "expected": { "result": "back", "attempts": 2, "honors_retry_after": true }
+    },
+    {
+      "id": "fault.llm.retry-429-body-hint",
+      "title": "Retries on 429 and uses the 'retry in Xs' body hint as fallback",
+      "status": "active",
+      "provenance": { "source": "src/llm-client.test.ts", "ref": "retries on 429 and uses 'retry in Xs' body hint as fallback" },
+      "input": { "responses": ["status:429 body:{\"error\":\"please retry in 0.1s\"}", "status:200 body:calm"], "max_attempts": 4 },
+      "expected": { "result": "calm", "attempts": 2, "uses_body_hint": true }
+    },
+    {
+      "id": "fault.llm.exhaust-500",
+      "title": "Throws after exhausting attempts on persistent 500",
+      "status": "active",
+      "provenance": { "source": "src/llm-client.test.ts", "ref": "throws after exhausting attempts on persistent 500" },
+      "input": { "responses": "persistent status:500", "max_attempts": 2 },
+      "expected": { "throws": true, "error_matches": "500", "attempts": 2 }
+    },
+    {
+      "id": "fault.llm.no-retry-400",
+      "title": "Does not retry on 400 (non-retryable)",
+      "status": "active",
+      "provenance": { "source": "src/llm-client.test.ts", "ref": "does not retry on 400 (non-retryable)" },
+      "input": { "responses": "status:400", "max_attempts": 4 },
+      "expected": { "throws": true, "error_matches": "400", "attempts": 1, "retried": false }
+    },
+    {
+      "id": "fault.llm.retry-network-error",
+      "title": "Retries on TypeError: fetch failed (network error) then succeeds",
+      "status": "active",
+      "provenance": { "source": "src/llm-client.test.ts", "ref": "retries on TypeError: fetch failed (network error)" },
+      "input": { "responses": ["error:TypeError fetch failed", "status:200 body:recovered"], "max_attempts": 4 },
+      "expected": { "result": "recovered", "attempts": 2 }
+    },
+    {
+      "id": "fault.llm.exhaust-network",
+      "title": "Throws after exhausting attempts on persistent network failure",
+      "status": "active",
+      "provenance": { "source": "src/llm-client.test.ts", "ref": "throws after exhausting attempts on persistent network failure" },
+      "input": { "responses": "persistent error:TypeError fetch failed", "max_attempts": 2 },
+      "expected": { "throws": true, "error_matches": "NetworkError", "attempts": 2 }
+    },
+    {
+      "id": "fault.queue.under-limit",
+      "title": "Acquires immediately when under the rate limit",
+      "status": "active",
+      "provenance": { "source": "src/queue.test.ts", "ref": "acquires immediately when under the rate limit" },
+      "input": { "limit": 3, "per_seconds": 1, "acquires": 3 },
+      "expected": { "all_immediate": true }
+    },
+    {
+      "id": "fault.queue.block-until-window",
+      "title": "Blocks when the window is full and resolves after the window expires",
+      "status": "active",
+      "provenance": { "source": "src/queue.test.ts", "ref": "blocks when window is full, resolves after window expires" },
+      "input": { "limit": 2, "per_seconds": 1, "acquires": 3, "advance_ms": 1002 },
+      "expected": { "third_blocks_until_window": true, "resolves_after_window": true }
+    },
+    {
+      "id": "fault.queue.pause-delays",
+      "title": "pause delays the next acquire for the pause duration",
+      "status": "active",
+      "provenance": { "source": "src/queue.test.ts", "ref": "pause delays subsequent acquire for the pause duration" },
+      "input": { "limit": 10, "per_seconds": 60, "pause_ms": 2000 },
+      "expected": { "blocked_until_pause_elapses": true }
+    },
+    {
+      "id": "fault.queue.pause-no-shorten",
+      "title": "A shorter pause does not override a longer active pause",
+      "status": "active",
+      "provenance": { "source": "src/queue.test.ts", "ref": "pause does not shorten an existing longer pause" },
+      "input": { "limit": 10, "per_seconds": 60, "pause_ms": [3000, 500] },
+      "expected": { "effective_pause_ms": 3000 }
+    },
+    {
+      "id": "fault.queue.trim-frees-slots",
+      "title": "trim removes expired timestamps so slots become available",
+      "status": "active",
+      "provenance": { "source": "src/queue.test.ts", "ref": "trim removes expired timestamps so slots become available" },
+      "input": { "limit": 1, "per_seconds": 1, "advance_ms": 1001, "then_trim": true },
+      "expected": { "acquires_immediately_after_trim": true }
+    },
+    {
+      "id": "fault.queue.serialized-within-limit",
+      "title": "Concurrent acquires are serialized within the window limit, preserving order",
+      "status": "active",
+      "provenance": { "source": "src/queue.test.ts", "ref": "concurrent acquires are serialized within the window limit" },
+      "input": { "limit": 2, "per_seconds": 1, "acquires": 3, "advance_ms": 1002 },
+      "expected": { "order": [1, 2, 3], "first_two_immediate": true, "third_after_window": true }
+    },
+    {
+      "id": "fault.indexer.rejection-not-leaked",
+      "title": "A failing per-file index rejects to the caller without leaking an unhandledRejection",
+      "status": "active",
+      "provenance": { "source": "src/indexer/indexer.test.ts", "ref": "does not leak unhandledRejection when _indexFileImpl rejects" },
+      "input": { "index_file_impl": "rejects with TypeError fetch failed" },
+      "expected": { "rejects_to_caller": true, "error_matches": "fetch failed", "no_unhandled_rejection": true, "impl_called_times": 1 }
+    }
+  ]
+}
