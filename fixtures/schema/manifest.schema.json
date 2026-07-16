@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-rag.dev/fixtures/manifest.schema.json",
+  "title": "Fixture corpus source manifest",
+  "description": "Provenance, per-family coverage, gap register and baseline inventory for the imported v1 fixtures (task T00-01).",
+  "type": "object",
+  "required": ["version", "generated", "task", "source", "denylist", "families", "gaps", "baseline", "deferred"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "type": "string", "minLength": 1 },
+    "generated": { "type": "string", "minLength": 1 },
+    "task": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "required": ["repo", "commit", "language"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "minLength": 1 },
+        "language": { "type": "string", "minLength": 1 },
+        "note": { "type": "string" }
+      }
+    },
+    "denylist": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Backend/vector-store payload field names that MUST NOT appear as keys in any fixture (01 §7, 14 §1)."
+    },
+    "families": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": ["name", "spec_ref", "coverage", "artifact", "provenance"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "enum": ["parser", "reconcile", "search", "memory", "adversarial", "fault"] },
+          "spec_ref": { "type": "string", "minLength": 1 },
+          "coverage": { "enum": ["full", "partial", "gap-only"] },
+          "artifact": { "type": ["string", "null"] },
+          "provenance": { "type": "array", "items": { "type": "string" } },
+          "gaps": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "family", "description", "blocking", "resolves_in"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^GAP-[0-9]{2}$" },
+          "family": { "enum": ["parser", "reconcile", "search", "memory", "adversarial", "fault"] },
+          "description": { "type": "string", "minLength": 1 },
+          "blocking": { "type": "boolean" },
+          "resolves_in": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "required": ["status", "metrics", "thresholds", "runs"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "metrics": { "type": "array", "items": { "type": "string" } },
+        "thresholds": {
+          "type": "object",
+          "description": "Every v2 gate threshold is [BASELINE]/[OPEN] -> value MUST be the string 'TBD' (O2: collect metrics, do not invent thresholds).",
+          "additionalProperties": { "const": "TBD" }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["file", "model", "flags", "date"],
+            "additionalProperties": true,
+            "properties": {
+              "file": { "type": "string" },
+              "model": { "type": "string" },
+              "flags": { "type": "string" },
+              "date": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "deferred": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Deferred scope (15 §3) explicitly NOT imported as v0 expected behavior."
+    }
+  }
+}

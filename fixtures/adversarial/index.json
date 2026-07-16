@@ -1,0 +1,117 @@
+{
+  "family": "adversarial",
+  "version": "1.0.0",
+  "description": "Robustness of the memory router against untrusted / malformed LLM output: reasoning-leak, CJK-leak, empty/invalid entries, malformed JSON, and null/non-array shapes. Links to 12 §4 (recalled memory is untrusted). Prompt-injection round-trip-inert, delimiter-collision escaping and recall caps (14 §6) are v2-spec requirements absent in v1 and registered as GAP-05.",
+  "cases": [
+    {
+      "id": "adversarial.router.null-llm",
+      "title": "LLM returns null -> no operations",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "runRouter: returns empty array when LLM returns null" },
+      "input": { "llm_result": null },
+      "expected": { "operations": [] }
+    },
+    {
+      "id": "adversarial.router.missing-operations",
+      "title": "LLM result without an operations field -> no operations",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "runRouter: returns empty array when operations is missing" },
+      "input": { "llm_result": { "other": "field" } },
+      "expected": { "operations": [] }
+    },
+    {
+      "id": "adversarial.router.non-array-operations",
+      "title": "operations that is not an array -> no operations",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "handles non-array operations gracefully" },
+      "input": { "llm_result": { "operations": "not-an-array" } },
+      "expected": { "operations": [] }
+    },
+    {
+      "id": "adversarial.router.llm-throws",
+      "title": "LLM call throws and there is no fallback -> no operations",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "returns empty array when LLM throws and no fallback" },
+      "input": { "llm_error": "timeout" },
+      "expected": { "operations": [] }
+    },
+    {
+      "id": "adversarial.router.invalid-status-dropped",
+      "title": "Operations with an invalid status are dropped",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "filters out operations with invalid status" },
+      "input": { "llm_operations": [ { "text": "valid", "status": "resolved", "confidence": 0.8 }, { "text": "bad", "status": "unknown_status", "confidence": 0.9 } ] },
+      "expected": { "kept_count": 1, "kept_text": "valid" }
+    },
+    {
+      "id": "adversarial.router.empty-text-dropped",
+      "title": "Operations with empty or whitespace-only text are dropped",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "filters out operations with empty text" },
+      "input": { "llm_operations": [ { "text": "", "status": "resolved", "confidence": 0.9 }, { "text": "  ", "status": "resolved", "confidence": 0.9 }, { "text": "good", "status": "resolved", "confidence": 0.9 } ] },
+      "expected": { "kept_count": 1, "kept_text": "good" }
+    },
+    {
+      "id": "adversarial.router.reasoning-and-cjk-leak",
+      "title": "Reasoning narration and CJK-leak entries are stripped; only the real memory survives",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "drops reasoning-leak entries from router output" },
+      "input": { "llm_operations": [
+        { "text": "(Wait, the user is asking in Russian, I should...)", "status": "observation", "confidence": 0.8 },
+        { "text": "Hmm, let me think about this", "status": "observation", "confidence": 0.8 },
+        { "text": "The user is testing the memory system", "status": "observation", "confidence": 0.8 },
+        { "text": "I should check if recall returned anything", "status": "observation", "confidence": 0.8 },
+        { "text": "사용자가 요청한 작업", "status": "observation", "confidence": 0.8 },
+        { "text": "Bug fixed in src/util.ts: contentHash now normalizes whitespace", "status": "resolved", "confidence": 0.8 }
+      ] },
+      "expected": { "kept_count": 1, "kept_text_contains": "contentHash" }
+    },
+    {
+      "id": "adversarial.detect.reasoning",
+      "title": "Reasoning detector flags agent narration but not real memory entries",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "looksLikeReasoning" },
+      "input": {
+        "reasoning_examples": ["(Wait, the user is asking...)", "Hmm, that's interesting", "Let me think about this", "The user is testing memory", "The user wants to know X", "I should check the docs", "I will analyse this"],
+        "non_reasoning_examples": ["Bug fixed in parser.ts", "Architectural decision: use Qdrant", "Problem: import fails on Windows"]
+      },
+      "expected": { "reasoning_examples_all_flagged": true, "non_reasoning_examples_all_unflagged": true }
+    },
+    {
+      "id": "adversarial.detect.cjk-leak",
+      "title": "CJK-leak detector flags long CJK text, tolerates short substrings, ignores ascii/cyrillic",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "hasCJKLeak" },
+      "input": {
+        "cjk_examples": ["사용자가 요청한 작업입니다", "これはテストです、長い文章", "这是一个测试句子很长"],
+        "non_cjk_examples": ["Bug fixed in parser.ts", "Архитектурное решение: использовать Qdrant"],
+        "short_cjk_examples": ["Tested with input 测 stub"]
+      },
+      "expected": { "cjk_examples_all_flagged": true, "non_cjk_examples_all_unflagged": true, "short_cjk_examples_tolerated_unflagged": true }
+    },
+    {
+      "id": "adversarial.parseops.chatty-preamble",
+      "title": "parseOps extracts the JSON array from a chatty preamble",
+      "status": "active",
+      "provenance": { "source": "scripts/test-parser-fix.ts", "ref": "CASES: Chatty with preamble", "note": "parseOps path: confidence threshold 0.4, VALID_STATUSES excludes 'observation' (differs from runRouter: 0.5 + observation)" },
+      "input": { "raw": "* Role: Memory extraction system\n* Task: Extract insights\n\nHere is the JSON:\n[\n  {\"text\": \"Found a bug in Gemini enum handling\", \"status\": \"resolved\", \"confidence\": 0.9}\n]" },
+      "expected": { "extracts_nonempty": true, "extracted_count": 1, "first_text_contains": "Gemini enum handling" }
+    },
+    {
+      "id": "adversarial.parseops.object-list",
+      "title": "parseOps recovers at least one op from newline-separated objects (no array)",
+      "status": "active",
+      "provenance": { "source": "scripts/test-parser-fix.ts", "ref": "CASES: Object list instead of array", "note": "test asserts non-empty extraction; v1 recovers the first parseable object" },
+      "input": { "raw": "I found these:\n{\"text\": \"Task A\", \"status\": \"in_progress\", \"confidence\": 0.8}\n{\"text\": \"Task B\", \"status\": \"open_question\", \"confidence\": 0.7}" },
+      "expected": { "extracts_nonempty": true }
+    },
+    {
+      "id": "adversarial.parseops.truncated-array",
+      "title": "parseOps repairs and extracts from a truncated JSON array",
+      "status": "active",
+      "provenance": { "source": "scripts/test-parser-fix.ts", "ref": "CASES: Truncated JSON array", "note": "unterminated array is repaired by appending ']'; the single op has confidence 0.5 >= 0.4 threshold" },
+      "input": { "raw": "Progress so far:\n[\n  {\"text\": \"Partially written\", \"status\": \"hypothesis\", \"confidence\": 0.5}" },
+      "expected": { "extracts_nonempty": true, "extracted_count": 1 }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "timestamp": "2026-07-16T13:12:13.607Z",
+  "projectDir": "/opt/soft/local-rag",
+  "llmModel": "gemma3n:e2b",
+  "results": [
+    {
+      "model": "embeddinggemma:300m",
+      "slug": "gemma_300m",
+      "timing": {
+        "indexMs": 13006,
+        "codeEmbedMs": 12562,
+        "descGenMs": 0,
+        "descEmbedMs": 0,
+        "queryEmbedMs": 4008,
+        "searchMs": 229,
+        "chunksIndexed": 544
+      },
+      "metrics": {
+        "hit1": 0.5918367346938775,
+        "hit3": 0.7959183673469388,
+        "hit5": 0.8367346938775511,
+        "mrr": 0.6962585034013605
+      },
+      "errors": []
+    }
+  ]
+}

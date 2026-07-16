@@ -1,0 +1,8 @@
+# Optional. The bootstrap validator (validate.py) runs on the Python 3 standard library alone
+# and needs nothing installed. If the reference `jsonschema` implementation is present it is
+# used instead of the built-in subset checker for authoritative Draft 2020-12 validation.
+#
+#   python3 -m pip install -r requirements.txt   # optional, for authoritative validation
+#
+# Pinned for offline determinism (fetched once during setup, never at test time).
+jsonschema==4.23.0

@@ -1,0 +1,173 @@
+{
+  "version": "1.0.0",
+  "generated": "2026-07-16",
+  "task": "T00-01",
+  "source": {
+    "repo": "local-rag (v1)",
+    "commit": "31dfba2",
+    "language": "TypeScript",
+    "note": "v1 is a vitest + tree-sitter + Qdrant + Ollama project. Assertions are imported as observable behavior only. Vector-store payload schema (src/types.ts CodeChunkPayload/MemoryPayload, src/qdrant.ts collections/named vectors, specification.md schema), the colForType collection-name mapping, and old/new payload-shape assertions are intentionally NOT imported (01 §7)."
+  },
+  "denylist": [
+    "file_path", "chunk_type", "code_vector", "description_vector", "named_vector",
+    "collection", "payload", "parent_id", "children_ids", "is_parent", "file_hash",
+    "branches", "qdrant", "vector", "points", "upsert", "prefetch",
+    "memory_type", "expires_at", "content_hash"
+  ],
+  "families": [
+    {
+      "name": "parser",
+      "spec_ref": "14 §1.1",
+      "coverage": "gap-only",
+      "artifact": null,
+      "provenance": [
+        "src/indexer/parser.ts (v1 parser exists, exercised only via the 49-query benchmark)"
+      ],
+      "gaps": ["GAP-01"]
+    },
+    {
+      "name": "reconcile",
+      "spec_ref": "14 §1.2",
+      "coverage": "partial",
+      "artifact": "reconcile/index.json",
+      "provenance": [
+        "src/indexer/gitignore.test.ts",
+        "src/indexer/indexer.test.ts (git-worktree shouldSkip)"
+      ],
+      "gaps": ["GAP-02"]
+    },
+    {
+      "name": "search",
+      "spec_ref": "14 §1.3, 14 §7",
+      "coverage": "partial",
+      "artifact": "search/corpus.json",
+      "provenance": [
+        "scripts/benchmark.ts (49-query corpus + Hit@k/MRR harness)",
+        "src/tools/search_code.test.ts",
+        "src/scoring.test.ts",
+        "baseline run: search/baseline/"
+      ],
+      "gaps": ["GAP-03"]
+    },
+    {
+      "name": "memory",
+      "spec_ref": "14 §1.4, 08 §7",
+      "coverage": "partial",
+      "artifact": "memory/index.json",
+      "provenance": [
+        "src/util.storeMemory.test.ts",
+        "src/util.test.ts",
+        "src/scoring.test.ts",
+        "src/router.test.ts (valid-op extraction, confidence threshold)"
+      ],
+      "gaps": ["GAP-04"]
+    },
+    {
+      "name": "adversarial",
+      "spec_ref": "14 §1.5, 14 §6, 12 §4",
+      "coverage": "partial",
+      "artifact": "adversarial/index.json",
+      "provenance": [
+        "src/router.test.ts (reasoning-leak, CJK-leak, empty/invalid, null/non-array)",
+        "scripts/test-parser-fix.ts (malformed JSON CASES)"
+      ],
+      "gaps": ["GAP-05"]
+    },
+    {
+      "name": "fault",
+      "spec_ref": "14 §1.6, 14 §3, 05 §10, 07 §7",
+      "coverage": "partial",
+      "artifact": "fault/index.json",
+      "provenance": [
+        "src/llm-client.test.ts (retry/backoff, Retry-After, exhaustion)",
+        "src/queue.test.ts (rate-limit window, pause, trim, serialization)",
+        "src/indexer/indexer.test.ts (rejection safety)",
+        "declarative matrices: fault/matrix.json (05 §10 F1-F12, 07 §7 S1-S8)"
+      ],
+      "gaps": ["GAP-06"]
+    }
+  ],
+  "gaps": [
+    {
+      "id": "GAP-01",
+      "family": "parser",
+      "description": "No v1 golden parser fixtures (source file -> expected units {kind, span, locator}) per language. The v0 language set is [OPEN] (O4). Parser unit goldens are authored once the language set is fixed.",
+      "blocking": false,
+      "resolves_in": "T04-01 (O4/ADR), T04-03..T04-06"
+    },
+    {
+      "id": "GAP-02",
+      "family": "reconcile",
+      "description": "Only skip-policy is present in v1. No full generation diff fixtures (tree A -> tree B -> expected files/occurrences added/removed/renamed + skips).",
+      "blocking": false,
+      "resolves_in": "T05-02, T05-03"
+    },
+    {
+      "id": "GAP-03",
+      "family": "search",
+      "description": "The 49-query corpus is single-relevant (one ground-truth target per query); no graded relevance judgments / multiple relevant docs. v2 gate thresholds (MRR regression budget, Recall@5) are TBD.",
+      "blocking": false,
+      "resolves_in": "T12-05"
+    },
+    {
+      "id": "GAP-04",
+      "family": "memory",
+      "description": "The rev6 labeled observation-stream corpus (transcript -> expected ops create|reinforce|supersede|noop, covering decision vs hypothesis vs negation, RU/EN mixed) is [FIXED, new in rev 6] and absent in v1. v1 store/dedup/scoring/router-extraction mechanics are imported; the op-quality corpus is not.",
+      "blocking": false,
+      "resolves_in": "T14-07"
+    },
+    {
+      "id": "GAP-05",
+      "family": "adversarial",
+      "description": "Prompt-injection round-trip-inert, delimiter-collision escaping and recall per-entry/per-block caps (14 §6, 12 §4) are v2-spec requirements absent in v1. Only router robustness against malformed LLM output is imported.",
+      "blocking": false,
+      "resolves_in": "T14-08, T16-04"
+    },
+    {
+      "id": "GAP-06",
+      "family": "fault",
+      "description": "Executable failpoint/kill-point scripts for the F1-F12 projection matrix (05 §10) and S1-S8 spool matrix (07 §7) are not present in v1 (v1 has no crash/kill/torn-write tests). Only the declarative matrices and v1 retry/rate-limit behavior are imported; executable scripts need the fail_point!-style harness.",
+      "blocking": false,
+      "resolves_in": "T00-03 (harness), T07-05 (F1-F12), T13-06 (S1-S8)"
+    }
+  ],
+  "baseline": {
+    "status": "captured — v1 live run, code-only, embeddinggemma:300m; thresholds intentionally left TBD (O2)",
+    "metrics": ["hit@1", "hit@3", "hit@5", "mrr", "index_ms", "query_embed_ms", "search_ms"],
+    "thresholds": {
+      "mrr_regression_budget_x": "TBD",
+      "recall_at_5_min_y": "TBD",
+      "memory_router_precision_p": "TBD",
+      "memory_router_recall_r": "TBD",
+      "warm_search_p95_ms": "TBD",
+      "one_file_reconcile_p95_ms": "TBD",
+      "branch_checkout_reconcile_ms": "TBD",
+      "idle_ram": "TBD",
+      "index_bytes_per_symbol": "TBD",
+      "embedding_cache_budget": "TBD"
+    },
+    "runs": [
+      {
+        "file": "search/baseline/run-embeddinggemma-300m-2026-07-16.json",
+        "model": "embeddinggemma:300m",
+        "flags": "code-only (noDescs=true); corpus excludes node_modules/.git/dist",
+        "date": "2026-07-16",
+        "chunks_indexed": 544,
+        "hit1": 0.5918367346938775,
+        "hit3": 0.7959183673469388,
+        "hit5": 0.8367346938775511,
+        "mrr": 0.6962585034013605
+      }
+    ]
+  },
+  "deferred": [
+    "LLM description leg (v1 description_vector / generateDescription) — post-v0",
+    "reranker (v1 src/reranker.ts, topK rerank) — post-v0",
+    "fine-grained evidence scoring — post-v0",
+    "full recall — post-v0",
+    "ANN for memory — post-v0",
+    "multiple generators / cross-generation matching — post-v0",
+    "LSP graph and v1 find_usages/get_dependencies parity, incl. import resolution (src/indexer/resolver.test.ts) — post-v0 until graph semantics fixed",
+    "multi-harness, FreeBSD, win32-arm64 — post-v0"
+  ]
+}

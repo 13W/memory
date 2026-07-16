@@ -1,0 +1,47 @@
+{
+  "family": "fault",
+  "version": "1.0.0",
+  "description": "Declarative capture of the two [FIXED] fault matrices. Row text is quoted verbatim from the spec. These are not v1 material — they are v2-spec obligations captured now so their shape is fixed; the executable failpoint/kill-point scripts are a registered gap (GAP-06).",
+  "matrices": [
+    {
+      "id": "F",
+      "name": "Projection fault-detection matrix",
+      "spec_ref": "05 §10",
+      "property": "Every case leads to detection at open -> dirty -> rebuild. Proves (a) any divergence is detected at open; (b) rebuild is correct and idempotent.",
+      "status": "declarative",
+      "gap": "Executable fail_point!-style scripts authored in T00-03 (harness) and T07-05 (F1-F12 fault matrix); absent in v1.",
+      "rows": [
+        { "id": "F1", "injected_fault": "kill between write-ahead and first backend op", "expected_signal": "status='updating'" },
+        { "id": "F2", "injected_fault": "kill mid-upsert batch", "expected_signal": "status='updating' (+ head op_id stale)" },
+        { "id": "F3", "injected_fault": "kill after all point ops, before write_head", "expected_signal": "head op_id != projection_op_id" },
+        { "id": "F4", "injected_fault": "kill after write_head, before SQLite commit", "expected_signal": "status='updating', head tuple = target != active" },
+        { "id": "F5", "injected_fault": "shard WAL loss/truncation after clean commit", "expected_signal": "manifest/point_count mismatch" },
+        { "id": "F6", "injected_fault": "partial point deletion with intact catalog", "expected_signal": "manifest_hash mismatch" },
+        { "id": "F7", "injected_fault": "missing head / stale head from previous op", "expected_signal": "head missing / op_id mismatch" },
+        { "id": "F8", "injected_fault": "equal point_count, different ID set", "expected_signal": "manifest_hash mismatch" },
+        { "id": "F9", "injected_fault": "failed final upsert/delete reported as ok by backend", "expected_signal": "manifest verification at next open" },
+        { "id": "F10", "injected_fault": "backend flush/sync failure swallowed", "expected_signal": "same as F5 at next open" },
+        { "id": "F11", "injected_fault": "crash during rebuild", "expected_signal": "status='rebuilding' -> rebuild restarts" },
+        { "id": "F12", "injected_fault": "corruption making shard unopenable", "expected_signal": "open error -> quarantine -> rebuild" }
+      ]
+    },
+    {
+      "id": "S",
+      "name": "Spool kill matrix",
+      "spec_ref": "07 §7",
+      "property": "No event with stable identity is ever lost after spool append (S8 [FIXED gate]); import is idempotent under daemon/hook kill at any point.",
+      "status": "declarative",
+      "gap": "Executable kill-point scripts authored in T00-03 (harness) and T13-06 (S1-S8 kill matrix); absent in v1.",
+      "rows": [
+        { "id": "S1", "injected_fault": "hook killed mid-write (torn frame)", "expected_signal": "event not durable; importer ignores tail; next hook appends after flock — segment remains valid" },
+        { "id": "S2", "injected_fault": "hook killed after fdatasync, before exit", "expected_signal": "event durable, imported once" },
+        { "id": "S3", "injected_fault": "daemon killed after reading frames, before tx commit", "expected_signal": "cursor not advanced; re-import; UNIQUE/dedup window prevents duplicates" },
+        { "id": "S4", "injected_fault": "daemon killed after tx commit, before segment truncation", "expected_signal": "re-scan skips frames <= committed offset" },
+        { "id": "S5", "injected_fault": "daemon killed mid-truncation/rotation", "expected_signal": "segment set still consistent (delete-after-commit only)" },
+        { "id": "S6", "injected_fault": "duplicate stable event across segments (hook retry)", "expected_signal": "exactly one envelope (UNIQUE dedup_key)" },
+        { "id": "S7", "injected_fault": "duplicate best-effort event within window", "expected_signal": "one envelope (windowed dedup); outside window: two envelopes, consolidation idempotence still holds" },
+        { "id": "S8", "injected_fault": "crash at any point", "expected_signal": "no event with stable identity is ever lost after spool append [FIXED gate]" }
+      ]
+    }
+  ]
+}

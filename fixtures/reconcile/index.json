@@ -1,0 +1,83 @@
+{
+  "family": "reconcile",
+  "version": "1.0.0",
+  "description": "Skip-policy fixtures: given an input tree with ignore files / a registered git worktree, which paths are excluded from indexing. Neutral predicate: skipped vs not_skipped. Full generation diff (tree A -> tree B -> files/occurrences add/remove/rename) is NOT present in v1 and is a registered gap (GAP-02).",
+  "cases": [
+    {
+      "id": "reconcile.gitignore.none",
+      "title": "No ignore file: nothing is skipped",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "ignores nothing when no .gitignore exists" },
+      "input": { "ignore_files": [], "query_paths": ["file.ts", "file.log"] },
+      "expected": { "skipped": [], "not_skipped": ["file.ts", "file.log"] }
+    },
+    {
+      "id": "reconcile.gitignore.pattern",
+      "title": ".gitignore pattern skips matching files",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "ignores files matching .gitignore pattern" },
+      "input": { "ignore_files": [{ "dir": ".", "kind": ".gitignore", "patterns": ["*.log"] }], "query_paths": ["debug.log", "debug.ts"] },
+      "expected": { "skipped": ["debug.log"], "not_skipped": ["debug.ts"] }
+    },
+    {
+      "id": "reconcile.dotignore.pattern",
+      "title": ".ignore pattern is honored too",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "ignores files matching .ignore pattern" },
+      "input": { "ignore_files": [{ "dir": ".", "kind": ".ignore", "patterns": ["*.tmp"] }], "query_paths": ["cache.tmp", "cache.ts"] },
+      "expected": { "skipped": ["cache.tmp"], "not_skipped": ["cache.ts"] }
+    },
+    {
+      "id": "reconcile.ignore.merge",
+      "title": ".gitignore and .ignore rules merge",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "merges rules from both .gitignore and .ignore" },
+      "input": { "ignore_files": [{ "dir": ".", "kind": ".gitignore", "patterns": ["*.log"] }, { "dir": ".", "kind": ".ignore", "patterns": ["*.tmp"] }], "query_paths": ["app.log", "app.tmp", "app.ts"] },
+      "expected": { "skipped": ["app.log", "app.tmp"], "not_skipped": ["app.ts"] }
+    },
+    {
+      "id": "reconcile.ignore.subdir-scope",
+      "title": "Sub-directory rules do not affect parent-directory files",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "sub-directory rules do not affect parent-directory files" },
+      "input": { "ignore_files": [{ "dir": "sub", "kind": ".gitignore", "patterns": ["*.ts"] }], "query_paths": ["root.ts", "sub/child.ts"] },
+      "expected": { "skipped": ["sub/child.ts"], "not_skipped": ["root.ts"] }
+    },
+    {
+      "id": "reconcile.ignore.outside-base",
+      "title": "Paths outside the base directory are never matched",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "paths outside the base directory are never matched" },
+      "input": { "ignore_files": [{ "dir": ".", "kind": ".gitignore", "patterns": ["*.log"] }], "query_paths": ["../other.log"], "note": "base is the root; relative path escaping the base (starts with ..) is never matched" },
+      "expected": { "skipped": [], "not_skipped": ["../other.log"] }
+    },
+    {
+      "id": "reconcile.ignore.stacked",
+      "title": "Stacked contexts accumulate rules by directory scope",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "stacked contexts: multiple addDir calls accumulate rules" },
+      "input": { "ignore_files": [{ "dir": ".", "kind": ".gitignore", "patterns": ["*.log"] }, { "dir": "nested", "kind": ".gitignore", "patterns": ["*.tmp"] }], "query_paths": ["app.log", "nested/debug.log", "nested/temp.tmp", "root.tmp"] },
+      "expected": { "skipped": ["app.log", "nested/debug.log", "nested/temp.tmp"], "not_skipped": ["root.tmp"] }
+    },
+    {
+      "id": "reconcile.ignore.empty-dir-noop",
+      "title": "A directory with no ignore files adds no rules",
+      "status": "active",
+      "provenance": { "source": "src/indexer/gitignore.test.ts", "ref": "addDir is a no-op when directory has no ignore files" },
+      "input": { "ignore_files": [], "query_paths": ["empty/anything.log"] },
+      "expected": { "skipped": [], "not_skipped": ["empty/anything.log"] }
+    },
+    {
+      "id": "reconcile.worktree.skip-registered",
+      "title": "Paths inside a registered git worktree are skipped; the main tree is not",
+      "status": "active",
+      "provenance": { "source": "src/indexer/indexer.test.ts", "ref": "CodeIndexer.shouldSkip — git worktrees: skips paths inside a registered git worktree" },
+      "input": {
+        "worktree_registration": "repo/.git/worktrees/wt1/gitdir points at repo/.worktrees/wt1/.git",
+        "worktree_path": ".worktrees/wt1",
+        "query_paths": [".worktrees/wt1/src/foo.ts", "src/foo.ts"]
+      },
+      "expected": { "skipped": [".worktrees/wt1/src/foo.ts"], "not_skipped": ["src/foo.ts"] }
+    }
+  ]
+}

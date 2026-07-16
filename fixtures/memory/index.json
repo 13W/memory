@@ -1,0 +1,278 @@
+{
+  "family": "memory",
+  "version": "1.0.0",
+  "description": "Memory-pipeline behavior imported neutrally as request/stream -> observable outcome. Internal storage shape is NOT imported: old-vs-new payload schema and colForType collection-name mapping are backend-specific (excluded per 01 §7). The rev6 labeled-observation-stream corpus with create|reinforce|supersede|noop ops (14 §1 item 4, [FIXED new in rev6]) is not present in v1 and is registered as GAP-04.",
+  "cases": [
+    {
+      "id": "memory.store.reject-invalid-type",
+      "title": "Storing with an invalid memory type errors and stores nothing",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "rejects invalid memoryType" },
+      "input": { "content": "test content", "type": "invalid" },
+      "expected": { "outcome": "error", "stored": false }
+    },
+    {
+      "id": "memory.store.dedup-already-exists",
+      "title": "A content whose normalized hash already exists is not stored again",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "returns 'already exists' when content hash is found" },
+      "input": { "content": "test content", "type": "episodic", "existing_entry_same_hash": { "id": "existing-id" } },
+      "expected": { "outcome": "already_exists", "stored": false, "references_existing_id": "existing-id" }
+    },
+    {
+      "id": "memory.store.new-entry-stored",
+      "title": "A new entry is stored and reports its type and importance",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "upserts and returns stored message for new entry" },
+      "input": { "content": "test content", "type": "episodic", "importance": 0.9 },
+      "expected": { "outcome": "stored", "stored": true, "reported_type": "episodic", "reported_importance": 0.9 }
+    },
+    {
+      "id": "memory.store.ttl-positive-sets-expiry",
+      "title": "ttl_hours > 0 gives the entry an expiry in the future",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "sets expires_at when ttlHours > 0" },
+      "input": { "content": "test content", "type": "episodic", "ttl_hours": 24 },
+      "expected": { "has_expiry": true, "expiry_in_future": true }
+    },
+    {
+      "id": "memory.store.ttl-zero-no-expiry",
+      "title": "ttl_hours = 0 leaves the entry without an expiry",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "leaves expires_at empty when ttlHours=0" },
+      "input": { "content": "test content", "type": "episodic", "ttl_hours": 0 },
+      "expected": { "has_expiry": false }
+    },
+    {
+      "id": "memory.store.tags-split",
+      "title": "Comma-separated tags are split and trimmed into a list",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "splits comma-separated tags into array" },
+      "input": { "content": "test content", "type": "episodic", "tags": "alpha, beta, gamma" },
+      "expected": { "tags": ["alpha", "beta", "gamma"] }
+    },
+    {
+      "id": "memory.store.default-status-episodic",
+      "title": "Default status for episodic is in_progress",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "default status for episodic is in_progress" },
+      "input": { "content": "test content", "type": "episodic" },
+      "expected": { "status": "in_progress" }
+    },
+    {
+      "id": "memory.store.default-status-semantic",
+      "title": "Default status for semantic is resolved",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "default status for semantic is resolved" },
+      "input": { "content": "a fact", "type": "semantic" },
+      "expected": { "status": "resolved" }
+    },
+    {
+      "id": "memory.store.explicit-status-override",
+      "title": "An explicit status overrides the type default",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "explicit status overrides the default" },
+      "input": { "content": "test content", "type": "episodic", "status": "resolved" },
+      "expected": { "status": "resolved" }
+    },
+    {
+      "id": "memory.store.project-scoping",
+      "title": "A stored entry is scoped to the request's project",
+      "status": "active",
+      "provenance": { "source": "src/util.storeMemory.test.ts", "ref": "stores the project_id from context", "note": "neutral: entry scoped to the routing project; the physical project_id field is a storage detail, not imported" },
+      "input": { "content": "test content", "type": "episodic", "request_project": "test-proj" },
+      "expected": { "scoped_to_project": "test-proj" }
+    },
+    {
+      "id": "memory.dedup.contenthash-format",
+      "title": "Content hash is a deterministic 16-char hex, distinct per distinct content",
+      "status": "active",
+      "provenance": { "source": "src/util.test.ts", "ref": "contentHash: 16-character hex; deterministic; differs for different inputs" },
+      "input": { "samples": ["hello", "same", "a", "b"] },
+      "expected": { "hash_pattern": "^[0-9a-f]{16}$", "deterministic": true, "distinct_content_distinct_hash": true }
+    },
+    {
+      "id": "memory.dedup.normalize-equivalences",
+      "title": "Dedup hash collapses trivial whitespace and case differences",
+      "status": "active",
+      "provenance": { "source": "src/util.test.ts", "ref": "contentHash collapses trivial whitespace and case differences" },
+      "input": {
+        "equivalent_pairs": [
+          ["foo", "Foo"],
+          ["foo", "foo "],
+          ["foo bar", "foo  bar"],
+          ["foo\nbar", "foo bar"]
+        ]
+      },
+      "expected": { "each_pair_hashes_identically": true }
+    },
+    {
+      "id": "memory.dedup.normalize-rules",
+      "title": "Hash normalization: lowercase, trim edges, collapse whitespace runs, NFKC",
+      "status": "active",
+      "provenance": { "source": "src/util.test.ts", "ref": "normalizeForHash: lowercases ASCII / trims edges / collapses whitespace runs / applies NFKC to full-width" },
+      "input": {
+        "normalizations": [
+          { "in": "FOO", "out": "foo" },
+          { "in": "  foo  ", "out": "foo" },
+          { "in": "a  b\t\nc", "out": "a b c" },
+          { "in": "ＡＢ", "out": "ab" }
+        ]
+      },
+      "expected": { "normalize_matches_out": true }
+    },
+    {
+      "id": "memory.router.extract-valid-ops",
+      "title": "Router keeps valid operations and reports their text/status/confidence",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "runRouter: returns valid operations with confidence >= 0.5", "note": "v1 op vocabulary is status-based; rev6 create|reinforce|supersede|noop ops are GAP-04" },
+      "input": { "transcript": "<mocked>", "llm_operations": [ { "text": "Bug found in parser", "status": "resolved", "confidence": 0.9 }, { "text": "Possible memory leak", "status": "open_question", "confidence": 0.7 } ] },
+      "expected": { "kept_count": 2, "first_op": { "text": "Bug found in parser", "status": "resolved", "confidence": 0.9 } }
+    },
+    {
+      "id": "memory.router.accepts-valid-statuses",
+      "title": "Router accepts all valid status values",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "accepts all valid status values" },
+      "input": { "transcript": "<mocked>", "statuses": ["in_progress", "resolved", "open_question", "hypothesis", "observation"] },
+      "expected": { "kept_count": 5 }
+    },
+    {
+      "id": "memory.router.confidence-threshold",
+      "title": "Router drops operations below the 0.5 confidence threshold",
+      "status": "active",
+      "provenance": { "source": "src/router.test.ts", "ref": "filters out operations with confidence < 0.5", "note": "runRouter threshold is 0.5; the separate parseOps path uses 0.4 (see adversarial.parseops.*)" },
+      "input": { "transcript": "<mocked>", "llm_operations": [ { "text": "low confidence", "status": "resolved", "confidence": 0.3 }, { "text": "borderline", "status": "resolved", "confidence": 0.49 }, { "text": "high confidence", "status": "in_progress", "confidence": 0.8 } ] },
+      "expected": { "kept_count": 1, "kept_text": "high confidence" }
+    },
+    {
+      "id": "memory.transcript.parse-lines",
+      "title": "Transcript parser reads JSONL and {messages:[]} and skips malformed lines",
+      "status": "active",
+      "provenance": { "source": "src/util.test.ts", "ref": "safeParseLines: JSONL / messages array / skips malformed / empty input" },
+      "input": {
+        "samples": [
+          { "raw": "{\"role\":\"user\"}\n{\"role\":\"assistant\"}", "expect_count": 2 },
+          { "raw": "{\"messages\":[{\"role\":\"user\"},{\"role\":\"assistant\"}]}", "expect_count": 2 },
+          { "raw": "{\"valid\":true}\nnot-json\n{\"also\":\"valid\"}", "expect_count": 2 },
+          { "raw": "   ", "expect_count": 0 }
+        ]
+      },
+      "expected": { "parsed_count_matches_expect": true }
+    },
+    {
+      "id": "memory.transcript.extract-line-text",
+      "title": "Line-text extraction handles roles, array content blocks, tools, and unknown roles",
+      "status": "active",
+      "provenance": { "source": "src/util.test.ts", "ref": "extractLineText" },
+      "input": {
+        "lines": [
+          { "line": { "message": { "role": "user", "content": "hello" } }, "text": "user: hello" },
+          { "line": { "message": { "role": "assistant", "content": "world" } }, "text": "assistant: world" },
+          { "line": { "role": "user", "content": "direct" }, "text": "user: direct" },
+          { "line": { "role": "assistant", "content": [{ "type": "text", "text": "block1" }, { "type": "text", "text": "block2" }] }, "text": "assistant: block1 block2" },
+          { "line": { "role": "system", "content": "ignored" }, "text": "" },
+          { "line": { "role": "tool_use", "name": "recall" }, "text": "[Tool Use: recall]" },
+          { "line": { "role": "user", "content": "" }, "text": "" }
+        ]
+      },
+      "expected": { "extracted_text_matches": true, "tool_result_contains": "Tool Result:" }
+    },
+    {
+      "id": "memory.transcript.window",
+      "title": "Context window keeps chronological order and drops oldest lines past the char cap",
+      "status": "active",
+      "provenance": { "source": "src/util.test.ts", "ref": "buildWindow" },
+      "input": { "lines": ["msg1", "msg2", "msg3"], "cases": [ { "max_chars": 10000, "contains_all": true, "chronological": true }, { "max_chars": 20, "must_contain": ["msg3"] }, { "empty_lines": true, "result": "" } ] },
+      "expected": { "behaves_as_described": true }
+    },
+    {
+      "id": "memory.validation.requests",
+      "title": "Validation-request formatting: null for empty, numbered list, text truncated to 200",
+      "status": "active",
+      "provenance": { "source": "src/util.test.ts", "ref": "buildValidationRequests" },
+      "input": { "empty_ops_result": null, "sample_ops": [ { "text": "some work", "status": "in_progress", "confidence": 0.75 }, { "text": "a decision", "status": "resolved", "confidence": 0.85 } ], "truncate_over_chars": 200 },
+      "expected": { "empty_returns_null": true, "numbered_list": true, "includes_confidence": true, "truncates_long_text": true }
+    },
+    {
+      "id": "memory.score.decay-fresh",
+      "title": "Time decay is 1.0 for a brand-new entry",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "timeDecay: returns 1.0 for brand-new date" },
+      "input": { "age_days": 0 },
+      "expected": { "decay": 1.0, "close_to_digits": 5 }
+    },
+    {
+      "id": "memory.score.decay-one-half-life",
+      "title": "Time decay is ~0.5 at the 7-day default half-life",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "timeDecay: ~0.5 at default half-life (7 days)" },
+      "input": { "age_days": 7, "half_life_days": 7 },
+      "expected": { "decay": 0.5, "close_to_digits": 5 }
+    },
+    {
+      "id": "memory.score.decay-two-half-lives",
+      "title": "Time decay is ~0.25 at two half-lives (14 days)",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "timeDecay: ~0.25 at two half-lives (14 days)" },
+      "input": { "age_days": 14, "half_life_days": 7 },
+      "expected": { "decay": 0.25, "close_to_digits": 5 }
+    },
+    {
+      "id": "memory.score.decay-custom-half-life",
+      "title": "Time decay respects a custom half-life",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "timeDecay: respects custom half-life" },
+      "input": { "age_days": 1, "half_life_days": 1 },
+      "expected": { "decay": 0.5, "close_to_digits": 5 }
+    },
+    {
+      "id": "memory.score.decay-monotonic",
+      "title": "Time decay is monotonically decreasing with age",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "timeDecay: monotonically decreasing over time" },
+      "input": { "ages_days": [1, 7, 30], "half_life_days": 7 },
+      "expected": { "monotonic_decreasing": true }
+    },
+    {
+      "id": "memory.score.formula",
+      "title": "finalScore = cosine * decay * (0.3 + 0.7 * importance)",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "finalScore: applyDecay=false score = cosine * 1.0 * (0.3 + 0.7 * importance)" },
+      "input": { "cosine": 1.0, "importance": 1.0, "apply_decay": false },
+      "expected": { "score": 1.0, "formula": "cosine * decay * (0.3 + 0.7 * importance)" }
+    },
+    {
+      "id": "memory.score.min-importance-weight",
+      "title": "importance=0 yields the minimum 0.3 weight factor",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "finalScore: importance=0 gives minimum weight (0.3 factor)" },
+      "input": { "cosine": 1.0, "importance": 0, "apply_decay": false },
+      "expected": { "score": 0.3 }
+    },
+    {
+      "id": "memory.score.zero-cosine",
+      "title": "cosine=0 yields a zero score regardless of importance",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "finalScore: cosine=0 gives zero score regardless of importance" },
+      "input": { "cosine": 0, "importance": 1.0, "apply_decay": false },
+      "expected": { "score": 0.0 }
+    },
+    {
+      "id": "memory.score.decay-reduces-old",
+      "title": "Enabling decay reduces the score for old entries",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "finalScore: applyDecay=true reduces score for old entries" },
+      "input": { "cosine": 1.0, "importance": 1.0, "age_days": 30, "apply_decay": true },
+      "expected": { "less_than_without_decay": true }
+    },
+    {
+      "id": "memory.score.range",
+      "title": "finalScore stays within [0, 1] for valid inputs",
+      "status": "active",
+      "provenance": { "source": "src/scoring.test.ts", "ref": "finalScore: produces values in a reasonable range [0, 1]" },
+      "input": { "cosine": 0.75, "importance": 0.8, "apply_decay": true },
+      "expected": { "in_range": [0, 1] }
+    }
+  ]
+}

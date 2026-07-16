@@ -6,7 +6,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 ## 00 — Контракт разработки и baseline
 
-- [ ] T00-01 Импортировать v1 behavioral fixtures и зафиксировать baseline inventory
+- [x] T00-01 Импортировать v1 behavioral fixtures и зафиксировать baseline inventory
 - [ ] T00-02 Создать Rust workspace, quality commands и CI smoke
 - [ ] T00-03 Создать общий fixture/failpoint test harness
 - [ ] G00 Сверка foundations и testing contract
@@ -200,4 +200,21 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 | ID | Commit/PR | Проверки | Результат/артефакт | Исполнитель/дата |
 | --- | --- | --- | --- | --- |
-| — | — | — | — | — |
+| T00-01 | не коммичено | `python3 fixtures/tooling/validate.py` exit 0 (stdlib); тот же скрипт под venv `jsonschema==4.23.0` exit 0; негативный self-test PASS (denylist/schema/49-count/dup-id); live v1 бенчмарк без ошибок | `fixtures/` — 6 семейств, 114 уникальных id; `search/corpus.json` = 49 запросов; baseline снят (embeddinggemma:300m, code-only): MRR 0.696, Hit@1 0.592, Hit@3 0.796, Hit@5 0.837, 544 чанка; gap-register GAP-01..06; пороги = TBD | Claude Opus 4.8 / 2026-07-16 |
+
+Примечания к T00-01:
+
+- Формат fixtures: JSON + JSON Schema (Draft 2020-12) в `fixtures/schema/`; валидатор
+  `fixtures/tooling/validate.py` покрывает 4 проверки карточки (schema validation, ID
+  uniqueness, runner dry-run, no backend-specific fields). Это временный bootstrap: Rust-harness
+  из T00-03 переиспользует те же fixtures и схемы.
+- Baseline v1 снят живым прогоном `scripts/benchmark.ts` (Qdrant 1.18.2 + Ollama на localhost,
+  docker не использовался). Правки применялись только к сборочному артефакту
+  `dist/scripts/benchmark.js` (форс code-only; исключение вендоренных `node_modules` из обхода
+  корпуса) и **возвращены** после прогона; исходники v1 не менялись. Сырые артефакты —
+  `fixtures/search/baseline/`.
+- Общая workspace quality-команда ещё не существует (создаётся в T00-02), поэтому она не
+  запускалась; выполнены доступные проверки: `validate.py` (stdlib + jsonschema), негативный
+  self-test и well-formedness всех JSON. Rust/cargo проверки неприменимы (production-кода нет).
+- DEVIATIONS.md без изменений: gap-register разрешён карточкой («manifest OR explicitly
+  registered blocking gap»), нормативных расхождений спека↔v1 не обнаружено.
