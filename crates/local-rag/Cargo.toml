@@ -1,0 +1,18 @@
+[package]
+name = "local-rag"
+description = "local-rag daemon + CLI (scaffold; multiplexed per spec 13 §1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+local-rag-core = { path = "../core" }
+local-rag-store = { path = "../store" }
+local-rag-index = { path = "../index" }
+local-rag-projection = { path = "../projection" }
+local-rag-memory = { path = "../memory" }
+local-rag-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

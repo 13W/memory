@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/store",
+    "crates/index",
+    "crates/projection",
+    "crates/memory",
+    "crates/protocol",
+    "crates/local-rag",
+    "crates/local-rag-proxy",
+    "crates/local-rag-hook",
+    "crates/xtask",
+]
+# `xtask` is a dev-only tool: exclude it from the default set so root
+# `cargo build` / `cargo run` touch only product crates. `cargo test
+# --workspace` (run by `cargo xtask ci`) still covers it.
+default-members = [
+    "crates/core",
+    "crates/store",
+    "crates/index",
+    "crates/projection",
+    "crates/memory",
+    "crates/protocol",
+    "crates/local-rag",
+    "crates/local-rag-proxy",
+    "crates/local-rag-hook",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+# Centralized lints; each crate opts in via `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

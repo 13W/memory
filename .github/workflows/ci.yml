@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Single host target for v0 (T00-02). Additional platform targets are added
+# by the distribution work (T17).
+jobs:
+  check:
+    name: full check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        # rust-toolchain.toml drives the exact channel + components.
+        run: rustup show
+      - name: Run full check
+        run: cargo xtask ci
