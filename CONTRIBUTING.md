@@ -45,6 +45,8 @@ the license check. Additions require a new row here.
 | Crate | Scope | Why std is insufficient | License |
 | --- | --- | --- | --- |
 | `libc` | `crates/core`, `cfg(unix)` only | `std` exposes no `geteuid`/`getuid`; POSIX owner verification (spec 02 §2.1) needs the current effective uid. `libc` is rust-lang-maintained with zero transitive dependencies. | MIT OR Apache-2.0 |
+| `rusqlite` (feature `bundled`) | `crates/store` | The store *is* SQLite (spec 03); `std` has no SQLite. `bundled` compiles SQLite from source for reproducible, offline builds and a self-contained binary with no system `libsqlite3` (spec 13 §1/§2). Pulls `libsqlite3-sys`, `cc` (build), `bitflags`, `hashlink`, `fallible-iterator`. | MIT |
+| `tokio` (lib: feature `sync` only) | `crates/store` (+ test-only `rt-multi-thread`, `macros`) | The bounded write queue is an async `mpsc` + `oneshot` with backpressure/cancellation (spec 02 §5 L4). `std` has no async channels with cancellable backpressure. The library links only `sync` (no runtime/net/mio); the daemon supplies the runtime later (T15). | MIT |
 
 The earlier "zero external sources" property (T00-02) is therefore superseded by
 this explicit allowlist plus the no-dense/model-SDK-before-T10 rule above.
