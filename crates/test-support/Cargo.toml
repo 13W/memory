@@ -1,0 +1,17 @@
+[package]
+name = "local-rag-test-support"
+description = "Shared test harness for local-rag: temp LOCAL_RAG_HOME, controllable clock/UUID, fixtures, subprocess capture, and named failpoints. Dev-only; never distributed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# A tiny helper binary that crashes on demand, so the subprocess/artifact-bundle
+# behaviour can be exercised deterministically and cross-platform. Built only
+# when this dev-only crate is compiled (it is excluded from `default-members`).
+[[bin]]
+name = "crash-helper"
+path = "src/bin/crash-helper.rs"
+
+[lints]
+workspace = true

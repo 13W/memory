@@ -10,11 +10,12 @@ members = [
     "crates/local-rag",
     "crates/local-rag-proxy",
     "crates/local-rag-hook",
+    "crates/test-support",
     "crates/xtask",
 ]
-# `xtask` is a dev-only tool: exclude it from the default set so root
+# `xtask` and `test-support` are dev-only: exclude them from the default set so root
 # `cargo build` / `cargo run` touch only product crates. `cargo test
-# --workspace` (run by `cargo xtask ci`) still covers it.
+# --workspace` (run by `cargo xtask ci`) still covers them.
 default-members = [
     "crates/core",
     "crates/store",

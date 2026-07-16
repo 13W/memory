@@ -42,7 +42,11 @@ After the initial `cargo fetch`, the full check runs **offline**.
   `protocol`.
 - Product binaries: `local-rag` (daemon + CLI), `local-rag-proxy` (stdio MCP
   proxy), `local-rag-hook` (spool writer).
-- `xtask` is a dev-only tool, not a distributed binary.
+- Dev-only crates (workspace members, excluded from `default-members`, never
+  distributed): `xtask` (task runner) and `test-support` (shared test harness —
+  temp `LOCAL_RAG_HOME`, controllable clock/UUID, subprocess capture, named
+  failpoints). Downstream crates depend on `test-support` only as a
+  `[dev-dependencies]`.
 
 ## Committing
 
