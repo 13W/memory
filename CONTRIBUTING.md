@@ -36,6 +36,21 @@ After the initial `cargo fetch`, the full check runs **offline**.
 - Lints are centralized in `[workspace.lints]`; each crate opts in via
   `[lints] workspace = true`.
 
+### Approved external dependencies
+
+The workspace was dependency-free through G00. As of T01-01 the following
+external crates are allowed; each entry records why `std` is insufficient and
+the license check. Additions require a new row here.
+
+| Crate | Scope | Why std is insufficient | License |
+| --- | --- | --- | --- |
+| `libc` | `crates/core`, `cfg(unix)` only | `std` exposes no `geteuid`/`getuid`; POSIX owner verification (spec 02 §2.1) needs the current effective uid. `libc` is rust-lang-maintained with zero transitive dependencies. | MIT OR Apache-2.0 |
+
+The earlier "zero external sources" property (T00-02) is therefore superseded by
+this explicit allowlist plus the no-dense/model-SDK-before-T10 rule above.
+Historical T00-*/G00 evidence in `docs/implementation-plan/PROGRESS.md` is not
+rewritten.
+
 ## Workspace layout
 
 - Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `memory`,

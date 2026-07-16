@@ -1,8 +1,10 @@
 //! Foundational types for `local-rag`.
 //!
-//! This crate is intentionally minimal at the T00-02 scaffold stage: it holds
-//! only the shared version string used by every binary. No business logic
-//! lives here yet — later groups grow it in place.
+//! Beyond the shared version string, this crate hosts the [`paths`] platform
+//! abstraction (store/config directory resolution, layout, endpoint, and
+//! permission primitives) that every binary shares.
+
+pub mod paths;
 
 /// The workspace version, shared by every `local-rag` binary.
 ///
