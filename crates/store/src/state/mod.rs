@@ -55,7 +55,19 @@ impl StateDb {
         capacity: usize,
     ) -> Result<Self, OpenError> {
         let path = path.into();
-        let conn = open::open_state_rw(&path)?;
+        let mut conn = open::open_state_rw(&path)?;
+        // Run the migration framework under the migration lock (L1) before the
+        // bounded writer exists (spec 02 §4.1: open → migrate → serve). The lock
+        // file is a sibling of `state.sqlite`, so this path is byte-identical to
+        // `StoreLayout::migration_lock()` for any real store path.
+        let lock_path = path.with_file_name("migration.lock");
+        crate::migrate::run(
+            &mut conn,
+            crate::migrate::ALL,
+            &lock_path,
+            crate::clock::system_now_ms(),
+        )
+        .map_err(|e| OpenError::Migration(Box::new(e)))?;
         let writer = writer::StateWriter::spawn(conn, capacity).map_err(OpenError::Spawn)?;
         Ok(Self { path, writer })
     }

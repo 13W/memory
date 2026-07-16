@@ -26,6 +26,7 @@ Claude hooks ──atomic append──▶ spool/<session>/  ◀──tail/import
 ```
 <data_dir>/local-rag/
   store.lock            # flock'd JSON: {instance_uuid, pid, daemon_version, started_at}
+  migration.lock        # L1 advisory file lock, held only while migrating (§5, 13 §3)
   state.sqlite          # source of truth (+ -wal/-shm)
   cache.sqlite          # rebuildable, independently validated (+ -wal/-shm)
   projection/
@@ -198,3 +199,10 @@ the same code string; hooks map any error to fail-open (empty output, exit 0).
 
 Diagnostics: every degraded search response includes the validation reason
 (e.g. `fts_head: tokenizer_version mismatch (3 != 4)`) so acceptance tests can assert *why*.
+
+Migration-store faults map into this taxonomy at the protocol boundary (T15): a store
+newer than the binary, a migration checksum drift, or rewritten migration history all
+surface as `INCOMPATIBLE_STORE`, disambiguated by a `details` field (e.g.
+`store_version 3 > binary_max 2`, or `checksum drift at version 1`); a migration in
+progress surfaces as `MIGRATION_IN_PROGRESS`. The runner's own typed errors (13 §3) are
+finer-grained than the wire codes.
