@@ -70,7 +70,13 @@ For every implementation task:
 6. Update relevant `[SPEC]` text to as-built precision when the task reveals an executable
    detail. Never rewrite `[FIXED]` behavior as an implementation convenience.
 7. Mark the task `[x]` only after all acceptance criteria pass.
-8. Append immutable evidence to `PROGRESS.md`: commit/PR if available, exact commands, result,
+8. Commit the completed task (mandatory): a single focused commit containing the task's changes
+   plus the `PROGRESS.md` update, with a descriptive message and the required `Co-Authored-By`
+   trailer. Branch first only when the working branch is a shared/default branch backed by a
+   remote; a local single-line repository commits to its working branch. Do not push unless the
+   user asks. A task is not done until it is committed.
+9. Append immutable evidence to `PROGRESS.md`: the commit reference (short hash, or the commit
+   subject when the evidence line ships inside that same commit), exact commands, result,
    artifact/report path, executor, and date.
 
 If the repository-wide command does not exist yet, run all discoverable checks appropriate to
