@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
 name = "local-rag"
 version = "0.0.0"
 dependencies = [
@@ -18,6 +24,10 @@ dependencies = [
 [[package]]
 name = "local-rag-core"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "local-rag-test-support",
+]
 
 [[package]]
 name = "local-rag-hook"

@@ -45,12 +45,18 @@ Claude hooks ──atomic append──▶ spool/<session>/  ◀──tail/import
 
 | Item | POSIX | Windows |
 | --- | --- | --- |
-| `<data_dir>` | `$LOCAL_RAG_HOME`, else `$XDG_DATA_HOME`, else `~/.local/share` | `%LOCALAPPDATA%` |
-| `<config_dir>` | `$XDG_CONFIG_HOME/local-rag`, else `~/.config/local-rag` | `%APPDATA%\local-rag` |
+| `<data_dir>` | `$LOCAL_RAG_HOME`, else `$XDG_DATA_HOME`, else `~/.local/share` | `$LOCAL_RAG_HOME`, else `%LOCALAPPDATA%` |
+| `<config_dir>` | `$LOCAL_RAG_HOME/config`, else `$XDG_CONFIG_HOME/local-rag`, else `~/.config/local-rag` | `$LOCAL_RAG_HOME/config`, else `%APPDATA%\local-rag` |
 | MCP endpoint | `<data_dir>/local-rag/run/daemon.sock` | named pipe `\\.\pipe\local-rag-<sha256(user SID)[..12]>` |
 
-`LOCAL_RAG_HOME` overrides everything (tests, containers). All directories are created `0700`,
-files `0600` (POSIX); on Windows, default per-user ACLs of `%LOCALAPPDATA%` apply.
+`LOCAL_RAG_HOME` overrides everything (tests, containers): when it is set, `<data_dir>` is
+`$LOCAL_RAG_HOME` and `<config_dir>` is `$LOCAL_RAG_HOME/config` — a sibling of the store root
+`$LOCAL_RAG_HOME/local-rag`, so a container is fully self-contained even with `HOME` unset. Per
+the XDG Base Directory spec, an empty base-directory variable is treated as unset and a relative
+`$XDG_*` value is ignored. All directories are created `0700`, files `0600` (POSIX); on Windows,
+default per-user ACLs of `%LOCALAPPDATA%` apply. `sha256(user SID)[..12]` is the first 12
+lowercase hex characters of the SHA-256 of the user SID. macOS is a POSIX target and uses the
+XDG fallbacks (not `~/Library/Application Support`).
 
 ## 3. Configuration model
 
