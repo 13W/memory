@@ -14,5 +14,8 @@ local-rag-projection = { path = "../projection" }
 local-rag-memory = { path = "../memory" }
 local-rag-protocol = { path = "../protocol" }
 
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
+
 [lints]
 workspace = true

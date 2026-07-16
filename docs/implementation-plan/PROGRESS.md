@@ -8,7 +8,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 - [x] T00-01 Импортировать v1 behavioral fixtures и зафиксировать baseline inventory
 - [x] T00-02 Создать Rust workspace, quality commands и CI smoke
-- [ ] T00-03 Создать общий fixture/failpoint test harness
+- [x] T00-03 Создать общий fixture/failpoint test harness
 - [ ] G00 Сверка foundations и testing contract
 
 ## 01 — Миграции и SQLite foundation
@@ -202,6 +202,31 @@ Gate следующей группы нельзя начинать до `PASS` �
 | --- | --- | --- | --- | --- |
 | T00-01 | не коммичено | `python3 fixtures/tooling/validate.py` exit 0 (stdlib); тот же скрипт под venv `jsonschema==4.23.0` exit 0; негативный self-test PASS (denylist/schema/49-count/dup-id); live v1 бенчмарк без ошибок | `fixtures/` — 6 семейств, 114 уникальных id; `search/corpus.json` = 49 запросов; baseline снят (embeddinggemma:300m, code-only): MRR 0.696, Hit@1 0.592, Hit@3 0.796, Hit@5 0.837, 544 чанка; gap-register GAP-01..06; пороги = TBD | Claude Opus 4.8 / 2026-07-16 |
 | T00-02 | коммит `T00-02: scaffold Rust workspace + xtask quality gate + CI` (хэш в git-логе; строка edet в том же коммите) | `cargo build --workspace` OK; каждый бинарник `version` → `<имя> 0.0.0`, неизвестная команда exit 2; `cargo xtask ci` (fmt --check → clippy `-D warnings` → test --workspace → doc --no-deps) = all checks passed; offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; 12 значимых тестов (3×2 CLI-smoke, 2 core unit, 2 core doctests, 2 xtask ci_config) | Workspace: 6 либ (`core/store/index/projection/memory/protocol`) + 3 продуктовых бинарника (`local-rag`, `local-rag-proxy`, `local-rag-hook`) + dev-only `xtask`; toolchain pin 1.96.1 (`rust-toolchain.toml`), edition 2024, MSRV 1.96; `CONTRIBUTING.md` (единая команда `cargo xtask ci` + dependency policy); `.github/workflows/ci.yml` (ubuntu-latest); `Cargo.lock` без внешних зависимостей (0 registry sources) | Claude Opus 4.8 / 2026-07-16 |
+| T00-03 | коммит `T00-03: shared fixture/failpoint test harness` (хэш в git-логе; строка evidence в том же коммите) | `cargo test -p local-rag-test-support` OK (8 integration + 5 unit + 6 doctests); `cargo test -p local-rag --test harness_smoke` OK; `cargo xtask ci` = all checks passed; offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; `cargo doc` без warnings; ручная проверка bundle: `status.txt=signal: 6 (SIGABRT)` + command/stdout/stderr сохранены вне temp home, temp homes подчищены на Drop | Dev-only crate `crates/test-support` (`local-rag-test-support`, в `members`, не в `default-members`): `TempHome` (temp `LOCAL_RAG_HOME` под `env::temp_dir()`, RAII-cleanup, `.command()` ставит env только в дочерний процесс), `Clock`/`FixedClock`/`ManualClock`, `IdSource`/`SeqUuids`, `subprocess::run_capturing` + artifact bundle, `Failpoints` + `fail_point!` (registry-strict: неизвестное имя → `FailpointError::Unknown`; `Action::Abort` = crash-точка F/S-матриц), `fixtures` (root/read, std-only). Приёмка: smoke в `local-rag` (dev-dependency); `$HOME` не читается (страж-тест). `Cargo.lock` по-прежнему 0 внешних источников. GAP-06 механизм закрыт; строки F1–F12/S1–S8 остаются за T07-05/T13-06 | Claude Opus 4.8 / 2026-07-16 |
+
+Примечания к T00-03:
+
+- Крейт `test-support` — dev-only по образцу `xtask`: добавлен в `members`, но не в
+  `default-members`, поэтому продуктовый `cargo build`/дистрибуция его не трогают, а
+  `cargo test --workspace` (внутри `cargo xtask ci`) покрывает. Потребляется только как
+  `[dev-dependencies]` (сейчас — из `local-rag`).
+- Изоляция temp store — по путям: каждый `TempHome` владеет своим каталогом; `LOCAL_RAG_HOME`
+  ставится только в окружение дочернего процесса (`Command::env`), в родительский процесс env не
+  пишется (иначе параллельные тесты гонялись бы за глобал). `$HOME` не читается нигде — база
+  `std::env::temp_dir()`; страж-тест проверяет, что путь не под `$HOME`, `.command()` дополнительно
+  делает `env_remove("HOME")` для дочернего процесса.
+- Failpoints реализованы registry-strict (карточка: «неизвестный failpoint отвергается»): имя
+  надо объявить (`register`) до `arm`; `arm`/`eval`/`disarm` неизвестного имени → `Err(Unknown)`.
+  `Action::Abort` = crash-точка (симуляция kill), `Panic`, `Error` (early-return через 2-арг
+  `fail_point!`). Механизм закрывает GAP-06; сами строки F1–F12 (T07-05) и S1–S8 (T13-06) здесь
+  НЕ писались (scope-guard).
+- Осознанное решение по зависимостям: харнесс на чистом `std`, без `tempfile`/`uuid`/`serde`,
+  чтобы сохранить свойство T00-02 «`Cargo.lock` = 0 внешних источников». `fixtures` отдаёт пути и
+  сырые байты/строки; типизированный JSON-парсинг отложен до задачи-потребителя, которая обоснует
+  зависимость по dependency policy (`CONTRIBUTING.md`).
+- Doctest edition 2024: `gen` — зарезервированное слово, переменная в примере переименована.
+- Отклонений не обнаружено; DEVIATIONS.md без изменений; `fixtures/manifest.json` GAP-06 не
+  переписан (историю не трогаем).
 
 Примечания к T00-02:
 
