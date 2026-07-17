@@ -554,6 +554,16 @@ At daemon startup / cache open:
 Loss of `cache.sqlite` or `projection/` loses nothing: both are reconstructible from
 `state.sqlite` `[FIXED]` — this is asserted by the `rebuild` acceptance gate (14).
 
+As-built note (T01-05, `[SPEC]`): steps 1–2 (plus a corrupt/unreadable file, "rebuild on
+doubt") are implemented by the cache open path; steps 3–4 stay lazy and their tables land in
+later tasks. `cache_schema_version` is currently `1`. Recreate is delete-and-recreate: the
+stale `cache.sqlite`/`-wal`/`-shm` are removed and `cache_meta` (schema + binding rows) is
+written in one transaction, so a crash mid-recreate leaves a missing/unbound cache that the
+next open rebuilds — idempotent convergence, `state.sqlite` never touched. The authoritative
+`store_instance_uuid` is supplied by the caller (the daemon reads it from `store_settings` at
+startup, §4.1 / 02 §4.1); seeding that value into state is deferred to the UUIDv7 generator
+(step 2) and daemon wiring (step 15).
+
 ## 5. Migration boundaries `[FIXED]`
 
 The identity model is migration-ready: deferred features (LLM descriptions, reranker, full
