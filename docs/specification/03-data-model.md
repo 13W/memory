@@ -183,7 +183,8 @@ As-built note (T02-02, `[SPEC]`): the repository-side tables (`repository`,
 created by the first numbered migration — `schema_migrations` version `1`, name `registry`
 (`local_rag_store::registry::SCHEMA_V1`, reproduced byte-for-byte from this section so its
 checksum is stable). The worktree/generation tables above are the second migration (see the
-T02-03 note below); `repo_settings` reads/writes and data-policy merge are T02-05. The
+T02-03 note below); `repo_settings` reads/writes and the data-policy merge are T02-05 (see that
+note below). The
 `create`/`observe`/`find`
 operations (`local_rag_store::registry`) mint `repo_id` as a caller-supplied UUIDv7 (never
 path-derived, 01 §5) and treat `git_remote_fingerprint` as a nullable, non-unique hint (12 §7).
@@ -237,6 +238,23 @@ checkout's path); it returns a typed `AttachError` (`UnknownWorktree`, `RepoMism
 carried on the request facts but **not stored** (no column) — advisory by construction. Git
 probing (`kind`, common-dir, remote URL) is the daemon's (T15); `local-rag-store` takes no git
 dependency (architecture guardrail until T10).
+
+As-built note (T02-05, `[SPEC]`): `repo_settings` reads/writes and the effective-`data_policy`
+merge (spec 02 §3.2, 12 §1) are `local_rag_store::registry::settings` — no new table or migration
+(the generic `(repo_id, key, value)` table from `SCHEMA_V1` needs no schema change; a policy is
+just a key). Writes compose in a `StateWriter::transaction` (`set_repo_setting` upserts via
+`ON CONFLICT(repo_id, key) DO UPDATE`; an unknown `repo_id` is rejected by the FK and rolls back)
+and reads run on a read-only connection (`get_repo_setting`, `repo_settings` ordered by key). The
+typed accessors `set_repo_data_policy`/`repo_data_policy` store/parse the canonical string under
+the mirrored key `data_policy` (`DATA_POLICY_KEY`); a stored value outside the four canonical
+names is corruption and surfaces as `rusqlite::Error::FromSqlConversionFailure` (the same idiom as
+`worktree.state`), never a silent default. `effective_data_policy(global, conn, repo_ids)` folds
+`DataPolicy::most_restrictive` over the global value and every involved repository's stored policy;
+because that operation is commutative/associative the fold is order-independent (deterministic
+merged snapshot) and a repository can only *tighten*, never relax, the global policy. The central
+remote-policy guard that consumes the effective value (provider pool, spec 10 §1, 12 §1) is a later
+group (T11/T16); T02-05 supplies only the stored values and the merge. The global config side is
+`local_rag_core::config` (see 02 §3.1).
 
 ### 2.2 Projection state & model registry
 

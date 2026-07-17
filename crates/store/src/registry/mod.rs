@@ -31,14 +31,18 @@
 //! move (spec 02 §3.3, 04 §7). Auto-resolution is by *current* path only; the
 //! path/remote/common-dir fingerprints are advisory (spec 12 §7).
 //!
-//! `repo_settings` merge/data-policy ordering is T02-05, so this module ships the
-//! `repo_settings` table but no settings operations; the `generation` builder,
-//! occurrence schema (spec 03 §2.4), and generation state machine (spec 04 §1)
-//! are group 05 — T02-03 ships only the `generation` table and the worktree-side
-//! seam that writes `worktree.current_generation_id`.
+//! Per-repository **settings** (T02-05, module `settings`) sit alongside the
+//! resolution layer: generic `repo_settings` reads/writes (spec 03 §2.1) plus the
+//! typed `data_policy` accessor and the effective-policy merge — the *most
+//! restrictive* of the global and every involved repository's policy (spec 02
+//! §3.2, 12 §1). The `generation` builder, occurrence schema (spec 03 §2.4), and
+//! generation state machine (spec 04 §1) are group 05 — T02-03 ships only the
+//! `generation` table and the worktree-side seam that writes
+//! `worktree.current_generation_id`.
 
 mod repository;
 mod resolve;
+mod settings;
 pub mod worktree;
 
 pub use repository::{
@@ -47,6 +51,10 @@ pub use repository::{
 };
 pub use resolve::{
     AttachError, Candidate, RequestRoot, Resolution, WorktreeRootFacts, attach, resolve,
+};
+pub use settings::{
+    DATA_POLICY_KEY, effective_data_policy, get_repo_setting, repo_data_policy, repo_settings,
+    set_repo_data_policy, set_repo_setting,
 };
 pub use worktree::{
     IllegalWorktreeTransition, WorktreeKind, WorktreePathObservation, WorktreeState,
