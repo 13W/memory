@@ -370,20 +370,20 @@ async fn migration_produces_exact_registry_schema() {
         "index is partial on is_current = 1: {index_sql}",
     );
 
-    // Exactly one applied migration: (version 1, name "registry").
-    let (version, name): (i64, String) = read
-        .query_row(
-            "SELECT version, name FROM schema_migrations ORDER BY version",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .expect("read migration row");
-    assert_eq!(version, 1);
-    assert_eq!(name, "registry");
-    let count: i64 = read
-        .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
-        .expect("count migrations");
-    assert_eq!(count, 1, "exactly one production migration at T02-02");
+    // Two applied migrations: (1,"registry") — this task — and (2,"worktree").
+    let mut stmt = read
+        .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+        .expect("prepare migration rows");
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query migration rows")
+        .collect::<Result<_, _>>()
+        .expect("collect migration rows");
+    assert_eq!(
+        rows,
+        vec![(1, "registry".to_string()), (2, "worktree".to_string())],
+        "the production set is [v1 registry, v2 worktree] at T02-03",
+    );
 }
 
 /// `repository` has no `canonical_path` column: `repository_path` is the single

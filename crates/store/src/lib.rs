@@ -40,6 +40,14 @@
 //! random UUIDv7, never path-derived (spec 01 §5); the git remote fingerprint is
 //! a nullable, non-unique hint (spec 12 §7).
 //!
+//! T02-03 adds the **worktree registry** (version-2 migration): the
+//! `worktree`/`worktree_path`/`generation` tables — whose circular composite FK
+//! proves the current generation belongs to its worktree — plus worktree
+//! create/observe/transition operations and the explicit `active`/`detached`/
+//! `removing` state machine (spec 04 §7). `worktree.worktree_id` is a random,
+//! caller-minted UUIDv7 (never path-derived); `worktree_path.path_fingerprint`
+//! is a lookup accelerator only, never identity (spec 01 §5).
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -57,7 +65,11 @@ pub use cache::{
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
-    PathObservation, create_repository, current_path, find_repositories_by_remote,
-    find_repository_by_path, observe_repository_path, path_history,
+    IllegalWorktreeTransition, PathObservation, WorktreeKind, WorktreePathObservation,
+    WorktreeState, WorktreeTransitionError, create_repository, create_worktree, current_generation,
+    current_path, current_worktree_path, find_repositories_by_remote, find_repository_by_path,
+    find_worktrees_by_path_fingerprint, observe_repository_path, observe_worktree_path,
+    path_history, set_current_generation, transition_worktree_state, worktree_path_history,
+    worktree_state,
 };
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};
