@@ -303,8 +303,9 @@ fn repeated_run_is_noop() {
     assert_eq!(rows[1].3, 1000, "v2 timestamp unchanged");
 }
 
-/// End-to-end: `StateDb::open` bootstraps the framework tables with the real
-/// (empty) production set, and a second open is a clean no-op.
+/// End-to-end: `StateDb::open` bootstraps the framework tables and applies the
+/// real production set (registry migration v1, T02-02), and a second open is a
+/// clean no-op.
 #[test]
 fn state_db_open_bootstraps_and_is_idempotent() {
     let (_home, layout) = temp_store();
@@ -321,10 +322,15 @@ fn state_db_open_bootstraps_and_is_idempotent() {
             )
             .expect("count framework tables");
         assert_eq!(tables, 2, "bootstrap created both framework tables");
-        let applied: i64 = read
-            .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
-            .expect("count migrations");
-        assert_eq!(applied, 0, "the production set is empty at T01-03");
+        // The production set applies migration v1: the registry tables exist …
+        for t in ["repository", "repository_path", "repo_settings"] {
+            assert!(table_exists(&read, t), "registry table {t} created");
+        }
+        // … and it is recorded as exactly one row (version 1, name "registry").
+        let rows = migration_rows(&read);
+        assert_eq!(rows.len(), 1, "the production set is [v1] at T02-02");
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, "registry");
     }
     drop(db);
 
@@ -334,5 +340,5 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 0, "reopen adds no migration rows");
+    assert_eq!(applied, 1, "reopen adds no new migration rows");
 }

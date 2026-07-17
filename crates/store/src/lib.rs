@@ -32,6 +32,14 @@
 //! from state's, so state and cache can never share one transaction — the
 //! writable cross-database `ATTACH` prohibition (03 §1.4) is structural.
 //!
+//! T02-02 adds the **repository registry** ([`registry`]): the version-1
+//! migration creates the repository-side tables (`repository`,
+//! `repository_path`, `repo_settings`; spec 03 §2.1), and the module's
+//! operations create/find repositories and observe their current path while
+//! keeping exactly one current path per repository. `repository.repo_id` is a
+//! random UUIDv7, never path-derived (spec 01 §5); the git remote fingerprint is
+//! a nullable, non-unique hint (spec 12 §7).
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -41,10 +49,15 @@ pub use rusqlite;
 mod cache;
 mod clock;
 pub mod migrate;
+pub mod registry;
 mod state;
 
 pub use cache::{
     CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome, CacheWriteError, CacheWriter,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
+pub use registry::{
+    PathObservation, create_repository, current_path, find_repositories_by_remote,
+    find_repository_by_path, observe_repository_path, path_history,
+};
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};
