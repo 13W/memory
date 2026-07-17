@@ -19,7 +19,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [x] T01-04 Добавить resumable/destructive migration mechanics
 - [x] T01-05 Реализовать cache DB binding и recreation
 - [x] D-001 Устранить недетерминизм concurrent-migrator теста (WAL-init race)
-- [ ] G01 Сверка migration/storage foundation
+- [x] G01 Сверка migration/storage foundation
 
 ## 02 — Реестр repository/worktree
 
@@ -177,7 +177,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 | Gate | Результат | Ссылка на evidence/report |
 | --- | --- | --- |
 | G00 | PASS | строка G00 в «Task evidence» + трейс «G00 — трейс требование → artifact/test» ниже |
-| G01 | — | — |
+| G01 | PASS | строка G01 в «Task evidence» + трейс «G01 — трейс требование → artifact/test» ниже |
 | G02 | — | — |
 | G03 | — | — |
 | G04 | — | — |
@@ -210,6 +210,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 | T01-04 | коммит `T01-04: resumable/destructive migration mechanics` (строка evidence в том же коммите) | `cargo test -p local-rag-store --test migrate_resumable` OK (6 default: resume-after-each-checkpoint, failed-step/retry, backup-pre-change, backup-idempotent-on-resume, destructive-sql-only, finalize-pending-resume); `--features failpoints` → 7 (та же 6 + `resumable_hard_kill_via_sigabrt`: реальный SIGABRT-child через re-exec, parent резюмит); регресс `--test migrate` 7 OK, `--test state` 6 OK; `cargo test -p local-rag-core` 21 unit + 4 doctests OK; `cargo xtask ci` = all checks passed (fmt → clippy `-D warnings` → test --workspace → doc → clippy+test `--features failpoints`); offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; `RUSTDOCFLAGS="-D warnings" cargo doc -p local-rag-store -p local-rag-core --no-deps` (и `--features failpoints`) clean; аудит `Cargo.lock` = 36 внешних источников (git diff vs HEAD = 0 новых; `failpoints` тянет optional path-dep `test-support`, 0 внешних); grep всех `Cargo.toml` на qdrant/usearch/ollama/onnx/candle/tree-sitter/net = NONE (T10 держится) | Крейт `local-rag-store` `migrate/mod.rs`: `Migration` += `destructive: bool` и `steps: &[MigrationStep]` (+ `const fn sql/destructive/with_steps`, `StepFn`); `checksum()` над SQL (drift-тест T01-03 не тронут). Bootstrap += `migration_progress(version,seq,label,done_at)` (03 §2.1). `run()`: простые миграции — атомарный путь T01-03; сложные (destructive/steps) — `apply_complex` пер-юнитовыми чекпойнтами `[backup?][sql?][steps…]`, финализация одной tx (insert `schema_migrations` + очистка прогресса). Backup: `VACUUM INTO <root>/backups/state-<version>-<now_ms>.sqlite` до мутации (dir 0700, файл 0600), progress backup — отдельной tx (VACUUM вне транзакции); resume пропускает закоммиченные юниты. `MigrationError` += `Backup`/`BackupPath`. Restore-шов задокументирован в docstring. Feature-gated seam `#[cfg(feature="failpoints")] fail_point!("migrate:after_backup")` для hard-kill теста; `Cargo.toml` store += optional `test-support` + фича `failpoints`; `xtask ci` += 2 шага под фичей; `CONTRIBUTING.md` обновлён. Core: `StoreLayout::backups_dir()` + создание в `ensure()` (0700). `[SPEC]`-уточнения (тот же коммит): 02 §2 дерево += `backups/`; 03 §2.1 += `migration_progress`. Найдено отклонение D-001 (флейк concurrent-теста), исправлено до T01-04 done | Claude Opus 4.8 / 2026-07-17 |
 | T01-05 | коммит `T01-05: cache.sqlite binding + recreation + bounded writer` (строка evidence в том же коммите) | `cargo test -p local-rag-store --test cache` OK (9: pragmas WAL/FK=0/synchronous=1(NORMAL)/busy=5000, matching-reopen-preserves-rows→Reused, uuid-mismatch→Recreated, schema-version-999→Recreated, corrupt-file→Recreated+usable, state-untouched (sha256 state.sqlite до/после rebuild равен + строка store_settings читается), writer-backpressure-cancels-cleanly, recreate-idempotent-on-retry, source-lint no-writable-ATTACH); `--features failpoints` → 10 (+ `cache_recreate_hard_kill_resumes`: реальный SIGABRT-child в `cache:after_delete` между delete и seed, parent резюмит → Recreated bound to B); регресс `--test state` 6 OK, `--test migrate` 7 OK, `--test migrate_resumable` 6/7 OK; `cargo xtask ci` = all checks passed (fmt → clippy `-D warnings` → test --workspace → doc → clippy+test `--features failpoints`); offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; `RUSTDOCFLAGS="-D warnings" cargo doc -p local-rag-store --no-deps` clean; аудит `Cargo.lock` = 36 внешних источников (git diff vs HEAD = 0 новых — только std + уже-разрешённые rusqlite/tokio); grep всех `Cargo.toml` на qdrant/usearch/ollama/onnx/candle/tree-sitter/net = NONE (T10 держится) | Крейт `local-rag-store` новый модуль `cache/{mod,open,writer}.rs` (зеркало `state/`): `CacheDb::open[_with_capacity](path, store_instance_uuid, [cap])`. `open_cache_rw`/`open_cache_read_only` применяют cache-pragmas (03 §4: WAL set-and-verify, FK=OFF, synchronous=NORMAL, busy=5000; отличие от state — FK/synchronous). `open_and_bind`: `inspect_existing` (open RW → read `cache_meta`) → валиден+совпал uuid/`CACHE_SCHEMA_VERSION`(=1) ⇒ `Reused`; иначе (нет файла / mismatch / порча-NOTADB / unreadable) ⇒ `recreate` (unlink `cache.sqlite`/`-wal`/`-shm`, ignore NotFound) → fresh `open_cache_rw` → `seed_binding` одной tx (`cache_meta` DDL + rows uuid/version/created_at) ⇒ `Created`|`Recreated`. Порядок open→validate/recreate→serve (writer получает уже связанный conn). Отдельный `CacheWriter` (02 §5 L4b): выделенный поток `local-rag-cache-writer`, bounded mpsc→oneshot, `transaction`/`queue_capacity`/`available_slots`, writable conn наружу не выходит. Cross-DB (03 §1.4): без ATTACH; source-lint тест охраняет инвариант. Feature-gated seam `#[cfg(feature="failpoints")] fail_point!("cache:after_delete")`; `Cargo.toml`/`xtask` не менялись (фича уже есть). `lib.rs` += `mod cache` + re-exports (`CACHE_SCHEMA_VERSION`,`CacheDb`,`CacheOpenError`,`CacheOpenOutcome`,`CacheWriteError`,`CacheWriter`). Scope-guard: payload-таблицы (`embedding_cache`/`normalized_text_cache`/`fts_*`) НЕ создаются (T03/T08/T11); §4.4 шаги 3–4 (FTS/per-row checksum) — лениво позже. Решение (утверждено пользователем): `store_instance_uuid` подаётся вызывающей стороной, посев в state отложен до T02-01 (UUIDv7)+T15-01 (daemon startup) — не deviation (ни один `[FIXED]`/`[SPEC]` не нарушен, карточка посев не требует). `[SPEC]`-уточнение (тот же коммит): 03 §4.4 as-built-нота (delete-and-recreate + идемпотентная сходимость; `cache_schema_version`=1; uuid — от caller). Отклонений не обнаружено; `DEVIATIONS.md` без изменений | Claude Opus 4.8 / 2026-07-17 |
 | D-001 | коммит `T01-04: resumable/destructive migration mechanics` (та же правка) | `migrate.rs` concurrent-тест: 40/40 прогонов зелёные (`--exact concurrent_migrators_apply_exactly_once --test-threads=1`), до фикса ~4/5 виснул на `Barrier::wait` или паниковал в `raw_conn:51` (`enable WAL`); полный `cargo xtask ci` не виснет | Недетерминизм T01-03-теста: два worker-потока гонялись за однократным `PRAGMA journal_mode=WAL` на свежей БД (эксклюзивная перезапись заголовка → `SQLITE_BUSY`), проигравший паниковал до `Barrier::wait(2)` → deadlock второго worker'а; обнажено добавленной T01-04 параллельной нагрузкой (`migrate_resumable`). Фикс: пред-инициализация БД в WAL в главном потоке до spawn (`drop(raw_conn(&state_path))`), открытие уже-WAL БД идемпотентно → остаётся только целевая гонка за migration lock (L1). Ассерт не ослаблен. Продуктовый flock-код корректен. `DEVIATIONS.md` → resolved | Claude Opus 4.8 / 2026-07-17 |
+| G01 | этот коммит (gate-hardening тесты + docs + `PROGRESS.md` в одной правке) | узкие тесты группы 01: `cargo test -p local-rag-core` OK (22 unit + 4 doctests; +`ensure_rejects_symlink_swap`, +pinned pipe_name KAT, +config_dir empty/relative); `-p local-rag-store --test state` 6 OK, `--test migrate` 8 OK (+`malformed_set_is_rejected`), `--test migrate_resumable` 6 OK, `--test cache` 9 OK; под `--features failpoints` → `--test cache` 10 (`cache_recreate_hard_kill_resumes`), `--test migrate_resumable` 7 (`resumable_hard_kill_via_sigabrt` — реальный SIGABRT-child); `cargo xtask ci` = all checks passed (fmt --check → clippy `-D warnings` → test --workspace → doc --no-deps → clippy+test `--features failpoints`); offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed; `RUSTDOCFLAGS="-D warnings" cargo doc -p local-rag-store -p local-rag-core --no-deps` clean; аудит `Cargo.lock` = 36 `source=` (все crates.io), grep всех `Cargo.toml` на dense/model/tree-sitter/сеть = 0 | Сверка G01 (перечитаны spec 02 §2/§2.1/§4–5; 03 §1.4/§2.1/§3/§4/§5; 13 §3): перестроен трейс «требование → код → тест» (блок ниже), расхождений код↔спека НЕ обнаружено. Все нормативные требования группы (layout+directory resolution, state/cache pragmas, bounded single-writer L4a/L4b, L1 migration lock, cross-DB запрет, framework bootstrap DDL, migration runner/compat/drift/resumable/backup, `StateDb::open` order) = as-built + verified. Backend-coupling guardrail держится: 3 allowlisted прямых dep (`libc`/`rusqlite bundled`/`tokio sync`), 0 dense/model/tree-sitter/network. Отложено by-design (seam на месте, не преждевременная реализация): wire-code mapping `INCOMPATIBLE_STORE`/`MIGRATION_IN_PROGRESS` → T15; посев `store_instance_uuid` → T02-01/T15; Windows SID → T17; batching/checkpoint/VACUUM-by-metrics → позже; v1→v2 migration `[OPEN]` не закрыт молча. Gate-hardening (тесты + docs; не features, не D-NNN): закрыты дешёвые пробелы покрытия защитного кода — `MalformedSet`, config_dir empty/relative, реальный symlink-swap reject, pinned pipe_name KAT, синхронизирован allowlist транзитивных deps в `CONTRIBUTING.md`. Отклонений не обнаружено; `DEVIATIONS.md` без изменений | Claude Opus 4.8 / 2026-07-17 |
 | G00 | этот коммит (строка evidence в том же коммите; изменён только `PROGRESS.md`) | `python3 fixtures/tooling/validate.py` exit 0 (built-in subset validator; 6 семейств, 114 уникальных id, 20 matrix-строк, no-backend-keys); `cargo xtask ci` = all checks passed; offline `CARGO_NET_OFFLINE=true cargo xtask ci` = passed (fmt --check → clippy `-D warnings` → test --workspace → doc --no-deps; прогнаны все group-тесты: test-support 7 unit + 8 integration + 6 doctests, `harness_smoke`, три пары `cli_version`, `xtask ci_config`, core doctests); аудит `Cargo.lock` = 0 строк `source=`/`checksum=`, 11 пакетов; grep всех `Cargo.toml` по dense/model/tree-sitter/sqlite/сеть = NONE; 10/10 baseline-порогов = `"TBD"`; manifest families = ровно 6, gaps = GAP-01..06 (все `blocking:false`) | Сверка G00: перечитаны spec 01/14/15, каждый маркер `[FIXED]`/`[SPEC]`/`[OPEN]` сопоставлен с as-built (трейс ниже). Fixture families 1–6 учтены (spec 14 §1), deferred scope в workspace отсутствует (spec 15 §3, 01 §2 O1), gaps GAP-01..06 видимы в `manifest.json`. Ни один `[OPEN]` (O1 backend, O2 пороги, O4 языки, O8 split) не закрыт молча. Отклонений не обнаружено → `DEVIATIONS.md` без изменений, D-NNN не заводился. `jsonschema==4.23.0` вариант validate.py — сетезависим (в системе не установлен), авторитетно подтверждён ещё в T00-01; для G00 сетенезависимым путём выступает built-in валидатор | Claude Opus 4.8 / 2026-07-16 |
 
 ### G00 — трейс требование → artifact/test
@@ -271,6 +272,80 @@ Spec 15 — Roadmap:
   `055a27a` (`T00-01: import v1 behavioral fixtures and baseline inventory`); правило «коммить
   каждую задачу» появилось позже (`6d0546d`). Историческое evidence не переписывается (CLAUDE.md,
   «Repository hygiene») — фиксирую факт здесь.
+
+### G01 — трейс требование → artifact/test
+
+Дата 2026-07-17, исполнитель Claude Opus 4.8. Команды воспроизводимы из README-плана и строки
+evidence G01 выше. `отложено` = требование нормативно, но реализуется позже по плану; на G01
+проверено лишь отсутствие преждевременного нарушения/coupling и наличие seam. Ссылки на код —
+`file:symbol`/`file:line` на момент сверки.
+
+Spec 02 — Architecture / lifecycle / locking:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Store layout, все 11 путей `[SPEC]` 02 §2 | `StoreLayout` core `paths/mod.rs:234+` (incl. `migration_lock`, `backups_dir`) | `store_layout_maps_every_path` | as-built |
+| Directory resolution precedence `[SPEC]` 02 §2.1 | `data_dir`/`config_dir` + `nonempty_var`/`absolute` (`paths/mod.rs:162/175/144/153`) | `data_dir_precedence_posix`, `config_dir_precedence_posix` (empty/relative добавлены) | as-built |
+| `LOCAL_RAG_HOME` overrides all incl config_dir `[SPEC]` 02 §2.1 | early-return `paths/mod.rs:163/176` | `local_rag_home_overrides_data_dir`, `config_dir_under_local_rag_home` | as-built |
+| state pragmas WAL(set-and-verify)/FK=ON/FULL/busy=5000 `[SPEC]` 02 §5 ↔ 03 §2 | `apply_state_pragmas` store `state/open.rs:98` (verify 101-104) | `state_pragmas_are_applied` | as-built |
+| Bounded single-writer L4a `[FIXED]` 02 §5 | `state/writer.rs` (spawn/transaction/run_transaction); writable conn не публичен | `concurrent_producers_serialize`, `queue_saturation_waits_then_cancels_cleanly`, `foreign_keys_are_enforced`, `closure_error_rolls_back_then_retry_is_idempotent`, `read_only_connection_cannot_write` | as-built |
+| Bounded single-writer L4b (cache) `[FIXED]` 02 §5 | `cache/writer.rs` (отдельный поток `local-rag-cache-writer`) | `cache_writer_backpressure_cancels_cleanly` | as-built |
+| L1 migration lock, held only while migrating, RAII `[SPEC]` 02 §5 | `migrate/lock.rs` (Drop 50-55), `mod.rs:299` `_guard` | `concurrent_migrators_apply_exactly_once` | as-built |
+| `StateDb::open` order (open_rw → migrate под L1 → spawn writer) `[FIXED, mechanics [SPEC]]` 02 §4.1 | `state/mod.rs:53-73` | `state_db_open_bootstraps_and_is_idempotent` | as-built |
+| Degraded modes / wire-code taxonomy `[SPEC]` 02 §6 | типизированные ошибки в `OpenError::Migration`; mapping → protocol boundary | — | отложено (T15) |
+
+Spec 03 — Data model / DDL / hash rules:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Cross-DB запрет: no writable ATTACH `[FIXED]` 03 §1.4 | два физически раздельных writer-потока; нет ATTACH в src (только read-only в docstring) | `no_writable_cross_db_attach` (source-lint скан `crates/store/src/**`) | as-built |
+| Framework bootstrap DDL байт-в-байт `[SPEC]` 03 §2.1 | `bootstrap()` `migrate/mod.rs:554-578` (`schema_migrations`/`store_settings`/`migration_progress`) | `state_db_open_bootstraps_and_is_idempotent`, `empty_to_latest_applies_all` | as-built |
+| state write policy: single bounded queue `[FIXED, numbers [SPEC]]` 03 §3 | L4a (см. 02 §5 выше) | (L4a-тесты) | as-built (queue) / отложено (batched last_used/checkpoint/VACUUM-by-metrics) |
+| cache pragmas WAL/FK=OFF/NORMAL/busy=5000 `[SPEC]` 03 §4 | `apply_cache_pragmas` `cache/open.rs:147` | `cache_pragmas_are_applied` | as-built |
+| cache binding/recreation `[FIXED principle]` 03 §4.4 (`CACHE_SCHEMA_VERSION=1`) | `cache/open.rs` (`open_and_bind`:173/`inspect_existing`:208/`seed_binding`:251/`recreate`:279) | `matching_reopen_preserves_rows`, `uuid_mismatch_rebuilds`, `schema_version_mismatch_rebuilds`, `corrupt_cache_yields_clean_cache`, `state_untouched_on_cache_rebuild`, `recreate_is_idempotent_on_retry`, `cache_recreate_hard_kill_resumes` | as-built |
+| payload-таблицы (embedding/normalized_text/fts) НЕ создаются | только `cache_meta` DDL `cache/open.rs:39` | — | scope-guard (T03/T08/T11) |
+| Migration boundaries: hash schema/`occurrence_id`/`worktree_id`/`received_seq` стабильны; deferred additive `[FIXED]` 03 §5 | `ALL: &[] ` `mod.rs:149` (первая миграция T02-02); `store_instance_uuid` не засеян | — | as-built / отложено (посев T02-01/T15) |
+
+Spec 13 §3 — Migration framework:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| numbered/checksummed(over SQL)/forward-only `[FIXED]` | `Migration.version`/`checksum()=sha256_hex(SQL)` `mod.rs:88/132`; `filter(v>store_version)`:348 | `checksum_drift_is_rejected`, `older_to_latest_applies_only_new` | as-built |
+| well-formed set (strictly-increasing-contiguous-from-1) | `validate_set` `mod.rs:532` → `MalformedSet` | `malformed_set_is_rejected` (добавлен) | as-built |
+| compat-check: refuse newer store `[FIXED]` | `run()` `mod.rs:310-316` `IncompatibleStore` | `newer_store_is_rejected` | as-built (wire-code → T15) |
+| checksum drift / rewritten history `[FIXED]` | `mod.rs:319-337` `ChecksumDrift`/`UnknownAppliedVersion` | `checksum_drift_is_rejected` | as-built |
+| resumable: idempotent steps, progress row/step, crash⇒resume `[FIXED]` | `apply_complex` `mod.rs:375-433` + `migration_progress` | `resume_after_each_checkpoint`, `resume_from_finalize_pending`, `resumable_hard_kill_via_sigabrt`, `failed_step_leaves_version_unapplied_then_retry_succeeds` | as-built |
+| backup before destructive (`VACUUM INTO backups/state-<v>-<ts>.sqlite`) `[SPEC mechanics]` | `mod.rs:387-399`, `take_backup`:442, `backup_path`:469 | `destructive_backup_has_pre_change_data`, `destructive_backup_idempotent_on_resume`, `destructive_sql_only_backs_up_then_applies_sql` | as-built |
+| cache never migrated (bump ⇒ drop&rebuild) `[FIXED]` ↔ 03 §4.4 | cache recreate path | `schema_version_mismatch_rebuilds` | as-built |
+| migration tests on every prior released schema `[FIXED]` | синтетические наборы M1..M4 (matrix); реальный `ALL` пуст | migrate matrix (8) | as-built (released schema нет до T02-02) |
+| v1→v2 data migration `[OPEN]` | — | — | не закрыт молча (решение до GA) |
+
+Backend-coupling guardrail (архитектурный инвариант, T10):
+
+| Проверка | Результат |
+| --- | --- |
+| прямые внешние deps | ровно 3 allowlisted: `libc` (unix), `rusqlite` (bundled), `tokio` (sync) |
+| `Cargo.lock` `source=` | 36 (все crates.io; wasm-подсемейство rusqlite 0.40 target-gated, не линкуется в native) |
+| grep dense/model/tree-sitter/network SDK по всем `Cargo.toml` | 0 (qdrant/usearch/ollama/onnx/candle/tree-sitter/reqwest/… = NONE) |
+
+Заметки G01 (не отклонения):
+
+- Все затронутые группой маркеры `[FIXED]`/`[SPEC]` = as-built + verified; единственный
+  затронутый `[OPEN]` — O8 (state/cache split, уже `[FIXED]`) соблюдён, а v1→v2 migration
+  (`[OPEN]` 13 §3) не закрыт молча. Ни один `[OPEN]` не разрешён имплицитно.
+- Спека «single writer *task*» (02 §5 L4a/L4b) реализована выделенным OS-потоком с
+  `blocking_recv` (не tokio-task). Семантически эквивалентно (ровно один физический писатель
+  на БД); не расхождение — docstring `state/mod.rs`/`cache/mod.rs` использует слово «task».
+- Gate-hardening (закрытие дешёвых пробелов покрытия защитного/edge кода; только тесты + docs,
+  продуктовый код не тронут — это не features и не D-NNN): `malformed_set_is_rejected` (store
+  `tests/migrate.rs`), edge-cases empty/relative `XDG_CONFIG_HOME` в `config_dir_precedence_posix`,
+  реальный symlink-swap reject `ensure_rejects_symlink_swap` (core `paths/perms.rs`), pinned
+  12-hex KAT в `pipe_name_fixture` (ground truth вычислен независимо), синхронизация перечня
+  транзитивных deps `rusqlite` в `CONTRIBUTING.md` с `Cargo.lock`.
+- Отложенные by-design seam (проверено наличие, не преждевременная реализация): protocol
+  wire-code mapping (T15), посев `store_instance_uuid` (T02-01/T15), Windows SID (T17),
+  batched `last_used_at`/WAL checkpoint/VACUUM-by-metrics (позже). Отклонений не обнаружено;
+  `DEVIATIONS.md` без изменений; historical evidence не переписывалось.
 
 Примечания к T00-03:
 

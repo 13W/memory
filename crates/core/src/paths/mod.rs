@@ -522,6 +522,24 @@ mod tests {
             PathBuf::from("/home/user/.config/local-rag")
         );
 
+        // empty XDG is treated as unset → home fallback (same helper as data_dir).
+        let env = MockEnv::default()
+            .set("XDG_CONFIG_HOME", "")
+            .home("/home/user");
+        assert_eq!(
+            config_dir(&env).unwrap(),
+            PathBuf::from("/home/user/.config/local-rag")
+        );
+
+        // relative XDG is ignored per XDG spec → home fallback.
+        let env = MockEnv::default()
+            .set("XDG_CONFIG_HOME", "relative/config")
+            .home("/home/user");
+        assert_eq!(
+            config_dir(&env).unwrap(),
+            PathBuf::from("/home/user/.config/local-rag")
+        );
+
         let env = MockEnv::default();
         assert!(matches!(
             config_dir(&env),
@@ -589,9 +607,15 @@ mod tests {
     #[test]
     fn pipe_name_fixture() {
         let prefix = r"\\.\pipe\local-rag-";
-        // Fixed SID → digest table (ground truth: first 12 hex of sha256(sid)).
-        let cases = [("S-1-5-21-1-2-3-1001", "sha256"), ("S-1-5-18", "sha256")];
-        for (sid, _kind) in cases {
+        // Pinned known-answer table: `sid → first 12 hex of sha256(sid.as_bytes())`,
+        // ground truth computed independently (`printf %s <sid> | shasum -a 256`).
+        // Pinning the exact suffix — not just its length/charset — catches a
+        // regression that sliced a different 12 chars of the digest.
+        let cases = [
+            ("S-1-5-18", "593347bdfcc9"),
+            ("S-1-5-21-1-2-3-1001", "c169ebe52e9c"),
+        ];
+        for (sid, expected_suffix) in cases {
             let name = pipe_name(sid);
             assert!(name.starts_with(prefix), "prefix for {sid}");
             let suffix = &name[prefix.len()..];
@@ -602,6 +626,7 @@ mod tests {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
                 "lowercase hex for {sid}"
             );
+            assert_eq!(suffix, expected_suffix, "pinned digest slice for {sid}");
             // Determinism.
             assert_eq!(name, pipe_name(sid));
         }
