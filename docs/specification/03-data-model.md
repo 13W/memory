@@ -81,6 +81,14 @@ CREATE TABLE store_settings (        -- store_instance_uuid, default_model_space
   value TEXT NOT NULL
 );
 
+CREATE TABLE migration_progress (    -- resumable-migration checkpoints (13 §3); rows exist
+  version  INTEGER NOT NULL,         -- only for the in-flight migration, cleared on finalize
+  seq      INTEGER NOT NULL,         -- unit index within the migration (backup/sql/step…)
+  label    TEXT NOT NULL,
+  done_at  INTEGER NOT NULL,
+  PRIMARY KEY (version, seq)
+);
+
 CREATE TABLE repository (
   repo_id                 TEXT PRIMARY KEY,           -- UUIDv7
   git_remote_fingerprint  TEXT,                       -- H(remote_fingerprint), nullable; NOT unique

@@ -15,6 +15,16 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # (spec 02 §5 L4). No runtime/net/mio in the library; the blocking SQLite
 # writer lives on a dedicated OS thread driven via `Receiver::blocking_recv`.
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# Optional, dev-only path crate (0 external sources): enabled ONLY by the
+# `failpoints` feature so the migration runner can host named crash-injection
+# points for hard-kill (SIGABRT) resume tests. Never enabled in release/dist.
+local-rag-test-support = { path = "../test-support", optional = true }
+
+[features]
+# Compile the migration runner's named failpoint seams (spec 13 §3 crash tests).
+# Off by default → zero-cost, and the release/distribution build never links the
+# test-support crate.
+failpoints = ["dep:local-rag-test-support"]
 
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }

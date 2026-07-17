@@ -323,13 +323,21 @@ impl StoreLayout {
         self.root.join("quarantine")
     }
 
+    /// `backups/` — pre-mutation `state.sqlite` snapshots taken via `VACUUM INTO`
+    /// before a destructive migration (spec 13 §3). Individual backup files are
+    /// named `state-<version>-<ts>.sqlite` by the migration runner.
+    pub fn backups_dir(&self) -> PathBuf {
+        self.root.join("backups")
+    }
+
     /// Idempotently create the store directory tree.
     ///
     /// The store root and its managed subdirectories are created `0700` (POSIX)
     /// and verified to be owned by the current uid; ancestors of the root (e.g.
     /// `~/.local/share`) may be shared and are created at the platform default
-    /// mode. Files (`store.lock`, `*.sqlite`) and `backups/` are created by
-    /// later tasks, not here.
+    /// mode. Files (`store.lock`, `*.sqlite`) are created by later tasks, not
+    /// here; individual backup files are written by the migration runner into the
+    /// `backups/` directory created here.
     pub fn ensure(&self) -> Result<(), PathError> {
         if let Some(parent) = self.root.parent() {
             std::fs::create_dir_all(parent).map_err(|e| PathError::io(parent, e))?;
@@ -342,6 +350,7 @@ impl StoreLayout {
             self.run_dir(),
             self.logs_dir(),
             self.quarantine_dir(),
+            self.backups_dir(),
         ] {
             perms::ensure_dir(&dir)?;
         }
@@ -574,6 +583,7 @@ mod tests {
             layout.quarantine_dir(),
             Path::new("/s/local-rag/quarantine")
         );
+        assert_eq!(layout.backups_dir(), Path::new("/s/local-rag/backups"));
     }
 
     #[test]
@@ -631,6 +641,7 @@ mod tests {
             layout.run_dir(),
             layout.logs_dir(),
             layout.quarantine_dir(),
+            layout.backups_dir(),
         ] {
             assert!(dir.is_dir(), "{} exists", dir.display());
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
