@@ -406,11 +406,26 @@ async fn recreate_is_idempotent_on_retry() {
     );
 }
 
+/// Whether `line` carries the SQL `ATTACH` keyword.
+///
+/// SQL in this crate is written with uppercase keywords by strict convention
+/// (every `CREATE`/`INSERT`/`PRAGMA`/`VACUUM`/… is uppercase), so the uppercase
+/// token is the SQL form. Keying on it deliberately does **not** match the Rust
+/// identifier `attach` / `AttachError` / `Reattachable` — the spec-named
+/// `repo attach` worktree operation (04 §7, T02-04), which is not SQL. Before
+/// D-002 the scan lowercased the line and matched the substring `attach`, which
+/// false-positived on that operation once it landed; the invariant enforced is
+/// unchanged (no uppercase SQL `ATTACH` can slip in), only the identifier
+/// collision is removed.
+fn contains_sql_attach(line: &str) -> bool {
+    line.contains("ATTACH")
+}
+
 /// The cross-database rule (spec 03 §1.4 `[FIXED]`): the storage crate must not
-/// contain a *writable* cross-DB `ATTACH`. This source lint flags any `ATTACH`
-/// occurrence in real code (not comments) that is not annotated as read-only, so
-/// a future writable-ATTACH path cannot land silently. Read-only `ATTACH` is
-/// permitted and must carry a `// cross-db: read-only` marker.
+/// contain a *writable* cross-DB `ATTACH`. This source lint flags any SQL
+/// `ATTACH` occurrence in real code (not comments) that is not annotated as
+/// read-only, so a future writable-ATTACH path cannot land silently. Read-only
+/// `ATTACH` is permitted and must carry a `// cross-db: read-only` marker.
 #[test]
 fn no_writable_cross_db_attach() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -422,7 +437,7 @@ fn no_writable_cross_db_attach() {
     for file in &files {
         let text = std::fs::read_to_string(file).expect("read source file");
         for (i, line) in text.lines().enumerate() {
-            if !line.to_ascii_lowercase().contains("attach") {
+            if !contains_sql_attach(line) {
                 continue;
             }
             let is_comment = line.trim_start().starts_with("//");
@@ -437,6 +452,27 @@ fn no_writable_cross_db_attach() {
         "writable cross-DB ATTACH is forbidden (spec 03 §1.4); found:\n{}",
         violations.join("\n")
     );
+}
+
+/// D-002 regression: the source lint keys on the SQL `ATTACH` keyword, not on the
+/// Rust `attach` identifier / `AttachError` type / `Reattachable` (the spec-named
+/// `repo attach` operation, 04 §7). Uppercase SQL is still detected; the Rust
+/// identifier is not.
+#[test]
+fn source_lint_targets_sql_attach_not_the_rust_identifier() {
+    // Positive: real SQL keyword (uppercase by crate convention) is detected.
+    assert!(contains_sql_attach(
+        r#"tx.execute("ATTACH DATABASE 'x' AS y", [])"#
+    ));
+    assert!(contains_sql_attach("  ATTACH 'file' AS aux"));
+    // Negative: the Rust `attach` operation and its types are not SQL.
+    assert!(!contains_sql_attach("pub fn attach("));
+    assert!(!contains_sql_attach(
+        "        return Ok(Err(AttachError::UnknownWorktree));"
+    ));
+    assert!(!contains_sql_attach(
+        "    NotReattachable(IllegalWorktreeTransition),"
+    ));
 }
 
 // ---- hard-kill (SIGABRT) end-to-end -----------------------------------------

@@ -190,6 +190,21 @@ pub struct WorktreePathObservation {
     pub last_seen_at: i64,
 }
 
+/// A worktree's core identity fields (spec 03 §2.1), read in one query for the
+/// request-root resolver and [`attach`](super::attach) (T02-04): the repository
+/// it belongs to, its `kind`, and its lifecycle `state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSummary {
+    /// The worktree's stable id (never path-derived, spec 01 §5).
+    pub worktree_id: String,
+    /// The repository this worktree belongs to.
+    pub repo_id: String,
+    /// Whether it is the main tree, a linked worktree, or a non-git directory.
+    pub kind: WorktreeKind,
+    /// Its current lifecycle state (spec 04 §7).
+    pub state: WorktreeState,
+}
+
 /// Insert a `worktree` row (spec 03 §2.1).
 ///
 /// `worktree_id` is a caller-minted UUIDv7 (never path-derived, spec 01 §5). The
@@ -448,6 +463,93 @@ pub fn find_worktrees_by_path_fingerprint(
     rows.collect()
 }
 
+/// Map a `(worktree_id, repo_id, kind, state)` row into a [`WorktreeSummary`],
+/// parsing `kind`/`state` with the same `FromSqlConversionFailure` fallback used
+/// by [`worktree_state`] so a value outside the CHECK domain (corruption)
+/// surfaces as a typed SQLite error rather than a silent default.
+fn summary_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeSummary> {
+    let worktree_id: String = r.get(0)?;
+    let repo_id: String = r.get(1)?;
+    let kind_raw: String = r.get(2)?;
+    let state_raw: String = r.get(3)?;
+    let kind = WorktreeKind::from_db(&kind_raw).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            format!("invalid worktree.kind {kind_raw:?}").into(),
+        )
+    })?;
+    let state = WorktreeState::from_db(&state_raw).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            format!("invalid worktree.state {state_raw:?}").into(),
+        )
+    })?;
+    Ok(WorktreeSummary {
+        worktree_id,
+        repo_id,
+        kind,
+        state,
+    })
+}
+
+/// The single worktree whose **current** (`is_current = 1`) observed canonical
+/// path is `observed_canonical_path`, if any (spec 03 §2.1). Symmetric to
+/// [`find_repository_by_path`](super::find_repository_by_path).
+///
+/// This is the resolver's only auto-resolution key (T02-04): it matches strictly
+/// on the current path, never on history or a fingerprint. Because
+/// `worktree_path_current` is a *per-worktree* partial unique index (not a global
+/// one), a canonical path is not guaranteed unique across worktrees; the daemon
+/// maintains a single current occupant per path, and this query is deterministic
+/// regardless via `ORDER BY worktree_id LIMIT 1`.
+pub fn find_worktree_by_current_path(
+    conn: &Connection,
+    observed_canonical_path: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT worktree_id FROM worktree_path \
+         WHERE observed_canonical_path = ?1 AND is_current = 1 \
+         ORDER BY worktree_id LIMIT 1",
+        params![observed_canonical_path],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// The [`WorktreeSummary`] for `worktree_id`, if it exists (spec 03 §2.1) — the
+/// repo/kind/state trio the resolver and [`attach`](super::attach) need in one
+/// query.
+pub fn worktree_summary(
+    conn: &Connection,
+    worktree_id: &str,
+) -> rusqlite::Result<Option<WorktreeSummary>> {
+    conn.query_row(
+        "SELECT worktree_id, repo_id, kind, state FROM worktree WHERE worktree_id = ?1",
+        params![worktree_id],
+        summary_from_row,
+    )
+    .optional()
+}
+
+/// Every worktree of `repo_id`, ascending by `worktree_id` (spec 03 §2.1).
+///
+/// Used by the resolver to expand a remote-fingerprint hint into that
+/// repository's worktrees when disambiguating a move (T02-04); the remote
+/// fingerprint is a hint, so this is advisory input, never identity (spec 12 §7).
+pub fn worktrees_of_repo(
+    conn: &Connection,
+    repo_id: &str,
+) -> rusqlite::Result<Vec<WorktreeSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT worktree_id, repo_id, kind, state FROM worktree \
+         WHERE repo_id = ?1 ORDER BY worktree_id",
+    )?;
+    let rows = stmt.query_map(params![repo_id], summary_from_row)?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +605,60 @@ mod tests {
                 "removing → {to:?} illegal",
             );
         }
+    }
+
+    /// A store whose `worktree.kind`/`state` somehow hold a value outside the
+    /// CHECK domain (corruption) must surface a typed conversion error from
+    /// [`worktree_summary`], not a silent default. A minimal constraint-free
+    /// table injects the bad value.
+    #[test]
+    fn summary_from_row_rejects_corrupt_enum() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE worktree (worktree_id TEXT, repo_id TEXT, kind TEXT, state TEXT);\n\
+             INSERT INTO worktree VALUES ('w1', 'r', 'bogus', 'active');\n\
+             INSERT INTO worktree VALUES ('w2', 'r', 'main', 'bogus');",
+        )
+        .expect("seed corrupt rows");
+
+        let bad_kind = worktree_summary(&conn, "w1");
+        assert!(
+            matches!(
+                bad_kind,
+                Err(Error::FromSqlConversionFailure(2, Type::Text, _))
+            ),
+            "corrupt kind → typed conversion failure, got {bad_kind:?}",
+        );
+        let bad_state = worktree_summary(&conn, "w2");
+        assert!(
+            matches!(
+                bad_state,
+                Err(Error::FromSqlConversionFailure(3, Type::Text, _))
+            ),
+            "corrupt state → typed conversion failure, got {bad_state:?}",
+        );
+    }
+
+    /// A well-formed row parses into the expected [`WorktreeSummary`]; an absent
+    /// id yields `None`.
+    #[test]
+    fn summary_from_row_parses_valid_row() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE worktree (worktree_id TEXT, repo_id TEXT, kind TEXT, state TEXT);\n\
+             INSERT INTO worktree VALUES ('w', 'r', 'linked', 'detached');",
+        )
+        .expect("seed row");
+
+        assert_eq!(
+            worktree_summary(&conn, "w").expect("summary"),
+            Some(WorktreeSummary {
+                worktree_id: "w".to_string(),
+                repo_id: "r".to_string(),
+                kind: WorktreeKind::Linked,
+                state: WorktreeState::Detached,
+            }),
+        );
+        assert_eq!(worktree_summary(&conn, "absent").expect("absent"), None);
     }
 }

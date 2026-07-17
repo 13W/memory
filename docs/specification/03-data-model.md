@@ -213,6 +213,31 @@ crash/retry that re-requests the current state safe (never a coercion, 04 preamb
 schema (§2.4), and state machine (04 §1) are group 05 — and `set_current_generation` is the
 worktree-side write that the FK guards against pointing at another worktree's generation.
 
+As-built note (T02-04, `[SPEC]`): the request-root resolver and `repo attach` (spec 02 §3.3,
+04 §7) are a composition layer (`local_rag_store::registry::resolve`) over the T02-02/03
+primitives — no new tables or migration. It adds three registry reads:
+`find_worktree_by_current_path` (the single worktree whose `is_current = 1` observed canonical
+path equals the query — symmetric to `find_repository_by_path`), `worktree_summary`
+(`worktree_id`/`repo_id`/`kind`/`state` in one row), and `worktrees_of_repo`. Because
+`worktree_path_current`/`repository_path_current` are *per-row* partial unique indexes, a
+canonical path is not globally unique across worktrees/repos; `find_worktree_by_current_path`
+returns the deterministic first (`ORDER BY worktree_id LIMIT 1`) and the daemon maintains one
+current occupant per path. `resolve` auto-resolves **only** on an exact current-path match;
+`path_fingerprint` (current or historical), `git_remote_fingerprint`, and the daemon's
+common-dir/admin-dir fingerprint are advisory and never produce a resolved identity on their own
+— reattach candidates are restricted to `state = 'detached'` worktrees of the requested `kind`,
+and binding one requires an explicit id via `attach` (an explicit `repo_hint` that selects a
+single candidate also resolves; a repo-level hint cannot pick between two linked worktrees of
+one repo). A recreated path therefore never steals a moved (still-`active`) worktree's identity,
+and an unknown root yields *global scope only* (not an error). `attach` composes
+`transition_worktree_state`(→`active`) + `observe_worktree_path` (+ `observe_repository_path`
+only when the **stored** `kind` is not `linked`, so a linked reattach never moves the main
+checkout's path); it returns a typed `AttachError` (`UnknownWorktree`, `RepoMismatch`,
+`NotReattachable`) and mutates nothing on rejection. The daemon's common-dir fingerprint is
+carried on the request facts but **not stored** (no column) — advisory by construction. Git
+probing (`kind`, common-dir, remote URL) is the daemon's (T15); `local-rag-store` takes no git
+dependency (architecture guardrail until T10).
+
 ### 2.2 Projection state & model registry
 
 ```sql
