@@ -44,12 +44,32 @@ All content/manifest/subject hashes are **domain-separated and version-tagged**.
 Deterministic IDs (`occurrence_id`, projection point IDs, memory-op keys) MUST be stable under
 retry/reconcile and independent of row insertion order `[FIXED]`.
 
+As-built note (T02-01, `[SPEC]`): `local_rag_core::identity::domain` implements the encoding
+above (`encode`/`hash`, hex-encoded 64 chars) with a `Domain` enum covering all twelve domains
+and the version-tagged string `local-rag/1/<slug>` (the two `subject/*` slugs keep their `/`).
+Field payloads are raw bytes; the serialization conventions this codebase commits to are: text
+→ UTF-8 bytes; an already-hex identity (a UUID or another domain hash) → its lowercase ASCII
+bytes exactly as stored in its `TEXT` column; a fixed-width integer field → little-endian bytes
+of the declared width. Only the two *lookup* fingerprints (`path_fingerprint`,
+`remote_fingerprint`) have typed constructors so far; the deterministic-ID domains are hashed
+through the generic `hash` entry point by their owning tasks (T03/T05/T08/T11/T14), which
+assemble the field list in the order fixed by the table above.
+
 ### 1.3 Path canonicalization `[FIXED principle, details [SPEC]]`
 
 `normalized_path` (worktree-relative): `/` separators, no leading `./`, Unicode **NFC**; on
 case-insensitive filesystems additionally simple case-fold. The original spelling is preserved
 in `display_path`. Absolute worktree paths use the same rules plus: symlink resolution,
 Windows drive-letter upcasing, UNC normalization. Identity never depends on the display form.
+
+As-built note (T02-01, `[SPEC]`): `local_rag_core::identity::path` returns a `Canonical
+{ canonical, display }` so the identity form and the preserved spelling travel together.
+Simple case folding uses `casefold::simple_fold` (a Unicode simple-fold, 1:1, distinct from
+full folding) applied *after* NFC. Filesystem case-sensitivity is not probed here: the caller
+passes a `CaseSensitivity` (the registry knows each worktree's filesystem), keeping the
+primitive deterministic. Symlink/`.`/`..` resolution is delegated to `std::fs::canonicalize`
+(the only filesystem-touching step); the Windows `\\?\` verbatim and `\\?\UNC\` prefixes are
+stripped and drive letters upcased as part of the string-level rules.
 
 ### 1.4 Cross-database rule `[FIXED]`
 
