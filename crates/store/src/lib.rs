@@ -1,7 +1,7 @@
 //! `local-rag` durable storage layer.
 //!
 //! This crate owns the SQLite databases described in spec 03: the canonical
-//! `state.sqlite` (source of truth) and, later, the rebuildable `cache.sqlite`.
+//! `state.sqlite` (source of truth) and the rebuildable `cache.sqlite`.
 //!
 //! T01-02 introduces the **state open policy** and the **bounded writer**:
 //!
@@ -22,7 +22,15 @@
 //! mechanics**: complex migrations apply as per-unit checkpoints
 //! (`migration_progress`) so a crash resumes exactly, and a `destructive`
 //! migration takes a `VACUUM INTO` backup into `<root>/backups/` before any
-//! mutation. `cache.sqlite` (T01-05) builds on top of this.
+//! mutation.
+//!
+//! T01-05 adds the **cache open policy** ([`CacheDb`]): `cache.sqlite` is opened
+//! with its own pragmas (`foreign_keys=OFF`, `synchronous=NORMAL`; spec 03 §4),
+//! bound to a store via `cache_meta`, and dropped & rebuilt when incompatible or
+//! corrupt (03 §4.4). It is never migrated (13 §3). Its writes flow through a
+//! **separate** bounded queue ([`CacheWriter`], 02 §5 L4b), physically distinct
+//! from state's, so state and cache can never share one transaction — the
+//! writable cross-database `ATTACH` prohibition (03 §1.4) is structural.
 //!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
@@ -30,9 +38,13 @@
 pub use local_rag_core::VERSION;
 pub use rusqlite;
 
+mod cache;
 mod clock;
 pub mod migrate;
 mod state;
 
+pub use cache::{
+    CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome, CacheWriteError, CacheWriter,
+};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};
