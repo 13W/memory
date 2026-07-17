@@ -17,10 +17,17 @@ publish.workspace = true
 # no Unicode normalization.
 # casefold: Unicode simple case folding (spec 03 §1.3) for case-insensitive
 # filesystems; std offers only full case mapping (lowercasing), not simple fold.
+# toml + serde: parse the versioned global config `<config_dir>/config.toml`
+# (spec 02 §3.1). std has no TOML parser; hand-rolling one for a security-relevant
+# config (data_policy) is disproportionate and error-prone. serde `derive` types
+# the sections; parsing is lenient (unknown keys ignored), version/enum validation
+# is explicit in `config::Config`.
 [dependencies]
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 unicode-normalization = "0.1"
 casefold = "0.1"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
 
 # `geteuid` for POSIX owner verification (spec 02 §2.1). std exposes no getuid;
 # libc is a rust-lang-maintained, zero-transitive-dependency crate. See the

@@ -88,6 +88,20 @@ languages = ["typescript", "javascript"]   # [OPEN — first-release language se
 max_file_size_kb = 1024
 ```
 
+As-built note (T02-05, `[SPEC]`): the global config is parsed by
+`local_rag_core::config` (`Config::load(<config_dir>)` reads only
+`<config_dir>/config.toml`; `Config::parse_toml` for text). Validation policy for the cases this
+section left implicit: a **missing file** yields the full defaults above (config is optional); an
+**unknown/unsupported `schema_version`** is a typed `ConfigError::UnsupportedSchemaVersion`
+(this binary supports `1`); an **invalid `data_policy`** value is a typed
+`ConfigError::InvalidDataPolicy` — never silently downgraded to the default (§6 "nothing degrades
+silently" `[FIXED]`); **unknown TOML keys are ignored** (lenient/forward-compatible), and missing
+keys default per section. The `[OPEN]` numbers (`storage.retired_generations_keep`/`_ttl_h`,
+`index.languages`) are parsed as the provisional defaults shown here — T02-05 does not close those
+open questions. `Config::load` takes only the resolved `<config_dir>`; there is no API that
+consults a worktree or repository tree, which is the structural form of §3.2's "never via files
+inside the repository".
+
 ### 3.2 Per-repository settings `[SPEC]`
 
 Stored in `state.sqlite` (`repo_settings` table, 03 §2.1), edited via CLI/dashboard-equivalent,
@@ -98,6 +112,17 @@ Keys mirror `[models]`/`[index]` sections.
 repository value. Order of restrictiveness:
 `local_only > metadata_only_remote > allow_remote_with_redaction > allow_remote_full`.
 Requests routed while any involved repo demands stricter policy MUST use the stricter policy.
+
+As-built note (T02-05, `[SPEC]`): the `repo_settings` reads/writes and the merge live in
+`local_rag_store::registry::settings` (see 03 §2.1 T02-05 note for the storage detail).
+`DataPolicy::most_restrictive` (`local_rag_core::config`) picks the lower-ranked (stricter) of two
+policies; `effective_data_policy(global, conn, repo_ids)` folds it over the global value and every
+involved repository's stored policy. The fold is commutative/associative, so the effective policy
+is deterministic regardless of the order repositories are visited, and a repository can only
+tighten — never relax — the global policy. A repository with no `data_policy` setting does not
+change the effective value. The enforcement point that consumes this — the central remote-policy
+guard in the provider pool (§6 `POLICY_BLOCKED_REMOTE`; 10 §1; 12 §1) — is a later group
+(T11/T16); T02-05 supplies the effective-policy computation it calls.
 
 ### 3.3 Request context `[FIXED — daemon defines routing]`
 

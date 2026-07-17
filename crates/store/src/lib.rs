@@ -58,6 +58,15 @@
 //! moved worktree's identity and ambiguous linked worktrees require an explicit
 //! attach.
 //!
+//! T02-05 adds **per-repository settings and the `data_policy` merge**
+//! ([`registry::set_repo_setting`]/[`registry::get_repo_setting`] and the typed
+//! [`registry::repo_data_policy`]/[`registry::set_repo_data_policy`]): the generic
+//! `repo_settings` table (spec 03 §2.1) whose keys mirror the global
+//! `[models]`/`[index]` config, plus [`registry::effective_data_policy`], which
+//! returns the *most restrictive* of the global and every involved repository's
+//! policy (spec 02 §3.2, 12 §1). The global config itself is parsed by
+//! [`local_rag_core::config`]; the central remote-policy guard is a later group.
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -75,12 +84,14 @@ pub use cache::{
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
-    AttachError, Candidate, IllegalWorktreeTransition, PathObservation, RequestRoot, Resolution,
-    WorktreeKind, WorktreePathObservation, WorktreeRootFacts, WorktreeState, WorktreeSummary,
-    WorktreeTransitionError, attach, create_repository, create_worktree, current_generation,
-    current_path, current_worktree_path, find_repositories_by_remote, find_repository_by_path,
-    find_worktree_by_current_path, find_worktrees_by_path_fingerprint, observe_repository_path,
-    observe_worktree_path, path_history, resolve, set_current_generation,
+    AttachError, Candidate, DATA_POLICY_KEY, IllegalWorktreeTransition, PathObservation,
+    RequestRoot, Resolution, WorktreeKind, WorktreePathObservation, WorktreeRootFacts,
+    WorktreeState, WorktreeSummary, WorktreeTransitionError, attach, create_repository,
+    create_worktree, current_generation, current_path, current_worktree_path,
+    effective_data_policy, find_repositories_by_remote, find_repository_by_path,
+    find_worktree_by_current_path, find_worktrees_by_path_fingerprint, get_repo_setting,
+    observe_repository_path, observe_worktree_path, path_history, repo_data_policy, repo_settings,
+    resolve, set_current_generation, set_repo_data_policy, set_repo_setting,
     transition_worktree_state, worktree_path_history, worktree_state, worktree_summary,
     worktrees_of_repo,
 };
