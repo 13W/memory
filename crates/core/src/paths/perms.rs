@@ -196,6 +196,44 @@ mod tests {
     }
 
     #[test]
+    fn ensure_rejects_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let home = TempHome::new().expect("temp home");
+
+        // A symlink pointing at a *real directory* must still be rejected by
+        // ensure_dir: `symlink_metadata` does not follow the link, so the path
+        // reports as a symlink, not a directory. Following the link would have
+        // seen a valid dir and wrongly accepted it — this is the symlink-swap
+        // defence.
+        let real_dir = home.join("real_dir");
+        ensure_dir(&real_dir).expect("create real dir");
+        let dir_link = home.join("dir_link");
+        symlink(&real_dir, &dir_link).expect("create dir symlink");
+        assert!(matches!(
+            ensure_dir(&dir_link),
+            Err(PathError::UnexpectedType {
+                expected: "directory",
+                ..
+            })
+        ));
+
+        // Likewise a symlink pointing at a *real file* must be rejected by
+        // ensure_file_0600.
+        let real_file = home.join("real_file");
+        ensure_file_0600(&real_file).expect("create real file");
+        let file_link = home.join("file_link");
+        symlink(&real_file, &file_link).expect("create file symlink");
+        assert!(matches!(
+            ensure_file_0600(&file_link),
+            Err(PathError::UnexpectedType {
+                expected: "file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn verify_owner_accepts_our_own_dir() {
         let home = TempHome::new().expect("temp home");
         verify_owner(home.path()).expect("we own our temp home");

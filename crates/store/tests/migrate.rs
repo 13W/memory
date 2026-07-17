@@ -186,6 +186,46 @@ fn newer_store_is_rejected() {
     assert_eq!(migration_rows(&conn).len(), 3);
 }
 
+/// malformed set: a migration set that is not strictly-increasing-and-contiguous
+/// -from-1 is a programming error caught up front by `validate_set`, before the
+/// migration lock is taken or any framework table is bootstrapped.
+#[test]
+fn malformed_set_is_rejected() {
+    let (_home, layout) = temp_store();
+    let mut conn = raw_conn(&layout.state_db());
+
+    // Does not start at version 1.
+    let err = run(&mut conn, &[M2], &layout.migration_lock(), 1000).expect_err("not from 1");
+    match err {
+        MigrationError::MalformedSet { detail } => {
+            assert!(
+                detail.contains("expected version 1"),
+                "unexpected detail: {detail}"
+            );
+        }
+        other => panic!("expected MalformedSet, got {other:?}"),
+    }
+
+    // Contiguous-from-1 but with a gap (missing version 2).
+    let err = run(&mut conn, &[M1, M3], &layout.migration_lock(), 1000).expect_err("gap at v2");
+    match err {
+        MigrationError::MalformedSet { detail } => {
+            assert!(
+                detail.contains("expected version 2"),
+                "unexpected detail: {detail}"
+            );
+        }
+        other => panic!("expected MalformedSet, got {other:?}"),
+    }
+
+    // Rejected before any write: validate_set runs ahead of bootstrap, so the
+    // framework tables were never created on this store.
+    assert!(
+        !table_exists(&conn, "schema_migrations"),
+        "no bootstrap on a malformed set"
+    );
+}
+
 /// concurrent migrator exclusion: two migrators race on the same store; L1
 /// (flock) serializes them so both return `Ok` and the set is applied exactly
 /// once. If L1 were broken, both would read store_version 0 and the loser's
