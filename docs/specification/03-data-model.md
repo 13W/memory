@@ -182,8 +182,9 @@ As-built note (T02-02, `[SPEC]`): the repository-side tables (`repository`,
 `repository_path` + its `repository_path_current` partial unique index, `repo_settings`) are
 created by the first numbered migration — `schema_migrations` version `1`, name `registry`
 (`local_rag_store::registry::SCHEMA_V1`, reproduced byte-for-byte from this section so its
-checksum is stable). The worktree/generation tables above land in a later migration (T02-03);
-`repo_settings` reads/writes and data-policy merge are T02-05. The `create`/`observe`/`find`
+checksum is stable). The worktree/generation tables above are the second migration (see the
+T02-03 note below); `repo_settings` reads/writes and data-policy merge are T02-05. The
+`create`/`observe`/`find`
 operations (`local_rag_store::registry`) mint `repo_id` as a caller-supplied UUIDv7 (never
 path-derived, 01 §5) and treat `git_remote_fingerprint` as a nullable, non-unique hint (12 §7).
 `repository_path` keeps at most one `is_current = 1` row per repo: because SQLite has no
@@ -191,6 +192,26 @@ deferred UNIQUE constraints, observing a path clears the current flag and re-set
 separate statements (never a single multi-row swap), so the partial unique index is never
 transiently violated; path history is retained (a moved path keeps its row with `is_current = 0`
 and its original `first_seen_at`).
+
+As-built note (T02-03, `[SPEC]`): the worktree-side tables (`worktree`, `worktree_path` + its
+`worktree_path_current` partial unique index and `worktree_path_fp` lookup index, `generation`)
+are the second numbered migration — `schema_migrations` version `2`, name `worktree`
+(`local_rag_store::registry::SCHEMA_V2`, reproduced byte-for-byte from this section). All three
+tables ship in one migration because their foreign keys are circular
+(`worktree`→`generation`→`worktree`); SQLite resolves FK parents lazily, and the composite FK
+target is valid because `generation` declares `UNIQUE (generation_id, worktree_id)`. The
+worktree operations (`local_rag_store::registry::worktree`) mint `worktree_id` as a
+caller-supplied UUIDv7 (never path-derived, 01 §5); `worktree_path.path_fingerprint` is a lookup
+accelerator only (never identity, never an FK target), stored alongside the preserved
+`display_path`, and `worktree_path` keeps a single current path via the same clear-then-set
+upsert as `repository_path` (history retained). The `active`/`detached`/`removing` machine
+(04 §7) is enforced by `transition_worktree_state`, which returns a typed
+`WorktreeTransitionError` (`UnknownWorktree` or an `IllegalWorktreeTransition { from, to }`) and
+mutates nothing on rejection; self-transitions (`X → X`) are idempotent no-ops, which keeps a
+crash/retry that re-requests the current state safe (never a coercion, 04 preamble). The
+`generation` table ships here only as the worktree composite-FK seam — its builder, occurrence
+schema (§2.4), and state machine (04 §1) are group 05 — and `set_current_generation` is the
+worktree-side write that the FK guards against pointing at another worktree's generation.
 
 ### 2.2 Projection state & model registry
 

@@ -304,8 +304,8 @@ fn repeated_run_is_noop() {
 }
 
 /// End-to-end: `StateDb::open` bootstraps the framework tables and applies the
-/// real production set (registry migration v1, T02-02), and a second open is a
-/// clean no-op.
+/// real production set (registry migration v1 T02-02, worktree migration v2
+/// T02-03), and a second open is a clean no-op.
 #[test]
 fn state_db_open_bootstraps_and_is_idempotent() {
     let (_home, layout) = temp_store();
@@ -322,15 +322,21 @@ fn state_db_open_bootstraps_and_is_idempotent() {
             )
             .expect("count framework tables");
         assert_eq!(tables, 2, "bootstrap created both framework tables");
-        // The production set applies migration v1: the registry tables exist …
+        // The production set applies v1 (repository side) …
         for t in ["repository", "repository_path", "repo_settings"] {
             assert!(table_exists(&read, t), "registry table {t} created");
         }
-        // … and it is recorded as exactly one row (version 1, name "registry").
+        // … and v2 (worktree side).
+        for t in ["worktree", "worktree_path", "generation"] {
+            assert!(table_exists(&read, t), "worktree table {t} created");
+        }
+        // Recorded as exactly two rows: (1,"registry"), (2,"worktree").
         let rows = migration_rows(&read);
-        assert_eq!(rows.len(), 1, "the production set is [v1] at T02-02");
+        assert_eq!(rows.len(), 2, "the production set is [v1,v2] at T02-03");
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1, "worktree");
     }
     drop(db);
 
@@ -340,5 +346,5 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 1, "reopen adds no new migration rows");
+    assert_eq!(applied, 2, "reopen adds no new migration rows");
 }
