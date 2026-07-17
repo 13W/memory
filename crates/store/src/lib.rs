@@ -18,8 +18,11 @@
 //! T01-03 adds the **forward-only migration runner** ([`migrate`]): every
 //! `StateDb::open` bootstraps `schema_migrations`/`store_settings`, checks
 //! compatibility, and applies pending migrations under the migration lock (L1)
-//! before the writer spawns. Resumable/destructive migrations (T01-04) and
-//! `cache.sqlite` (T01-05) build on top of this.
+//! before the writer spawns. T01-04 extends it with **resumable/destructive
+//! mechanics**: complex migrations apply as per-unit checkpoints
+//! (`migration_progress`) so a crash resumes exactly, and a `destructive`
+//! migration takes a `VACUUM INTO` backup into `<root>/backups/` before any
+//! mutation. `cache.sqlite` (T01-05) builds on top of this.
 //!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
@@ -31,5 +34,5 @@ mod clock;
 pub mod migrate;
 mod state;
 
-pub use migrate::{ALL, Migration, MigrationError, MigrationReport};
+pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};

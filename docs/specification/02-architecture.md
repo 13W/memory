@@ -40,6 +40,7 @@ Claude hooks ──atomic append──▶ spool/<session>/  ◀──tail/import
     daemon.sock         # unix domain socket (POSIX); dir mode 0700
   logs/                 # daemon logs (rotated)
   quarantine/           # corrupted shards moved here before rebuild (05 §7)
+  backups/              # pre-mutation state.sqlite snapshots: state-<version>-<ts>.sqlite (13 §3)
 ```
 
 ### 2.1 Directory resolution `[SPEC]`

@@ -19,32 +19,13 @@ use local_rag_test_support::TempHome;
 
 // Synthetic migrations. Each creates a distinct table so "applied" is
 // observable. `M1B` collides with `M1`'s version but carries different SQL (a
-// different checksum) — the drift fixture.
-const M1: Migration = Migration {
-    version: 1,
-    name: "one",
-    sql: "CREATE TABLE t1 (x INTEGER);",
-};
-const M2: Migration = Migration {
-    version: 2,
-    name: "two",
-    sql: "CREATE TABLE t2 (x INTEGER);",
-};
-const M3: Migration = Migration {
-    version: 3,
-    name: "three",
-    sql: "CREATE TABLE t3 (x INTEGER);",
-};
-const M4: Migration = Migration {
-    version: 4,
-    name: "four",
-    sql: "CREATE TABLE t4 (x INTEGER);",
-};
-const M1B: Migration = Migration {
-    version: 1,
-    name: "one",
-    sql: "CREATE TABLE t1_altered (x INTEGER);",
-};
+// different checksum) — the drift fixture. All are simple (non-destructive,
+// SQL-only) so they exercise the T01-03 atomic apply path unchanged.
+const M1: Migration = Migration::sql(1, "one", "CREATE TABLE t1 (x INTEGER);");
+const M2: Migration = Migration::sql(2, "two", "CREATE TABLE t2 (x INTEGER);");
+const M3: Migration = Migration::sql(3, "three", "CREATE TABLE t3 (x INTEGER);");
+const M4: Migration = Migration::sql(4, "four", "CREATE TABLE t4 (x INTEGER);");
+const M1B: Migration = Migration::sql(1, "one", "CREATE TABLE t1_altered (x INTEGER);");
 
 // `&'static` sets so they can cross thread boundaries in the concurrency test.
 const SET_12: &[Migration] = &[M1, M2];
@@ -214,6 +195,14 @@ fn concurrent_migrators_apply_exactly_once() {
     let (_home, layout) = temp_store();
     let state_path = layout.state_db();
     let lock_path = layout.migration_lock();
+
+    // Pre-initialise the store to WAL in this thread so the two workers don't
+    // race on SQLite's *one-time* journal-mode switch (which needs an exclusive
+    // header rewrite and can return SQLITE_BUSY under contention). Opening an
+    // already-WAL database is a no-op, so the only race left is the one under
+    // test: both migrators contending on the migration lock (L1). (D-001.)
+    drop(raw_conn(&state_path));
+
     let barrier = Arc::new(Barrier::new(2));
 
     let handles: Vec<_> = (0..2)
