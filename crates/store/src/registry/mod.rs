@@ -24,6 +24,13 @@
 //!   operations and the explicit `active`/`detached`/`removing` state machine
 //!   (see [`worktree`]).
 //!
+//! On top of those primitives sits the **resolution layer** (T02-04, module
+//! `resolve`): [`resolve()`] turns a request's `worktree_root` into
+//! `{repo_id, worktree_id}` (or *global scope only*) via the registry, and
+//! [`attach()`] re-binds an existing identity to a new path after a directory
+//! move (spec 02 §3.3, 04 §7). Auto-resolution is by *current* path only; the
+//! path/remote/common-dir fingerprints are advisory (spec 12 §7).
+//!
 //! `repo_settings` merge/data-policy ordering is T02-05, so this module ships the
 //! `repo_settings` table but no settings operations; the `generation` builder,
 //! occurrence schema (spec 03 §2.4), and generation state machine (spec 04 §1)
@@ -31,17 +38,22 @@
 //! seam that writes `worktree.current_generation_id`.
 
 mod repository;
+mod resolve;
 pub mod worktree;
 
 pub use repository::{
     PathObservation, create_repository, current_path, find_repositories_by_remote,
     find_repository_by_path, observe_repository_path, path_history,
 };
+pub use resolve::{
+    AttachError, Candidate, RequestRoot, Resolution, WorktreeRootFacts, attach, resolve,
+};
 pub use worktree::{
     IllegalWorktreeTransition, WorktreeKind, WorktreePathObservation, WorktreeState,
-    WorktreeTransitionError, create_worktree, current_generation, current_worktree_path,
-    find_worktrees_by_path_fingerprint, observe_worktree_path, set_current_generation,
-    transition_worktree_state, worktree_path_history, worktree_state,
+    WorktreeSummary, WorktreeTransitionError, create_worktree, current_generation,
+    current_worktree_path, find_worktree_by_current_path, find_worktrees_by_path_fingerprint,
+    observe_worktree_path, set_current_generation, transition_worktree_state,
+    worktree_path_history, worktree_state, worktree_summary, worktrees_of_repo,
 };
 
 /// Version-1 migration DDL: the repository-side registry (spec 03 §2.1).

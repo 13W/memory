@@ -106,6 +106,18 @@ Every daemon request (MCP tool call, hook recall RPC) carries an explicit contex
 `worktree_id`/`repo_id` via the registry (03 §2.1); there is **no ambient current project**.
 Requests without a resolvable worktree operate in global scope only.
 
+As-built note (T02-04, `[SPEC]`): the context maps to
+`local_rag_store::registry::RequestRoot { worktree_root: Option<WorktreeRootFacts>, repo_hint:
+Option<repo_id> }`; `session_id` is routing/telemetry only and is not part of identity
+resolution. `worktree_root = None` **or** an unresolvable root resolves to
+`Resolution::GlobalOnly` — never an error. `repo_hint` is a `repo_id` used solely to break a tie
+between reattach candidates (never a lookup key into identity, 01 §5); a repo-level hint cannot
+disambiguate two linked worktrees of one repository (that needs an explicit worktree-level
+`attach`, 04 §7). The daemon (T15) supplies already-canonicalized, git-probed
+`WorktreeRootFacts` (`kind`, advisory `common_dir_fingerprint`/`remote_fingerprint`) because
+`local-rag-store` carries no git/network dependency (architecture guardrail until T10); the
+resolver is a pure registry lookup over those facts.
+
 ## 4. Daemon lifecycle `[FIXED, mechanics [SPEC]]`
 
 ### 4.1 Startup

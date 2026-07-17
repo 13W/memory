@@ -48,6 +48,16 @@
 //! caller-minted UUIDv7 (never path-derived); `worktree_path.path_fingerprint`
 //! is a lookup accelerator only, never identity (spec 01 §5).
 //!
+//! T02-04 adds the **resolution layer** on top of those primitives:
+//! [`resolve`] turns a request's `worktree_root` into `{repo_id, worktree_id}` —
+//! or *global scope only* when it does not resolve — with no ambient current
+//! project (spec 02 §3.3), and [`attach`] re-binds an existing identity to a new
+//! path after a directory move (spec 04 §7). Auto-resolution matches strictly on
+//! a worktree's current observed path; the path/remote/common-dir fingerprints are
+//! advisory hints, never identity (spec 12 §7), so a recreated path never steals a
+//! moved worktree's identity and ambiguous linked worktrees require an explicit
+//! attach.
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -65,11 +75,13 @@ pub use cache::{
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
-    IllegalWorktreeTransition, PathObservation, WorktreeKind, WorktreePathObservation,
-    WorktreeState, WorktreeTransitionError, create_repository, create_worktree, current_generation,
+    AttachError, Candidate, IllegalWorktreeTransition, PathObservation, RequestRoot, Resolution,
+    WorktreeKind, WorktreePathObservation, WorktreeRootFacts, WorktreeState, WorktreeSummary,
+    WorktreeTransitionError, attach, create_repository, create_worktree, current_generation,
     current_path, current_worktree_path, find_repositories_by_remote, find_repository_by_path,
-    find_worktrees_by_path_fingerprint, observe_repository_path, observe_worktree_path,
-    path_history, set_current_generation, transition_worktree_state, worktree_path_history,
-    worktree_state,
+    find_worktree_by_current_path, find_worktrees_by_path_fingerprint, observe_repository_path,
+    observe_worktree_path, path_history, resolve, set_current_generation,
+    transition_worktree_state, worktree_path_history, worktree_state, worktree_summary,
+    worktrees_of_repo,
 };
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};
