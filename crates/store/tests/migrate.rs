@@ -305,7 +305,7 @@ fn repeated_run_is_noop() {
 
 /// End-to-end: `StateDb::open` bootstraps the framework tables and applies the
 /// real production set (registry migration v1 T02-02, worktree migration v2
-/// T02-03), and a second open is a clean no-op.
+/// T02-03, code migration v3 T03-01), and a second open is a clean no-op.
 #[test]
 fn state_db_open_bootstraps_and_is_idempotent() {
     let (_home, layout) = temp_store();
@@ -326,17 +326,32 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         for t in ["repository", "repository_path", "repo_settings"] {
             assert!(table_exists(&read, t), "registry table {t} created");
         }
-        // … and v2 (worktree side).
+        // … v2 (worktree side) …
         for t in ["worktree", "worktree_path", "generation"] {
             assert!(table_exists(&read, t), "worktree table {t} created");
         }
-        // Recorded as exactly two rows: (1,"registry"), (2,"worktree").
+        // … and v3 (code storage: content-shared §2.3 + generation membership §2.4).
+        for t in [
+            "file_revision",
+            "content_blob",
+            "parsed_unit",
+            "generation_file",
+            "skipped_file",
+            "generation_unit_occurrence",
+            "unresolved_reference",
+            "resolved_graph_edge",
+        ] {
+            assert!(table_exists(&read, t), "code table {t} created");
+        }
+        // Recorded as exactly three rows: (1,"registry"), (2,"worktree"), (3,"code").
         let rows = migration_rows(&read);
-        assert_eq!(rows.len(), 2, "the production set is [v1,v2] at T02-03");
+        assert_eq!(rows.len(), 3, "the production set is [v1,v2,v3] at T03-01");
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
         assert_eq!(rows[1].0, 2);
         assert_eq!(rows[1].1, "worktree");
+        assert_eq!(rows[2].0, 3);
+        assert_eq!(rows[2].1, "code");
     }
     drop(db);
 
@@ -346,5 +361,5 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 2, "reopen adds no new migration rows");
+    assert_eq!(applied, 3, "reopen adds no new migration rows");
 }

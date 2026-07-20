@@ -146,12 +146,15 @@ impl Migration {
 /// `migration_progress`) are created by [bootstrap](run), not by a numbered
 /// migration. Version 1 (T02-02) is the repository-side registry
 /// (`registry::SCHEMA_V1`); version 2 (T02-03) is the worktree side —
-/// `worktree`/`worktree_path`/`generation` (`registry::SCHEMA_V2`). Each
+/// `worktree`/`worktree_path`/`generation` (`registry::SCHEMA_V2`); version 3
+/// (T03-01) is the code-storage side — `file_revision`/`content_blob`/
+/// `parsed_unit` and the generation-membership tables (`code::SCHEMA_V3`). Each
 /// checksum is frozen once shipped (see [`Migration::checksum`]); later schema
 /// changes are new entries here, never edits to an applied one.
 pub const ALL: &[Migration] = &[
     Migration::sql(1, "registry", crate::registry::SCHEMA_V1),
     Migration::sql(2, "worktree", crate::registry::SCHEMA_V2),
+    Migration::sql(3, "code", crate::code::SCHEMA_V3),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

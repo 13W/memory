@@ -67,6 +67,18 @@
 //! policy (spec 02 §3.2, 12 §1). The global config itself is parsed by
 //! [`local_rag_core::config`]; the central remote-policy guard is a later group.
 //!
+//! T03-01 adds the **code-storage side** ([`code`]): the version-3 migration
+//! creates the exact-source tables — the content-shared, path-independent
+//! `file_revision`/`content_blob`/`parsed_unit` (spec 03 §2.3) and the
+//! path-dependent generation-membership tables `generation_file`/`skipped_file`/
+//! `generation_unit_occurrence`/`unresolved_reference`/`resolved_graph_edge`
+//! (spec 03 §2.4) — plus typed insert/read repositories and the CHECK-mirroring
+//! enums. The strict source-blob invariant (spec 12 §5) is structural: an
+//! occurrence exists only on a `generation_file` member (composite FK), so a
+//! `skipped_file` never gets one. Parsing, hashing, encoding detection, zstd, and
+//! the deterministic `occurrence_id` derivation are later tasks (T03-03/04, group
+//! 05).
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -75,12 +87,20 @@ pub use rusqlite;
 
 mod cache;
 mod clock;
+pub mod code;
 pub mod migrate;
 pub mod registry;
 mod state;
 
 pub use cache::{
     CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome, CacheWriteError, CacheWriter,
+};
+pub use code::{
+    EdgeResolution, NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit, NewResolvedEdge,
+    NewUnresolvedReference, NewlineStyle, SkipReason, SourceCompression, UnitKind,
+    file_revision_id_by_content_key, insert_content_blob, insert_file_revision,
+    insert_generation_file, insert_occurrence, insert_parsed_unit, insert_resolved_edge,
+    insert_skipped_file, insert_unresolved_reference, member_file_revision, skip_reason,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{

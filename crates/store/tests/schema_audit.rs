@@ -11,13 +11,26 @@
 //! content-shared tables that arrive in groups 03/11):
 //!
 //! 1. **No durable ID is derived from a filesystem path.** No `FOREIGN KEY`
-//!    targets a path-bearing or fingerprint column — "a path-derived hash is
-//!    permitted only as a *lookup key* (`worktree_path.path_fingerprint`), never
-//!    as an FK target for durable state" (spec 01 §5.1).
-//! 2. **Path columns are confined to the path-ledger tables.** Only
-//!    `repository_path`/`worktree_path` may carry a filesystem-path column; no
-//!    identity or content table does (spec 01 §5.1: path/generation-dependent data
-//!    lives only in the dedicated tables).
+//!    targets a path-derived *hash* — "a path-derived hash is permitted only as a
+//!    *lookup key* (`worktree_path.path_fingerprint`), never as an FK target for
+//!    durable state" (spec 01 §5.1). A plain `normalized_path` is *not* a
+//!    path-derived hash: it is the path itself used as a generation-membership
+//!    natural key, and spec 03 §2.4 normatively declares exactly one FK through it
+//!    — `generation_unit_occurrence(generation_id, normalized_path) →
+//!    generation_file(...)`, the structural source-blob invariant. So an FK may
+//!    target a path column *only* on the sanctioned membership anchor
+//!    ([`PATH_FK_TARGET_TABLES`]); a `*_fingerprint` target is forbidden outright.
+//! 2. **Path columns are confined to the path-bearing tables.** Only the two
+//!    path-observation ledgers ([`PATH_LEDGER_TABLES`]) and the generation-membership
+//!    tables ([`PATH_MEMBERSHIP_TABLES`]) may carry a filesystem-path column; no
+//!    content-shared or identity table does (spec 01 §5.1: "Everything
+//!    path/generation-dependent lives only in `generation_unit_occurrence`,
+//!    `resolved_graph_edge`, `generation_file`, and the FTS projection").
+//! 3. **Content-shared rows carry no context/path/generation field**
+//!    ([`CONTENT_SHARED_TABLES`]): the §2.3 tables are shared by content across
+//!    every path and generation, so they must not carry any path-, context-, or
+//!    generation-specific column (spec 01 §5.1) — the "schema audit forbidden path
+//!    columns" guardrail T03-01 owns.
 //!
 //! Deterministic: an isolated [`TempHome`], the production migration set, no clock
 //! or network.
@@ -37,10 +50,47 @@ fn open_state() -> (TempHome, StateDb) {
     (home, db)
 }
 
-/// The only tables permitted to carry a filesystem-path column. Spec 01 §5.1:
-/// path-dependent data lives only in dedicated tables — for the registry, the two
-/// `*_path` observation ledgers.
+/// The two path-observation ledgers. Spec 01 §5.1: path-dependent data lives only
+/// in dedicated tables — for the registry, these `*_path` observation ledgers.
 const PATH_LEDGER_TABLES: &[&str] = &["repository_path", "worktree_path"];
+
+/// The generation-membership tables that legitimately carry a `normalized_path`/
+/// `display_path` (spec 03 §2.4; spec 01 §5.1 names `generation_unit_occurrence`,
+/// `resolved_graph_edge`, `generation_file` — plus `skipped_file`, the
+/// path-keyed skip ledger, per 06 §2.2 / 12 §5). Only the three that actually
+/// carry a path column are listed; `resolved_graph_edge` is occurrence-id keyed.
+const PATH_MEMBERSHIP_TABLES: &[&str] = &[
+    "generation_file",
+    "skipped_file",
+    "generation_unit_occurrence",
+];
+
+/// The content-shared, path-independent tables (spec 03 §2.3): a row here is
+/// shared by content across every path and generation, so it must carry **no**
+/// path-, context-, or generation-specific field (spec 01 §5.1).
+const CONTENT_SHARED_TABLES: &[&str] = &["file_revision", "content_blob", "parsed_unit"];
+
+/// The only tables a foreign key may target *through a path column*: the
+/// generation-membership anchor whose primary key is `(generation_id,
+/// normalized_path)`. Spec 03 §2.4 declares exactly this composite FK from
+/// `generation_unit_occurrence`; nothing else may FK-target a path column, and a
+/// path-derived hash (`*_fingerprint`) is never a legal FK target (spec 01 §5.1).
+const PATH_FK_TARGET_TABLES: &[&str] = &["generation_file"];
+
+/// Whether `table` is permitted to carry a filesystem-path column (a ledger or a
+/// generation-membership table).
+fn may_carry_path(table: &str) -> bool {
+    PATH_LEDGER_TABLES.contains(&table) || PATH_MEMBERSHIP_TABLES.contains(&table)
+}
+
+/// A context/generation-specific column forbidden on a content-shared table
+/// (spec 01 §5.1). Path columns are caught separately by [`is_path_column`].
+fn is_context_or_generation_column(name: &str) -> bool {
+    matches!(
+        name,
+        "generation_id" | "worktree_id" | "context_hash" | "qualified_name"
+    )
+}
 
 /// A column name that denotes a filesystem path (`path` or any `_path` suffix,
 /// e.g. `observed_path`, `observed_canonical_path`, `display_path`).
@@ -102,10 +152,11 @@ fn foreign_keys(conn: &Connection, table: &str) -> Vec<(String, String, String)>
 }
 
 /// Spec 01 §5.1: no durable ID is derived from a filesystem path — a path-derived
-/// hash is a lookup key only, never an FK target. Assert no foreign key anywhere in
-/// the schema references a path-bearing or fingerprint column.
+/// *hash* is a lookup key only, never an FK target. A plain `normalized_path` may
+/// be an FK target only on the sanctioned generation-membership anchor
+/// ([`PATH_FK_TARGET_TABLES`]), the one composite FK spec 03 §2.4 declares.
 #[tokio::test]
-async fn no_foreign_key_targets_a_path_or_fingerprint_column() {
+async fn no_foreign_key_targets_a_path_hash_or_stray_path_column() {
     let (_home, db) = open_state();
     let read = db.open_read().expect("read conn");
 
@@ -117,35 +168,74 @@ async fn no_foreign_key_targets_a_path_or_fingerprint_column() {
 
     for table in &tables {
         for (from, to_table, to_col) in foreign_keys(&read, table) {
+            // A path-derived hash is NEVER an FK target (spec 01 §5.1).
             assert!(
-                !is_path_column(&to_col) && !is_fingerprint_column(&to_col),
-                "FK {table}.{from} -> {to_table}.{to_col} targets a path/fingerprint column; \
-                 spec 01 §5.1 forbids a durable ID derived from a path (a lookup hash is never \
-                 an FK target)",
+                !is_fingerprint_column(&to_col),
+                "FK {table}.{from} -> {to_table}.{to_col} targets a path-derived fingerprint \
+                 hash; spec 01 §5.1 forbids a durable ID derived from a path (a lookup hash is \
+                 never an FK target)",
             );
+            // A plain path column may be an FK target only on the sanctioned
+            // membership anchor (spec 03 §2.4's structural source-blob invariant).
+            if is_path_column(&to_col) {
+                assert!(
+                    PATH_FK_TARGET_TABLES.contains(&to_table.as_str()),
+                    "FK {table}.{from} -> {to_table}.{to_col} targets a path column on a table \
+                     that is not a sanctioned generation-membership anchor \
+                     ({PATH_FK_TARGET_TABLES:?}); spec 01 §5.1 / 03 §2.4",
+                );
+            }
         }
     }
 }
 
-/// Spec 01 §5.1: path-dependent data lives only in the dedicated ledger tables.
-/// Assert no table outside [`PATH_LEDGER_TABLES`] carries a filesystem-path column.
+/// Spec 01 §5.1: path-dependent data lives only in dedicated tables. Assert no
+/// table outside the path ledgers or the generation-membership tables carries a
+/// filesystem-path column.
 #[tokio::test]
-async fn path_columns_live_only_on_ledger_tables() {
+async fn path_columns_live_only_on_path_bearing_tables() {
     let (_home, db) = open_state();
     let read = db.open_read().expect("read conn");
 
     for table in user_tables(&read) {
-        if PATH_LEDGER_TABLES.contains(&table.as_str()) {
-            // The ledgers legitimately carry observed/display paths; their identity
-            // is still the composite PK scoped to a UUID (checked by the per-table
-            // tests), never a bare path.
+        if may_carry_path(&table) {
+            // Ledgers carry observed/display paths; membership tables carry a
+            // `normalized_path`/`display_path` scoped to a generation. Their
+            // identity is still a composite key (checked elsewhere), never a
+            // bare path, and no path-derived hash is an FK target.
             continue;
         }
         for col in columns_of(&read, &table) {
             assert!(
                 !is_path_column(&col),
                 "table `{table}` carries path column `{col}`, but a filesystem path may live \
-                 only on {PATH_LEDGER_TABLES:?} (spec 01 §5.1)",
+                 only on {PATH_LEDGER_TABLES:?} or {PATH_MEMBERSHIP_TABLES:?} (spec 01 §5.1)",
+            );
+        }
+    }
+}
+
+/// Spec 01 §5.1: "No row that is shared by content … may carry any context- or
+/// path-specific field." Assert the §2.3 content-shared tables carry no path-,
+/// context-, or generation-specific column — the "schema audit forbidden path
+/// columns" guardrail T03-01 owns.
+#[tokio::test]
+async fn content_shared_tables_carry_no_path_or_context_field() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+
+    let tables = user_tables(&read);
+    for shared in CONTENT_SHARED_TABLES {
+        assert!(
+            tables.iter().any(|t| t == shared),
+            "sanity: content-shared table `{shared}` exists in the migrated schema ({tables:?})",
+        );
+        for col in columns_of(&read, shared) {
+            assert!(
+                !is_path_column(&col) && !is_context_or_generation_column(&col),
+                "content-shared table `{shared}` carries forbidden path/context/generation \
+                 column `{col}`; spec 01 §5.1 forbids any path-/context-specific field on a \
+                 content-shared row",
             );
         }
     }
@@ -161,9 +251,27 @@ fn column_classifiers_discriminate() {
         "observed_path",
         "observed_canonical_path",
         "display_path",
+        "normalized_path",
     ] {
         assert!(is_path_column(name), "{name} is a path column");
         assert!(!is_fingerprint_column(name), "{name} is not a fingerprint");
+        assert!(
+            !is_context_or_generation_column(name),
+            "{name} is a path column, classified separately from context/generation columns",
+        );
+    }
+    // Context/generation-specific columns forbidden on content-shared tables.
+    for name in [
+        "generation_id",
+        "worktree_id",
+        "context_hash",
+        "qualified_name",
+    ] {
+        assert!(
+            is_context_or_generation_column(name),
+            "{name} is a context/generation column",
+        );
+        assert!(!is_path_column(name), "{name} is not a path column");
     }
     // Fingerprints (lookup hashes) are not paths.
     for name in ["path_fingerprint", "git_remote_fingerprint"] {
