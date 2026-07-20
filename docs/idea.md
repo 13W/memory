@@ -747,7 +747,7 @@ explicit durable decision; migration-ready; транскрипт diagnostic opt-
 
 **Открыто (spike/метрики, не блокирует core storage):** **dense backend** (шаг 11 —
 сравнительный спайк); числа gates, включая P/R memory-роутера; default модель и
-доставка весов; языки первого релиза; миграция v1-memory vs clean start; K/T retention;
+доставка весов; миграция v1-memory vs clean start; K/T retention;
 финальный `SyntaxLocator`/graph semantics; одна общая DB vs `state`+`cache` при росте
 (сейчас — split).
 
