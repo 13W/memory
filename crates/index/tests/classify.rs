@@ -211,3 +211,109 @@ async fn classified_skip_becomes_non_member_with_no_occurrence() {
         );
     }
 }
+
+/// G03 "reverse absence" for **every** skip reason (spec 06 §2.2, 12 §5). The test
+/// above proves the seam for two reasons; the gate requires that each of the six —
+/// ignored, huge, lfs, binary, encoding, secret — becomes a `skipped_file` that is a
+/// non-member (no `file_revision`, hence no `source_blob`) and rejects an occurrence
+/// on the membership FK. One fixture per reason, reused from the classifier's unit
+/// tests, is driven through the real store seam.
+#[tokio::test]
+async fn every_skip_reason_yields_no_occurrence_and_no_source_blob() {
+    const CAP: u64 = 1024;
+    let (_home, db) = open_state();
+    let generation_id = seed_generation(&db, 1).await;
+    let unit = seed_unit(&db).await;
+
+    let mut b = GitignoreSetBuilder::new("/repo");
+    b.add_gitignore(".", "*.log\n");
+    let ignores = b.build().expect("gitignore");
+    let cfg = ClassifierConfig::new(CAP);
+    let scanner = Scanner::new();
+
+    let lfs_pointer = "version https://git-lfs.github.com/spec/v1\n\
+                       oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                       size 12345\n";
+
+    // (path, content, expected). `huge` is stat-only: its content is empty and its
+    // size is forced one byte over the cap below.
+    let cases = [
+        ("build/app.log", b"log text".as_slice(), SkipReason::Ignored),
+        ("big.rs", b"".as_slice(), SkipReason::Huge),
+        ("assets/model.bin", lfs_pointer.as_bytes(), SkipReason::Lfs),
+        ("data/x", b"ab\0cd".as_slice(), SkipReason::Binary),
+        (
+            "weird.txt",
+            b"\xFF\xFE\x41".as_slice(),
+            SkipReason::Encoding,
+        ),
+        (
+            "config.py",
+            b"aws = \"AKIAIOSFODNN7EXAMPLE\"\n".as_slice(),
+            SkipReason::Secret,
+        ),
+    ];
+
+    for (path, content, expected) in cases {
+        let size = if expected == SkipReason::Huge {
+            CAP + 1
+        } else {
+            content.len() as u64
+        };
+
+        // 1. Classification yields exactly this reason (never Indexed).
+        assert_eq!(
+            classify(path, size, content, &ignores, &cfg, &scanner),
+            Classification::Skipped(expected),
+            "classify({path})",
+        );
+
+        // 2. Record it as reconcile would; a skip never carries a source_blob
+        //    (`insert_skipped_file` has no such column).
+        let (g, p) = (generation_id.clone(), path.to_string());
+        db.writer()
+            .transaction(move |tx| insert_skipped_file(tx, &g, &p, expected, None))
+            .await
+            .expect("insert skip");
+
+        // 3. The path is a non-member: no file_revision is bound to it, so no
+        //    source_blob exists for it.
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            member_file_revision(&read, &generation_id, path).expect("member read"),
+            None,
+            "{path}: skipped ⇒ non-member (no source_blob)",
+        );
+        assert_eq!(
+            skip_reason(&read, &generation_id, path).expect("skip read"),
+            Some(expected),
+        );
+
+        // 4. An occurrence on the skipped path fails the membership FK — the
+        //    structural "skipped ⇒ no occurrence" invariant, proven per reason.
+        let occ = uuid(200);
+        let (g, p, u) = (generation_id.clone(), path.to_string(), unit.clone());
+        let err = db
+            .writer()
+            .transaction(move |tx| {
+                insert_occurrence(
+                    tx,
+                    &NewOccurrence {
+                        occurrence_id: &occ,
+                        generation_id: &g,
+                        normalized_path: &p,
+                        unit_id: &u,
+                        qualified_name: None,
+                        context_hash: None,
+                    },
+                )
+            })
+            .await
+            .expect_err("occurrence on a skipped path must fail");
+        assert_eq!(
+            extended_code(&err),
+            Some(SQLITE_CONSTRAINT_FOREIGNKEY),
+            "{path}: expected membership FK violation, got {err:?}",
+        );
+    }
+}

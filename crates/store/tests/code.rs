@@ -22,7 +22,8 @@ use local_rag_store::code::{
 use local_rag_store::registry::{WorktreeKind, create_repository, create_worktree};
 use local_rag_store::rusqlite::Error;
 use local_rag_store::rusqlite::ffi::{
-    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE,
+    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_NOTNULL,
+    SQLITE_CONSTRAINT_UNIQUE,
 };
 use local_rag_store::{StateDb, WriteError};
 use local_rag_test_support::TempHome;
@@ -848,4 +849,130 @@ async fn code_tables_exist_after_migration() {
             .expect("query index");
         assert_eq!(n, 1, "code index {idx} exists");
     }
+}
+
+/// G03 property: the source-blob invariant holds at whole-generation granularity
+/// (spec 12 §5, 03 §2.3–2.4). After building a realistic generation — several member
+/// files with occurrences plus a skipped, non-member file — every row in
+/// `generation_unit_occurrence` resolves `occurrence → generation_file →
+/// file_revision` to a non-null `source_blob`, and the skipped file contributes
+/// none. The composite membership FK already forbids the negative at write time
+/// (`occurrence_requires_generation_file_member`); this data-level sweep proves the
+/// forward chain end to end and is non-vacuous (there is at least one occurrence).
+#[tokio::test]
+async fn occurrence_implies_member_file_with_non_null_source_blob() {
+    let (_home, db) = open_state();
+    let genr = seed_generation(&db, 1).await;
+    let rev_a = seed_revision(&db, 2, "ch-a", "fp-a").await;
+    let rev_b = seed_revision(&db, 3, "ch-b", "fp-b").await;
+    let unit_a = seed_unit(&db, 4, &rev_a).await;
+    let unit_b = seed_unit(&db, 5, &rev_b).await;
+
+    let (g, ra, rb, ua, ub) = (
+        genr.generation_id.clone(),
+        rev_a.clone(),
+        rev_b.clone(),
+        unit_a.clone(),
+        unit_b.clone(),
+    );
+    let (occ_a, occ_b) = (uuid(20), uuid(21));
+    db.writer()
+        .transaction(move |tx| {
+            insert_generation_file(tx, &g, "src/a.rs", "src/a.rs", &ra)?;
+            insert_generation_file(tx, &g, "src/b.rs", "src/b.rs", &rb)?;
+            // A skipped, non-member file lives in the same generation.
+            insert_skipped_file(tx, &g, "vendor.min.js", SkipReason::Ignored, None)?;
+            insert_occurrence(
+                tx,
+                &NewOccurrence {
+                    occurrence_id: &occ_a,
+                    generation_id: &g,
+                    normalized_path: "src/a.rs",
+                    unit_id: &ua,
+                    qualified_name: Some("crate::a"),
+                    context_hash: None,
+                },
+            )?;
+            insert_occurrence(
+                tx,
+                &NewOccurrence {
+                    occurrence_id: &occ_b,
+                    generation_id: &g,
+                    normalized_path: "src/b.rs",
+                    unit_id: &ub,
+                    qualified_name: Some("crate::b"),
+                    context_hash: None,
+                },
+            )
+        })
+        .await
+        .expect("members + occurrences + skip");
+
+    let read = db.open_read().expect("read conn");
+
+    // The sweep is not vacuous: there is at least one occurrence to check.
+    let total: i64 = read
+        .query_row("SELECT count(*) FROM generation_unit_occurrence", [], |r| {
+            r.get(0)
+        })
+        .expect("count occurrences");
+    assert_eq!(total, 2, "fixture seeded two occurrences");
+
+    // occurrence ⇒ generation_file ⇒ file_revision.source_blob (non-null): count the
+    // rows that break the chain; there must be none.
+    let orphans: i64 = read
+        .query_row(
+            "SELECT count(*) \
+             FROM generation_unit_occurrence o \
+             LEFT JOIN generation_file gf \
+               ON gf.generation_id = o.generation_id \
+              AND gf.normalized_path = o.normalized_path \
+             LEFT JOIN file_revision fr \
+               ON fr.file_revision_id = gf.file_revision_id \
+             WHERE gf.file_revision_id IS NULL \
+                OR fr.file_revision_id IS NULL \
+                OR fr.source_blob IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sweep occurrences");
+    assert_eq!(
+        orphans, 0,
+        "every occurrence must resolve to a member file with a non-null source_blob",
+    );
+
+    // The reverse absence: the skipped file is present but carries no occurrence.
+    let skip_occ: i64 = read
+        .query_row(
+            "SELECT count(*) FROM generation_unit_occurrence \
+             WHERE generation_id = ?1 AND normalized_path = 'vendor.min.js'",
+            [&genr.generation_id],
+            |r| r.get(0),
+        )
+        .expect("count skip occurrences");
+    assert_eq!(skip_occ, 0, "a skipped file has no occurrences");
+}
+
+/// `file_revision.source_blob` is `BLOB NOT NULL` (spec 03 §2.3, the physical seat of
+/// the invariant): a raw insert with a null blob is rejected. Guards against a future
+/// migration or code path quietly persisting a revision without its exact bytes.
+#[tokio::test]
+async fn source_blob_is_not_nullable() {
+    let (_home, db) = open_state();
+    let id = uuid(1);
+    let err = db
+        .writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO file_revision \
+                   (file_revision_id, content_hash, parser_fingerprint, source_blob, \
+                    source_compression, source_encoding, newline_style, source_size, created_at) \
+                 VALUES (?1, 'ch-null', 'fp-null', NULL, 'none', 'utf-8', 'lf', 0, 1000)",
+                [&id],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect_err("null source_blob must be rejected");
+    assert_eq!(extended_code(&err), Some(SQLITE_CONSTRAINT_NOTNULL));
 }
