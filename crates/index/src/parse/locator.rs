@@ -9,14 +9,15 @@
 //! `OccurrenceLocator = {normalized_path, qualified_name, SyntaxLocator}`, which
 //! this task does not build.
 //!
-//! ## Scope: shape and serialization only
+//! ## Scope: shape and serialization
 //!
-//! The `[FIXED]` field set and the path-free property are fixed here. The **finer
-//! derivation semantics** — how a `syntax_path` or a `signature_fingerprint` is
-//! computed from a real parse tree — remain **`[OPEN]`** (idea.md "final
-//! `SyntaxLocator` semantics"; O7). T04-02 defines only the value type and the
-//! canonical, path-free serialization; deriving these fields from trees is
-//! T04-03+.
+//! The `[FIXED]` field set and the path-free property are fixed here, along with
+//! the canonical serialization. The **derivation** of `syntax_path` and
+//! `signature_fingerprint` from a real parse tree — once `[OPEN]` (O7) — is fixed
+//! by **ADR-0002** and realized by the T04-03 adapter engine
+//! ([`crate::parse::adapter`]); [`SyntaxLocatorDraft`] is the path-free,
+//! blob-free value the parser produces, completed via [`SyntaxLocator::from_draft`]
+//! at persistence (T04-06). The **graph** half of O7 remains `[OPEN]`.
 
 use crate::parse::fingerprint::canonical_kv;
 use crate::parse::language::LanguageId;
@@ -52,6 +53,24 @@ pub struct SyntaxLocator {
     /// The `content_blob` id this unit's normalized text hashes to (the `blob`
     /// key).
     pub blob_id: String,
+}
+
+/// A [`SyntaxLocator`] before the `blob_id` is known — path-free **and**
+/// blob-free (spec 03 §2.4, ADR-0002).
+///
+/// A parser adapter (T04-03+) produces this from the parse tree alone: it knows
+/// the `language`, the structural `anchor`, and the `signature_fingerprint`, but
+/// not the `blob_id` (that is the normalized-text identity of `source_blob[span]`,
+/// derived at persistence time — T04-06). [`SyntaxLocator::from_draft`] completes
+/// it once the `blob_id` is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxLocatorDraft {
+    /// The language of the unit ([`LanguageId`]).
+    pub language: LanguageId,
+    /// The structural anchor ([`SyntaxAnchor`]).
+    pub anchor: SyntaxAnchor,
+    /// A fingerprint of the unit's signature (ADR-0002).
+    pub signature_fingerprint: String,
 }
 
 /// A typed [`SyntaxLocator::parse`] failure.
@@ -121,6 +140,19 @@ const FORBIDDEN_PATH_KEYS: &[&str] = &[
 ];
 
 impl SyntaxLocator {
+    /// Complete a [`SyntaxLocatorDraft`] into a full locator once the `blob_id`
+    /// (normalized-text identity of `source_blob[span]`) is known — the T04-06
+    /// seam that joins the parser's structural output (path-free) to the store's
+    /// content-blob world.
+    pub fn from_draft(draft: SyntaxLocatorDraft, blob_id: String) -> Self {
+        SyntaxLocator {
+            language: draft.language,
+            anchor: draft.anchor,
+            signature_fingerprint: draft.signature_fingerprint,
+            blob_id,
+        }
+    }
+
     /// Serialize to the canonical, path-free `parsed_unit.syntax_locator` string
     /// (spec 03 §2.4): sorted `key=value` over `{anchor, blob, lang, sig}` joined
     /// with `;`. The anchor is tagged `p:<syntax_path>` or `o:<ordinal>`.

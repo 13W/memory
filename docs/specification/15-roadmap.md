@@ -65,7 +65,7 @@ multiple generators; cross-generation matching; LSP graph; multi-harness; FreeBS
 | O4 | First-release language set | **RESOLVED — ADR-0001 (T04-01): TypeScript, JavaScript, Rust** | parser scope |
 | O5 | v1 memory migration vs clean start | product decision before GA | 13 §3 last step |
 | O6 | Retention K / T for retired generations | usage metrics | GC defaults |
-| O7 | Final `SyntaxLocator` / graph semantics | design follow-up | `find_usages`/`get_dependencies` |
+| O7 | Final `SyntaxLocator` / graph semantics | **`SyntaxLocator` derivation RESOLVED — ADR-0002 (T04-03); graph semantics = design follow-up** | `find_usages`/`get_dependencies` (graph only) |
 | O8 | One shared DB vs `state`+`cache` at scale | revisit on growth; **split now** `[FIXED]` | nothing |
 
 ## 5. Spec growth plan

@@ -109,6 +109,26 @@ fn first_release_language_adr_is_well_formed() {
     );
 }
 
+#[test]
+fn syntax_locator_derivation_adr_is_well_formed() {
+    let path = adr_dir().join("0002-syntax-locator-derivation.md");
+    let adr = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for section in ["## Status", "## Context", "## Decision", "## Consequences"] {
+        assert!(
+            adr.contains(section),
+            "ADR-0002 must contain a `{section}` section"
+        );
+    }
+    assert!(
+        adr.contains("Accepted"),
+        "ADR-0002 must record an Accepted status"
+    );
+    assert!(
+        adr.contains("O7"),
+        "ADR-0002 must reference the open question O7 it resolves"
+    );
+}
+
 /// Guard the resolver used above so a false "all links pass" can't hide behind a
 /// broken parser.
 #[test]

@@ -24,12 +24,12 @@
 //! - fixed-width integer fields (e.g. `algo_version`) → little-endian bytes of
 //!   the declared width.
 //!
-//! Only the two path/remote *lookup* fingerprints owned by the registry
-//! ([`path_fingerprint`], [`remote_fingerprint`]) get typed constructors here;
-//! the deterministic-ID domains ([`Domain::OccurrenceId`], the projection/FTS
-//! manifests, embedding subjects, `memory_op`) are hashed through the generic
-//! [`hash`] entry point by their owning tasks, which assemble the fields in the
-//! order fixed by the spec table.
+//! The single-field fingerprints owned outside the registry
+//! ([`path_fingerprint`], [`remote_fingerprint`], [`signature_fingerprint`]) get
+//! typed constructors here; the multi-field deterministic-ID domains
+//! ([`Domain::OccurrenceId`], the projection/FTS manifests, embedding subjects,
+//! `memory_op`) are hashed through the generic [`hash`] entry point by their
+//! owning tasks, which assemble the fields in the order fixed by the spec table.
 
 /// Hash-schema version embedded in every domain string (spec 03 §1.2 / §5).
 ///
@@ -45,6 +45,12 @@ pub enum Domain {
     FileContent,
     /// `content_blob.blob_id`.
     ContentBlob,
+    /// `parsed_unit.syntax_locator` signature fingerprint — the `sig` field of a
+    /// `SyntaxLocator` (spec 03 §2.4). Derived from the parse subtree only
+    /// (never from a path/offset), so it is path-free and stable under unrelated
+    /// edits; hashing makes the serialized locator delimiter-safe by
+    /// construction (ADR-0002).
+    SignatureFingerprint,
     /// `generation_unit_occurrence.occurrence_id`.
     OccurrenceId,
     /// Dense projection point ID (05 §3).
@@ -75,6 +81,7 @@ impl Domain {
         match self {
             Domain::FileContent => "file_content",
             Domain::ContentBlob => "content_blob",
+            Domain::SignatureFingerprint => "signature_fingerprint",
             Domain::OccurrenceId => "occurrence_id",
             Domain::ProjectionPoint => "projection_point",
             Domain::ProjectionManifest => "projection_manifest",
@@ -141,6 +148,23 @@ pub fn remote_fingerprint(normalized_remote_url: &str) -> String {
     hash(
         Domain::RemoteFingerprint,
         &[normalized_remote_url.as_bytes()],
+    )
+}
+
+/// `H(signature_fingerprint, canonical_descriptor)` — the `sig` field of a
+/// `SyntaxLocator` (spec 03 §2.4, ADR-0002).
+///
+/// The caller (a parser adapter) assembles a single canonical, deterministic
+/// descriptor string of the unit's signature from the parse subtree only. It is
+/// hashed as **one** field, so the domain's field count stays fixed at 1 and the
+/// descriptor's internal structure is free to evolve within a `queries=` /
+/// `grammar=` rebuild event without a [`HASH_SCHEMA_VERSION`] bump. Hashing also
+/// makes the value delimiter-safe (64 lowercase hex, no `;`/`=`) for the locator
+/// serialization.
+pub fn signature_fingerprint(canonical_descriptor: &str) -> String {
+    hash(
+        Domain::SignatureFingerprint,
+        &[canonical_descriptor.as_bytes()],
     )
 }
 
@@ -248,6 +272,10 @@ mod tests {
                 "6a6b4afdd576f05ca96a0d6dfb0f12cb794027df06770164201f89ad7254a21f",
             ),
             (
+                Domain::SignatureFingerprint,
+                "447e7f848f8176ebd3a0c7585eead7bc1f206914a3f48b2928b8b472b5be9b2b",
+            ),
+            (
                 Domain::OccurrenceId,
                 "7aed9f4f28b74e0ec9f9354eb66e986a070de9d8bbe12344063865a6e70f4d89",
             ),
@@ -342,6 +370,10 @@ mod tests {
         assert_eq!(
             remote_fingerprint("github.com/org/repo"),
             "a00bd1a5288c0359548d80f6d56c002a4c3262120ffdbcd8a02b4afa25b8f2c3",
+        );
+        assert_eq!(
+            signature_fingerprint("fn\u{1f}foo\u{1f}(number)"),
+            hash(Domain::SignatureFingerprint, &[b"fn\x1ffoo\x1f(number)"],),
         );
     }
 

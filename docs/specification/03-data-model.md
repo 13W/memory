@@ -30,6 +30,7 @@ All content/manifest/subject hashes are **domain-separated and version-tagged**.
 | --- | --- | --- |
 | `…/file_content` | raw file bytes | `file_revision.content_hash` |
 | `…/content_blob` | algo_version, language, normalization_version, normalized_text | `content_blob.blob_id` |
+| `…/signature_fingerprint` | canonical signature descriptor (one field) | `parsed_unit.syntax_locator` `sig` (§2.4, ADR-0002) |
 | `…/occurrence_id` | generation_id, normalized_path, unit_id | `generation_unit_occurrence.occurrence_id` |
 | `…/projection_point` | worktree_id, occurrence_id, model_space_id, representation_kind | dense point ID (05 §3) |
 | `…/projection_manifest` | tuple fields ‖ point IDs sorted ascending bytewise | `ProjectionHead.manifest_hash` |
@@ -44,16 +45,19 @@ All content/manifest/subject hashes are **domain-separated and version-tagged**.
 Deterministic IDs (`occurrence_id`, projection point IDs, memory-op keys) MUST be stable under
 retry/reconcile and independent of row insertion order `[FIXED]`.
 
-As-built note (T02-01, `[SPEC]`): `local_rag_core::identity::domain` implements the encoding
-above (`encode`/`hash`, hex-encoded 64 chars) with a `Domain` enum covering all twelve domains
-and the version-tagged string `local-rag/1/<slug>` (the two `subject/*` slugs keep their `/`).
-Field payloads are raw bytes; the serialization conventions this codebase commits to are: text
-→ UTF-8 bytes; an already-hex identity (a UUID or another domain hash) → its lowercase ASCII
-bytes exactly as stored in its `TEXT` column; a fixed-width integer field → little-endian bytes
-of the declared width. Only the two *lookup* fingerprints (`path_fingerprint`,
-`remote_fingerprint`) have typed constructors so far; the deterministic-ID domains are hashed
-through the generic `hash` entry point by their owning tasks (T03/T05/T08/T11/T14), which
-assemble the field list in the order fixed by the table above.
+As-built note (T02-01, updated T04-03, `[SPEC]`): `local_rag_core::identity::domain` implements
+the encoding above (`encode`/`hash`, hex-encoded 64 chars) with a `Domain` enum covering all
+thirteen domains and the version-tagged string `local-rag/1/<slug>` (the two `subject/*` slugs
+keep their `/`). Field payloads are raw bytes; the serialization conventions this codebase
+commits to are: text → UTF-8 bytes; an already-hex identity (a UUID or another domain hash) →
+its lowercase ASCII bytes exactly as stored in its `TEXT` column; a fixed-width integer field →
+little-endian bytes of the declared width. The single-field fingerprints (`path_fingerprint`,
+`remote_fingerprint`, and — added in T04-03 — `signature_fingerprint`) have typed constructors;
+the multi-field deterministic-ID domains are hashed through the generic `hash` entry point by
+their owning tasks (T03/T05/T08/T11/T14), which assemble the field list in the order fixed by the
+table above. `signature_fingerprint` hashes exactly one field — an opaque canonical descriptor
+the parser assembles (ADR-0002) — so its internal structure may evolve within a `queries=`/
+`grammar=` rebuild event without a `HASH_SCHEMA_VERSION` bump.
 
 As-built note (T03-04, `[SPEC]`): the `content_blob` domain is the first to encode an *integer*
 field, so it fixes the previously-unstated "declared width" for this codebase: `algo_version` and
@@ -384,11 +388,18 @@ As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
   `grammar=<grammar_name>@<grammar_version>`, `queries=<query_version>`; all `1` in v0.
   `BOUNDARY_NORM_VERSION` is **distinct** from `content_blob`'s `normalization_version`
   (§4.2) — that versions text identity, this versions boundary-affecting normalization.
-- No tree-sitter grammar is linked in v0 (parser adapters are T04-03+); `grammar_version`/
-  `query_version` are **declared constants**. Reconciling them to a real grammar's versions is
-  a **documented rebuild event** that changes the fingerprint (and its goldens), never a silent
-  bump. The FIXED key set, the sort, extension-based language selection, and the `.c`/`.cpp`
-  consequence are unchanged.
+- `grammar_version`/`query_version` are **our** boundary-version counters (not the upstream
+  crate semver). T04-03 links the first real grammar (TypeScript, `tsx` variant) and
+  **reconciles them to `@1`/`1`** against the pinned crates `tree-sitter 0.24` /
+  `tree-sitter-typescript 0.23` (recorded in `parse::fingerprint::descriptor`; ADR-0002). No
+  units are persisted before T04-06, so the `fingerprint.rs` goldens stay green — this is the
+  deliberate, documented reconciliation the earlier rev anticipated, never a silent bump. A
+  later grammar/query change that shifts unit boundaries is a deliberate version bump (a rebuild
+  event), guarded by the `version_constants_and_descriptors_are_pinned` tripwire.
+  `BOUNDARY_NORM_VERSION = 1` means "no boundary-shifting normalization (raw bytes are parsed)";
+  `CHUNK_POLICY_VERSION = 1` means "fallback chunks only for outermost ERROR/MISSING spans, no
+  size-based splitting". The FIXED key set, the sort, extension-based language selection, and the
+  `.c`/`.cpp` consequence are unchanged.
 
 ### 2.4 Generation membership (path-dependent)
 
@@ -455,10 +466,20 @@ over the allow-list `{anchor, blob, lang, sig}` joined with `;` (via the same `c
 as the fingerprint), where `anchor` is tagged `p:<syntax_path>` or `o:<local_ordinal>`.
 Path-freedom is enforced in two layers: the `SyntaxLocator` type structurally cannot hold a
 filesystem path, and the parser rejects any path-like key (`path`, `normalized_path`,
-`display_path`, …) or non-allow-listed key (spec 01 §5.1). Only the value **shape** and this
-**serialization** are fixed here; the finer **derivation** of `syntax_path` and
-`signature_fingerprint` from a real parse tree remains **`[OPEN]`** (final `SyntaxLocator`
-semantics, O7) and is deferred to the parser adapters (T04-03+).
+`display_path`, …) or non-allow-listed key (spec 01 §5.1).
+
+As-built `SyntaxLocator` **derivation** `[SPEC]` (realized by T04-03 in
+`crates/index/src/parse/`, fixed by **ADR-0002** — resolves the `SyntaxLocator` half of O7):
+`anchor` is a named route `<lang_kind>:<name>/…` from the enclosing declaration ancestors when
+the unit and all ancestors have safe (identifier) names (the whole-file unit uses `p:file`),
+else `o:<local_ordinal>` (position among the parent's direct child units in canonical order);
+`signature_fingerprint` is the domain-separated hash (`…/signature_fingerprint`, §1.2) of a
+canonical descriptor of the unit's signature built from the parse subtree only (path-free,
+offset-free). The parse output is a pure, DB-free function `bytes -> {units, unresolved_refs}`
+(spans are byte offsets into the exact `source_blob`; a unit's `parent` is an in-file index;
+`unit_id`/`blob_id` are minted at persistence, T04-06). Units are emitted in a canonical order
+(`span.start` asc, `span.end` desc, `unit_kind`, `lang_kind`, `local_name`, `sig`). The graph
+half of O7 (`resolved_graph_edge.edge_kind`, `find_usages`/`get_dependencies`) remains `[OPEN]`.
 
 ### 2.5 Memory side
 

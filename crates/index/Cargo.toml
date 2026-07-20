@@ -17,6 +17,16 @@ local-rag-store = { path = "../store" }
 # defensively (this version ships no meaningful default features).
 ignore = { version = "0.4", default-features = false }
 
+# The incremental parser (spec 06 §2.1 `[FIXED]` tree-sitter) and the first-release
+# TypeScript grammar (ADR-0001). Pinned as a compatible pair: the grammar declares
+# `tree-sitter ^0.24`, so the core is held at 0.24 (no grammar targets 0.25/0.26
+# yet). See the dependency policy / allowlist in CONTRIBUTING.md. tree-sitter 0.24
+# yields query matches as a `StreamingIterator`, so `streaming-iterator` is a
+# direct dependency to drive it.
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+streaming-iterator = "0.1"
+
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
 # The `skipped ⇒ no occurrence` integration test drives the store's async
@@ -26,6 +36,12 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
     "sync",
 ] }
+# T04-03 is the first task to consume typed JSON fixtures (spec 14 §1 parser
+# family). `serde(derive)` is already approved (crates/core); `serde_json` is
+# dev-only here so the shipped binary is unaffected. Typed models with
+# `#[serde(deny_unknown_fields)]` make deserialization the schema check.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

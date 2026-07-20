@@ -1,17 +1,28 @@
-# parser fixtures — gap-only
+# parser fixtures
 
-v1 has **no golden tree-sitter chunking fixtures** (`source file → expected units {kind, span,
-locator}`). The v1 parser (`src/indexer/parser.ts`) exists and is exercised only indirectly
-through the 49-query search benchmark; there are no per-language unit goldens to import.
+Implementation-neutral golden parser fixtures (spec 14 §1.1): a source file maps
+to its expected units (`source file → expected {unit_kind, byte span, local_name,
+kind, anchor, parent}`) and its classified unresolved references. Byte spans are
+offsets into the exact source bytes; the `anchor` is the readable `p:<syntax_path>`
+/ `o:<ordinal>` form (ADR-0002). Implementation-specific values — the `sig` hash
+and the full serialized `syntax_locator` — are deliberately **not** stored here
+(they would defeat neutrality and churn for JS/Rust); they are pinned in
+crate-local goldens in `crates/index` instead.
 
-Adjacent v1 material was imported into other families rather than here:
+Artifact: [`index.json`](index.json), validated by
+[`../schema/parser.schema.json`](../schema/parser.schema.json) and consumed by the
+Rust integration test `crates/index/tests/parse_typescript.rs`.
 
-- import resolution (`src/indexer/resolver.test.ts`) feeds the dependency graph, which is
-  **deferred** in v0 (`find_usages`/`get_dependencies` parity — 15 §3). Recorded in
-  `../manifest.json` under `deferred`, not as a v0 fixture.
-- `.gitignore`/`.ignore` skip semantics → `reconcile` family (skip policy).
-- malformed LLM-output parsing (`scripts/test-parser-fix.ts`) → `adversarial` family.
+## Status
 
-The blocking gap is registered as **GAP-01** in `../manifest.json`. Real parser unit goldens
-are authored once the v0 language set is fixed (O4 / T04-01) in tasks T04-03…T04-06.
-No fixtures are invented here.
+- **TypeScript** — authored in **T04-03** (`tree-sitter` `tsx` adapter, ADR-0002),
+  covering the `syntax`, `error`, `empty`, and `unicode` categories.
+- **JavaScript** — T04-04. **Rust** — T04-05. Until both land, **GAP-01**
+  (`../manifest.json`) stays open for the missing languages.
+
+v1 had no golden tree-sitter chunking fixtures (the v1 parser `src/indexer/parser.ts`
+was exercised only through the 49-query benchmark), so these are authored, not
+imported. Adjacent v1 material lives in other families: import resolution feeds the
+post-v0 dependency graph (recorded under `deferred` in `../manifest.json`);
+`.gitignore` skip semantics went to the `reconcile` family; malformed-output
+parsing went to `adversarial`.

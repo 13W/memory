@@ -38,13 +38,17 @@ DOC_SCHEMAS = {
     "manifest.json": "manifest.schema.json",
     "search/corpus.json": "corpus.schema.json",
     "fault/matrix.json": "fault-matrix.schema.json",
+    "parser/index.json": "parser.schema.json",
     "reconcile/index.json": "case-index.schema.json",
     "memory/index.json": "case-index.schema.json",
     "adversarial/index.json": "case-index.schema.json",
     "fault/index.json": "case-index.schema.json",
 }
 
-CASE_INDEX_FILES = ["reconcile/index.json", "memory/index.json",
+# Files whose `cases[].id` share the global id namespace and are dry-run counted.
+# `parser/index.json` has a bespoke schema (above) but the same `{cases:[{id}]}`
+# shape, so it participates in id-uniqueness / counting here.
+CASE_INDEX_FILES = ["parser/index.json", "reconcile/index.json", "memory/index.json",
                     "adversarial/index.json", "fault/index.json"]
 
 errors: list[str] = []

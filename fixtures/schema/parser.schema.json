@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-rag.dev/fixtures/parser.schema.json",
+  "title": "Parser fixtures (source -> expected units)",
+  "description": "Implementation-neutral golden parser fixtures (spec 14 §1.1; T04-03, ADR-0002): a source file maps to its expected units {unit_kind, byte span, local_name, kind, anchor, parent} and its classified unresolved references. Byte spans are offsets into the exact source bytes. Implementation-specific values (the sig hash, the full serialized syntax_locator) are pinned in crate-local goldens, not here.",
+  "type": "object",
+  "required": ["family", "version", "cases"],
+  "additionalProperties": false,
+  "properties": {
+    "family": { "const": "parser" },
+    "version": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "status",
+          "provenance",
+          "language",
+          "category",
+          "source",
+          "expected_units",
+          "expected_unresolved"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$" },
+          "title": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["active", "skip"] },
+          "provenance": {
+            "type": "object",
+            "required": ["source"],
+            "additionalProperties": false,
+            "properties": {
+              "source": { "type": "string", "minLength": 1 },
+              "ref": { "type": "string" },
+              "note": { "type": "string" }
+            }
+          },
+          "language": { "const": "typescript" },
+          "category": { "type": "string", "enum": ["syntax", "error", "empty", "unicode"] },
+          "source": { "type": "string" },
+          "expected_units": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "unit_kind",
+                "span_start",
+                "span_end",
+                "local_name",
+                "kind",
+                "anchor",
+                "parent"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "unit_kind": {
+                  "type": "string",
+                  "enum": ["symbol", "file", "config_section", "text_section", "fallback_chunk"]
+                },
+                "span_start": { "type": "integer", "minimum": 0 },
+                "span_end": { "type": "integer", "minimum": 0 },
+                "local_name": { "type": ["string", "null"] },
+                "kind": { "type": ["string", "null"] },
+                "anchor": { "type": "string", "pattern": "^(p:|o:)" },
+                "parent": { "type": ["integer", "null"], "minimum": 0 }
+              }
+            }
+          },
+          "expected_unresolved": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["source_unit", "reference_text", "reference_kind"],
+              "additionalProperties": false,
+              "properties": {
+                "source_unit": { "type": "integer", "minimum": 0 },
+                "reference_text": { "type": "string", "minLength": 1 },
+                "reference_kind": {
+                  "type": "string",
+                  "enum": ["import", "type_import", "reexport"]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
