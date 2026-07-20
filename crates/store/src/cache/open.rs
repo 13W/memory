@@ -14,8 +14,10 @@
 //! 3. a corrupt/unreadable cache → drop & recreate ("rebuild on doubt").
 //!
 //! Per-worktree FTS validity (§4.4 step 3) and per-row `embedding_cache` checksums
-//! (step 4) are checked lazily elsewhere, not here, and their tables are created
-//! by later tasks (T03/T08/T11) — this task creates only `cache_meta`.
+//! (step 4) are checked lazily elsewhere, not here. The `embedding_cache`/FTS
+//! tables are created by later tasks (T08/T11); this build creates `cache_meta`
+//! and `normalized_text_cache` (spec 03 §4.2, T03-04). Adding a table means
+//! bumping [`CACHE_SCHEMA_VERSION`] so an older cache is auto-rebuilt (§4.4 step 2).
 
 use std::fmt;
 use std::io;
@@ -33,10 +35,28 @@ const BUSY_TIMEOUT_MS: u64 = 5000;
 /// Stored in `cache_meta.cache_schema_version`. Because the cache is never
 /// migrated (13 §3), any stored value other than this is "unsupported" and forces
 /// a drop & rebuild. Bump this whenever the cache DDL changes.
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+///
+/// - `1`: `cache_meta` only (T01-05).
+/// - `2`: adds `normalized_text_cache` (T03-04).
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// The `cache_meta` binding table (spec 03 §4.1). Created on every (re)build.
 const CACHE_META_DDL: &str = "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+
+/// The `normalized_text_cache` table (spec 03 §4.2). Created on every (re)build
+/// alongside `cache_meta`. It holds the normalized text derived from
+/// `state.sqlite`'s `source_blob` (recomputable via the code-storage normalize
+/// layer, spec 06 §4); losing it loses nothing. `blob_id` is the content-derived
+/// `content_blob.blob_id`; there is no checksum column — a row is validated by
+/// recomputing its identity from the text (spec 03 §4.4-style "rebuild on doubt").
+const NORMALIZED_TEXT_CACHE_DDL: &str = "\
+CREATE TABLE normalized_text_cache (
+  blob_id          TEXT PRIMARY KEY,
+  normalized_text  TEXT NOT NULL,
+  byte_size        INTEGER NOT NULL,
+  created_at       INTEGER NOT NULL,
+  last_used_at     INTEGER NOT NULL
+);";
 
 /// An error opening, validating, or rebuilding a `cache.sqlite` connection.
 #[derive(Debug)]
@@ -246,8 +266,9 @@ fn read_binding(conn: &Connection) -> Option<(String, u32)> {
     Some((uuid, version))
 }
 
-/// Create `cache_meta` and seed the binding rows in one transaction
-/// (all-or-nothing: a crash before commit leaves the fresh file unbound).
+/// Create the cache schema (`cache_meta` + `normalized_text_cache`) and seed the
+/// binding rows in one transaction (all-or-nothing: a crash before commit leaves
+/// the fresh file unbound, so the next open rebuilds it).
 fn seed_binding(
     conn: &mut Connection,
     store_instance_uuid: &str,
@@ -255,6 +276,7 @@ fn seed_binding(
 ) -> Result<(), CacheOpenError> {
     let tx = conn.transaction()?;
     tx.execute_batch(CACHE_META_DDL)?;
+    tx.execute_batch(NORMALIZED_TEXT_CACHE_DDL)?;
     let rows: [(&str, String); 3] = [
         ("store_instance_uuid", store_instance_uuid.to_string()),
         ("cache_schema_version", CACHE_SCHEMA_VERSION.to_string()),

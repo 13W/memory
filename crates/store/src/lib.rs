@@ -103,17 +103,21 @@ pub mod registry;
 mod state;
 
 pub use cache::{
-    CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome, CacheWriteError, CacheWriter,
+    BatchingLastUsed, CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome,
+    CacheWriteError, CacheWriter, LastUsedSink, NormalizedTextRow, delete_normalized_text,
+    flush_last_used, get_normalized_text, insert_normalized_text, verify_cached_text,
 };
 pub use code::{
-    EdgeResolution, NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit, NewResolvedEdge,
+    ALGO_VERSION, BlobOutcome, DerivedContentBlob, EdgeResolution, NORMALIZATION_VERSION,
+    NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit, NewResolvedEdge,
     NewUnresolvedReference, NewlineStyle, PreparedSource, RevisionOutcome, SOURCE_ENCODING_UTF8,
-    SOURCE_ZSTD_LEVEL, SkipReason, SourceCompression, UnitKind, content_hash,
-    create_or_reuse_file_revision, decode_source, detect_encoding, detect_newline_style,
+    SOURCE_ZSTD_LEVEL, SkipReason, SourceCompression, UnitKind, content_blob_exists,
+    content_blob_id, content_hash, create_or_reuse_content_blob, create_or_reuse_file_revision,
+    decode_source, derive_content_blob, detect_encoding, detect_newline_style,
     file_revision_id_by_content_key, insert_content_blob, insert_file_revision,
     insert_generation_file, insert_occurrence, insert_parsed_unit, insert_resolved_edge,
-    insert_skipped_file, insert_unresolved_reference, member_file_revision, prepare_source,
-    skip_reason, source_bytes,
+    insert_skipped_file, insert_unresolved_reference, member_file_revision, normalize,
+    prepare_source, skip_reason, source_bytes,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{

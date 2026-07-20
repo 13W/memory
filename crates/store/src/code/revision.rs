@@ -18,6 +18,8 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use super::normalize::DerivedContentBlob;
+
 /// How `file_revision.source_blob` is stored (spec 03 §2.3
 /// `file_revision.source_compression`).
 ///
@@ -220,6 +222,75 @@ pub fn insert_content_blob(
         ],
     )?;
     Ok(())
+}
+
+/// The outcome of [`create_or_reuse_content_blob`]: whether an existing blob was
+/// reused or a new one created. Either way [`BlobOutcome::id`] is the `blob_id`
+/// to reference (and to key the `normalized_text_cache` row on).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobOutcome {
+    /// A `content_blob` with this `blob_id` already existed.
+    Reused(String),
+    /// A new `content_blob` row was inserted.
+    Created(String),
+}
+
+impl BlobOutcome {
+    /// The `blob_id` to reference, regardless of reuse vs create.
+    pub fn id(&self) -> &str {
+        match self {
+            BlobOutcome::Reused(id) | BlobOutcome::Created(id) => id,
+        }
+    }
+
+    /// Whether this outcome inserted a new row.
+    pub fn is_created(&self) -> bool {
+        matches!(self, BlobOutcome::Created(_))
+    }
+}
+
+/// Whether a `content_blob` row already exists for `blob_id` (its primary key).
+pub fn content_blob_exists(conn: &Connection, blob_id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM content_blob WHERE blob_id = ?1",
+        params![blob_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+}
+
+/// Reuse the existing `content_blob` for `derived.blob_id`, or insert a new one
+/// (spec 03 §2.3, §1.2). Materializes the blob *identity* in `state.sqlite`; the
+/// normalized text it names lives only in `normalized_text_cache` (spec 03 §4.2).
+///
+/// The `blob_id` is the content-derived primary key, so it *is* the reuse key:
+/// two units with identical normalized text (same `algo_version`/`language`/
+/// `normalization_version`) share one `content_blob` row. Like
+/// [`create_or_reuse_file_revision`](super::source::create_or_reuse_file_revision),
+/// a plain SELECT-then-INSERT is race-free under the single bounded writer (spec
+/// 02 §5) and idempotent on retry — a replay returns [`BlobOutcome::Reused`] with
+/// no duplicate.
+pub fn create_or_reuse_content_blob(
+    tx: &Transaction<'_>,
+    derived: &DerivedContentBlob,
+    language: &str,
+    now_ms: i64,
+) -> rusqlite::Result<BlobOutcome> {
+    if content_blob_exists(tx, &derived.blob_id)? {
+        return Ok(BlobOutcome::Reused(derived.blob_id.clone()));
+    }
+    insert_content_blob(
+        tx,
+        &NewContentBlob {
+            blob_id: &derived.blob_id,
+            language,
+            algo_version: derived.algo_version,
+            normalization_version: derived.normalization_version,
+        },
+        now_ms,
+    )?;
+    Ok(BlobOutcome::Created(derived.blob_id.clone()))
 }
 
 /// A row to insert into `parsed_unit` (spec 03 §2.3).

@@ -55,6 +55,15 @@ of the declared width. Only the two *lookup* fingerprints (`path_fingerprint`,
 through the generic `hash` entry point by their owning tasks (T03/T05/T08/T11/T14), which
 assemble the field list in the order fixed by the table above.
 
+As-built note (T03-04, `[SPEC]`): the `content_blob` domain is the first to encode an *integer*
+field, so it fixes the previously-unstated "declared width" for this codebase: `algo_version` and
+`normalization_version` are hashed as **little-endian `u32`** (4 bytes), matching the `le_u32`
+length framing of `encode` and `HASH_SCHEMA_VERSION: u32`. `content_blob_id`
+(`local_rag_store::code::normalize`) assembles the fields in exact table order — `algo_version`
+(u32-LE), `language` (UTF-8), `normalization_version` (u32-LE), `normalized_text` (UTF-8) — and a
+golden test pins the resulting digest and the width choice. The `content_blob` DB columns remain
+`INTEGER` (i64, SQLite affinity); only the hash pre-image narrows to `u32`.
+
 ### 1.3 Path canonicalization `[FIXED principle, details [SPEC]]`
 
 `normalized_path` (worktree-relative): `/` separators, no leading `./`, Unicode **NFC**; on
@@ -559,6 +568,10 @@ per-worktree writers converge into it). Batched `last_used_at`/`last_seen_at` up
 `TRUNCATE` when WAL > 64 MiB and no readers. `VACUUM` by metrics (free-page ratio > 30 %),
 never by schedule.
 
+As-built note (T03-04, `[SPEC]`): the batched-`last_used_at` seam for the cache side is
+`LastUsedSink`/`BatchingLastUsed` + `flush_last_used` (§4.2 note); the flush-cadence driver is a
+later task. The `last_seen_at` registry updates remain immediate single-row writes for now.
+
 ## 4. `cache.sqlite` — rebuildable, independently validated
 
 ```sql
@@ -607,6 +620,24 @@ CREATE TABLE normalized_text_cache (                  -- derived from source_blo
 per-occurrence (context is path-dependent by definition) `[FIXED]`. Eviction: LRU by
 `last_used_at` toward `embedding_cache_budget_mb`; rows pinned while referenced by an active
 projection tuple or a running rebuild are exempt `[SPEC]`.
+
+As-built note (T03-04, `[SPEC]`): `normalized_text_cache` is created (alongside `cache_meta`) by
+the cache seed transaction (`local_rag_store::cache::open`), and `CACHE_SCHEMA_VERSION` is bumped
+to `2` — an older `cache_meta`-only cache is auto-dropped-and-rebuilt on open (§4.4 step 2). The
+`normalized_text` is derived from the exact `source_blob` by a **versioned normalization**
+(`normalization_version = 1`, `local_rag_store::code::normalize`): strip a leading UTF-8 BOM →
+`CRLF`/lone-`CR` → `LF` → Unicode **NFC** → trim trailing whitespace per line (deterministic,
+idempotent). `byte_size` is the UTF-8 length of `normalized_text`. Because the row's `blob_id`
+*is* `H(content_blob …)` over that text, there is no separate checksum: `verify_cached_text`
+recomputes the identity and a mismatch means the row is corrupt → delete + regenerate from
+`source_blob` (spec 06 §4). Normalized text is stored **only** here — never in the canonical
+`content_blob` row (asserted by the schema audit) — so the cache stays fully rebuildable and the
+content-shared `state.sqlite` rows stay path-/text-free (spec 01 §5.1).
+
+Batching seam (T03-04, `[SPEC]`, spec §3): the `last_used_at` updates required to be batched are
+serviced through a seam — `LastUsedSink`/`BatchingLastUsed` (dedup-to-latest in-memory buffer) +
+`flush_last_used` (one batched `UPDATE` transaction). The flush *cadence* (≤ 5 s / 500 rows) is a
+later reconcile/search task; T03-04 ships only the interface + accumulator + flush helper.
 
 ### 4.3 FTS materialized view
 
