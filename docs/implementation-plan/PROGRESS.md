@@ -37,6 +37,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [ ] T03-02 Реализовать file classification и skip reasons
 - [ ] T03-03 Реализовать exact source_blob/file_revision reuse
 - [ ] T03-04 Реализовать normalized text cache regeneration
+- [ ] D-003 Устранить недетерминизм cache read-helper под нагрузкой (transient SQLITE_BUSY)
 - [ ] G03 Сверка source-blob invariant
 
 ## 04 — Парсинг и path-independent units
