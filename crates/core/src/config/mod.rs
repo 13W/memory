@@ -24,9 +24,9 @@
 //! is never silently downgraded to the default — spec 02 §6 "nothing degrades
 //! silently" `[FIXED]`); unknown TOML keys are ignored (lenient / forward
 //! compatible). The `[OPEN]` numbers in spec 02 §3.1
-//! (`storage.retired_generations_keep`/`_ttl_h`, `index.languages`) are parsed as
-//! provisional defaults matching the spec text — this module does not close those
-//! open questions.
+//! (`storage.retired_generations_keep`/`_ttl_h`) are parsed as provisional
+//! defaults matching the spec text — this module does not close those open
+//! questions. `index.languages` is the closed set fixed by ADR-0001 (O4).
 //!
 //! Per-repository overrides (spec 02 §3.2, the `repo_settings` table) and the
 //! effective-policy merge across repos live in `local-rag-store`
@@ -194,12 +194,12 @@ impl Default for ModelsConfig {
 
 /// `[index]` section of `config.toml` (spec 02 §3.1).
 ///
-/// `languages` is the `[OPEN]` first-release language set; the value here is the
-/// spec's provisional default, not a closed answer.
+/// `languages` is the first-release language set fixed by ADR-0001 (O4):
+/// TypeScript, JavaScript, Rust.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
-    /// Languages to index (spec `[OPEN]`).
+    /// Languages to index (ADR-0001, closes O4).
     pub languages: Vec<String>,
     /// Maximum indexed file size, KiB.
     pub max_file_size_kb: u64,
@@ -208,7 +208,11 @@ pub struct IndexConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         IndexConfig {
-            languages: vec!["typescript".to_string(), "javascript".to_string()],
+            languages: vec![
+                "typescript".to_string(),
+                "javascript".to_string(),
+                "rust".to_string(),
+            ],
             max_file_size_kb: 1024,
         }
     }
@@ -420,7 +424,7 @@ default_model_space = \"default\"
 data_policy = \"local_only\"
 
 [index]
-languages = [\"typescript\", \"javascript\"]
+languages = [\"typescript\", \"javascript\", \"rust\"]
 max_file_size_kb = 1024
 ";
 

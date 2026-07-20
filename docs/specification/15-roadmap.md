@@ -37,7 +37,8 @@ Steps 1–7 depend on **no** open question `[FIXED]`.
 
 Identities/protocols fixed, logic minimal: Rust binary + minimal CC plugin/launcher;
 `state.sqlite` + `cache.sqlite` + migration framework; repo registry + stable worktree UUID +
-generation + locking; tree-sitter for 2–3 languages `[OPEN which]`; `file_revision`
+generation + locking; tree-sitter for TypeScript, JavaScript, Rust (ADR-0001, closes O4);
+`file_revision`
 (+source_blob+parser_fingerprint) + `parsed_unit` + occurrences + structural sharing +
 `skipped_file`; authoritative reconcile + write-ahead switch + validate-on-open (per-worktree
 shard); one embedding model + representations registry; `embedding_cache`; **dense leg = the
@@ -61,7 +62,7 @@ multiple generators; cross-generation matching; LSP graph; multi-harness; FreeBS
 | O1 | Dense backend (Qdrant Edge / usearch / brute-force) | step-11 spike | steps 12+ dense specifics only |
 | O2 | Gate numbers (quality/latency/resources; memory router P/R) | baseline runs | release criteria only |
 | O3 | Default embedding model + weights delivery; local generator crate | model evaluation + 10 §5 | init UX, router quality |
-| O4 | First-release language set | benchmark corpus needs | parser scope |
+| O4 | First-release language set | **RESOLVED — ADR-0001 (T04-01): TypeScript, JavaScript, Rust** | parser scope |
 | O5 | v1 memory migration vs clean start | product decision before GA | 13 §3 last step |
 | O6 | Retention K / T for retired generations | usage metrics | GC defaults |
 | O7 | Final `SyntaxLocator` / graph semantics | design follow-up | `find_usages`/`get_dependencies` |

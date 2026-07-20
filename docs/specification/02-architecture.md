@@ -84,7 +84,7 @@ data_policy = "local_only"        # local_only | metadata_only_remote |
                                   # allow_remote_with_redaction | allow_remote_full  [FIXED default]
 
 [index]
-languages = ["typescript", "javascript"]   # [OPEN — first-release language set]
+languages = ["typescript", "javascript", "rust"]   # ADR-0001 (closes O4)
 max_file_size_kb = 1024
 ```
 
@@ -96,9 +96,10 @@ section left implicit: a **missing file** yields the full defaults above (config
 (this binary supports `1`); an **invalid `data_policy`** value is a typed
 `ConfigError::InvalidDataPolicy` — never silently downgraded to the default (§6 "nothing degrades
 silently" `[FIXED]`); **unknown TOML keys are ignored** (lenient/forward-compatible), and missing
-keys default per section. The `[OPEN]` numbers (`storage.retired_generations_keep`/`_ttl_h`,
-`index.languages`) are parsed as the provisional defaults shown here — T02-05 does not close those
-open questions. `Config::load` takes only the resolved `<config_dir>`; there is no API that
+keys default per section. The `[OPEN]` numbers (`storage.retired_generations_keep`/`_ttl_h`) are
+parsed as the provisional defaults shown here — T02-05 does not close those open questions.
+`index.languages` is now the closed set fixed by ADR-0001 (O4), not a provisional placeholder.
+`Config::load` takes only the resolved `<config_dir>`; there is no API that
 consults a worktree or repository tree, which is the structural form of §3.2's "never via files
 inside the repository".
 
