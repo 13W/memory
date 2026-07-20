@@ -15,39 +15,48 @@
 //! Sorting makes the value **order-independent by construction**: however the
 //! components are assembled, the same inputs render the same bytes.
 //!
-//! ## Versions are declared in v0 (T10 guardrail)
+//! ## Versions are our boundary counters, reconciled to pinned crates
 //!
-//! No tree-sitter grammar is linked yet (real grammars/adapters land in
-//! T04-03/04/05). The grammar and query versions here are **declared constants**.
-//! When a real grammar is wired in, reconciling these to its actual versions is a
-//! **documented rebuild event** that changes the fingerprint and its goldens —
-//! never a silent bump. The goldens in this module are the tripwire.
+//! `grammar_version`/`query_version` are **our** boundary-version counters, not
+//! the upstream crate semver. T04-03 links the first real grammar (TypeScript,
+//! `tsx` variant) and **reconciles them to `1`/`1`** against the pinned crates
+//! `tree-sitter 0.24` / `tree-sitter-typescript 0.23` (see [`descriptor`]);
+//! because no units are persisted before T04-06, the goldens below stay green —
+//! this is the deliberate, documented reconciliation, never a silent bump
+//! (ADR-0002). A later grammar/query change that shifts unit boundaries is a
+//! deliberate bump (a rebuild event); the goldens and
+//! `version_constants_and_descriptors_are_pinned` are the tripwire. JavaScript
+//! and Rust grammars are not linked until T04-04/T04-05.
 
 use crate::parse::language::LanguageId;
 
 /// The chunking-policy version — how oversized/opaque content is split into
 /// `fallback_chunk` units. The `chunk=` fingerprint field.
 ///
-/// Bumping it moves unit boundaries ⇒ new `(content_hash, parser_fingerprint)`
-/// keys ⇒ a full rebuild. A deliberate, version-gated event, never an
-/// implementation convenience.
+/// v0 semantics (ADR-0002): a `fallback_chunk` is emitted only for outermost
+/// ERROR/MISSING spans; there is no size-based splitting. Bumping it moves unit
+/// boundaries ⇒ new `(content_hash, parser_fingerprint)` keys ⇒ a full rebuild. A
+/// deliberate, version-gated event, never an implementation convenience.
 pub const CHUNK_POLICY_VERSION: u32 = 1;
 
 /// The boundary-normalization version — pre-parse normalization that shifts where
 /// unit boundaries fall. The `norm=` fingerprint field.
 ///
-/// **Distinct** from `local_rag_store`'s `NORMALIZATION_VERSION`: that versions
-/// `content_blob` text identity and never affects boundaries, whereas this
-/// versions normalization that changes the parse itself. Bumping it is a rebuild
-/// event on the same terms as [`CHUNK_POLICY_VERSION`].
+/// v0 semantics (ADR-0002): **identity** — the grammar parses the raw source
+/// bytes, so spans address the exact `source_blob`. **Distinct** from
+/// `local_rag_store`'s `NORMALIZATION_VERSION`: that versions `content_blob` text
+/// identity and never affects boundaries, whereas this versions normalization that
+/// changes the parse itself. Bumping it is a rebuild event on the same terms as
+/// [`CHUNK_POLICY_VERSION`].
 pub const BOUNDARY_NORM_VERSION: u32 = 1;
 
 /// The boundary-affecting, per-language grammar/query metadata — the "data/config"
 /// of ADR-0001 ("the choice lives in data/config, not in the parser abstraction").
 ///
-/// In v0 `grammar_version`/`query_version` are declared constants (no tree-sitter
-/// linked yet, T10 guardrail). See the module docs on the rebuild event when the
-/// real grammar arrives.
+/// `grammar_version`/`query_version` are our boundary counters. TypeScript's are
+/// reconciled to the pinned real grammar in T04-03 (see [`descriptor`]); the
+/// JavaScript/Rust rows stay declared constants until T04-04/T04-05. See the
+/// module docs on the rebuild event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageDescriptor {
     /// The grammar name (the `<name>` in `grammar=<name>@<ver>`).
@@ -59,6 +68,11 @@ pub struct LanguageDescriptor {
 }
 
 /// The boundary-affecting descriptor for a language (ADR-0001 grammar mapping).
+///
+/// TypeScript is reconciled (T04-03, ADR-0002) to the linked crates
+/// `tree-sitter 0.24` + `tree-sitter-typescript 0.23` (`tsx` grammar variant);
+/// `grammar_version=1`/`query_version=1` are the boundary counters for that
+/// binding, bumped deliberately on any boundary-shifting upgrade.
 pub const fn descriptor(language: LanguageId) -> LanguageDescriptor {
     match language {
         LanguageId::TypeScript => LanguageDescriptor {

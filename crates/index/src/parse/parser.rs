@@ -1,4 +1,5 @@
-//! The language-agnostic parser seam (spec 03 §2.3.1; ADR-0001).
+//! The language-agnostic parser seam (spec 03 §2.3.1, §2.4; 06 §2.1; ADR-0001,
+//! ADR-0002).
 //!
 //! [`LanguageParser`] is the abstraction the per-language tree-sitter adapters of
 //! T04-03/04/05 implement. Honoring ADR-0001 ("parser core stays language-
@@ -6,17 +7,24 @@
 //! trait names no concrete language and the fingerprint comes from the shared
 //! descriptor table, not per-adapter code.
 //!
-//! The parse **output** contract — unit byte spans, parents, unresolved
-//! references — is intentionally NOT defined here; that is T04-03 scope. This task
-//! fixes only the identity seam every adapter shares.
+//! The parse **output** contract — [`ParseOutput`], byte spans, parents,
+//! unresolved references — is defined in [`crate::parse::output`] (T04-03).
 
 use crate::parse::fingerprint;
 use crate::parse::language::LanguageId;
+use crate::parse::output::ParseOutput;
 
-/// A per-language parser adapter (implemented in T04-03+).
+/// A per-language parser adapter.
 pub trait LanguageParser {
     /// The language this parser handles.
     fn language(&self) -> LanguageId;
+
+    /// Parse exact source bytes into a deterministic, DB-free [`ParseOutput`]
+    /// (spec 06 §2.1: same `(content, parser_fingerprint)` ⇒ byte-identical
+    /// output). `source` is the exact `source_blob` and is guaranteed valid UTF-8
+    /// (the classifier skips non-UTF-8 as `encoding`, spec 06 §2.2). The adapter
+    /// mints no ids and touches no database — persistence is T04-06.
+    fn parse(&self, source: &[u8]) -> ParseOutput;
 
     /// The `parser_fingerprint` keying every `file_revision` this parser produces
     /// (spec 03 §2.3.1).
@@ -26,30 +34,5 @@ pub trait LanguageParser {
     /// not normally override it.
     fn parser_fingerprint(&self) -> String {
         fingerprint::parser_fingerprint(self.language())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A minimal stand-in that exercises the trait and its default method until the
-    /// real tree-sitter adapters land (T04-03+).
-    struct StubTypeScript;
-
-    impl LanguageParser for StubTypeScript {
-        fn language(&self) -> LanguageId {
-            LanguageId::TypeScript
-        }
-    }
-
-    #[test]
-    fn language_parser_reports_language_and_default_fingerprint() {
-        let parser = StubTypeScript;
-        assert_eq!(parser.language(), LanguageId::TypeScript);
-        assert_eq!(
-            parser.parser_fingerprint(),
-            fingerprint::parser_fingerprint(LanguageId::TypeScript)
-        );
     }
 }
