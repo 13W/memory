@@ -12,15 +12,18 @@
 //! they compose inside a single
 //! [`StateWriter::transaction`](crate::StateWriter::transaction) closure and read
 //! operations take a [`Connection`]. Ids/hashes are minted by the caller and
-//! passed in as strings — T03-01 stores exactly what it is given; the
-//! create-or-reuse-by-key and hashing/encoding/compression logic is T03-03.
+//! passed in as strings — these low-level ops store exactly what they are given;
+//! the create-or-reuse-by-key and hashing/encoding/compression logic lives in the
+//! sibling [`source`](super::source) module (T03-03).
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// How `file_revision.source_blob` is stored (spec 03 §2.3
 /// `file_revision.source_compression`).
 ///
-/// T03-01 stores the tag verbatim; the actual zstd round-trip is T03-03.
+/// This enum is only the stored tag; the zstd round-trip that produces and reads
+/// it lives in [`source::prepare_source`](super::source::prepare_source) /
+/// [`source::decode_source`](super::source::decode_source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCompression {
     /// The blob is the exact original bytes, uncompressed.
@@ -153,8 +156,9 @@ pub struct NewFileRevision<'a> {
 /// The `UNIQUE (content_hash, parser_fingerprint)` constraint makes a second
 /// insert with the same reuse key fail with a
 /// [`ConstraintViolation`](rusqlite::ErrorCode::ConstraintViolation) that rolls
-/// the transaction back; the create-or-reuse wrapper that turns that into a reuse
-/// is T03-03.
+/// the transaction back; the create-or-reuse wrapper that looks the key up first
+/// and turns a hit into a reuse is
+/// [`source::create_or_reuse_file_revision`](super::source::create_or_reuse_file_revision).
 pub fn insert_file_revision(
     tx: &Transaction<'_>,
     rev: &NewFileRevision<'_>,
@@ -279,8 +283,9 @@ pub fn insert_parsed_unit(tx: &Transaction<'_>, unit: &NewParsedUnit<'_>) -> rus
 /// The `file_revision_id` for a `(content_hash, parser_fingerprint)` reuse key,
 /// if one exists (spec 03 §2.3).
 ///
-/// This is the read half of the create-or-reuse logic completed in T03-03; here
-/// it is a plain unique-key lookup.
+/// This is the read half of the create-or-reuse logic; the completing wrapper is
+/// [`source::create_or_reuse_file_revision`](super::source::create_or_reuse_file_revision).
+/// Here it is a plain unique-key lookup.
 pub fn file_revision_id_by_content_key(
     conn: &Connection,
     content_hash: &str,

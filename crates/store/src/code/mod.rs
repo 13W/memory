@@ -23,17 +23,19 @@
 //!   `file_revision` with a non-null `source_blob`. Skipped files
 //!   (`skipped_file`) never get occurrences (spec 06 §2.2, 12 §5).
 //!
-//! Scope note (T03-01): this task ships the schema plus the low-level typed
-//! insert/read repositories with their exact constraints and typed enums. It does
-//! **not** parse, hash, detect encodings, or compress — the create-or-reuse-by
-//! `(content_hash, parser_fingerprint)` semantics are T03-03, file classification
-//! is T03-02, the normalized-text cache is T03-04, and the deterministic
-//! `occurrence_id` derivation and generation builder are group 05. Callers supply
-//! ids/hashes as strings, exactly as the registry primitives do, keeping the clock
-//! and entropy out of the write path.
+//! Scope note: T03-01 shipped the schema plus the low-level typed insert/read
+//! repositories with their exact constraints and typed enums, storing exactly the
+//! ids/hashes/bytes it was handed. T03-03 adds the [`source`] ingestion layer —
+//! content hashing, encoding/newline detection, optional zstd with exact byte
+//! round-trip, and the create-or-reuse-by `(content_hash, parser_fingerprint)`
+//! wrapper. File classification is T03-02, the normalized-text cache is T03-04,
+//! and the deterministic `occurrence_id` derivation and generation builder are
+//! group 05. Callers still supply ids/`now_ms` as the registry primitives do,
+//! keeping the clock and entropy out of the write path.
 
 mod membership;
 mod revision;
+mod source;
 
 pub use membership::{
     EdgeResolution, NewOccurrence, NewResolvedEdge, NewUnresolvedReference, SkipReason,
@@ -43,6 +45,11 @@ pub use membership::{
 pub use revision::{
     NewContentBlob, NewFileRevision, NewParsedUnit, NewlineStyle, SourceCompression, UnitKind,
     file_revision_id_by_content_key, insert_content_blob, insert_file_revision, insert_parsed_unit,
+};
+pub use source::{
+    PreparedSource, RevisionOutcome, SOURCE_ENCODING_UTF8, SOURCE_ZSTD_LEVEL, content_hash,
+    create_or_reuse_file_revision, decode_source, detect_encoding, detect_newline_style,
+    prepare_source, source_bytes,
 };
 
 /// Version-3 migration DDL: the code-storage side (spec 03 §2.3–2.4).

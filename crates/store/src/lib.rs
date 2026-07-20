@@ -75,9 +75,19 @@
 //! (spec 03 §2.4) — plus typed insert/read repositories and the CHECK-mirroring
 //! enums. The strict source-blob invariant (spec 12 §5) is structural: an
 //! occurrence exists only on a `generation_file` member (composite FK), so a
-//! `skipped_file` never gets one. Parsing, hashing, encoding detection, zstd, and
-//! the deterministic `occurrence_id` derivation are later tasks (T03-03/04, group
-//! 05).
+//! `skipped_file` never gets one. The deterministic `occurrence_id` derivation and
+//! generation builder are group 05.
+//!
+//! T03-03 adds the **exact-source ingestion** layer ([`code::prepare_source`] and
+//! [`code::create_or_reuse_file_revision`]): raw file bytes become a
+//! `file_revision` via `H(file_content)` hashing (spec 03 §1.2), `newline_style`/
+//! `source_encoding` detection, and a keep-if-smaller optional-zstd policy whose
+//! [`code::source_bytes`] read-back reproduces the exact original bytes (spec 03
+//! §2.3 `[FIXED]`, 12 §5). Revisions are created-or-reused by
+//! `(content_hash, parser_fingerprint)` (structural sharing, spec 06 §2); the pure
+//! preparation runs off the writer thread, and the transaction step is a single
+//! lookup + insert. Building the `parser_fingerprint` from a real parser is T04-02
+//! and the normalized-text cache derived from these bytes is T03-04.
 //!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
@@ -97,10 +107,13 @@ pub use cache::{
 };
 pub use code::{
     EdgeResolution, NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit, NewResolvedEdge,
-    NewUnresolvedReference, NewlineStyle, SkipReason, SourceCompression, UnitKind,
+    NewUnresolvedReference, NewlineStyle, PreparedSource, RevisionOutcome, SOURCE_ENCODING_UTF8,
+    SOURCE_ZSTD_LEVEL, SkipReason, SourceCompression, UnitKind, content_hash,
+    create_or_reuse_file_revision, decode_source, detect_encoding, detect_newline_style,
     file_revision_id_by_content_key, insert_content_blob, insert_file_revision,
     insert_generation_file, insert_occurrence, insert_parsed_unit, insert_resolved_edge,
-    insert_skipped_file, insert_unresolved_reference, member_file_revision, skip_reason,
+    insert_skipped_file, insert_unresolved_reference, member_file_revision, prepare_source,
+    skip_reason, source_bytes,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{

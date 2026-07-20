@@ -97,7 +97,8 @@ pub fn is_lfs_pointer(content: &[u8]) -> bool {
 /// T03-02's `encoding` gate: v0 supports only UTF-8, so invalid bytes ⇒
 /// `skipped_file(reason='encoding')` (no transcoding without an offset mapping,
 /// spec 03 §2.3.1 / 06 §2.1 `[FIXED]`). Full `source_encoding`/`newline_style`
-/// detection for *accepted* files is T03-03, not here.
+/// detection for *accepted* files lives in `local_rag_store::code::source`
+/// (`prepare_source`, T03-03), not here.
 pub fn is_valid_utf8(content: &[u8]) -> bool {
     std::str::from_utf8(content).is_ok()
 }
