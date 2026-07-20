@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use local_rag_core::hash::sha256_hex;
 use local_rag_core::paths::StoreLayout;
-use local_rag_store::rusqlite::Connection;
+use local_rag_store::rusqlite::{Connection, Error, ErrorCode};
 use local_rag_store::{CACHE_SCHEMA_VERSION, CacheDb, CacheOpenOutcome, StateDb};
 use local_rag_test_support::TempHome;
 
@@ -35,15 +35,58 @@ fn open_cache(layout: &StoreLayout, uuid: &str, capacity: usize) -> CacheDb {
     CacheDb::open_with_capacity(layout.cache_db(), uuid, capacity).expect("open cache.sqlite")
 }
 
-/// Read a single `cache_meta` value through a read-only connection.
-fn cache_meta(db: &CacheDb, key: &str) -> Option<String> {
-    let conn = db.open_read().expect("open read-only cache");
-    conn.query_row(
-        "SELECT value FROM cache_meta WHERE key = ?1",
-        [key],
-        |row| row.get::<_, String>(0),
+/// The busy/locked error family a fresh read connection can hit transiently right
+/// after a rebuild — notably `SQLITE_BUSY_SNAPSHOT` (primary code `SQLITE_BUSY`),
+/// which the connection's `busy_timeout` does **not** wait out. Retrying on a fresh
+/// connection takes a new WAL snapshot and clears it.
+fn is_transient(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::SqliteFailure(err, _)
+            if matches!(err.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
     )
-    .ok()
+}
+
+/// A "no such table" error — a *legitimate absence* for [`probe_present`] after a
+/// rebuild wiped the table, distinct from a transient lock or an unexpected fault.
+fn is_no_such_table(e: &Error) -> bool {
+    matches!(e, Error::SqliteFailure(_, Some(msg)) if msg.contains("no such table"))
+}
+
+/// Run a single-row read against a fresh read-only cache connection, returning
+/// `None` **only** for a genuinely absent row (`QueryReturnedNoRows`).
+///
+/// Transient busy/locked contention is retried on a fresh connection; any other
+/// error panics loudly rather than masquerading as an absent row. This replaces the
+/// earlier `.ok()`/`unwrap_or(false)` that conflated a transient lock with absence
+/// and made these helpers non-deterministic under parallel load (D-003). No
+/// wall-clock sleep: each connection's `busy_timeout` waits out ordinary contention
+/// internally, and a fresh snapshot clears `BUSY_SNAPSHOT` on the next attempt.
+fn read_optional<T>(db: &CacheDb, query: impl Fn(&Connection) -> rusqlite::Result<T>) -> Option<T> {
+    const ATTEMPTS: usize = 16;
+    let mut last: Option<Error> = None;
+    for _ in 0..ATTEMPTS {
+        let conn = db.open_read().expect("open read-only cache");
+        match query(&conn) {
+            Ok(value) => return Some(value),
+            Err(Error::QueryReturnedNoRows) => return None,
+            Err(e) if is_transient(&e) => last = Some(e),
+            Err(e) => panic!("cache read failed (not a transient lock): {e}"),
+        }
+    }
+    panic!("cache read stayed busy after {ATTEMPTS} fresh attempts: {last:?}");
+}
+
+/// Read a single `cache_meta` value through a read-only connection. `None` means
+/// the key is genuinely absent, never a masked transient error (D-003).
+fn cache_meta(db: &CacheDb, key: &str) -> Option<String> {
+    read_optional(db, |conn| {
+        conn.query_row(
+            "SELECT value FROM cache_meta WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+    })
 }
 
 /// Create a small `probe` table and insert one row through the write queue.
@@ -60,11 +103,23 @@ async fn write_probe(db: &CacheDb) {
 }
 
 /// Whether the `probe` table exists and holds its row, via a read-only connection.
+///
+/// A wiped table after a rebuild (`no such table`) is a legitimate `false`;
+/// transient busy/locked contention is retried; any other error panics (never
+/// masked as `false`, the pre-D-003 `unwrap_or(false)` behaviour).
 fn probe_present(db: &CacheDb) -> bool {
-    let conn = db.open_read().expect("open read-only cache");
-    conn.query_row("SELECT COUNT(*) FROM probe", [], |r| r.get::<_, i64>(0))
-        .map(|n| n == 1)
-        .unwrap_or(false)
+    const ATTEMPTS: usize = 16;
+    let mut last: Option<Error> = None;
+    for _ in 0..ATTEMPTS {
+        let conn = db.open_read().expect("open read-only cache");
+        match conn.query_row("SELECT COUNT(*) FROM probe", [], |r| r.get::<_, i64>(0)) {
+            Ok(n) => return n == 1,
+            Err(e) if is_no_such_table(&e) => return false,
+            Err(e) if is_transient(&e) => last = Some(e),
+            Err(e) => panic!("probe read failed (not transient / no-such-table): {e}"),
+        }
+    }
+    panic!("probe read stayed busy after {ATTEMPTS} fresh attempts: {last:?}");
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -404,6 +459,72 @@ async fn recreate_is_idempotent_on_retry() {
         cache_meta(&db, "store_instance_uuid").as_deref(),
         Some(UUID_A)
     );
+}
+
+/// D-003 regression: the read-helper error classifiers discriminate correctly, so
+/// a transient lock can never be masked as an absent row (the pre-D-003 `.ok()` /
+/// `unwrap_or(false)` bug that made `recreate_is_idempotent_on_retry` flaky under
+/// parallel load). `SQLITE_BUSY_SNAPSHOT` — the specific transient the connection's
+/// `busy_timeout` does not wait out — must classify as transient (retryable), not
+/// as absence, and a wiped table must be absence, not a masked fault.
+#[test]
+fn read_helper_classifiers_discriminate() {
+    use local_rag_store::rusqlite::ffi;
+
+    // The busy/locked family (incl. BUSY_SNAPSHOT, primary code SQLITE_BUSY) is
+    // transient → retried on a fresh connection, never returned as absence.
+    for code in [
+        ffi::SQLITE_BUSY,
+        ffi::SQLITE_BUSY_SNAPSHOT,
+        ffi::SQLITE_LOCKED,
+    ] {
+        let e = Error::SqliteFailure(ffi::Error::new(code), None);
+        assert!(is_transient(&e), "extended code {code} must be transient");
+        assert!(!is_no_such_table(&e), "a busy error is not a missing table");
+    }
+
+    // A genuinely absent row is signalled by QueryReturnedNoRows, not a busy error.
+    assert!(!is_transient(&Error::QueryReturnedNoRows));
+
+    // "no such table" is a legitimate absence for `probe_present`, not transient.
+    let missing = Error::SqliteFailure(
+        ffi::Error::new(ffi::SQLITE_ERROR),
+        Some("no such table: probe".to_string()),
+    );
+    assert!(is_no_such_table(&missing));
+    assert!(!is_transient(&missing));
+
+    // A generic fault is neither → the helpers panic loudly instead of masking it
+    // as absence.
+    let generic = Error::SqliteFailure(
+        ffi::Error::new(ffi::SQLITE_ERROR),
+        Some("near \"SELCT\": syntax error".to_string()),
+    );
+    assert!(!is_transient(&generic));
+    assert!(!is_no_such_table(&generic));
+}
+
+/// D-003 regression (behavioural): the read helpers return a real `None`/`false`
+/// only for genuine absence, and the present value otherwise — on a real cache, so
+/// the query/visibility path is exercised end-to-end.
+#[tokio::test]
+async fn read_helpers_distinguish_present_from_absent() {
+    let (_home, layout) = temp_store();
+    let db = open_cache(&layout, UUID_A, 8);
+
+    // A seeded key resolves; a genuinely absent key is a real None (not a masked
+    // transient error).
+    assert_eq!(
+        cache_meta(&db, "store_instance_uuid").as_deref(),
+        Some(UUID_A)
+    );
+    assert_eq!(cache_meta(&db, "definitely_absent_key"), None);
+
+    // `probe_present`: no table yet → false (a legitimate absence, not a panic);
+    // after a write → true.
+    assert!(!probe_present(&db), "no probe table before any write");
+    write_probe(&db).await;
+    assert!(probe_present(&db), "probe row present after write");
 }
 
 /// Whether `line` carries the SQL `ATTACH` keyword.
