@@ -8,6 +8,24 @@ publish.workspace = true
 
 [dependencies]
 local-rag-core = { path = "../core" }
+local-rag-store = { path = "../store" }
+
+# gitignore matching for the `ignored` skip reason (spec 06 §2). See the
+# dependency policy in CONTRIBUTING.md for the justification, license, and the
+# recorded transitive set. T03-02 uses only the `ignore::gitignore` matcher, not
+# the parallel `Walk` (that is T05-02). `default-features = false` is set
+# defensively (this version ships no meaningful default features).
+ignore = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
+# The `skipped ⇒ no occurrence` integration test drives the store's async
+# bounded writer, so the test harness needs a runtime and `#[tokio::test]`.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+] }
 
 [lints]
 workspace = true

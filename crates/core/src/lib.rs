@@ -5,14 +5,16 @@
 //! permission primitives) that every binary shares, the [`config`] model (the
 //! versioned `config.toml` and the `data_policy` restrictiveness merge), the
 //! vendored [`hash`] digest used for stable namespacing and migration checksums,
-//! and the [`identity`] primitives (UUIDv7, domain-separated BLAKE3 hashing, path
+//! the [`identity`] primitives (UUIDv7, domain-separated BLAKE3 hashing, path
 //! canonicalization, remote normalization) that the registry and every durable
-//! ID are built from.
+//! ID are built from, and the shared, versioned [`redaction`] secret scanner
+//! reused by file classification, spool ingestion, and remote transmission.
 
 pub mod config;
 pub mod hash;
 pub mod identity;
 pub mod paths;
+pub mod redaction;
 
 pub use config::{Config, ConfigError, DataPolicy};
 

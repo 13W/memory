@@ -24,6 +24,19 @@ selection; violations return `POLICY_BLOCKED_REMOTE`, never silently downgrade.
 - Files classified `secret` by the scanner are `skipped_file(reason='secret')` — no
   `source_blob`, no occurrences (06 §2.2).
 
+**Scanner rule set v0 (as-built, T03-02) `[SPEC]`.** The scanner is a single shared component
+(`local-rag-core::redaction`, `redaction_version = 1`) reused by file classification, spool
+ingestion, and remote transmission so verdicts stay consistent and auditable against one version.
+Detection is deterministic, dependency-free byte/line scanning (no regex engine): (1) PEM
+private-key header lines; (2) known credential formats by prefix + plausible length (AWS
+`AKIA`/`ASIA`, GitHub `ghp_`/`gho_`/`ghs_`/`github_pat_`, Slack `xox[bpas]-`, OpenAI-style `sk-`);
+(3) secret-like keys (`password`/`secret`/`api_key`/`token`/…) assigned a **quoted** literal of
+non-trivial length (unquoted assignments in ordinary code are not flagged); (4) long high-entropy
+strings (≥ 40 chars, Shannon entropy ≥ 4.5 bits/char, above a hex digest's 4.0 ceiling so git SHAs
+do not trip). The set is intentionally conservative and expected to grow; any change bumps
+`redaction_version`. The classifier consumes a boolean verdict; scan spans (for payload redaction
+in spool/remote flows) are exposed for later groups.
+
 ## 3. Retention `[FIXED]`
 
 - `observation_payload` under real TTL (`payload_ttl_hours`), enforced by a sweeper; envelopes
