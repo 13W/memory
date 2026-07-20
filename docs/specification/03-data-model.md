@@ -370,6 +370,26 @@ revisions — language is selected by extension/path. Spans are always byte offs
 exact `source_blob`; unsupported encoding ⇒ the file is **skipped** (no transcoding without an
 offset mapping) `[FIXED]`.
 
+As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
+
+- Keys are sorted in **ascending ASCII byte order** (`chunk` < `grammar` < `lang` < `norm` <
+  `queries`) and joined with `;`; `;` is a **separator with no trailing terminator** (the
+  `key=value;` above denotes the pair grammar, not a trailing `;` — matching the concrete
+  example). Sorting makes the value order-independent by construction.
+- `lang` is the canonical `LanguageId` string (= the `index.languages` token). The
+  language-by-path selector (`parse::select_language`) realizes ADR-0001's deferred
+  "precise selector is T04-02": extension-only, case-insensitive
+  (`.ts/.tsx/.mts/.cts`→typescript, `.js/.jsx/.mjs/.cjs`→javascript, `.rs`→rust).
+- Version realization: `chunk=CHUNK_POLICY_VERSION`, `norm=BOUNDARY_NORM_VERSION`,
+  `grammar=<grammar_name>@<grammar_version>`, `queries=<query_version>`; all `1` in v0.
+  `BOUNDARY_NORM_VERSION` is **distinct** from `content_blob`'s `normalization_version`
+  (§4.2) — that versions text identity, this versions boundary-affecting normalization.
+- No tree-sitter grammar is linked in v0 (parser adapters are T04-03+); `grammar_version`/
+  `query_version` are **declared constants**. Reconciling them to a real grammar's versions is
+  a **documented rebuild event** that changes the fingerprint (and its goldens), never a silent
+  bump. The FIXED key set, the sort, extension-based language selection, and the `.c`/`.cpp`
+  consequence are unchanged.
+
 ### 2.4 Generation membership (path-dependent)
 
 ```sql
@@ -428,6 +448,17 @@ CREATE TABLE resolved_graph_edge (                    -- per generation, on occu
 Locators `[FIXED]`:
 `SyntaxLocator = {language, syntax_path | local_ordinal, signature_fingerprint, blob_id}` — no path.
 `OccurrenceLocator = {normalized_path, qualified_name, SyntaxLocator}`.
+
+As-built `SyntaxLocator` serialization `[SPEC]` (realized by T04-02 in
+`crates/index/src/parse/locator.rs`): a canonical, path-free string — sorted `key=value`
+over the allow-list `{anchor, blob, lang, sig}` joined with `;` (via the same `canonical_kv`
+as the fingerprint), where `anchor` is tagged `p:<syntax_path>` or `o:<local_ordinal>`.
+Path-freedom is enforced in two layers: the `SyntaxLocator` type structurally cannot hold a
+filesystem path, and the parser rejects any path-like key (`path`, `normalized_path`,
+`display_path`, …) or non-allow-listed key (spec 01 §5.1). Only the value **shape** and this
+**serialization** are fixed here; the finer **derivation** of `syntax_path` and
+`signature_fingerprint` from a real parse tree remains **`[OPEN]`** (final `SyntaxLocator`
+semantics, O7) and is deferred to the parser adapters (T04-03+).
 
 ### 2.5 Memory side
 
