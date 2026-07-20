@@ -348,6 +348,7 @@ dependencies = [
  "local-rag-test-support",
  "rusqlite",
  "tokio",
+ "unicode-normalization",
  "zstd",
 ]
 

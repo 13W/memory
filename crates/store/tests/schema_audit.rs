@@ -241,6 +241,33 @@ async fn content_shared_tables_carry_no_path_or_context_field() {
     }
 }
 
+/// Spec 03 §2.3/§4.2: a `content_blob` row carries identity + metadata only; the
+/// normalized text "lives in the cache" (`normalized_text_cache`). Assert **no**
+/// `state.sqlite` table stores a `normalized_text` column — the "no normalized
+/// text stored in path-bearing/canonical code rows" guardrail T03-04 owns. The
+/// only home for normalized text is the rebuildable cache (checked in
+/// `tests/normalized_text.rs`).
+#[tokio::test]
+async fn no_state_table_stores_normalized_text() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+
+    let tables = user_tables(&read);
+    assert!(
+        tables.iter().any(|t| t == "content_blob"),
+        "sanity: content_blob exists in the migrated schema ({tables:?})",
+    );
+    for table in &tables {
+        for col in columns_of(&read, table) {
+            assert_ne!(
+                col, "normalized_text",
+                "table `{table}` stores `normalized_text`, but normalized text is canonical only \
+                 in the rebuildable `normalized_text_cache` (spec 03 §2.3/§4.2, T03-04)",
+            );
+        }
+    }
+}
+
 /// Guard the guard: the classifiers must actually distinguish paths, fingerprints,
 /// and plain identity columns — otherwise the two lints above would be vacuous.
 #[test]

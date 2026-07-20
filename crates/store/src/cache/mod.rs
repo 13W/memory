@@ -13,9 +13,14 @@
 //! seeds that UUID — the UUIDv7 generator and its seeding land in later tasks.
 
 mod open;
+mod text;
 mod writer;
 
 pub use open::{CACHE_SCHEMA_VERSION, CacheOpenError, CacheOpenOutcome};
+pub use text::{
+    BatchingLastUsed, LastUsedSink, NormalizedTextRow, delete_normalized_text, flush_last_used,
+    get_normalized_text, insert_normalized_text, verify_cached_text,
+};
 pub use writer::{CacheWriteError, CacheWriter};
 
 use std::path::{Path, PathBuf};

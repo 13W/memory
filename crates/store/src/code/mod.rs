@@ -28,12 +28,17 @@
 //! ids/hashes/bytes it was handed. T03-03 adds the [`source`] ingestion layer —
 //! content hashing, encoding/newline detection, optional zstd with exact byte
 //! round-trip, and the create-or-reuse-by `(content_hash, parser_fingerprint)`
-//! wrapper. File classification is T03-02, the normalized-text cache is T03-04,
-//! and the deterministic `occurrence_id` derivation and generation builder are
-//! group 05. Callers still supply ids/`now_ms` as the registry primitives do,
-//! keeping the clock and entropy out of the write path.
+//! wrapper. T03-04 adds the [`normalize`] layer — versioned text normalization,
+//! the `content_blob` identity derivation (`H(content_blob …)`), and
+//! `create_or_reuse_content_blob`; the normalized text it derives lives in the
+//! rebuildable `normalized_text_cache` (spec 03 §4.2, see the `cache::text`
+//! module). File classification is T03-02, and the deterministic `occurrence_id`
+//! derivation and generation builder are group 05. Callers still supply
+//! ids/`now_ms` as the registry primitives do, keeping the clock and entropy out
+//! of the write path.
 
 mod membership;
+mod normalize;
 mod revision;
 mod source;
 
@@ -42,9 +47,14 @@ pub use membership::{
     insert_generation_file, insert_occurrence, insert_resolved_edge, insert_skipped_file,
     insert_unresolved_reference, member_file_revision, skip_reason,
 };
+pub use normalize::{
+    ALGO_VERSION, DerivedContentBlob, NORMALIZATION_VERSION, content_blob_id, derive_content_blob,
+    normalize,
+};
 pub use revision::{
-    NewContentBlob, NewFileRevision, NewParsedUnit, NewlineStyle, SourceCompression, UnitKind,
-    file_revision_id_by_content_key, insert_content_blob, insert_file_revision, insert_parsed_unit,
+    BlobOutcome, NewContentBlob, NewFileRevision, NewParsedUnit, NewlineStyle, SourceCompression,
+    UnitKind, content_blob_exists, create_or_reuse_content_blob, file_revision_id_by_content_key,
+    insert_content_blob, insert_file_revision, insert_parsed_unit,
 };
 pub use source::{
     PreparedSource, RevisionOutcome, SOURCE_ENCODING_UTF8, SOURCE_ZSTD_LEVEL, content_hash,

@@ -19,6 +19,11 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # 12 §5). Vendors libzstd from source via `zstd-sys`/`cc` — bundled/offline like
 # rusqlite's SQLite. `std` has no zstd. See CONTRIBUTING allowlist.
 zstd = "0.13"
+# Unicode NFC for the versioned content_blob text normalization
+# (`normalization_version=1`, spec 03 §1.3/§4.2, T03-04). std has no Unicode
+# normalization. Already in Cargo.lock via local-rag-core (0 new external
+# sources). See CONTRIBUTING allowlist.
+unicode-normalization = "0.1"
 # Optional, dev-only path crate (0 external sources): enabled ONLY by the
 # `failpoints` feature so the migration runner can host named crash-injection
 # points for hard-kill (SIGABRT) resume tests. Never enabled in release/dist.
