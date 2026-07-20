@@ -59,6 +59,26 @@ rows change) `[FIXED]`.
 configured excludes), `encoding`. Skipped files get **no occurrences** and are absent from the
 searchable generation `[FIXED §10 invariant, structural per 03 §2.4]`.
 
+**Precedence and detector semantics (as-built, T03-02) `[SPEC]`.** `skipped_file`'s primary key
+admits exactly one reason per path, so classification applies a deterministic precondition chain,
+first match wins; a file matching none is indexed:
+
+1. `ignored` — path only, gitignore + configured excludes; matched via the `ignore` crate's
+   `gitignore` matcher with standard Git precedence (nearest `.gitignore` wins, `!` re-includes).
+2. `huge` — `size_bytes` **strictly greater** than `max_file_size_kb · 1024` (a file exactly at the
+   cap is kept). Uses stat only; content is not read.
+3. `lfs` — a Git-LFS pointer file (first line the LFS v1 version line, with `oid sha256:` and a
+   numeric `size`), detected by format so it is caught even at a binary extension.
+4. `binary` — a NUL byte within the first 8 KiB, or a path with a built-in binary extension.
+5. `encoding` — content is not valid UTF-8 (v0 supports only UTF-8; full `source_encoding` /
+   `newline_style` detection for accepted files is a separate step, spec 03 §2.3).
+6. `secret` — the shared redaction scanner (12 §2) flags the decoded UTF-8 text.
+
+Each step is a precondition for the next (the secret scan runs only on valid decoded text). Because
+every outcome is a skip, short-circuiting a cheaper reason never lets a secret-bearing file be
+indexed. The binary-extension list is a built-in constant (not config); only the size cap is
+configurable in v0.
+
 ## 3. Hybrid read consistency `[FIXED]`
 
 The whole search pipeline holds the per-worktree READ lock:
