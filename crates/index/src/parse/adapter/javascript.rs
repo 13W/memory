@@ -1,14 +1,19 @@
-//! The TypeScript tree-sitter adapter (ADR-0001 first language; ADR-0002
+//! The JavaScript tree-sitter adapter (ADR-0001 second language; ADR-0002
 //! derivation).
 //!
-//! One grammar variant — `tsx` — is used for every TypeScript extension
-//! (`.ts`/`.tsx`/`.mts`/`.cts`). The `parser_fingerprint` is identical across
-//! them and [`LanguageParser::parse`] never sees the path, so a single grammar is
-//! required for determinism (spec 06 §2.1); `tsx` is the practical superset that
-//! also parses JSX (ADR-0002). The declared `grammar_version`/`query_version`
-//! (1/1) are reconciled to the pinned crates `tree-sitter 0.24` /
-//! `tree-sitter-typescript 0.23` — a documented, non-silent binding (spec 03
-//! §2.3.1).
+//! The standalone `tree-sitter-javascript` grammar is used for every JavaScript
+//! extension (`.js`/`.jsx`/`.mjs`/`.cjs`). It is pinned at `0.23` (ABI 14) to pair
+//! with the workspace `tree-sitter 0.24` core — the newer `0.25` grammar is ABI 15,
+//! which the core refuses to load (it would silently degrade to a file-only parse),
+//! the same reason `tree-sitter-typescript` is held at `0.23` (see the dependency
+//! allowlist in CONTRIBUTING.md). The declared `grammar_version`/`query_version`
+//! (1/1) are reconciled to the pinned crate — a documented, non-silent binding
+//! (spec 03 §2.3.1), matching the TypeScript reconciliation of T04-03.
+//!
+//! The shared engine ([`parse_with`]) owns everything language-independent; this
+//! adapter supplies only the grammar, the JavaScript query set (`javascript.scm`),
+//! the capture map, and the name/signature/reference hooks. Primitives identical
+//! across languages (`modifiers`, `field_text`, …) come from [`crate::parse::adapter`].
 
 use tree_sitter::{Node, Query};
 
@@ -23,34 +28,34 @@ use crate::parse::signature::SignatureDescriptor;
 use local_rag_store::code::UnitKind;
 
 /// The versioned query set (`queries=1`), embedded at build time.
-const QUERY_SRC: &str = include_str!("typescript.scm");
+const QUERY_SRC: &str = include_str!("javascript.scm");
 
-/// A TypeScript parser adapter over the `tsx` grammar.
-pub struct TypeScriptParser {
+/// A JavaScript parser adapter over the `tree-sitter-javascript` grammar.
+pub struct JavaScriptParser {
     language: tree_sitter::Language,
     query: Query,
 }
 
-impl TypeScriptParser {
+impl JavaScriptParser {
     /// Compile the grammar and query once. The query is a build-time constant, so
     /// a compile failure is a bug (panics).
     pub fn new() -> Self {
-        let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TSX.into();
+        let language: tree_sitter::Language = tree_sitter_javascript::LANGUAGE.into();
         let query =
-            Query::new(&language, QUERY_SRC).expect("the bundled TypeScript query must compile");
+            Query::new(&language, QUERY_SRC).expect("the bundled JavaScript query must compile");
         Self { language, query }
     }
 }
 
-impl Default for TypeScriptParser {
+impl Default for JavaScriptParser {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LanguageParser for TypeScriptParser {
+impl LanguageParser for JavaScriptParser {
     fn language(&self) -> LanguageId {
-        LanguageId::TypeScript
+        LanguageId::JavaScript
     }
 
     fn parse(&self, source: &[u8]) -> ParseOutput {
@@ -58,9 +63,9 @@ impl LanguageParser for TypeScriptParser {
     }
 }
 
-impl LanguageSpec for TypeScriptParser {
+impl LanguageSpec for JavaScriptParser {
     fn language(&self) -> LanguageId {
-        LanguageId::TypeScript
+        LanguageId::JavaScript
     }
 
     fn ts_language(&self) -> &tree_sitter::Language {
@@ -79,10 +84,6 @@ impl LanguageSpec for TypeScriptParser {
         match capture_name {
             "decl.function" => decl("function"),
             "decl.class" => decl("class"),
-            "decl.interface" => decl("interface"),
-            "decl.enum" => decl("enum"),
-            "decl.type_alias" => decl("type_alias"),
-            "decl.namespace" => decl("namespace"),
             "decl.method" => decl("method"),
             "decl.const" => decl("const"),
             "ref.import" | "ref.reexport" => CaptureRole::Reference,
@@ -110,32 +111,24 @@ impl LanguageSpec for TypeScriptParser {
         lang_kind: &str,
         src: &[u8],
     ) -> String {
+        // JavaScript has no type annotations, so the descriptor carries no
+        // type_parameters/return_type/type-alias fields — only the name, the
+        // modifier set, the parameter text, the value shape (for function/class-
+        // valued `const`), heritage, and the body member count.
         let mut d = SignatureDescriptor::new(
-            LanguageId::TypeScript.as_str(),
+            LanguageId::JavaScript.as_str(),
             unit_kind.as_str(),
             lang_kind,
         );
         d.push(self.local_name(decl, src).unwrap_or_default());
         d.push(modifiers(decl));
-        d.push(field_text(decl, "type_parameters", src));
         d.push(field_text(decl, "parameters", src));
-        d.push(field_text(decl, "return_type", src));
         match decl.child_by_field_name("value") {
             Some(value) => {
                 d.push(value.kind());
                 d.push(field_text(value, "parameters", src));
-                d.push(field_text(value, "return_type", src));
-                // The aliased type is small and identity-relevant; a function/class
-                // value's body is not, so only type aliases carry the value text.
-                if lang_kind == "type_alias" {
-                    d.push(value.utf8_text(src).unwrap_or(""));
-                } else {
-                    d.push("");
-                }
             }
             None => {
-                d.push("");
-                d.push("");
                 d.push("");
                 d.push("");
             }
@@ -153,31 +146,12 @@ impl LanguageSpec for TypeScriptParser {
     ) -> Option<(ReferenceKind, String)> {
         let text = node.utf8_text(src).ok()?.to_string();
         match capture_name {
-            "ref.import" => {
-                // string_fragment -> string -> import_statement
-                let is_type = node
-                    .parent()
-                    .and_then(|s| s.parent())
-                    .map(has_type_token)
-                    .unwrap_or(false);
-                let kind = if is_type {
-                    ReferenceKind::TypeImport
-                } else {
-                    ReferenceKind::Import
-                };
-                Some((kind, text))
-            }
+            // JavaScript has no `import type`; every specifier is a value import.
+            "ref.import" => Some((ReferenceKind::Import, text)),
             "ref.reexport" => Some((ReferenceKind::Reexport, text)),
             _ => None,
         }
     }
-}
-
-/// Whether `stmt` has a direct anonymous `type` token (an `import type …`).
-fn has_type_token(stmt: Node) -> bool {
-    let mut cursor = stmt.walk();
-    stmt.children(&mut cursor)
-        .any(|c| !c.is_named() && c.kind() == "type")
 }
 
 #[cfg(test)]
@@ -186,7 +160,7 @@ mod tests {
     use crate::parse::locator::SyntaxAnchor;
 
     fn parse(src: &str) -> ParseOutput {
-        TypeScriptParser::new().parse(src.as_bytes())
+        JavaScriptParser::new().parse(src.as_bytes())
     }
 
     fn find<'a>(
@@ -198,6 +172,17 @@ mod tests {
             .iter()
             .find(|u| u.unit_kind == kind && u.local_name.as_deref() == Some(name))
             .unwrap_or_else(|| panic!("no {kind:?} unit named {name}"))
+    }
+
+    #[test]
+    fn grammar_loads_and_extracts_symbols() {
+        // Guard: if the grammar failed to load (e.g. an ABI mismatch), the engine
+        // degrades to a file-only parse. A non-empty source MUST yield a symbol.
+        let out = parse("function present() {}\n");
+        assert!(
+            out.units.iter().any(|u| u.unit_kind == UnitKind::Symbol),
+            "the JavaScript grammar must load and produce symbols (not just a file unit)"
+        );
     }
 
     #[test]
@@ -227,7 +212,7 @@ mod tests {
     #[test]
     fn extracts_core_declaration_kinds_with_lang_kind() {
         let out = parse(
-            "export function foo(a: number): void {}\nclass Bar {}\ninterface I {}\nenum E { A }\ntype T = number;\nnamespace N {}\n",
+            "export function foo(a) {}\nclass Bar {}\nfunction* gen() {}\nexport const g = (x) => x;\n",
         );
         assert_eq!(
             find(&out, UnitKind::Symbol, "foo").lang_kind.as_deref(),
@@ -238,20 +223,12 @@ mod tests {
             Some("class")
         );
         assert_eq!(
-            find(&out, UnitKind::Symbol, "I").lang_kind.as_deref(),
-            Some("interface")
+            find(&out, UnitKind::Symbol, "gen").lang_kind.as_deref(),
+            Some("function")
         );
         assert_eq!(
-            find(&out, UnitKind::Symbol, "E").lang_kind.as_deref(),
-            Some("enum")
-        );
-        assert_eq!(
-            find(&out, UnitKind::Symbol, "T").lang_kind.as_deref(),
-            Some("type_alias")
-        );
-        assert_eq!(
-            find(&out, UnitKind::Symbol, "N").lang_kind.as_deref(),
-            Some("namespace")
+            find(&out, UnitKind::Symbol, "g").lang_kind.as_deref(),
+            Some("const")
         );
     }
 
@@ -266,7 +243,7 @@ mod tests {
 
     #[test]
     fn method_parent_is_the_class() {
-        let out = parse("class Host {\n  method(x: number) {}\n}\n");
+        let out = parse("class Host {\n  method(x) {}\n}\n");
         let host = find(&out, UnitKind::Symbol, "Host");
         let host_idx = out
             .units
@@ -300,28 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn overloads_differ_by_signature() {
-        let out = parse(
-            "function ov(a: number): number;\nfunction ov(a: string): string;\nfunction ov(a: any): any { return a; }\n",
-        );
-        let sigs: Vec<&str> = out
-            .units
-            .iter()
-            .filter(|u| u.local_name.as_deref() == Some("ov"))
-            .map(|u| u.signature_fingerprint.as_str())
-            .collect();
-        assert_eq!(sigs.len(), 3);
-        let mut uniq = sigs.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        assert_eq!(uniq.len(), 3, "overloads must have distinct signatures");
-    }
-
-    #[test]
     fn top_level_function_const_is_captured_but_value_const_is_not() {
-        let out = parse(
-            "export const f = (x: number) => x;\nexport const obj = { a: 1 };\nconst n = 5;\n",
-        );
+        let out = parse("export const f = (x) => x;\nexport const obj = { a: 1 };\nconst n = 5;\n");
         assert_eq!(
             find(&out, UnitKind::Symbol, "f").lang_kind.as_deref(),
             Some("const")
@@ -341,9 +298,7 @@ mod tests {
 
     #[test]
     fn unresolved_references_are_classified() {
-        let out = parse(
-            "import { A } from \"./mod\";\nimport type { T } from \"./types\";\nexport * from \"./re\";\n",
-        );
+        let out = parse("import { A } from \"./mod\";\nexport * from \"./re\";\n");
         let by_text = |t: &str| {
             out.unresolved
                 .iter()
@@ -351,7 +306,6 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(by_text("./mod").reference_kind, ReferenceKind::Import);
-        assert_eq!(by_text("./types").reference_kind, ReferenceKind::TypeImport);
         assert_eq!(by_text("./re").reference_kind, ReferenceKind::Reexport);
         // All refs originate from the file unit.
         let file_idx = out
@@ -386,7 +340,7 @@ mod tests {
             assert_eq!(parse(src), first);
         }
         // A fresh parser instance gives identical output.
-        assert_eq!(TypeScriptParser::new().parse(src.as_bytes()), first);
+        assert_eq!(JavaScriptParser::new().parse(src.as_bytes()), first);
     }
 
     #[test]
@@ -396,20 +350,20 @@ mod tests {
         // fixtures deliberately omit. A change to the sig algorithm or anchor
         // formatting must update these deliberately.
         use crate::parse::locator::SyntaxLocator;
-        let out = parse("function foo(a: number): void {}\n");
+        let out = parse("function foo(a) {}\n");
         let foo = find(&out, UnitKind::Symbol, "foo");
         assert_eq!(
             foo.signature_fingerprint,
-            "120e9865e8347d390dfc37e67dd1d75882d5348a2d0891cf01ca58deaf4ea8b4"
+            "ef7dab787bf7f0827f1e8cefac975d9e32c3f341c3b292ccdd84256bbd694a60"
         );
         let locator = SyntaxLocator::from_draft(
-            foo.locator_draft(LanguageId::TypeScript),
+            foo.locator_draft(LanguageId::JavaScript),
             "b10b1d".to_string(),
         );
         assert_eq!(
             locator.serialize(),
-            "anchor=p:function:foo;blob=b10b1d;lang=typescript;\
-             sig=120e9865e8347d390dfc37e67dd1d75882d5348a2d0891cf01ca58deaf4ea8b4"
+            "anchor=p:function:foo;blob=b10b1d;lang=javascript;\
+             sig=ef7dab787bf7f0827f1e8cefac975d9e32c3f341c3b292ccdd84256bbd694a60"
         );
     }
 
