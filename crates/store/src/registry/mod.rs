@@ -35,15 +35,30 @@
 //! resolution layer: generic `repo_settings` reads/writes (spec 03 §2.1) plus the
 //! typed `data_policy` accessor and the effective-policy merge — the *most
 //! restrictive* of the global and every involved repository's policy (spec 02
-//! §3.2, 12 §1). The `generation` builder, occurrence schema (spec 03 §2.4), and
-//! generation state machine (spec 04 §1) are group 05 — T02-03 ships only the
-//! `generation` table and the worktree-side seam that writes
-//! `worktree.current_generation_id`.
+//! §3.2, 12 §1).
+//!
+//! The **generation lifecycle** (T05-01, module [`generation`]) sits on top of the
+//! `generation` table `SCHEMA_V2` shipped: [`allocate_generation`] (per-worktree
+//! monotone number, born `building`), the [`GenerationState`] machine
+//! ([`transition_generation`], spec 04 §1), and the routable readers
+//! ([`active_generations`], [`generation_state`]) — `retiring`/`failed` are never
+//! routed (`[FIXED]`). The generation *builder* and structural sharing (T05-03),
+//! the reconcile scheduler (T05-04), and the projection switch that atomically
+//! retires N / activates N+1 with `worktree_projection_state` (05 §5) are later
+//! tasks; the occurrence schema is `SCHEMA_V3` (T03-01) and its deterministic
+//! `occurrence_id` derivation is [`code::occurrence_id`](crate::code::occurrence_id)
+//! (T05-01).
 
+mod generation;
 mod repository;
 mod resolve;
 mod settings;
 pub mod worktree;
+
+pub use generation::{
+    GenerationState, GenerationTransitionError, IllegalGenerationTransition, active_generations,
+    allocate_generation, generation_state, transition_generation,
+};
 
 pub use repository::{
     PathObservation, create_repository, current_path, find_repositories_by_remote,

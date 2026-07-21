@@ -32,10 +32,11 @@
 //! the `content_blob` identity derivation (`H(content_blob …)`), and
 //! `create_or_reuse_content_blob`; the normalized text it derives lives in the
 //! rebuildable `normalized_text_cache` (spec 03 §4.2, see the `cache::text`
-//! module). File classification is T03-02, and the deterministic `occurrence_id`
-//! derivation and generation builder are group 05. Callers still supply
-//! ids/`now_ms` as the registry primitives do, keeping the clock and entropy out
-//! of the write path.
+//! module). File classification is T03-02. T05-01 adds the deterministic
+//! [`occurrence_id`] derivation (`H(occurrence_id: generation_id, normalized_path,
+//! unit_id)`, spec 03 §1.2); the generation *builder* that mints and persists
+//! occurrences with it is T05-03. Callers still supply ids/`now_ms` as the
+//! registry primitives do, keeping the clock and entropy out of the write path.
 
 mod membership;
 mod normalize;
@@ -46,7 +47,7 @@ pub use membership::{
     EdgeResolution, NewOccurrence, NewResolvedEdge, NewUnresolvedReference, SkipReason,
     delete_unresolved_references_for_revision, insert_generation_file, insert_occurrence,
     insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
-    skip_reason,
+    occurrence_id, skip_reason,
 };
 pub use normalize::{
     ALGO_VERSION, DerivedContentBlob, NORMALIZATION_VERSION, content_blob_id, derive_content_blob,

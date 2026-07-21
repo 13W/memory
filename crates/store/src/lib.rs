@@ -118,19 +118,21 @@ pub use code::{
     detect_newline_style, file_revision_id_by_content_key, insert_content_blob,
     insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
     insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
-    normalize, parsed_unit_id_by_natural_key, prepare_source, skip_reason, source_bytes,
+    normalize, occurrence_id, parsed_unit_id_by_natural_key, prepare_source, skip_reason,
+    source_bytes,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
-    AttachError, Candidate, DATA_POLICY_KEY, IllegalWorktreeTransition, PathObservation,
-    RequestRoot, Resolution, WorktreeKind, WorktreePathObservation, WorktreeRootFacts,
-    WorktreeState, WorktreeSummary, WorktreeTransitionError, attach, create_repository,
-    create_worktree, current_generation, current_path, current_worktree_path,
+    AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
+    IllegalGenerationTransition, IllegalWorktreeTransition, PathObservation, RequestRoot,
+    Resolution, WorktreeKind, WorktreePathObservation, WorktreeRootFacts, WorktreeState,
+    WorktreeSummary, WorktreeTransitionError, active_generations, allocate_generation, attach,
+    create_repository, create_worktree, current_generation, current_path, current_worktree_path,
     effective_data_policy, find_repositories_by_remote, find_repository_by_path,
-    find_worktree_by_current_path, find_worktrees_by_path_fingerprint, get_repo_setting,
-    observe_repository_path, observe_worktree_path, path_history, repo_data_policy, repo_settings,
-    resolve, set_current_generation, set_repo_data_policy, set_repo_setting,
-    transition_worktree_state, worktree_path_history, worktree_state, worktree_summary,
-    worktrees_of_repo,
+    find_worktree_by_current_path, find_worktrees_by_path_fingerprint, generation_state,
+    get_repo_setting, observe_repository_path, observe_worktree_path, path_history,
+    repo_data_policy, repo_settings, resolve, set_current_generation, set_repo_data_policy,
+    set_repo_setting, transition_generation, transition_worktree_state, worktree_path_history,
+    worktree_state, worktree_summary, worktrees_of_repo,
 };
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};

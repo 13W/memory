@@ -500,6 +500,15 @@ inserted in the canonical order above, so a parent's row always precedes its chi
 `parent_unit_id` self-reference. Persisting generation membership (`generation_unit_occurrence`) is
 group 05, not this function.
 
+As-built note (T05-01, `[SPEC]`): the deterministic `occurrence_id` derivation is
+`local_rag_store::code::occurrence_id` — the free function `H(occurrence_id: generation_id,
+normalized_path, unit_id)` through the generic `identity::domain::hash` entry point, assembling the
+fields in the exact §1.2 table order (all three are text / already-hex identities → their exact
+bytes). Because each id depends only on its own tuple, it is stable under retry/reconcile and
+independent of row insertion order (§1.2 `[FIXED]`) — a store-layer golden pins the digest and asserts
+the function only forwards its fields. `insert_occurrence` still stores the id verbatim (T03-01); the
+generation *builder* that mints occurrences with this derivation and writes them is T05-03.
+
 ### 2.5 Memory side
 
 ```sql
