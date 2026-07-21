@@ -242,6 +242,37 @@ groups (14/16), so today the mark reduces to the generation-state and `K`/`T` ro
 `[OPEN: O6]`, read from `[storage].retired_generations_keep` / `retired_generations_ttl_h`
 (provisional defaults `2` / `168 h`, not normative).
 
+As-built note (T06-02, `[SPEC]`): the **sweep phase** — the batched, mutating deletion — is
+`local_rag_store::retention::{run_sweep, plan_sweep}` over the mark phase above. It walks the
+delete order verbatim (occurrences/edges → generation_file/skipped_file → generation → then the
+`file_revision` sweep); `resolved_graph_edge` is deleted before
+`generation_unit_occurrence` because the edge foreign-keys the occurrence (`foreign_keys=ON`
+enforces this order at runtime). As-built decisions that close gaps this section leaves implicit:
+(1) **candidate = `state ∈ {retiring, failed}` AND not pinned.** The GC-eligible states are
+exactly the two 04 §1 names; the state guard also means a concurrently built `building`/`active`
+generation is never swept from a stale pin snapshot. The store-wide pin set is the union of every
+worktree's [`pinned_generation_roots`], so a generation pinned in any worktree survives.
+(2) **Reachability closure:** a `file_revision` is swept only when no *surviving* (non-candidate)
+`generation_file` references it and it is not in `ExternalPins::referenced_file_revisions` — this
+is the "shared revision retained until final ref" invariant (a rename/content-shared revision
+outlives the retirement of any single generation). A `content_blob` is swept once no surviving
+`parsed_unit` references it. (3) **Batch ceiling `[SPEC ≤ 500 rows/tx]`** is realized as
+`DELETE … WHERE rowid IN (SELECT rowid … WHERE <pred> LIMIT n)` — portable, never depending on
+`SQLITE_ENABLE_UPDATE_DELETE_LIMIT` — with `n = SWEEP_BATCH_ROWS` (`500`, tunable via
+`run_sweep_with_batch`). The `parsed_unit` delete is **leaf-first** (each batch removes only rows
+no not-yet-deleted orphan unit still names as `parent_unit_id`), so the self-referential foreign
+key stays satisfied at every statement boundary even when a nested unit tree spans batches.
+(4) **Resumable without a progress table:** each batch is its own committed transaction and the
+sweepable sets are recomputed from the live database on every call, so an interruption between
+batches — a returned error or a hard `SIGABRT` — is healed by simply re-running `run_sweep`;
+already-deleted rows match nothing, deletions are monotone, and re-running converges. The
+scratch sets live in connection-local `temp` tables (never part of `state.sqlite`).
+(5) **Dry run (`plan_sweep`) mutates nothing:** it runs the same scratch-set setup and per-phase
+counts inside one writer transaction that touches only the `temp` schema (read-only connections
+are `query_only` and cannot create temp tables), so no canonical row and no main-database WAL
+frame is written. Shard/FTS rows for swept generations are **not** touched here — they disappear
+via desired-set reconciliation (05 §8), never as part of a sweep.
+
 ## 6. Non-git roots
 
 `kind='non_git'` worktrees reconcile identically minus git triggers (watcher + periodic only).
