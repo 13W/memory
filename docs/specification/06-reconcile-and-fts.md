@@ -32,6 +32,45 @@ and the internal `.git` is pruned unconditionally. Non-git worktrees set `requir
 `.gitignore` is still honored (§6 parity). An optional `prune_roots` excludes nested registered
 worktrees (the daemon supplies them, T05-04). No git binary/crate is used (guardrail until T15).
 
+As-built note (T05-04, `[SPEC]`): the scheduler is `local_rag_index::reconcile::{schedule, driver,
+watcher}`. It is split so a **live** filesystem watcher never makes the timing untestable:
+
+- **Engine (pure, `schedule`).** `Debouncer` is a pure state machine parameterized by an explicit
+  monotonic `now_ms: i64` (mirroring `build_generation(.., now_ms)` and `uuidv7_from(now_ms, ..)`).
+  It coalesces triggers into one pending request, escalates the scan mode (`Strict` wins), resets the
+  quiet window on each debounced event, and self-injects the periodic backstop. The intervals are
+  index-crate constants `DEBOUNCE_MS = 500` `[SPEC: 500 ms quiet window]` and
+  `PERIODIC_MS = 6 h` `[SPEC: every 6 h while open]` (a `ScheduleConfig`), deliberately **not** added
+  to `core::config::Config`, so spec 02 §3.1 and its pinned `default_matches_spec_toml` stay frozen.
+- **Trigger taxonomy.** `Startup`/`Periodic`/`Manual`/`WatcherOverflow` bypass the debounce and select
+  `ScanMode::Strict`; `Manual` is the "reindex" force. `FsChange`/`GitHead` are debounced and select
+  `ScanMode::Fast`. `WatcherOverflow` is a mandatory immediate `Strict` (`[FIXED]` "never resync from
+  events"). `GitHead` is dropped for non-git worktrees (§6).
+- **Watcher = hint (`watcher`).** `watch_event_to_trigger(&WatchEvent, is_git)` is a pure, tested
+  mapping (`Rescan → WatcherOverflow`; a `.git`-touching path → `GitHead` on git worktrees, else
+  `FsChange`). The live `notify` wrapper (`spawn_watcher`) lowers `notify::Event → WatchEvent` and is
+  intentionally excluded from CI (its event timing is not reproducible); reconcile — not the event
+  stream — is the truth.
+- **Driver (`driver`).** One `WorktreeReconciler` task per worktree owns the advisory `StatCache`, runs
+  a `biased` `select!` (timer vs trigger), and on a due deadline runs one `reconcile_once` (`scan →
+  build_generation`) **to completion** before re-arming — the "one writer per worktree" write side
+  (spec 02 §5 L2), realized structurally by the single owning task (no explicit `RwLock`; the L2 read
+  side and the projection switch are later groups). Triggers arriving during a build stay buffered and
+  are coalesced into at most one follow-up, so concurrent triggers make exactly one next generation. On
+  graceful shutdown (all trigger senders dropped) a scheduled reconcile is flushed. Cancellation is
+  drop-safe at the state-writer tx boundary (spec 02 §4.3): each `db.writer().transaction().await` is
+  atomic, so a dropped in-flight reconcile leaves only an abandoned `building`/`projection_ready`
+  generation (a disjoint row set, never activated), and any already-active generation is untouched.
+- **Registry composition.** `load_worktree_meta`/`nested_prune_roots` build `WorktreeMeta`
+  (`worktree_id`, `root` via `current_worktree_path`, `kind`, `prune_roots`) from existing store
+  readers. `prune_roots` are the **same-repo** nested worktrees under the root (no global cross-repo
+  enumeration exists; a foreign nested checkout's own `.git` is still pruned). `CaseSensitivity` is
+  **not persisted** — the daemon supplies it out-of-band. The scheduler builds on the T05-03 builder,
+  whose `uuids` seam was tightened to `&(dyn UuidSource + Send + Sync)` so the reconcile future is
+  `Send`-spawnable (a behavior-preserving bound tightening). It **stops at `projection_ready`** — no
+  activation (group 07) and no typed failure/backoff bookkeeping (T05-05, which only reuses the
+  builder's existing `building → failed`).
+
 ## 2. Reconcile pipeline `[FIXED]`
 
 Under the per-worktree write lock (single writer per worktree; store-level lockfile at L0):
