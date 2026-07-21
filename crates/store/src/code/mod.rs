@@ -58,6 +58,7 @@ pub use revision::{
     SourceCompression, UnitKind, content_blob_exists, create_or_reuse_content_blob,
     create_or_reuse_parsed_unit, file_revision_id_by_content_key, insert_content_blob,
     insert_file_revision, insert_parsed_unit, parsed_unit_id_by_natural_key,
+    parsed_units_for_revision,
 };
 pub use source::{
     PreparedSource, RevisionOutcome, SOURCE_ENCODING_UTF8, SOURCE_ZSTD_LEVEL, content_hash,

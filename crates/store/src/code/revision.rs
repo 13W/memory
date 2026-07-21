@@ -405,6 +405,30 @@ pub fn parsed_unit_id_by_natural_key(
     .optional()
 }
 
+/// Every `unit_id` of a file revision, in a deterministic order (spec 03 §2.3).
+///
+/// Ordered by `(span_start, span_end, unit_kind, unit_id)` so the result is stable
+/// regardless of insertion order. This is the read the reconcile generation builder
+/// (group 05) uses to re-derive a **reused** revision's occurrences without
+/// re-parsing: a `file_revision` shared by content across generations already has
+/// its `parsed_unit` rows, so the builder reads their ids and mints a
+/// per-generation `occurrence` for each (occurrence identity is order-independent,
+/// so the ordering here is only for tidy, reproducible output).
+pub fn parsed_units_for_revision(
+    conn: &Connection,
+    file_revision_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT unit_id FROM parsed_unit \
+         WHERE file_revision_id = ?1 \
+         ORDER BY span_start, span_end, unit_kind, unit_id",
+    )?;
+    let ids = stmt
+        .query_map(params![file_revision_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 /// Reuse the existing `parsed_unit` for `unit`'s natural key, or insert a new one
 /// under `unit.unit_id` (spec 03 §2.3, 06 §2 structural sharing).
 ///

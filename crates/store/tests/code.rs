@@ -19,7 +19,7 @@ use local_rag_store::code::{
     file_revision_id_by_content_key, insert_content_blob, insert_file_revision,
     insert_generation_file, insert_occurrence, insert_parsed_unit, insert_resolved_edge,
     insert_skipped_file, insert_unresolved_reference, member_file_revision,
-    parsed_unit_id_by_natural_key, skip_reason,
+    parsed_unit_id_by_natural_key, parsed_units_for_revision, skip_reason,
 };
 use local_rag_store::registry::{WorktreeKind, create_repository, create_worktree};
 use local_rag_store::rusqlite::Error;
@@ -156,6 +156,79 @@ async fn seed_unit(db: &StateDb, seed: u8, revision: &str) -> String {
         .await
         .expect("seed unit");
     unit
+}
+
+/// [`parsed_units_for_revision`] returns every unit of a revision ordered by span
+/// (not insertion order), and an empty vec for an unknown revision — the read the
+/// group-05 builder uses to re-derive a reused revision's occurrences.
+#[tokio::test]
+async fn parsed_units_for_revision_lists_units_in_span_order() {
+    let (_home, db) = open_state();
+    let rev = seed_revision(&db, 50, "ch-units", "lang=rust;grammar=rs@1").await;
+    let blob = uuid(60);
+    let (unit_a, unit_b) = (uuid(61), uuid(62));
+
+    // Insert the later-span unit FIRST, so a span-ordered result proves ordering
+    // is by span, not insertion order.
+    let (b, ua, ub, r) = (blob, unit_a.clone(), unit_b.clone(), rev.clone());
+    db.writer()
+        .transaction(move |tx| {
+            insert_content_blob(
+                tx,
+                &NewContentBlob {
+                    blob_id: &b,
+                    language: "rust",
+                    algo_version: 1,
+                    normalization_version: 1,
+                },
+                1000,
+            )?;
+            insert_parsed_unit(
+                tx,
+                &NewParsedUnit {
+                    unit_id: &ub,
+                    file_revision_id: &r,
+                    unit_kind: UnitKind::Symbol,
+                    syntax_locator: "fn:b",
+                    blob_id: &b,
+                    span_start: 10,
+                    span_end: 20,
+                    local_name: Some("b"),
+                    kind: Some("fn"),
+                    parent_unit_id: None,
+                },
+            )?;
+            insert_parsed_unit(
+                tx,
+                &NewParsedUnit {
+                    unit_id: &ua,
+                    file_revision_id: &r,
+                    unit_kind: UnitKind::Symbol,
+                    syntax_locator: "fn:a",
+                    blob_id: &b,
+                    span_start: 0,
+                    span_end: 6,
+                    local_name: Some("a"),
+                    kind: Some("fn"),
+                    parent_unit_id: None,
+                },
+            )
+        })
+        .await
+        .expect("seed two units");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        parsed_units_for_revision(&read, &rev).expect("read units"),
+        vec![unit_a, unit_b],
+        "units ordered by span_start, independent of insertion order",
+    );
+    assert!(
+        parsed_units_for_revision(&read, "unknown-revision")
+            .expect("read")
+            .is_empty(),
+        "an unknown revision has no units",
+    );
 }
 
 /// Happy path: insert a revision, blob, unit, membership, and occurrence; read

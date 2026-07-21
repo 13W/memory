@@ -57,6 +57,31 @@ re-embedding of known content, but cost ∝ reading/verifying the changed tree +
 occurrences/graph. Rename is free **only** for content embeddings (occurrence context and FTS
 rows change) `[FIXED]`.
 
+As-built note (T05-03, `[SPEC]`): the "build generation N+1" body is
+`local_rag_index::reconcile::build_generation`, consuming the T05-02 `ScanManifest`. It allocates a
+`building` generation, then per manifest entry: a `huge` entry (no `content_hash`) becomes
+`skipped_file(reason='huge')` unread; a **structural-sharing** pre-check
+(`file_revision_id_by_content_key(content_hash, parser_fingerprint)` on a read connection) reuses an
+existing `file_revision` and its `parsed_unit`s with **no read and no parse** (this is what makes
+"editing one file does not duplicate units of unchanged files" hold, and a rename reuse content but
+mint fresh path-scoped occurrences); otherwise the file is read once, `classify`d
+(`lfs`/`binary`/`encoding`/`secret` → `skipped_file`), and — if indexed — `prepare_source` +
+`parser_for(lang).parse` + `persist_parse_output` create the revision/units, followed by the
+`generation_file` member and one deterministic occurrence per unit. Each file is one transaction
+(the bounded phase); allocation and the final `building → projection_ready` transition are their own
+transactions, so the generation reaches `projection_ready` **only** once every entry is persisted.
+The IO/CPU (read, classify, prepare, parse) runs off the single writer thread; only the SQLite
+writes are in the transaction closure. On any error the generation is transitioned to `failed`
+(best-effort) and, because it is a distinct row set, no previously-built generation is mutated;
+retry allocates a fresh generation and de-duplicates content via `create_or_reuse_*`, so replays add
+no duplicate rows. **Deferral:** a file whose extension selects no v0 language
+(`select_language` → `None`) is neither indexed nor recorded as a skip — the language-agnostic
+`config_section | text_section | fallback_chunk` path (§2.1) is a later task, and there is no
+`skipped_file` reason for "unsupported"; the builder counts these as `files_deferred`. T05-03
+**stops at `projection_ready`**: activation, `worktree.current_generation_id`, and
+`worktree_projection_state` are the projection switch (05 §5, a later group). `occurrence`
+`qualified_name`/`context_hash` are left `NULL` (enrichment is search/§4, a later task).
+
 ### 2.1 Parsing rules
 
 - tree-sitter; language chosen by extension/path (consequence: same bytes as `.c` vs `.cpp` are
