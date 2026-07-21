@@ -100,6 +100,7 @@ mod clock;
 pub mod code;
 pub mod migrate;
 pub mod registry;
+pub mod retention;
 mod state;
 
 pub use cache::{
@@ -134,5 +135,9 @@ pub use registry::{
     repo_data_policy, repo_settings, resolve, set_current_generation, set_repo_data_policy,
     set_repo_setting, transition_generation, transition_worktree_state, worktree_path_history,
     worktree_state, worktree_summary, worktrees_of_repo,
+};
+pub use retention::{
+    ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams,
+    generation_meta_for_worktree, mark_pins, pinned_generation_roots,
 };
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};

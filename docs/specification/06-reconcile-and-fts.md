@@ -221,6 +221,27 @@ Generation deletion order: occurrences/edges → generation_file/skipped_file �
 then file_revision sweep. Shard/FTS rows for retired generations disappear naturally via
 desired-set reconciliation (they are never part of an expected set).
 
+As-built note (T06-01, `[SPEC]`): the **mark phase** — computing the pinned generation roots,
+not the sweep — is `local_rag_store::retention` (`mark_pins` pure core + `pinned_generation_roots`
+/ `generation_meta_for_worktree` DB readers; the batched, mutating sweep is T06-02). It is a pure
+function of an explicit `now_ms: i64` returning sorted `BTreeSet`s, mirroring the codebase's other
+time-as-a-parameter seams. As-built decisions that close gaps this section leaves implicit:
+(1) the pin roots pinned unconditionally are `state ∈ {active, building, projection_ready}`; the
+retention window applies **only** to `retiring` generations. (2) `failed` generations are **not**
+pinned by retention — the pin list above names only "retired" generations, and 04 §1 marks both
+`retiring` and `failed` as GC targets; a failed build's shared content still survives via the
+`active` generation's references (structural sharing, §2), so only its genuinely orphaned rows are
+swept. (`failed` can still be pinned transitively by an external reference or a lease.) (3) `K`
+(last-K) and the window `T` are a **union** (the spec's "OR"), the most protective reading for the
+"rollback/debug" intent. (4) the window `T` is measured against `generation.created_at` with an
+inclusive lower edge (`created_at ≥ now − T`): the `generation` table has no `retired_at` column
+(03 §2.1) and adding one is a numbered migration, out of scope for a pure mark phase; `K` needs no
+timestamp and is the primary mechanism. (5) memory-evidence / audit / export references and active
+job leases enter through an `ExternalPins` seam that defaults to empty — those subsystems are later
+groups (14/16), so today the mark reduces to the generation-state and `K`/`T` roots. `K`/`T` remain
+`[OPEN: O6]`, read from `[storage].retired_generations_keep` / `retired_generations_ttl_h`
+(provisional defaults `2` / `168 h`, not normative).
+
 ## 6. Non-git roots
 
 `kind='non_git'` worktrees reconcile identically minus git triggers (watcher + periodic only).
