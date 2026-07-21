@@ -9,6 +9,7 @@
 //! honoring ADR-0001 ("the choice lives in data/config, not the parser core").
 
 pub mod javascript;
+pub mod rust;
 pub mod typescript;
 
 use std::collections::{HashMap, HashSet};

@@ -726,6 +726,354 @@
         }
       ],
       "expected_unresolved": []
+    },
+    {
+      "id": "parser.rs.declarations",
+      "title": "Core Rust item kinds each become a symbol unit",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored); Rust adapter over tree-sitter-rust"
+      },
+      "language": "rust",
+      "category": "syntax",
+      "source": "pub fn foo(a: u8) -> u8 { a }\nstruct Bar {}\nenum E { A }\ntrait T {}\nconst C: u8 = 1;\nstatic S: u8 = 2;\ntype Alias = u8;\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 120,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 29,
+          "local_name": "foo",
+          "kind": "function",
+          "anchor": "p:function:foo",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 30,
+          "span_end": 43,
+          "local_name": "Bar",
+          "kind": "struct",
+          "anchor": "p:struct:Bar",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 44,
+          "span_end": 56,
+          "local_name": "E",
+          "kind": "enum",
+          "anchor": "p:enum:E",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 57,
+          "span_end": 67,
+          "local_name": "T",
+          "kind": "trait",
+          "anchor": "p:trait:T",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 68,
+          "span_end": 84,
+          "local_name": "C",
+          "kind": "const",
+          "anchor": "p:const:C",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 85,
+          "span_end": 102,
+          "local_name": "S",
+          "kind": "static",
+          "anchor": "p:static:S",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 103,
+          "span_end": 119,
+          "local_name": "Alias",
+          "kind": "type_alias",
+          "anchor": "p:type_alias:Alias",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.rs.impl",
+      "title": "impl methods are parented and routed through the Self type",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored)"
+      },
+      "language": "rust",
+      "category": "syntax",
+      "source": "struct Host;\nimpl Host {\n    fn method(&self) {}\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 51,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 12,
+          "local_name": "Host",
+          "kind": "struct",
+          "anchor": "p:struct:Host",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 13,
+          "span_end": 50,
+          "local_name": "Host",
+          "kind": "impl",
+          "anchor": "p:impl:Host",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 29,
+          "span_end": 48,
+          "local_name": "method",
+          "kind": "function",
+          "anchor": "p:impl:Host/function:method",
+          "parent": 2
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.rs.nesting",
+      "title": "Items nested in a module are parented to the module",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored)"
+      },
+      "language": "rust",
+      "category": "syntax",
+      "source": "mod outer {\n    fn inner() {}\n    struct Inner;\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 50,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 49,
+          "local_name": "outer",
+          "kind": "mod",
+          "anchor": "p:mod:outer",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 16,
+          "span_end": 29,
+          "local_name": "inner",
+          "kind": "function",
+          "anchor": "p:mod:outer/function:inner",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 34,
+          "span_end": 47,
+          "local_name": "Inner",
+          "kind": "struct",
+          "anchor": "p:mod:outer/struct:Inner",
+          "parent": 1
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.rs.use",
+      "title": "use paths become classified unresolved references",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored)"
+      },
+      "language": "rust",
+      "category": "syntax",
+      "source": "use std::fmt;\npub use crate::x::Y;\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 35,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": [
+        {
+          "source_unit": 0,
+          "reference_text": "std::fmt",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "crate::x::Y",
+          "reference_kind": "reexport"
+        }
+      ]
+    },
+    {
+      "id": "parser.rs.empty",
+      "title": "An empty Rust file is a single empty file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored)"
+      },
+      "language": "rust",
+      "category": "empty",
+      "source": "",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 0,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.rs.whitespace",
+      "title": "A whitespace-only Rust file is a single file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored)"
+      },
+      "language": "rust",
+      "category": "empty",
+      "source": "   \n\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 5,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.rs.error",
+      "title": "Malformed Rust recovers symbols and yields a fallback chunk",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored)"
+      },
+      "language": "rust",
+      "category": "error",
+      "source": "fn ok() {}\nfn @@@ broken(\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 26,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 10,
+          "local_name": "ok",
+          "kind": "function",
+          "anchor": "p:function:ok",
+          "parent": null
+        },
+        {
+          "unit_kind": "fallback_chunk",
+          "span_start": 11,
+          "span_end": 25,
+          "local_name": null,
+          "kind": "error",
+          "anchor": "o:2",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.rs.unicode",
+      "title": "Rust byte spans are byte offsets across multi-byte characters",
+      "status": "active",
+      "provenance": {
+        "source": "T04-05 (authored)"
+      },
+      "language": "rust",
+      "category": "unicode",
+      "source": "const S: &str = \"café☕\";\nfn café() {}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 42,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 27,
+          "local_name": "S",
+          "kind": "const",
+          "anchor": "p:const:S",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 28,
+          "span_end": 41,
+          "local_name": "café",
+          "kind": "function",
+          "anchor": "p:function:café",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
     }
   ]
 }
