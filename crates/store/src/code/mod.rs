@@ -44,17 +44,19 @@ mod source;
 
 pub use membership::{
     EdgeResolution, NewOccurrence, NewResolvedEdge, NewUnresolvedReference, SkipReason,
-    insert_generation_file, insert_occurrence, insert_resolved_edge, insert_skipped_file,
-    insert_unresolved_reference, member_file_revision, skip_reason,
+    delete_unresolved_references_for_revision, insert_generation_file, insert_occurrence,
+    insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
+    skip_reason,
 };
 pub use normalize::{
     ALGO_VERSION, DerivedContentBlob, NORMALIZATION_VERSION, content_blob_id, derive_content_blob,
     normalize,
 };
 pub use revision::{
-    BlobOutcome, NewContentBlob, NewFileRevision, NewParsedUnit, NewlineStyle, SourceCompression,
-    UnitKind, content_blob_exists, create_or_reuse_content_blob, file_revision_id_by_content_key,
-    insert_content_blob, insert_file_revision, insert_parsed_unit,
+    BlobOutcome, NewContentBlob, NewFileRevision, NewParsedUnit, NewlineStyle, ParsedUnitOutcome,
+    SourceCompression, UnitKind, content_blob_exists, create_or_reuse_content_blob,
+    create_or_reuse_parsed_unit, file_revision_id_by_content_key, insert_content_blob,
+    insert_file_revision, insert_parsed_unit, parsed_unit_id_by_natural_key,
 };
 pub use source::{
     PreparedSource, RevisionOutcome, SOURCE_ENCODING_UTF8, SOURCE_ZSTD_LEVEL, content_hash,

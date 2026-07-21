@@ -19,14 +19,13 @@ use serde::Deserialize;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
-    JavaScriptParser, LanguageId, LanguageParser, RustParser, SyntaxAnchor, SyntaxLocator,
-    TypeScriptParser, parser_fingerprint,
+    JavaScriptParser, LanguageId, LanguageParser, RustParser, SyntaxAnchor, TypeScriptParser,
+    parser_fingerprint, persist_parse_output,
 };
 use local_rag_store::StateDb;
 use local_rag_store::code::{
-    NewOccurrence, NewParsedUnit, RevisionOutcome, UnitKind, create_or_reuse_content_blob,
-    create_or_reuse_file_revision, derive_content_blob, insert_generation_file, insert_occurrence,
-    insert_parsed_unit, prepare_source,
+    NewOccurrence, RevisionOutcome, create_or_reuse_file_revision, insert_generation_file,
+    insert_occurrence, prepare_source,
 };
 use local_rag_store::registry::{WorktreeKind, create_repository, create_worktree};
 use local_rag_test_support::TempHome;
@@ -295,21 +294,6 @@ fn uuid(seed: u16) -> String {
     uuidv7_from(1000, rand).to_string()
 }
 
-/// One persistable unit, precomputed off the writer thread (all fields owned).
-struct UnitRow {
-    unit_id: String,
-    unit_kind: UnitKind,
-    locator: String,
-    derived: local_rag_store::code::DerivedContentBlob,
-    blob_id: String,
-    span_start: i64,
-    span_end: i64,
-    local_name: Option<String>,
-    kind: Option<String>,
-    parent_unit_id: Option<String>,
-    occurrence_id: String,
-}
-
 #[tokio::test]
 async fn every_produced_unit_kind_is_searchable() {
     // A source that yields all TypeScript unit kinds this adapter produces:
@@ -325,36 +309,12 @@ async fn every_produced_unit_kind_is_searchable() {
     assert!(produced.contains("symbol"));
     assert!(produced.contains("fallback_chunk"));
 
-    // Precompute ids and per-unit rows (pure; off the writer thread).
-    let unit_ids: Vec<String> = (0..out.units.len()).map(|i| uuid(500 + i as u16)).collect();
+    // The content side goes through the T04-06 orchestrator; occurrences (group 05)
+    // are then keyed off the unit ids it returns.
+    let candidate_ids: Vec<String> = (0..out.units.len()).map(|i| uuid(500 + i as u16)).collect();
+    let occ_ids: Vec<String> = (0..out.units.len()).map(|i| uuid(900 + i as u16)).collect();
     let fingerprint = parser.parser_fingerprint();
     let rev_id = uuid(10);
-    let rows: Vec<UnitRow> = out
-        .units
-        .iter()
-        .enumerate()
-        .map(|(i, u)| {
-            let slice = &source[u.span.start as usize..u.span.end as usize];
-            let derived = derive_content_blob("typescript", slice);
-            let blob_id = derived.blob_id.clone();
-            let locator =
-                SyntaxLocator::from_draft(u.locator_draft(LanguageId::TypeScript), blob_id.clone())
-                    .serialize();
-            UnitRow {
-                unit_id: unit_ids[i].clone(),
-                unit_kind: u.unit_kind,
-                locator,
-                derived,
-                blob_id,
-                span_start: u.span.start as i64,
-                span_end: u.span.end as i64,
-                local_name: u.local_name.clone(),
-                kind: u.lang_kind.clone(),
-                parent_unit_id: u.parent.map(|p| unit_ids[p].clone()),
-                occurrence_id: uuid(900 + i as u16),
-            }
-        })
-        .collect();
 
     let (_home, db) = open_state();
     let prepared = prepare_source(source.as_bytes());
@@ -363,6 +323,8 @@ async fn every_produced_unit_kind_is_searchable() {
     let generation_id = uuid(3);
     let norm_path = "src/app.ts".to_string();
     let display_path = norm_path.clone();
+    let src_bytes = source.as_bytes().to_vec();
+    let out_c = out.clone();
 
     let (g_for_read, path_for_read) = (generation_id.clone(), norm_path.clone());
     db.writer()
@@ -378,31 +340,24 @@ async fn every_produced_unit_kind_is_searchable() {
             let rev = create_or_reuse_file_revision(tx, &prepared, &fingerprint, &rev_id, 1000)?;
             let rev_id = rev.id().to_string();
             insert_generation_file(tx, &generation_id, &norm_path, &display_path, &rev_id)?;
-            for row in &rows {
-                create_or_reuse_content_blob(tx, &row.derived, "typescript", 1000)?;
-                insert_parsed_unit(
-                    tx,
-                    &NewParsedUnit {
-                        unit_id: &row.unit_id,
-                        file_revision_id: &rev_id,
-                        unit_kind: row.unit_kind,
-                        syntax_locator: &row.locator,
-                        blob_id: &row.blob_id,
-                        span_start: row.span_start,
-                        span_end: row.span_end,
-                        local_name: row.local_name.as_deref(),
-                        kind: row.kind.as_deref(),
-                        parent_unit_id: row.parent_unit_id.as_deref(),
-                    },
-                )?;
+            let persisted = persist_parse_output(
+                tx,
+                &rev_id,
+                LanguageId::TypeScript,
+                &src_bytes,
+                &out_c,
+                &candidate_ids,
+                1000,
+            )?;
+            for (i, unit) in out_c.units.iter().enumerate() {
                 insert_occurrence(
                     tx,
                     &NewOccurrence {
-                        occurrence_id: &row.occurrence_id,
+                        occurrence_id: &occ_ids[i],
                         generation_id: &generation_id,
                         normalized_path: &norm_path,
-                        unit_id: &row.unit_id,
-                        qualified_name: row.local_name.as_deref(),
+                        unit_id: &persisted.unit_ids[i],
+                        qualified_name: unit.local_name.as_deref(),
                         context_hash: None,
                     },
                 )?;

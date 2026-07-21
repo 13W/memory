@@ -351,6 +351,91 @@ pub fn insert_parsed_unit(tx: &Transaction<'_>, unit: &NewParsedUnit<'_>) -> rus
     Ok(())
 }
 
+/// The outcome of [`create_or_reuse_parsed_unit`]: whether an existing unit was
+/// reused or a new one created. Either way [`ParsedUnitOutcome::id`] is the
+/// `unit_id` to reference (as a `parent_unit_id` or an occurrence's `unit_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedUnitOutcome {
+    /// A `parsed_unit` matching the natural key already existed; its `unit_id`.
+    Reused(String),
+    /// A new `parsed_unit` row was inserted under the caller's `unit_id`.
+    Created(String),
+}
+
+impl ParsedUnitOutcome {
+    /// The `unit_id` to reference, regardless of reuse vs create.
+    pub fn id(&self) -> &str {
+        match self {
+            ParsedUnitOutcome::Reused(id) | ParsedUnitOutcome::Created(id) => id,
+        }
+    }
+
+    /// Whether this outcome inserted a new row.
+    pub fn is_created(&self) -> bool {
+        matches!(self, ParsedUnitOutcome::Created(_))
+    }
+}
+
+/// The `unit_id` for a `parsed_unit` natural key, if one exists (spec 03 §2.3).
+///
+/// The natural key is the table's `UNIQUE (file_revision_id, unit_kind,
+/// syntax_locator, span_start, span_end)`. This is the read half of
+/// [`create_or_reuse_parsed_unit`]; here it is a plain unique-key lookup.
+pub fn parsed_unit_id_by_natural_key(
+    conn: &Connection,
+    file_revision_id: &str,
+    unit_kind: UnitKind,
+    syntax_locator: &str,
+    span_start: i64,
+    span_end: i64,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT unit_id FROM parsed_unit \
+         WHERE file_revision_id = ?1 AND unit_kind = ?2 AND syntax_locator = ?3 \
+           AND span_start = ?4 AND span_end = ?5",
+        params![
+            file_revision_id,
+            unit_kind.as_str(),
+            syntax_locator,
+            span_start,
+            span_end,
+        ],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Reuse the existing `parsed_unit` for `unit`'s natural key, or insert a new one
+/// under `unit.unit_id` (spec 03 §2.3, 06 §2 structural sharing).
+///
+/// The reuse key is the `UNIQUE (file_revision_id, unit_kind, syntax_locator,
+/// span_start, span_end)` tuple — not `unit_id`, which is a fresh UUIDv7 the caller
+/// mints unconditionally and which is consumed only on the create path. Like
+/// [`create_or_reuse_content_blob`] and
+/// [`create_or_reuse_file_revision`](super::source::create_or_reuse_file_revision),
+/// the plain SELECT-then-INSERT is race-free under the single bounded writer (spec
+/// 02 §5) and idempotent on retry: a replay of the same parse finds the row and
+/// returns [`ParsedUnitOutcome::Reused`] with no duplicate, so re-persisting an
+/// unchanged file revision reuses every unit id (the stability the deterministic
+/// `occurrence_id` of group 05 builds on).
+pub fn create_or_reuse_parsed_unit(
+    tx: &Transaction<'_>,
+    unit: &NewParsedUnit<'_>,
+) -> rusqlite::Result<ParsedUnitOutcome> {
+    if let Some(existing) = parsed_unit_id_by_natural_key(
+        tx,
+        unit.file_revision_id,
+        unit.unit_kind,
+        unit.syntax_locator,
+        unit.span_start,
+        unit.span_end,
+    )? {
+        return Ok(ParsedUnitOutcome::Reused(existing));
+    }
+    insert_parsed_unit(tx, unit)?;
+    Ok(ParsedUnitOutcome::Created(unit.unit_id.to_string()))
+}
+
 /// The `file_revision_id` for a `(content_hash, parser_fingerprint)` reuse key,
 /// if one exists (spec 03 §2.3).
 ///

@@ -229,6 +229,24 @@ pub fn insert_unresolved_reference(
     Ok(())
 }
 
+/// Delete every `unresolved_reference` row for a file revision, returning the
+/// number removed (spec 03 §2.4).
+///
+/// `unresolved_reference` has no natural key (a file may legitimately repeat a
+/// specifier, e.g. two `import "x"`), so idempotent re-persistence of a revision's
+/// references is a scoped clear-then-reinsert rather than a per-row create-or-reuse.
+/// The scan is served by the `unresolved_by_rev` index. Run inside the same
+/// transaction as the reinsert so a retry converges on the identical row set.
+pub fn delete_unresolved_references_for_revision(
+    tx: &Transaction<'_>,
+    file_revision_id: &str,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "DELETE FROM unresolved_reference WHERE file_revision_id = ?1",
+        params![file_revision_id],
+    )
+}
+
 /// A row to insert into `resolved_graph_edge` (spec 03 §2.4).
 ///
 /// Per generation, on occurrence ids. `edge_kind` is an open-ended label
