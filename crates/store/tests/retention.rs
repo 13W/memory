@@ -22,8 +22,12 @@ use local_rag_store::registry::{
     transition_generation,
 };
 use local_rag_store::{
-    ExternalPins, JobLease, RetentionParams, StateDb, generation_meta_for_worktree, mark_pins,
-    pinned_generation_roots,
+    EdgeResolution, ExternalPins, JobLease, NewContentBlob, NewFileRevision, NewOccurrence,
+    NewParsedUnit, NewResolvedEdge, NewUnresolvedReference, NewlineStyle, RetentionParams,
+    SkipReason, SourceCompression, StateDb, SweepReport, UnitKind, generation_meta_for_worktree,
+    insert_content_blob, insert_file_revision, insert_generation_file, insert_occurrence,
+    insert_parsed_unit, insert_resolved_edge, insert_skipped_file, insert_unresolved_reference,
+    mark_pins, pinned_generation_roots, plan_sweep, run_sweep, run_sweep_with_batch,
 };
 use local_rag_test_support::TempHome;
 
@@ -259,4 +263,592 @@ async fn empty_worktree_pins_nothing() {
         pinned_generation_roots(&read, &wt, &params, &ExternalPins::default(), 10_000).expect("r");
     assert!(roots.generations.is_empty());
     assert!(roots.referenced_file_revisions.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// T06-02 sweep tests. The content graph (revision/blob/unit/occurrence/edge) is
+// built directly through the `code`-side inserts (the group-05 generation builder
+// lives in the `index` crate and is not available here), mirroring how the group-03
+// code tests assemble fixtures. Ids for the content side are plain readable strings
+// (the columns are TEXT with no format check); generation ids come from the registry
+// helpers above.
+// ---------------------------------------------------------------------------
+
+/// Read a single `COUNT(*)` (or any scalar `i64`) over a fresh read connection.
+fn scalar(db: &StateDb, sql: &str) -> i64 {
+    let conn = db.open_read().expect("read conn");
+    conn.query_row(sql, [], |r| r.get(0)).expect("scalar query")
+}
+
+/// Rows in `table` (whole table).
+fn rows(db: &StateDb, table: &str) -> i64 {
+    scalar(db, &format!("SELECT COUNT(*) FROM {table}"))
+}
+
+/// Insert a `content_blob` identity row.
+async fn blob(db: &StateDb, blob_id: &str) {
+    let blob_id = blob_id.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            insert_content_blob(
+                tx,
+                &NewContentBlob {
+                    blob_id: &blob_id,
+                    language: "rust",
+                    algo_version: 1,
+                    normalization_version: 1,
+                },
+                1000,
+            )
+        })
+        .await
+        .expect("insert content_blob");
+}
+
+/// Insert a `file_revision`; `content_hash` must be distinct per revision (the
+/// `UNIQUE (content_hash, parser_fingerprint)` reuse key).
+async fn revision(db: &StateDb, rev_id: &str, content_hash: &str) {
+    let (rev_id, content_hash) = (rev_id.to_string(), content_hash.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            insert_file_revision(
+                tx,
+                &NewFileRevision {
+                    file_revision_id: &rev_id,
+                    content_hash: &content_hash,
+                    parser_fingerprint: "fp",
+                    source_blob: b"x",
+                    compression: SourceCompression::None,
+                    source_encoding: "utf-8",
+                    newline_style: NewlineStyle::Lf,
+                    source_size: 1,
+                },
+                1000,
+            )
+        })
+        .await
+        .expect("insert file_revision");
+}
+
+/// Insert a `parsed_unit` of `rev_id` (self-referencing `parent` for nested units).
+/// `unit_id` doubles as the `syntax_locator` so the natural key stays unique.
+async fn unit(db: &StateDb, unit_id: &str, rev_id: &str, blob_id: &str, parent: Option<&str>) {
+    let (unit_id, rev_id, blob_id, parent) = (
+        unit_id.to_string(),
+        rev_id.to_string(),
+        blob_id.to_string(),
+        parent.map(str::to_string),
+    );
+    db.writer()
+        .transaction(move |tx| {
+            insert_parsed_unit(
+                tx,
+                &NewParsedUnit {
+                    unit_id: &unit_id,
+                    file_revision_id: &rev_id,
+                    unit_kind: UnitKind::Symbol,
+                    syntax_locator: &unit_id,
+                    blob_id: &blob_id,
+                    span_start: 0,
+                    span_end: 1,
+                    local_name: None,
+                    kind: None,
+                    parent_unit_id: parent.as_deref(),
+                },
+            )
+        })
+        .await
+        .expect("insert parsed_unit");
+}
+
+/// Bind `path` in `generation_id` to `rev_id` (a `generation_file` member row).
+async fn gen_file(db: &StateDb, generation_id: &str, path: &str, rev_id: &str) {
+    let (g, p, r) = (
+        generation_id.to_string(),
+        path.to_string(),
+        rev_id.to_string(),
+    );
+    db.writer()
+        .transaction(move |tx| insert_generation_file(tx, &g, &p, &p, &r))
+        .await
+        .expect("insert generation_file");
+}
+
+/// Insert one occurrence of `unit_id` at `path` in `generation_id`.
+async fn occurrence(db: &StateDb, occ_id: &str, generation_id: &str, path: &str, unit_id: &str) {
+    let (occ, g, p, u) = (
+        occ_id.to_string(),
+        generation_id.to_string(),
+        path.to_string(),
+        unit_id.to_string(),
+    );
+    db.writer()
+        .transaction(move |tx| {
+            insert_occurrence(
+                tx,
+                &NewOccurrence {
+                    occurrence_id: &occ,
+                    generation_id: &g,
+                    normalized_path: &p,
+                    unit_id: &u,
+                    qualified_name: None,
+                    context_hash: None,
+                },
+            )
+        })
+        .await
+        .expect("insert occurrence");
+}
+
+/// Insert a `resolved_graph_edge` between two occurrences of `generation_id`.
+async fn edge(db: &StateDb, generation_id: &str, src: &str, dst: &str) {
+    let (g, s, d) = (generation_id.to_string(), src.to_string(), dst.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            insert_resolved_edge(
+                tx,
+                &NewResolvedEdge {
+                    generation_id: &g,
+                    src_occurrence_id: &s,
+                    dst_occurrence_id: &d,
+                    edge_kind: "import",
+                    resolution: EdgeResolution::Heuristic,
+                },
+            )
+        })
+        .await
+        .expect("insert resolved_graph_edge");
+}
+
+/// Insert a `skipped_file` row in `generation_id`.
+async fn skipped(db: &StateDb, generation_id: &str, path: &str) {
+    let (g, p) = (generation_id.to_string(), path.to_string());
+    db.writer()
+        .transaction(move |tx| insert_skipped_file(tx, &g, &p, SkipReason::Binary, None))
+        .await
+        .expect("insert skipped_file");
+}
+
+/// Insert an `unresolved_reference` from `unit_id` in `rev_id`.
+async fn unresolved(db: &StateDb, rev_id: &str, unit_id: &str) {
+    let (r, u) = (rev_id.to_string(), unit_id.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            insert_unresolved_reference(
+                tx,
+                &NewUnresolvedReference {
+                    file_revision_id: &r,
+                    source_unit_id: &u,
+                    reference_text: "dep",
+                    reference_kind: "import",
+                },
+            )
+        })
+        .await
+        .expect("insert unresolved_reference");
+}
+
+/// K=0 / T=0: pins nothing by the retention window, so every `retiring`/`failed`
+/// generation becomes a sweep candidate.
+fn sweep_everything_retired() -> RetentionParams {
+    RetentionParams {
+        keep_last_k: 0,
+        window_ms: 0,
+    }
+}
+
+/// A pinned (`active`) generation's rows — and the content it references — survive a
+/// sweep, while an unpinned `retiring` generation and its now-orphaned content go.
+#[tokio::test]
+async fn pinned_rows_survive() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+
+    // Pinned: an active generation with a full content graph.
+    let g_keep = allocate_at(&db, &wt, 10, 1000).await;
+    drive_to(&db, &g_keep, GenerationState::Active).await;
+    blob(&db, "blob-keep").await;
+    revision(&db, "rev-keep", "hash-keep").await;
+    unit(&db, "unit-keep", "rev-keep", "blob-keep", None).await;
+    gen_file(&db, &g_keep, "keep.rs", "rev-keep").await;
+    occurrence(&db, "occ-keep", &g_keep, "keep.rs", "unit-keep").await;
+    edge(&db, &g_keep, "occ-keep", "occ-keep").await;
+
+    // Candidate: a retiring generation with its own (distinct) content graph.
+    let g_drop = allocate_at(&db, &wt, 11, 1000).await;
+    drive_to(&db, &g_drop, GenerationState::Retiring).await;
+    blob(&db, "blob-drop").await;
+    revision(&db, "rev-drop", "hash-drop").await;
+    unit(&db, "unit-drop", "rev-drop", "blob-drop", None).await;
+    gen_file(&db, &g_drop, "drop.rs", "rev-drop").await;
+    occurrence(&db, "occ-drop", &g_drop, "drop.rs", "unit-drop").await;
+
+    let report = run_sweep(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+    )
+    .await
+    .expect("sweep");
+
+    // Only the retiring generation's rows were removed.
+    assert_eq!(report.generations, 1, "one generation swept");
+    assert_eq!(report.file_revisions, 1);
+    assert_eq!(report.content_blobs, 1);
+
+    // The pinned generation and everything it references is intact.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM generation WHERE generation_id = '{g_keep}'")
+        ),
+        1
+    );
+    assert_eq!(
+        rows(&db, "generation_file"),
+        1,
+        "only keep's membership remains"
+    );
+    assert_eq!(rows(&db, "generation_unit_occurrence"), 1);
+    assert_eq!(rows(&db, "resolved_graph_edge"), 1);
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM file_revision WHERE file_revision_id = 'rev-keep'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM parsed_unit WHERE unit_id = 'unit-keep'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM content_blob WHERE blob_id = 'blob-keep'"
+        ),
+        1
+    );
+
+    // The candidate's rows are all gone.
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) FROM generation WHERE generation_id = '{g_drop}'")
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM file_revision WHERE file_revision_id = 'rev-drop'"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM content_blob WHERE blob_id = 'blob-drop'"
+        ),
+        0
+    );
+}
+
+/// A wholly-unpinned generation with a complete graph (membership, skips,
+/// occurrences, edges, unresolved refs, nested units, revision, blob) is swept down
+/// to zero rows in every table.
+#[tokio::test]
+async fn orphan_graph_fully_removed() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+
+    let g = allocate_at(&db, &wt, 10, 1000).await;
+    drive_to(&db, &g, GenerationState::Retiring).await;
+
+    blob(&db, "blob").await;
+    revision(&db, "rev", "hash").await;
+    // A nested unit tree: root → child.
+    unit(&db, "unit-root", "rev", "blob", None).await;
+    unit(&db, "unit-child", "rev", "blob", Some("unit-root")).await;
+    unresolved(&db, "rev", "unit-root").await;
+    gen_file(&db, &g, "f.rs", "rev").await;
+    skipped(&db, &g, "vendor.bin").await;
+    occurrence(&db, "occ-root", &g, "f.rs", "unit-root").await;
+    occurrence(&db, "occ-child", &g, "f.rs", "unit-child").await;
+    edge(&db, &g, "occ-root", "occ-child").await;
+
+    let report = run_sweep(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(report.edges, 1);
+    assert_eq!(report.occurrences, 2);
+    assert_eq!(report.generation_files, 1);
+    assert_eq!(report.skipped_files, 1);
+    assert_eq!(report.generations, 1);
+    assert_eq!(report.unresolved_references, 1);
+    assert_eq!(report.parsed_units, 2);
+    assert_eq!(report.file_revisions, 1);
+    assert_eq!(report.content_blobs, 1);
+
+    for table in [
+        "resolved_graph_edge",
+        "generation_unit_occurrence",
+        "generation_file",
+        "skipped_file",
+        "generation",
+        "unresolved_reference",
+        "parsed_unit",
+        "file_revision",
+        "content_blob",
+    ] {
+        assert_eq!(rows(&db, table), 0, "{table} fully swept");
+    }
+}
+
+/// A content-shared `file_revision` survives while any pinned generation references
+/// it, and is swept only once its last referencing generation is gone.
+#[tokio::test]
+async fn shared_revision_retained_until_final_ref() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+
+    // One revision shared by two generations at two paths (structural sharing).
+    blob(&db, "blob-s").await;
+    revision(&db, "rev-s", "hash-s").await;
+    unit(&db, "unit-s", "rev-s", "blob-s", None).await;
+
+    let g_keep = allocate_at(&db, &wt, 10, 1000).await;
+    drive_to(&db, &g_keep, GenerationState::Active).await;
+    gen_file(&db, &g_keep, "a.rs", "rev-s").await;
+    occurrence(&db, "occ-keep", &g_keep, "a.rs", "unit-s").await;
+
+    let g_drop = allocate_at(&db, &wt, 11, 1000).await;
+    drive_to(&db, &g_drop, GenerationState::Retiring).await;
+    gen_file(&db, &g_drop, "b.rs", "rev-s").await;
+    occurrence(&db, "occ-drop", &g_drop, "b.rs", "unit-s").await;
+
+    // First sweep: the retiring generation goes, but the shared revision stays
+    // because the active generation still references it.
+    let r1 = run_sweep(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+    )
+    .await
+    .expect("sweep 1");
+    assert_eq!(r1.generations, 1);
+    assert_eq!(r1.file_revisions, 0, "shared revision retained");
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM file_revision WHERE file_revision_id = 'rev-s'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM parsed_unit WHERE unit_id = 'unit-s'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM content_blob WHERE blob_id = 'blob-s'"
+        ),
+        1
+    );
+
+    // Retire the last holder and sweep again: now the revision is orphaned.
+    db.writer()
+        .transaction({
+            let g = g_keep.clone();
+            move |tx| transition_generation(tx, &g, GenerationState::Retiring)
+        })
+        .await
+        .expect("transition tx")
+        .expect("active → retiring");
+
+    let r2 = run_sweep(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+    )
+    .await
+    .expect("sweep 2");
+    assert_eq!(r2.generations, 1);
+    assert_eq!(r2.file_revisions, 1, "revision swept after final ref");
+    assert_eq!(r2.parsed_units, 1);
+    assert_eq!(r2.content_blobs, 1);
+    assert_eq!(rows(&db, "file_revision"), 0);
+    assert_eq!(rows(&db, "parsed_unit"), 0);
+    assert_eq!(rows(&db, "content_blob"), 0);
+}
+
+/// A retiring generation pinned by an external `file_revision` reference keeps that
+/// revision even though the generation itself is swept.
+#[tokio::test]
+async fn external_revision_pin_retains_shared_content() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+
+    blob(&db, "blob-e").await;
+    revision(&db, "rev-e", "hash-e").await;
+    unit(&db, "unit-e", "rev-e", "blob-e", None).await;
+
+    let g = allocate_at(&db, &wt, 10, 1000).await;
+    drive_to(&db, &g, GenerationState::Retiring).await;
+    gen_file(&db, &g, "e.rs", "rev-e").await;
+    occurrence(&db, "occ-e", &g, "e.rs", "unit-e").await;
+
+    let external = ExternalPins {
+        referenced_file_revisions: BTreeSet::from(["rev-e".to_string()]),
+        ..ExternalPins::default()
+    };
+    let report = run_sweep(&db, &sweep_everything_retired(), &external, 2000)
+        .await
+        .expect("sweep");
+
+    // The generation and its membership/occurrence are swept, but the externally
+    // pinned revision (and its unit/blob) survive.
+    assert_eq!(report.generations, 1);
+    assert_eq!(report.file_revisions, 0);
+    assert_eq!(report.parsed_units, 0);
+    assert_eq!(report.content_blobs, 0);
+    assert_eq!(rows(&db, "file_revision"), 1);
+    assert_eq!(rows(&db, "parsed_unit"), 1);
+}
+
+/// A dry run reports the generations and rows it would delete and mutates no
+/// canonical row; a subsequent real sweep deletes exactly the reported counts.
+#[tokio::test]
+async fn dry_run_mutates_nothing() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+
+    let g = allocate_at(&db, &wt, 10, 1000).await;
+    drive_to(&db, &g, GenerationState::Retiring).await;
+    blob(&db, "blob").await;
+    revision(&db, "rev", "hash").await;
+    unit(&db, "unit", "rev", "blob", None).await;
+    gen_file(&db, &g, "f.rs", "rev").await;
+    occurrence(&db, "occ", &g, "f.rs", "unit").await;
+
+    let tables = [
+        "generation",
+        "generation_file",
+        "generation_unit_occurrence",
+        "file_revision",
+        "parsed_unit",
+        "content_blob",
+    ];
+    let before: Vec<i64> = tables.iter().map(|t| rows(&db, t)).collect();
+
+    let plan = plan_sweep(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+    )
+    .await
+    .expect("plan");
+
+    assert_eq!(plan.candidate_generations, vec![g.clone()]);
+    assert!(!plan.would_delete.is_empty(), "dry run projects deletions");
+    assert_eq!(plan.would_delete.generations, 1);
+    assert_eq!(plan.would_delete.file_revisions, 1);
+
+    // Nothing changed.
+    let after: Vec<i64> = tables.iter().map(|t| rows(&db, t)).collect();
+    assert_eq!(before, after, "dry run must not mutate canonical tables");
+
+    // The real sweep deletes exactly what the plan projected.
+    let report = run_sweep(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(report, plan.would_delete, "plan matches actual deletions");
+}
+
+/// A deep `parsed_unit` tree whose deletion spans several batches is removed
+/// leaf-first, so the self-referential `parent_unit_id` foreign key never dangles at
+/// a statement boundary even with a batch ceiling of one row.
+#[tokio::test]
+async fn deep_unit_tree_deleted_leaf_first_across_batches() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+
+    let g = allocate_at(&db, &wt, 10, 1000).await;
+    drive_to(&db, &g, GenerationState::Retiring).await;
+    blob(&db, "blob").await;
+    revision(&db, "rev", "hash").await;
+    // A five-deep chain: u1 (root) ← u2 ← u3 ← u4 ← u5.
+    unit(&db, "u1", "rev", "blob", None).await;
+    unit(&db, "u2", "rev", "blob", Some("u1")).await;
+    unit(&db, "u3", "rev", "blob", Some("u2")).await;
+    unit(&db, "u4", "rev", "blob", Some("u3")).await;
+    unit(&db, "u5", "rev", "blob", Some("u4")).await;
+    gen_file(&db, &g, "f.rs", "rev").await;
+
+    // Batch ceiling of 1 forces one leaf per statement — the strictest leaf-first case.
+    let report = run_sweep_with_batch(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+        1,
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(report.parsed_units, 5);
+    assert_eq!(report.file_revisions, 1);
+    assert_eq!(
+        rows(&db, "parsed_unit"),
+        0,
+        "whole tree removed, no FK error"
+    );
+    assert_eq!(rows(&db, "file_revision"), 0);
+    assert_eq!(rows(&db, "content_blob"), 0);
+}
+
+/// A sweep with nothing to collect is a no-op that reports zero and leaves an
+/// all-`active` store untouched (idempotence of the empty case).
+#[tokio::test]
+async fn empty_sweep_is_a_noop() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+    let g = allocate_at(&db, &wt, 10, 1000).await;
+    drive_to(&db, &g, GenerationState::Active).await;
+    revision(&db, "rev", "hash").await;
+    gen_file(&db, &g, "a.rs", "rev").await;
+
+    let report: SweepReport = run_sweep(
+        &db,
+        &sweep_everything_retired(),
+        &ExternalPins::default(),
+        2000,
+    )
+    .await
+    .expect("sweep");
+    assert!(report.is_empty());
+    assert_eq!(rows(&db, "generation"), 1);
+    assert_eq!(rows(&db, "generation_file"), 1);
 }

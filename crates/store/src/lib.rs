@@ -137,7 +137,8 @@ pub use registry::{
     worktree_state, worktree_summary, worktrees_of_repo,
 };
 pub use retention::{
-    ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams,
-    generation_meta_for_worktree, mark_pins, pinned_generation_roots,
+    ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,
+    SweepError, SweepPlan, SweepReport, generation_meta_for_worktree, mark_pins,
+    pinned_generation_roots, plan_sweep, run_sweep, run_sweep_with_batch,
 };
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};

@@ -1,12 +1,19 @@
-//! Pin-root calculation — the pure **mark phase** of retention/GC for the
-//! canonical source (spec 06 §5 `[FIXED]`), group 06 / T06-01.
+//! Retention/GC of the canonical source (spec 06 §5 `[FIXED]`), group 06.
 //!
-//! Retention is mark-and-sweep. This module is only the **mark** half: given a
-//! worktree's generations (plus the tuning parameters and external references),
-//! it computes the set of **pinned** generations — the ones a later sweep
-//! ([T06-02](super)) must not delete. The batched, mutating sweep and the
-//! `generation → file_revision` reachability closure it walks live in T06-02;
-//! nothing here writes to the database.
+//! Retention is mark-and-sweep, and both halves live here:
+//!
+//! - the **mark phase** (T06-01) — the pure [`mark_pins`] plus its DB readers
+//!   ([`generation_meta_for_worktree`], [`pinned_generation_roots`]) — computes the
+//!   set of **pinned** generations a sweep must not delete;
+//! - the **sweep phase** (T06-02) — [`run_sweep`] / [`plan_sweep`] — deletes the
+//!   unpinned generations and the content graph they orphan, in batches of
+//!   [`SWEEP_BATCH_ROWS`] rows/tx (spec 03 §3), walking the
+//!   `generation → file_revision` reachability closure so a content-shared revision
+//!   survives until its last referencing generation is swept.
+//!
+//! The mark phase writes nothing; the sweep phase mutates only through the single
+//! bounded writer ([`StateWriter::transaction`](crate::StateWriter)), one committed
+//! transaction per batch.
 //!
 //! # Pin roots (spec 06 §5)
 //!
@@ -66,6 +73,7 @@ use rusqlite::{Connection, Error, params};
 use local_rag_core::config::StorageConfig;
 
 use crate::registry::GenerationState;
+use crate::state::{StateDb, WriteError};
 
 /// Milliseconds per hour, for the `[storage].retired_generations_ttl_h` → window
 /// conversion.
@@ -293,6 +301,446 @@ pub fn pinned_generation_roots(
 ) -> rusqlite::Result<PinRoots> {
     let gens = generation_meta_for_worktree(conn, worktree_id)?;
     Ok(mark_pins(&gens, params, external, now_ms))
+}
+
+// ---------------------------------------------------------------------------
+// Sweep phase (T06-02) — the batched, mutating half of retention/GC.
+// ---------------------------------------------------------------------------
+
+/// The bounded state-transaction size for the sweep (spec 03 §3 `[SPEC]`: "≤ 500
+/// rows/tx"). Every batch deletes at most this many rows in one committed
+/// transaction, so a large sweep never grows the WAL without bound or starves
+/// other producers on the single write queue.
+pub const SWEEP_BATCH_ROWS: usize = 500;
+
+/// Per-table row counts for one sweep — either the rows a real sweep **deleted**
+/// ([`run_sweep`]) or the rows a dry run **would** delete ([`plan_sweep`],
+/// [`SweepPlan::would_delete`]).
+///
+/// Fields follow the delete order (spec 06 §5): the generation-scoped rows first
+/// (`edges` … `generations`), then the content-graph rows that become
+/// unreferenced once those generations are gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// `resolved_graph_edge` rows of candidate generations.
+    pub edges: u64,
+    /// `generation_unit_occurrence` rows of candidate generations.
+    pub occurrences: u64,
+    /// `generation_file` membership rows of candidate generations.
+    pub generation_files: u64,
+    /// `skipped_file` rows of candidate generations.
+    pub skipped_files: u64,
+    /// `generation` rows swept (the candidate generations themselves).
+    pub generations: u64,
+    /// `unresolved_reference` rows of orphaned file revisions.
+    pub unresolved_references: u64,
+    /// `parsed_unit` rows of orphaned file revisions.
+    pub parsed_units: u64,
+    /// `file_revision` rows that became unreferenced.
+    pub file_revisions: u64,
+    /// `content_blob` rows no longer referenced by any surviving `parsed_unit`.
+    pub content_blobs: u64,
+}
+
+impl SweepReport {
+    /// The total number of rows across every table.
+    pub fn total(&self) -> u64 {
+        self.edges
+            + self.occurrences
+            + self.generation_files
+            + self.skipped_files
+            + self.generations
+            + self.unresolved_references
+            + self.parsed_units
+            + self.file_revisions
+            + self.content_blobs
+    }
+
+    /// Whether the sweep touched (or would touch) no rows at all.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// The result of a dry run ([`plan_sweep`]): the generations that would be swept
+/// and the per-table row counts that would be deleted, computed without mutating
+/// a single canonical row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepPlan {
+    /// Candidate generation ids (sorted): the `retiring`/`failed` generations not
+    /// pinned by any worktree's roots or an external reference.
+    pub candidate_generations: Vec<String>,
+    /// Per-table counts of the rows a real sweep would delete.
+    pub would_delete: SweepReport,
+}
+
+/// A failure from [`run_sweep`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SweepError {
+    /// A batch (or the scratch setup/teardown) transaction failed and rolled
+    /// back; the store is unchanged for that batch. Earlier committed batches
+    /// stand — re-running the sweep resumes them idempotently.
+    Write(WriteError),
+    /// A between-batch failpoint fired (tests only; requires the `failpoints`
+    /// feature). Some batches committed before it; re-running completes the sweep.
+    #[cfg(feature = "failpoints")]
+    Interrupted,
+}
+
+impl std::fmt::Display for SweepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SweepError::Write(e) => write!(f, "sweep transaction failed: {e}"),
+            #[cfg(feature = "failpoints")]
+            SweepError::Interrupted => {
+                write!(f, "sweep interrupted at a between-batch failpoint")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SweepError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SweepError::Write(e) => Some(e),
+            #[cfg(feature = "failpoints")]
+            SweepError::Interrupted => None,
+        }
+    }
+}
+
+/// Create the connection-local scratch tables and materialize the sweep sets.
+///
+/// The scratch tables live in the `temp` schema (per-connection, never part of
+/// canonical `state.sqlite`, so a dry run over a read-only connection creates
+/// them without violating "mutate nothing"):
+///
+/// - `sweep_pinned` — the store-wide union of every worktree's pinned generation
+///   roots (spec 06 §5, computed in Rust via [`pinned_generation_roots`]);
+/// - `sweep_pinned_rev` — file revisions pinned directly by an external reference;
+/// - `sweep_candidates` — `retiring`/`failed` generations **not** pinned (the only
+///   GC-eligible states, spec 04 §1; the state guard also protects a concurrently
+///   built `building`/`active` generation from a stale pin snapshot);
+/// - `sweep_orphan_rev` — file revisions referenced only by candidate generations
+///   (or by none) and not externally pinned: the reachability closure that keeps a
+///   content-shared revision alive until its last referencing generation is swept.
+///
+/// `DROP … IF EXISTS` first so re-running on a still-open connection (e.g. after a
+/// between-batch failpoint) recomputes the sets from the current live state.
+fn setup_scratch(
+    conn: &Connection,
+    params: &RetentionParams,
+    external: &ExternalPins,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.sweep_orphan_rev;\
+         DROP TABLE IF EXISTS temp.sweep_candidates;\
+         DROP TABLE IF EXISTS temp.sweep_pinned_rev;\
+         DROP TABLE IF EXISTS temp.sweep_pinned;\
+         CREATE TEMP TABLE sweep_pinned (generation_id TEXT PRIMARY KEY);\
+         CREATE TEMP TABLE sweep_pinned_rev (file_revision_id TEXT PRIMARY KEY);\
+         CREATE TEMP TABLE sweep_candidates (generation_id TEXT PRIMARY KEY);\
+         CREATE TEMP TABLE sweep_orphan_rev (file_revision_id TEXT PRIMARY KEY);",
+    )?;
+
+    let pinned = store_wide_pinned(conn, params, external, now_ms)?;
+    {
+        let mut stmt = conn.prepare("INSERT INTO sweep_pinned (generation_id) VALUES (?1)")?;
+        for id in &pinned {
+            stmt.execute(params![id])?;
+        }
+    }
+    {
+        let mut stmt =
+            conn.prepare("INSERT INTO sweep_pinned_rev (file_revision_id) VALUES (?1)")?;
+        for id in &external.referenced_file_revisions {
+            stmt.execute(params![id])?;
+        }
+    }
+
+    // GC candidates: retiring/failed generations that no root pinned. Materialized
+    // once; deletions below leave it stable (already-deleted ids simply match no
+    // rows on a resume).
+    conn.execute(
+        "INSERT INTO sweep_candidates (generation_id) \
+         SELECT generation_id FROM generation \
+         WHERE state IN ('retiring','failed') \
+           AND generation_id NOT IN (SELECT generation_id FROM sweep_pinned)",
+        [],
+    )?;
+    // Reachability closure: a file_revision is orphaned when no surviving
+    // (non-candidate) generation_file references it and it is not externally
+    // pinned. Referencing the candidate set (not the live generation_file after
+    // deletion) makes this identical for a dry run and for a partially-applied
+    // resume.
+    conn.execute(
+        "INSERT INTO sweep_orphan_rev (file_revision_id) \
+         SELECT file_revision_id FROM file_revision \
+         WHERE file_revision_id NOT IN ( \
+                 SELECT file_revision_id FROM generation_file \
+                 WHERE generation_id NOT IN (SELECT generation_id FROM sweep_candidates)) \
+           AND file_revision_id NOT IN (SELECT file_revision_id FROM sweep_pinned_rev)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Drop the scratch tables created by [`setup_scratch`].
+fn drop_scratch(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.sweep_orphan_rev;\
+         DROP TABLE IF EXISTS temp.sweep_candidates;\
+         DROP TABLE IF EXISTS temp.sweep_pinned_rev;\
+         DROP TABLE IF EXISTS temp.sweep_pinned;",
+    )
+}
+
+/// The store-wide union of pinned generation roots across every worktree.
+///
+/// [`pinned_generation_roots`] is per-worktree (the "last `K`" counts within a
+/// worktree); the sweep is store-wide, so it unions the roots of every worktree.
+/// External-reference and lease pins enter through each per-worktree call
+/// (they are worktree-independent, so the union carries them).
+fn store_wide_pinned(
+    conn: &Connection,
+    params: &RetentionParams,
+    external: &ExternalPins,
+    now_ms: i64,
+) -> rusqlite::Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare("SELECT worktree_id FROM worktree")?;
+    let worktrees = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut pinned = BTreeSet::new();
+    for wt in &worktrees {
+        pinned.extend(pinned_generation_roots(conn, wt, params, external, now_ms)?.generations);
+    }
+    Ok(pinned)
+}
+
+// Each phase names a table and the predicate selecting its sweepable rows against
+// the scratch sets. `COUNT` uses the predicate directly; the batched `DELETE`
+// wraps it in `rowid IN (SELECT … LIMIT ?1)` — a portable ceiling that never
+// depends on `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`.
+struct SweepPhase {
+    /// The table swept.
+    table: &'static str,
+    /// The `COUNT(*)`/`SELECT rowid … WHERE` predicate over the scratch sets.
+    count_pred: &'static str,
+    /// The `SELECT rowid … WHERE` predicate for the batched delete. Equal to
+    /// `count_pred` except for `parsed_unit`, whose delete adds the leaf-first
+    /// filter (see [`PHASES`]).
+    delete_pred: &'static str,
+}
+
+/// The nine sweep phases in delete order (spec 06 §5). `generation_unit_occurrence`
+/// is a child of both `generation_file` and `parsed_unit`, so it precedes both;
+/// `resolved_graph_edge` is a child of the occurrence, so it precedes that. The
+/// `parsed_unit` delete is **leaf-first**: it only removes rows that no
+/// not-yet-deleted orphan unit still names as `parent_unit_id`, so each statement
+/// leaves the self-referential foreign key satisfied at its conclusion even when a
+/// nested unit tree spans several batches. Its `count_pred` counts the whole
+/// orphaned set (all waves) so a dry run matches the eventual total.
+const PHASES: [SweepPhase; 9] = [
+    SweepPhase {
+        table: "resolved_graph_edge",
+        count_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+        delete_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+    },
+    SweepPhase {
+        table: "generation_unit_occurrence",
+        count_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+        delete_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+    },
+    SweepPhase {
+        table: "generation_file",
+        count_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+        delete_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+    },
+    SweepPhase {
+        table: "skipped_file",
+        count_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+        delete_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+    },
+    SweepPhase {
+        table: "generation",
+        count_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+        delete_pred: "generation_id IN (SELECT generation_id FROM sweep_candidates)",
+    },
+    SweepPhase {
+        table: "unresolved_reference",
+        count_pred: "file_revision_id IN (SELECT file_revision_id FROM sweep_orphan_rev)",
+        delete_pred: "file_revision_id IN (SELECT file_revision_id FROM sweep_orphan_rev)",
+    },
+    SweepPhase {
+        table: "parsed_unit",
+        count_pred: "file_revision_id IN (SELECT file_revision_id FROM sweep_orphan_rev)",
+        delete_pred: "file_revision_id IN (SELECT file_revision_id FROM sweep_orphan_rev) \
+             AND unit_id NOT IN ( \
+                 SELECT parent_unit_id FROM parsed_unit \
+                 WHERE parent_unit_id IS NOT NULL \
+                   AND file_revision_id IN (SELECT file_revision_id FROM sweep_orphan_rev))",
+    },
+    SweepPhase {
+        table: "file_revision",
+        count_pred: "file_revision_id IN (SELECT file_revision_id FROM sweep_orphan_rev)",
+        delete_pred: "file_revision_id IN (SELECT file_revision_id FROM sweep_orphan_rev)",
+    },
+    SweepPhase {
+        table: "content_blob",
+        count_pred: "blob_id NOT IN ( \
+             SELECT blob_id FROM parsed_unit \
+             WHERE file_revision_id NOT IN (SELECT file_revision_id FROM sweep_orphan_rev))",
+        delete_pred: "blob_id NOT IN ( \
+             SELECT blob_id FROM parsed_unit \
+             WHERE file_revision_id NOT IN (SELECT file_revision_id FROM sweep_orphan_rev))",
+    },
+];
+
+/// Store the per-phase count into the matching [`SweepReport`] field. The order is
+/// the fixed [`PHASES`] order.
+fn record(report: &mut SweepReport, phase_index: usize, rows: u64) {
+    match phase_index {
+        0 => report.edges = rows,
+        1 => report.occurrences = rows,
+        2 => report.generation_files = rows,
+        3 => report.skipped_files = rows,
+        4 => report.generations = rows,
+        5 => report.unresolved_references = rows,
+        6 => report.parsed_units = rows,
+        7 => report.file_revisions = rows,
+        _ => report.content_blobs = rows,
+    }
+}
+
+/// Dry run: report the generations and rows a sweep **would** delete, mutating no
+/// canonical row (spec 06 §5, T06-02 card "dry-run mutates nothing").
+///
+/// Runs as a single transaction on the writer's connection (the only connection
+/// that may create the `temp` scratch tables — read-only connections are
+/// `query_only`). The transaction creates the connection-local scratch tables, holds
+/// the pinned/candidate/orphan sets, counts each phase against them, and drops them
+/// again: the `temp` schema is never part of `state.sqlite`, so no canonical row —
+/// and no main-database WAL frame — is written.
+pub async fn plan_sweep(
+    db: &StateDb,
+    params: &RetentionParams,
+    external: &ExternalPins,
+    now_ms: i64,
+) -> Result<SweepPlan, SweepError> {
+    let (params, external) = (*params, external.clone());
+    db.writer()
+        .transaction(move |tx| {
+            setup_scratch(tx, &params, &external, now_ms)?;
+
+            let mut candidate_generations = {
+                let mut stmt = tx
+                    .prepare("SELECT generation_id FROM sweep_candidates ORDER BY generation_id")?;
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            candidate_generations.sort();
+
+            let mut would_delete = SweepReport::default();
+            for (i, phase) in PHASES.iter().enumerate() {
+                let sql = format!(
+                    "SELECT COUNT(*) FROM {} WHERE {}",
+                    phase.table, phase.count_pred
+                );
+                let rows: i64 = tx.query_row(&sql, [], |r| r.get(0))?;
+                record(&mut would_delete, i, rows as u64);
+            }
+
+            drop_scratch(tx)?;
+            Ok(SweepPlan {
+                candidate_generations,
+                would_delete,
+            })
+        })
+        .await
+        .map_err(SweepError::Write)
+}
+
+/// Sweep unreferenced generations and the content graph they orphan, in batches of
+/// [`SWEEP_BATCH_ROWS`] rows/tx (spec 06 §5, 03 §3).
+///
+/// Idempotent and resumable: each batch is its own committed transaction, and the
+/// sweepable sets are recomputed from the live database on every call, so an
+/// interruption between batches is healed by simply calling `run_sweep` again — no
+/// separate progress checkpoint is needed. Returns the rows actually deleted.
+pub async fn run_sweep(
+    db: &StateDb,
+    params: &RetentionParams,
+    external: &ExternalPins,
+    now_ms: i64,
+) -> Result<SweepReport, SweepError> {
+    run_sweep_with_batch(db, params, external, now_ms, SWEEP_BATCH_ROWS).await
+}
+
+/// [`run_sweep`] with an explicit batch ceiling, for tests (crash/resume, the
+/// `parsed_unit` self-FK across a batch boundary) and future tuning. `run_sweep`
+/// is the normal entry point; this never exceeds `batch_rows` rows per transaction.
+pub async fn run_sweep_with_batch(
+    db: &StateDb,
+    params: &RetentionParams,
+    external: &ExternalPins,
+    now_ms: i64,
+    batch_rows: usize,
+) -> Result<SweepReport, SweepError> {
+    // Materialize the scratch sets on the writer's connection so every batch below
+    // (same connection) sees them; committed here, they persist across batches.
+    let (setup_params, setup_external) = (*params, external.clone());
+    db.writer()
+        .transaction(move |tx| setup_scratch(tx, &setup_params, &setup_external, now_ms))
+        .await
+        .map_err(SweepError::Write)?;
+
+    let mut report = SweepReport::default();
+    for (i, phase) in PHASES.iter().enumerate() {
+        let sql = format!(
+            "DELETE FROM {} WHERE rowid IN (SELECT rowid FROM {} WHERE {} LIMIT ?1)",
+            phase.table, phase.table, phase.delete_pred
+        );
+        let rows = delete_batched(db, sql, batch_rows).await?;
+        record(&mut report, i, rows);
+    }
+
+    db.writer()
+        .transaction(|tx| drop_scratch(tx))
+        .await
+        .map_err(SweepError::Write)?;
+    Ok(report)
+}
+
+/// Run one table's batched delete to exhaustion, ≤ `batch_rows` rows per committed
+/// transaction. Returns the total rows removed. A between-batch failpoint (tests
+/// only) fires after a non-empty batch commits, modelling an interruption with real
+/// partial progress on disk.
+async fn delete_batched(db: &StateDb, sql: String, batch_rows: usize) -> Result<u64, SweepError> {
+    let limit = batch_rows as i64;
+    let mut total: u64 = 0;
+    loop {
+        let sql = sql.clone();
+        let deleted = db
+            .writer()
+            .transaction(move |tx| tx.execute(&sql, params![limit]))
+            .await
+            .map_err(SweepError::Write)?;
+        total += deleted as u64;
+        if deleted == 0 {
+            break;
+        }
+        #[cfg(feature = "failpoints")]
+        {
+            local_rag_test_support::fail_point!(
+                "retention.sweep.between_batches",
+                Err(SweepError::Interrupted)
+            );
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -593,5 +1041,57 @@ mod tests {
         };
         let params = RetentionParams::from_storage_config(&cfg);
         assert_eq!(params.window_ms, i64::MAX);
+    }
+
+    /// The bounded transaction ceiling is the spec's `[SPEC: ≤ 500 rows/tx]`.
+    #[test]
+    fn sweep_batch_ceiling_is_500() {
+        assert_eq!(SWEEP_BATCH_ROWS, 500);
+    }
+
+    /// [`SweepReport::total`] sums every field; [`SweepReport::is_empty`] is the
+    /// zero case.
+    #[test]
+    fn sweep_report_total_and_is_empty() {
+        assert!(SweepReport::default().is_empty());
+        let r = SweepReport {
+            edges: 1,
+            occurrences: 2,
+            generation_files: 3,
+            skipped_files: 4,
+            generations: 5,
+            unresolved_references: 6,
+            parsed_units: 7,
+            file_revisions: 8,
+            content_blobs: 9,
+        };
+        assert_eq!(r.total(), 45);
+        assert!(!r.is_empty());
+    }
+
+    /// [`record`] writes each phase index into its own [`SweepReport`] field, in the
+    /// fixed [`PHASES`] order — no two indices collide, so a full sweep populates a
+    /// distinct field per phase.
+    #[test]
+    fn record_maps_each_phase_to_its_own_field() {
+        assert_eq!(PHASES.len(), 9);
+        let mut report = SweepReport::default();
+        for i in 0..PHASES.len() {
+            record(&mut report, i, (i as u64) + 1);
+        }
+        assert_eq!(
+            report,
+            SweepReport {
+                edges: 1,
+                occurrences: 2,
+                generation_files: 3,
+                skipped_files: 4,
+                generations: 5,
+                unresolved_references: 6,
+                parsed_units: 7,
+                file_revisions: 8,
+                content_blobs: 9,
+            }
+        );
     }
 }
