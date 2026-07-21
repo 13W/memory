@@ -30,8 +30,13 @@
 //! # Scope
 //!
 //! Pure classification only. Content hashing, `source_encoding`/`newline_style`
-//! detection, and zstd/reuse are T03-03; the normalized-text cache is T03-04; the
-//! directory walk and its config wiring are T05-02.
+//! detection, and zstd/reuse are T03-03; the normalized-text cache is T03-04. The
+//! authoritative directory walk is [`crate::scan`] (T05-02): its `ignore` walk
+//! prunes `ignored` files during traversal, so in the reconcile pipeline the
+//! `ignored` branch below is defense-in-depth (ignored files never reach it). The
+//! remaining, content-based reasons (`lfs`/`binary`/`encoding`/`secret`) are
+//! applied by the generation builder (T05-03) when it reads a manifest entry's
+//! bytes on a `file_revision` miss.
 
 pub mod detect;
 pub mod gitignore;

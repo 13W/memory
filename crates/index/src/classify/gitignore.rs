@@ -6,8 +6,13 @@
 //! file wins, and `!`-negation re-includes an otherwise-ignored path. Configured
 //! excludes act as an additional root-level layer.
 //!
-//! This is deliberately just the *matcher*, not a directory walk — the
-//! authoritative tree scan (`ignore::Walk`) is T05-02. The set is built from
+//! This is deliberately just the *matcher*, not a directory walk. The
+//! authoritative tree scan ([`crate::scan`], T05-02) uses `ignore::WalkBuilder`,
+//! whose native gitignore handling **prunes** ignored files during traversal — so
+//! in the reconcile pipeline ignored files never reach [`classify`](super::classify)
+//! at all (they are simply absent from the manifest, spec 06 §2.2 / §10). This
+//! matcher therefore remains as a standalone, defense-in-depth predicate for
+//! callers that classify a single path outside a walk. The set is built from
 //! in-memory `(dir, contents)` sources against a synthetic root, so tests need no
 //! filesystem and are fully deterministic.
 
