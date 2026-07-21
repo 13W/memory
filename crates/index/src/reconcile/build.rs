@@ -13,9 +13,14 @@
 //!
 //! This task **stops at `projection_ready`**. It does not activate the generation,
 //! set `worktree.current_generation_id`, or touch `worktree_projection_state` —
-//! that is the projection switch (spec 05 §5, a later group). It records the
-//! `building → failed` transition on error but not the typed failure/`last_error`/
-//! backoff bookkeeping (T05-05). Files whose extension selects no v0 language
+//! that is the projection switch (spec 05 §5, a later group). It marks the
+//! generation `failed` on **any** post-allocate error (including a failed finalize
+//! transition, spec 04 §1 "error in reconcile/switch") and — under the `failpoints`
+//! feature — hosts a named injection point at each build phase (T05-05). The
+//! `last_error`/backoff/counter *observability* around those failures lives on the
+//! reconcile driver ([`super::driver`], T05-05); persisting `last_error` into
+//! `worktree_projection_state` is the projection switch (spec 05 §5, group 07).
+//! Files whose extension selects no v0 language
 //! ([`select_language`](crate::parse::select_language) returns `None`) are
 //! **deferred**, not indexed and not skipped: the language-agnostic
 //! `config_section | text_section | fallback_chunk` path is a later task (that
@@ -102,6 +107,11 @@ pub enum BuildErrorKind {
     Write(WriteError),
     /// A generation state transition was rejected (domain).
     Transition(GenerationTransitionError),
+    /// A named build-phase failpoint fired (test-only, `failpoints` feature): the
+    /// deterministic per-phase crash injection the T05-05 retry/failure tests arm
+    /// (spec 04 §1 `building → failed` edge). Never present in a release build.
+    #[cfg(feature = "failpoints")]
+    Failpoint(&'static str),
 }
 
 impl std::fmt::Display for BuildError {
@@ -115,6 +125,8 @@ impl std::fmt::Display for BuildError {
             } => write!(f, "read {normalized_path}: {source}"),
             BuildErrorKind::Write(e) => write!(f, "write: {e}"),
             BuildErrorKind::Transition(e) => write!(f, "transition: {e}"),
+            #[cfg(feature = "failpoints")]
+            BuildErrorKind::Failpoint(name) => write!(f, "failpoint {name} fired"),
         }
     }
 }
@@ -157,39 +169,40 @@ pub async fn build_generation(
             })?
     };
 
-    // Phases 1..N: persist each entry. On the first error, mark the generation
-    // `failed` (best-effort) and surface the cause.
-    match run_build(
-        db,
-        &generation_id,
-        generation_number,
-        root,
-        manifest,
-        cfg,
-        scanner,
-        uuids,
-        now_ms,
-    )
-    .await
-    {
-        Ok(outcome) => {
-            // Final phase: `building → projection_ready` only once complete.
-            let genr = generation_id.clone();
-            db.writer()
-                .transaction(move |tx| {
-                    transition_generation(tx, &genr, GenerationState::ProjectionReady)
-                })
-                .await
-                .map_err(|e| BuildError {
-                    generation_id: generation_id.clone(),
-                    kind: BuildErrorKind::Write(e),
-                })?
-                .map_err(|e| BuildError {
-                    generation_id: generation_id.clone(),
-                    kind: BuildErrorKind::Transition(e),
-                })?;
-            Ok(outcome)
-        }
+    // Phases 1..N + finalize. Any error after allocation funnels through one path
+    // that marks the generation `failed` (best-effort) — including a failure of the
+    // final `building → projection_ready` transition itself (spec 04 §1 "error in
+    // reconcile/switch"), so a generation never lingers in `building` after a failed
+    // build. Because the new generation is a distinct row set, no previously-built
+    // generation is mutated.
+    let built: Result<BuildOutcome, BuildErrorKind> = async {
+        let outcome = run_build(
+            db,
+            &generation_id,
+            generation_number,
+            root,
+            manifest,
+            cfg,
+            scanner,
+            uuids,
+            now_ms,
+        )
+        .await?;
+        // Final phase: `building → projection_ready` only once complete.
+        let genr = generation_id.clone();
+        db.writer()
+            .transaction(move |tx| {
+                transition_generation(tx, &genr, GenerationState::ProjectionReady)
+            })
+            .await
+            .map_err(BuildErrorKind::Write)?
+            .map_err(BuildErrorKind::Transition)?;
+        Ok(outcome)
+    }
+    .await;
+
+    match built {
+        Ok(outcome) => Ok(outcome),
         Err(kind) => {
             let genr = generation_id.clone();
             // Best-effort; if this write also fails the generation stays `building`
@@ -220,6 +233,14 @@ async fn run_build(
     uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
 ) -> Result<BuildOutcome, BuildErrorKind> {
+    // Phase failpoint: fail immediately after allocation, before any per-file work
+    // (the generation is `building`; the caller marks it `failed`).
+    #[cfg(feature = "failpoints")]
+    local_rag_test_support::fail_point!(
+        "reconcile.build.after_allocate",
+        Err(BuildErrorKind::Failpoint("reconcile.build.after_allocate"))
+    );
+
     let mut out = BuildOutcome {
         generation_id: generation_id.to_string(),
         generation_number,
@@ -240,6 +261,13 @@ async fn run_build(
     let no_ignores = GitignoreSet::empty();
 
     for entry in &manifest.entries {
+        // Phase failpoint: fail mid-build, while persisting file entries.
+        #[cfg(feature = "failpoints")]
+        local_rag_test_support::fail_point!(
+            "reconcile.build.persist_file",
+            Err(BuildErrorKind::Failpoint("reconcile.build.persist_file"))
+        );
+
         let normalized_path = entry.normalized_path.as_str();
 
         // Huge files are stat-only (no `content_hash`); record the skip, never read.
@@ -339,6 +367,14 @@ async fn run_build(
             }
         }
     }
+
+    // Phase failpoint: fail after all entries are persisted, before the caller runs
+    // the final `building → projection_ready` transition.
+    #[cfg(feature = "failpoints")]
+    local_rag_test_support::fail_point!(
+        "reconcile.build.before_finalize",
+        Err(BuildErrorKind::Failpoint("reconcile.build.before_finalize"))
+    );
 
     Ok(out)
 }

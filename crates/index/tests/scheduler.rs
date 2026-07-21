@@ -144,7 +144,7 @@ async fn driver_runs_a_reconcile_on_shutdown_flush() {
         uuids,
         flush_only_schedule(),
     );
-    let ReconcileHandle { sender, join } = spawn_reconciler(reconciler, 8);
+    let ReconcileHandle { sender, join, .. } = spawn_reconciler(reconciler, 8);
     sender.send(TriggerKind::FsChange).await.expect("send");
     drop(sender); // graceful shutdown → flush the scheduled reconcile
     join.await.expect("join");
@@ -182,7 +182,7 @@ async fn concurrent_triggers_make_one_next_generation() {
         uuids,
         flush_only_schedule(),
     );
-    let ReconcileHandle { sender, join } = spawn_reconciler(reconciler, 64);
+    let ReconcileHandle { sender, join, .. } = spawn_reconciler(reconciler, 64);
     // A burst of triggers while nothing is in flight: they coalesce into one pending
     // request, flushed as a single reconcile on shutdown.
     for _ in 0..8 {

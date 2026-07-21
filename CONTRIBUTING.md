@@ -77,13 +77,15 @@ rewritten.
   distributed): `xtask` (task runner) and `test-support` (shared test harness —
   temp `LOCAL_RAG_HOME`, controllable clock/UUID, subprocess capture, named
   failpoints). Downstream crates depend on `test-support` as a
-  `[dev-dependencies]`, and — for `crates/store` only — additionally as an
-  **optional** dependency gated by the `failpoints` cargo feature (off by
-  default). That feature compiles the migration runner's named crash seams
-  (spec 13 §3 hard-kill resume tests); it is never enabled in a release or
-  distribution build, so the shipped binary never links `test-support`. `cargo
-  xtask ci` runs the store crate once more with `--features failpoints` to lint
-  and exercise that code path.
+  `[dev-dependencies]`, and — for `crates/store` and `crates/index` — additionally
+  as an **optional** dependency gated by the `failpoints` cargo feature (off by
+  default). That feature compiles named crash/error seams: `store`'s migration
+  runner (spec 13 §3 hard-kill resume tests) and `index`'s generation builder
+  (`reconcile.build.{after_allocate,persist_file,before_finalize}`, the per-phase
+  `building → failed` injection for spec 04 §1 / T05-05 retry-failure tests). It is
+  never enabled in a release or distribution build, so the shipped binary never
+  links `test-support`. `cargo xtask ci` runs each of those crates once more with
+  `--features failpoints` to lint and exercise those code paths.
 
 ## Committing
 

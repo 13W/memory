@@ -27,7 +27,7 @@ use local_rag_store::{
     OpenError, StateDb, WorktreeKind, WorktreeState, current_worktree_path, rusqlite,
     worktree_summary, worktrees_of_repo,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
@@ -90,6 +90,38 @@ impl std::error::Error for ReconcileError {
             ReconcileError::Build(e) => Some(e),
         }
     }
+}
+
+impl ReconcileError {
+    /// The generation that failed to build, when the build got far enough to
+    /// allocate one (spec 06 §2). A scan-phase failure (I/O before any generation
+    /// exists) has none.
+    fn failed_generation_id(&self) -> Option<String> {
+        match self {
+            ReconcileError::Scan(_) => None,
+            ReconcileError::Build(e) => Some(e.generation_id.clone()),
+        }
+    }
+}
+
+/// The observable record of the most recent failed reconcile (T05-05).
+///
+/// A failed generation is never routed (it never becomes `active`, spec 04 §1), so
+/// this record is pure **observability**: the failure counter that drives the
+/// scheduler's exponential backoff, the backoff deadline, the failed generation's id
+/// (when the build allocated one), and the human `last_error`. The `last_error` is
+/// the value the projection switch (group 07) will persist into
+/// `worktree_projection_state.last_error` (spec 04 §1); here it lives in memory only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileFailure {
+    /// The generation that failed to build, if allocation succeeded.
+    pub generation_id: Option<String>,
+    /// The human-readable cause (`Display` of the [`ReconcileError`]).
+    pub last_error: String,
+    /// Consecutive failed reconciles since the last success (≥ 1 here).
+    pub consecutive_failures: u32,
+    /// The monotonic millisecond before which no automatic retry may fire.
+    pub backoff_until_ms: i64,
 }
 
 /// The result of one reconcile cycle: the scan mode used, its fast-path telemetry,
@@ -164,6 +196,9 @@ pub struct WorktreeReconciler {
     cfg: ClassifierConfig,
     scanner: Scanner,
     uuids: Arc<dyn UuidSource + Send + Sync>,
+    /// Publishes the most recent failure (`None` while healthy) — the observability
+    /// seam a daemon / group-07 reads via [`ReconcileHandle::failures`] (T05-05).
+    failure_tx: watch::Sender<Option<ReconcileFailure>>,
 }
 
 impl WorktreeReconciler {
@@ -180,6 +215,7 @@ impl WorktreeReconciler {
         sched: ScheduleConfig,
     ) -> Self {
         let debouncer = Debouncer::new(sched, meta.is_git(), 0);
+        let (failure_tx, _) = watch::channel(None);
         Self {
             db,
             meta,
@@ -188,7 +224,15 @@ impl WorktreeReconciler {
             cfg,
             scanner,
             uuids,
+            failure_tx,
         }
+    }
+
+    /// Subscribe to this reconciler's failure observability (`None` while healthy).
+    /// [`spawn_reconciler`] wires the receiver into the returned
+    /// [`ReconcileHandle`]; a daemon may take further receivers before spawning.
+    pub fn subscribe_failures(&self) -> watch::Receiver<Option<ReconcileFailure>> {
+        self.failure_tx.subscribe()
     }
 
     /// Drive the reconcile loop until every trigger sender is dropped.
@@ -208,7 +252,7 @@ impl WorktreeReconciler {
                 _ = sleep_until(wake) => {
                     let now = now_ms(origin);
                     if let Some(plan) = self.debouncer.take_due(now) {
-                        let _ = self.run_reconcile(plan, now).await;
+                        self.run_and_observe(plan, now).await;
                     }
                 }
                 got = rx.recv() => match got {
@@ -220,7 +264,7 @@ impl WorktreeReconciler {
                         // All senders dropped: flush a scheduled reconcile, then stop.
                         if let Some(plan) = self.debouncer.take_pending() {
                             let now = now_ms(origin);
-                            let _ = self.run_reconcile(plan, now).await;
+                            self.run_and_observe(plan, now).await;
                         }
                         break;
                     }
@@ -229,9 +273,10 @@ impl WorktreeReconciler {
         }
     }
 
-    /// Run one reconcile with the planned mode. Errors are intentionally swallowed:
-    /// [`build_generation`] already records the `failed` transition, and typed
-    /// failure/backoff bookkeeping is T05-05.
+    /// Run one reconcile with the planned mode. The typed outcome is folded into the
+    /// failure observability by [`run_and_observe`](Self::run_and_observe); a failed
+    /// build has already been recorded `failed` in the store (spec 04 §1) and is
+    /// never routed.
     async fn run_reconcile(
         &mut self,
         plan: PlannedReconcile,
@@ -249,6 +294,35 @@ impl WorktreeReconciler {
         )
         .await
     }
+
+    /// Run one reconcile and fold its outcome into the failure observability (T05-05):
+    ///
+    /// - **success** resets the backoff/counter and publishes `None`;
+    /// - **failure** records the typed [`ReconcileFailure`], increments the counter,
+    ///   arms the exponential backoff (so a persistently failing worktree does not
+    ///   hot-loop), and publishes it.
+    ///
+    /// The error is never propagated: a failed generation is already `failed` in the
+    /// store (spec 04 §1) and is never selected for routing; this only updates the
+    /// in-memory observability the daemon / group-07 reads.
+    async fn run_and_observe(&mut self, plan: PlannedReconcile, now_ms: i64) {
+        match self.run_reconcile(plan, now_ms).await {
+            Ok(_) => {
+                self.debouncer.record_success();
+                let _ = self.failure_tx.send(None);
+            }
+            Err(e) => {
+                self.debouncer.record_failure(now_ms);
+                let failure = ReconcileFailure {
+                    generation_id: e.failed_generation_id(),
+                    last_error: e.to_string(),
+                    consecutive_failures: self.debouncer.consecutive_failures(),
+                    backoff_until_ms: self.debouncer.retry_backoff_until(),
+                };
+                let _ = self.failure_tx.send(Some(failure));
+            }
+        }
+    }
 }
 
 /// A handle to a spawned [`WorktreeReconciler`]: send triggers on `sender`; drop all
@@ -259,13 +333,22 @@ pub struct ReconcileHandle {
     pub sender: mpsc::Sender<TriggerKind>,
     /// The reconciler task's join handle.
     pub join: JoinHandle<()>,
+    /// Watch the reconciler's most recent failure (`None` while healthy) — the
+    /// observability seam group 07 reads to persist
+    /// `worktree_projection_state.last_error` (T05-05).
+    pub failures: watch::Receiver<Option<ReconcileFailure>>,
 }
 
 /// Spawn `reconciler` on the current runtime with a bounded trigger channel.
 pub fn spawn_reconciler(reconciler: WorktreeReconciler, capacity: usize) -> ReconcileHandle {
     let (sender, rx) = mpsc::channel(capacity.max(1));
+    let failures = reconciler.subscribe_failures();
     let join = tokio::spawn(reconciler.run(rx));
-    ReconcileHandle { sender, join }
+    ReconcileHandle {
+        sender,
+        join,
+        failures,
+    }
 }
 
 /// Monotonic milliseconds since the loop's `origin` (the engine's logical clock).
