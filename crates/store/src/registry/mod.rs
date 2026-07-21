@@ -73,10 +73,11 @@ pub use settings::{
 };
 pub use worktree::{
     IllegalWorktreeTransition, WorktreeKind, WorktreePathObservation, WorktreeState,
-    WorktreeSummary, WorktreeTransitionError, create_worktree, current_generation,
-    current_worktree_path, find_worktree_by_current_path, find_worktrees_by_path_fingerprint,
-    observe_worktree_path, set_current_generation, transition_worktree_state,
-    worktree_path_history, worktree_state, worktree_summary, worktrees_of_repo,
+    WorktreeSummary, WorktreeTransitionError, all_worktree_ids, create_worktree,
+    current_generation, current_worktree_path, find_worktree_by_current_path,
+    find_worktrees_by_path_fingerprint, observe_worktree_path, set_current_generation,
+    transition_worktree_state, worktree_path_history, worktree_state, worktree_summary,
+    worktrees_of_repo,
 };
 
 /// Version-1 migration DDL: the repository-side registry (spec 03 §2.1).

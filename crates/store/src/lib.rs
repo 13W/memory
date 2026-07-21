@@ -98,6 +98,7 @@ pub use rusqlite;
 mod cache;
 mod clock;
 pub mod code;
+pub mod housekeeping;
 pub mod migrate;
 pub mod registry;
 pub mod retention;
@@ -122,19 +123,22 @@ pub use code::{
     normalize, occurrence_id, parsed_unit_id_by_natural_key, parsed_units_for_revision,
     prepare_source, skip_reason, source_bytes,
 };
+pub use housekeeping::{
+    HousekeepingError, ShardSweepReport, run_orphan_shard_sweep, sweep_orphan_shard_dirs,
+};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
     AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
     IllegalGenerationTransition, IllegalWorktreeTransition, PathObservation, RequestRoot,
     Resolution, WorktreeKind, WorktreePathObservation, WorktreeRootFacts, WorktreeState,
-    WorktreeSummary, WorktreeTransitionError, active_generations, allocate_generation, attach,
-    create_repository, create_worktree, current_generation, current_path, current_worktree_path,
-    effective_data_policy, find_repositories_by_remote, find_repository_by_path,
-    find_worktree_by_current_path, find_worktrees_by_path_fingerprint, generation_state,
-    get_repo_setting, observe_repository_path, observe_worktree_path, path_history,
-    repo_data_policy, repo_settings, resolve, set_current_generation, set_repo_data_policy,
-    set_repo_setting, transition_generation, transition_worktree_state, worktree_path_history,
-    worktree_state, worktree_summary, worktrees_of_repo,
+    WorktreeSummary, WorktreeTransitionError, active_generations, all_worktree_ids,
+    allocate_generation, attach, create_repository, create_worktree, current_generation,
+    current_path, current_worktree_path, effective_data_policy, find_repositories_by_remote,
+    find_repository_by_path, find_worktree_by_current_path, find_worktrees_by_path_fingerprint,
+    generation_state, get_repo_setting, observe_repository_path, observe_worktree_path,
+    path_history, repo_data_policy, repo_settings, resolve, set_current_generation,
+    set_repo_data_policy, set_repo_setting, transition_generation, transition_worktree_state,
+    worktree_path_history, worktree_state, worktree_summary, worktrees_of_repo,
 };
 pub use retention::{
     ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,

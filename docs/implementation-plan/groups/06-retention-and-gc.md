@@ -24,6 +24,15 @@
 - **Тесты:** fake-clock grace/14-day cases; unknown shard; quarantine rotation; partial cursor
   retention; repeated sweep idempotence.
 
+**As-built (T06-03, split per D-004):** реализована только **orphan shard-dir sweep** (spec 05 §8),
+единственная часть с готовым фундаментом (layout `projection/<worktree_id>` + таблица `worktree`
+существуют) — `local_rag_store::housekeeping` (`sweep_orphan_shard_dirs` + `run_orphan_shard_sweep`);
+покрыты «unknown shard» и «repeated sweep idempotence». Остальные цели/тест-кейсы отложены в их
+owning-карточки, т.к. их подсистемы вводятся позже по `[FIXED]` roadmap (spec 15 §1): **quarantine
+rotation** → T07-04; **grace-destroy `removing`/`detached` shard** (нужна миграция `removed_at`) →
+группа 07/09 shard lifecycle; **spool-GC (14-day / committed cursor / uncommitted-retained)** →
+T13-05 (дубль spec 07 §6). См. `DEVIATIONS.md` D-004; G06 подтверждает деферал в owning-карточки.
+
 ## G06 — Сверка rebuildability и retention
 
 Перечитать spec 05 §8, 06 §5, 07 §6. Построить pin-root truth table и crash sweep tests.
