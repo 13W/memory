@@ -22,7 +22,8 @@
       "artifact": "parser/index.json",
       "provenance": [
         "src/indexer/parser.ts (v1 parser exists, exercised only via the 49-query benchmark)",
-        "T04-03 authored TypeScript goldens (tree-sitter tsx adapter, ADR-0002)"
+        "T04-03 authored TypeScript goldens (tree-sitter tsx adapter, ADR-0002)",
+        "T04-04 authored JavaScript goldens (tree-sitter-javascript adapter, ADR-0002)"
       ],
       "gaps": ["GAP-01"]
     },
@@ -92,7 +93,7 @@
     {
       "id": "GAP-01",
       "family": "parser",
-      "description": "No v1 golden parser fixtures per language. O4 is now closed (ADR-0001). TypeScript goldens authored in T04-03 (parser/index.json, ADR-0002); JavaScript and Rust goldens are authored in T04-04 / T04-05, closing this gap.",
+      "description": "No v1 golden parser fixtures per language. O4 is now closed (ADR-0001). TypeScript goldens authored in T04-03 and JavaScript goldens in T04-04 (parser/index.json, ADR-0002); the remaining Rust goldens are authored in T04-05, closing this gap.",
       "blocking": false,
       "resolves_in": "T04-03 (TypeScript), T04-04 (JavaScript), T04-05 (Rust)"
     },

@@ -33,6 +33,7 @@ pub mod output;
 pub mod parser;
 pub mod signature;
 
+pub use adapter::javascript::JavaScriptParser;
 pub use adapter::typescript::TypeScriptParser;
 pub use fingerprint::{
     BOUNDARY_NORM_VERSION, CHUNK_POLICY_VERSION, FingerprintComponents, LanguageDescriptor,

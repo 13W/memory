@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://local-rag.dev/fixtures/parser.schema.json",
   "title": "Parser fixtures (source -> expected units)",
-  "description": "Implementation-neutral golden parser fixtures (spec 14 §1.1; T04-03, ADR-0002): a source file maps to its expected units {unit_kind, byte span, local_name, kind, anchor, parent} and its classified unresolved references. Byte spans are offsets into the exact source bytes. Implementation-specific values (the sig hash, the full serialized syntax_locator) are pinned in crate-local goldens, not here.",
+  "description": "Implementation-neutral golden parser fixtures (spec 14 §1.1; T04-03/T04-04, ADR-0002): a source file maps to its expected units {unit_kind, byte span, local_name, kind, anchor, parent} and its classified unresolved references. Multi-language: each case declares its `language` (TypeScript in T04-03, JavaScript in T04-04). Byte spans are offsets into the exact source bytes. Implementation-specific values (the sig hash, the full serialized syntax_locator) are pinned in crate-local goldens, not here.",
   "type": "object",
   "required": ["family", "version", "cases"],
   "additionalProperties": false,
@@ -41,7 +41,7 @@
               "note": { "type": "string" }
             }
           },
-          "language": { "const": "typescript" },
+          "language": { "type": "string", "enum": ["typescript", "javascript"] },
           "category": { "type": "string", "enum": ["syntax", "error", "empty", "unicode"] },
           "source": { "type": "string" },
           "expected_units": {

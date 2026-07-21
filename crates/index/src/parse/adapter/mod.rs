@@ -8,6 +8,7 @@
 //! [`LanguageSpec`] (grammar, query, capture map, name/signature/reference hooks),
 //! honoring ADR-0001 ("the choice lives in data/config, not the parser core").
 
+pub mod javascript;
 pub mod typescript;
 
 use std::collections::{HashMap, HashSet};
@@ -351,6 +352,106 @@ fn finalize(raws: &[Raw]) -> Vec<ParsedUnitDraft> {
             }
         })
         .collect()
+}
+
+// ── Shared node helpers (language-agnostic, used by every adapter) ────────────────
+//
+// These extract structural facts from a tree-sitter node in a language-independent
+// way, so each adapter's `LanguageSpec` composes them instead of re-deriving the
+// same primitives. A helper's node-kind/token/field vocabulary is a *superset*
+// across the v0 languages: kinds/tokens that a given grammar never produces simply
+// never match, so a shared helper stays correct per language (e.g. `type_identifier`
+// exists only in TypeScript, the TS accessibility modifiers never appear in a JS
+// tree).
+
+/// Identifier-family node kinds whose text is a safe path segment.
+pub(crate) fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "property_identifier"
+            | "private_property_identifier"
+            | "shorthand_property_identifier"
+    )
+}
+
+/// Whether a name is a delimiter-safe `syntax_path` segment (no `;`/`=`/`/`/`:`,
+/// no whitespace or control). Identifier-family names always satisfy this; the
+/// check is a defensive backstop for the `SyntaxLocator::serialize` invariant.
+pub(crate) fn is_safe_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| !matches!(c, ';' | '=' | '/' | ':') && !c.is_whitespace() && !c.is_control())
+}
+
+/// The text of `node`'s `field` child, or `""`.
+pub(crate) fn field_text(node: Node, field: &str, src: &[u8]) -> String {
+    node.child_by_field_name(field)
+        .and_then(|n| n.utf8_text(src).ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The sorted, de-duplicated set of modifier keyword tokens directly under `node`
+/// (async/static/abstract/get/set/…), joined with `,`. The token set is the union
+/// across v0 languages; a token a grammar never emits simply never matches.
+pub(crate) fn modifiers(node: Node) -> String {
+    const MODS: &[&str] = &[
+        "async",
+        "*",
+        "static",
+        "abstract",
+        "readonly",
+        "get",
+        "set",
+        "public",
+        "private",
+        "protected",
+        "override",
+        "declare",
+        "const",
+    ];
+    let mut found: Vec<&str> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() && MODS.contains(&child.kind()) {
+            found.push(child.kind());
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found.join(",")
+}
+
+/// The concatenated heritage clauses (`extends`/`implements`) of `node`, or `""`.
+pub(crate) fn heritage_text(node: Node, src: &[u8]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+        if kind == "class_heritage" || kind.contains("extends") || kind.contains("implements") {
+            parts.push(child.utf8_text(src).unwrap_or("").to_string());
+        }
+    }
+    parts.join("|")
+}
+
+/// The count of named members in `node`'s body (class/interface/enum/namespace).
+pub(crate) fn body_member_count(node: Node) -> usize {
+    let body = node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .find(|c| c.kind().ends_with("_body") || c.kind() == "statement_block")
+    });
+    match body {
+        Some(b) => {
+            let mut cursor = b.walk();
+            b.children(&mut cursor).filter(|c| c.is_named()).count()
+        }
+        None => 0,
+    }
 }
 
 /// The named-declaration route `<kind>:<name>/…` from the outermost ancestor down

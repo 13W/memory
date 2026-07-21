@@ -25,6 +25,14 @@ ignore = { version = "0.4", default-features = false }
 # direct dependency to drive it.
 tree-sitter = "0.24"
 tree-sitter-typescript = "0.23"
+# The second-release language grammar (ADR-0001, T04-04). Pinned at 0.23 (not the
+# newer 0.25) for ABI compatibility: `tree-sitter-javascript 0.25` ships an ABI-15
+# grammar that `tree-sitter 0.24` (max supported ABI 14) refuses to load, whereas
+# 0.23.x is ABI 14 — the same reason `tree-sitter-typescript` is held at 0.23. Its
+# only runtime dependency is `tree-sitter-language` (already in the tree, shared
+# with `tree-sitter`), so it adds no new transitive crate. See the dependency
+# allowlist in CONTRIBUTING.md.
+tree-sitter-javascript = "0.23"
 streaming-iterator = "0.1"
 
 [dev-dependencies]

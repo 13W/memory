@@ -1,22 +1,30 @@
-//! T04-03 integration: the TypeScript adapter against the neutral parser fixtures
-//! (spec 14 §1.1), the determinism gate (spec 14 §5), the fingerprint reconciliation
-//! (spec 03 §2.3.1), and a searchable round-trip through the real `state.sqlite`.
+//! T04-03/T04-04 integration: the per-language adapters against the neutral parser
+//! fixtures (spec 14 §1.1), the determinism gate (spec 14 §5), the fingerprint
+//! reconciliation (spec 03 §2.3.1), the extension→revision consequence
+//! (spec 03 §2.3.1 / 06 §2.1 `[FIXED]`), and a searchable round-trip through the
+//! real `state.sqlite`.
 //!
 //! The pure derivation rules are unit-tested inside `local-rag-index`; here the
-//! fixtures pin observable behavior (kind/span/anchor/parent/refs) and the store
-//! seam proves every produced `unit_kind` becomes a queryable occurrence.
-//! Deterministic: isolated [`TempHome`], fixed `now_ms`, ids from [`uuidv7_from`].
+//! multi-language fixtures pin observable behavior (kind/span/anchor/parent/refs),
+//! routed to the parser named by each case's `language`. The store seam proves
+//! every produced `unit_kind` becomes a queryable occurrence, and that
+//! byte-identical source under different-language extensions forms distinct
+//! `file_revision` rows. Deterministic: isolated [`TempHome`], fixed `now_ms`,
+//! ids from [`uuidv7_from`].
+
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
-    LanguageId, LanguageParser, SyntaxAnchor, SyntaxLocator, TypeScriptParser, parser_fingerprint,
+    JavaScriptParser, LanguageId, LanguageParser, SyntaxAnchor, SyntaxLocator, TypeScriptParser,
+    parser_fingerprint,
 };
 use local_rag_store::StateDb;
 use local_rag_store::code::{
-    NewOccurrence, NewParsedUnit, UnitKind, create_or_reuse_content_blob,
+    NewOccurrence, NewParsedUnit, RevisionOutcome, UnitKind, create_or_reuse_content_blob,
     create_or_reuse_file_revision, derive_content_blob, insert_generation_file, insert_occurrence,
     insert_parsed_unit, prepare_source,
 };
@@ -92,6 +100,16 @@ fn load_index() -> Index {
     serde_json::from_str(&raw).expect("parser fixtures deserialize (schema check)")
 }
 
+/// The adapter for a fixture's declared `language`. The choice lives in data (the
+/// fixture's `language` field), not in the test — mirroring ADR-0001.
+fn parser_for(language: &str) -> Box<dyn LanguageParser> {
+    match language {
+        "typescript" => Box::new(TypeScriptParser::new()),
+        "javascript" => Box::new(JavaScriptParser::new()),
+        other => panic!("no parser for fixture language {other:?}"),
+    }
+}
+
 fn anchor_str(anchor: &SyntaxAnchor) -> String {
     match anchor {
         SyntaxAnchor::Path(p) => format!("p:{p}"),
@@ -129,11 +147,10 @@ fn actual_refs(out: &local_rag_index::parse::ParseOutput) -> Vec<ExpectedRef> {
 fn parser_fixtures_match_expected_units_and_refs() {
     let index = load_index();
     assert_eq!(index.family, "parser");
-    let parser = TypeScriptParser::new();
-    let mut checked = 0usize;
+    let mut per_language: BTreeMap<String, usize> = BTreeMap::new();
     for case in &index.cases {
-        assert_eq!(case.language, "typescript", "{}", case.id);
         assert_eq!(case.status, "active", "{}", case.id);
+        let parser = parser_for(&case.language);
         let out = parser.parse(case.source.as_bytes());
         assert_eq!(
             actual_units(&out),
@@ -147,20 +164,29 @@ fn parser_fixtures_match_expected_units_and_refs() {
             "unresolved refs for {}",
             case.id
         );
-        checked += 1;
+        *per_language.entry(case.language.clone()).or_default() += 1;
     }
-    assert!(checked >= 4, "expected the authored parser cases");
+    // Both v0-authored languages must be exercised (TypeScript T04-03, JavaScript
+    // T04-04); Rust is T04-05.
+    assert!(
+        per_language.get("typescript").copied().unwrap_or(0) >= 4,
+        "expected the authored TypeScript cases"
+    );
+    assert!(
+        per_language.get("javascript").copied().unwrap_or(0) >= 4,
+        "expected the authored JavaScript cases"
+    );
 }
 
 #[test]
 fn parser_output_is_byte_identical_on_reparse() {
     // The determinism gate (spec 14 §5): same (content, parser_fingerprint) ⇒
     // byte-identical unit sets. We compare the neutral projection twice per case
-    // and across a fresh parser instance.
+    // and across a fresh parser instance, for every language.
     let index = load_index();
     for case in &index.cases {
-        let a = TypeScriptParser::new().parse(case.source.as_bytes());
-        let b = TypeScriptParser::new().parse(case.source.as_bytes());
+        let a = parser_for(&case.language).parse(case.source.as_bytes());
+        let b = parser_for(&case.language).parse(case.source.as_bytes());
         assert_eq!(a, b, "reparse differs for {}", case.id);
         assert_eq!(actual_units(&a), actual_units(&b));
         assert_eq!(actual_refs(&a), actual_refs(&b));
@@ -168,12 +194,65 @@ fn parser_output_is_byte_identical_on_reparse() {
 }
 
 #[test]
-fn fingerprint_is_reconciled_to_at_one_after_linking_the_grammar() {
-    // §4.2 of the plan / ADR-0002: linking the real grammar keeps the T04-02 golden
+fn fingerprints_are_reconciled_after_linking_the_grammars() {
+    // §4.2 of the plan / ADR-0002: linking a real grammar keeps the T04-02 goldens
     // green (versions reconciled to @1, no persisted data yet).
     assert_eq!(
         parser_fingerprint(LanguageId::TypeScript),
         "chunk=1;grammar=tree-sitter-typescript@1;lang=typescript;norm=1;queries=1"
+    );
+    assert_eq!(
+        parser_fingerprint(LanguageId::JavaScript),
+        "chunk=1;grammar=tree-sitter-javascript@1;lang=javascript;norm=1;queries=1"
+    );
+}
+
+// ── Extension → revision consequence (spec 03 §2.3.1 / 06 §2.1 [FIXED]) ───────────
+
+#[tokio::test]
+async fn ambiguous_extension_yields_distinct_file_revisions() {
+    // Language is chosen by extension, so byte-identical source under different
+    // extensions (`.ts` → typescript vs `.js` → javascript) has different
+    // parser_fingerprints and therefore forms *distinct* file_revision rows
+    // (UNIQUE(content_hash, parser_fingerprint)). This is the local analogue of the
+    // spec's `.c` vs `.cpp` consequence. Re-inserting the same (bytes, fingerprint)
+    // reuses the row.
+    let bytes = b"export function foo(a) {}\n";
+    let fp_ts = parser_fingerprint(LanguageId::TypeScript);
+    let fp_js = parser_fingerprint(LanguageId::JavaScript);
+    assert_ne!(fp_ts, fp_js, "the two fingerprints must differ by lang=");
+
+    let id_ts = uuid(11);
+    let id_js = uuid(12);
+    let id_ts_again = uuid(13);
+
+    let (_home, db) = open_state();
+    let outcomes = db
+        .writer()
+        .transaction(move |tx| {
+            let prepared = prepare_source(bytes);
+            let ts = create_or_reuse_file_revision(tx, &prepared, &fp_ts, &id_ts, 1000)?;
+            let js = create_or_reuse_file_revision(tx, &prepared, &fp_js, &id_js, 1000)?;
+            // Same bytes + same fingerprint ⇒ reuse the TypeScript row.
+            let ts_again =
+                create_or_reuse_file_revision(tx, &prepared, &fp_ts, &id_ts_again, 1000)?;
+            Ok((ts, js, ts_again))
+        })
+        .await
+        .expect("create/reuse file revisions");
+
+    let (ts, js, ts_again) = outcomes;
+    assert!(ts.is_created(), "the TypeScript revision is new");
+    assert!(js.is_created(), "the JavaScript revision is new");
+    assert_ne!(
+        ts.id(),
+        js.id(),
+        "identical bytes under different extensions must be different revisions"
+    );
+    assert_eq!(
+        ts_again,
+        RevisionOutcome::Reused(ts.id().to_string()),
+        "same bytes + same fingerprint must reuse the existing revision"
     );
 }
 

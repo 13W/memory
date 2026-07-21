@@ -1,7 +1,7 @@
 {
   "family": "parser",
   "version": "1.0.0",
-  "description": "Golden parser fixtures (T04-03, ADR-0002): TypeScript source -> expected units {unit_kind, byte span, local_name, kind, anchor, parent} and classified unresolved references. Implementation-specific sig hashes / full serialized locators are pinned in crate-local goldens, not here (neutrality for JS/Rust reuse).",
+  "description": "Golden parser fixtures (T04-03/T04-04, ADR-0002): multi-language source -> expected units {unit_kind, byte span, local_name, kind, anchor, parent} and classified unresolved references. Each case declares its `language` (TypeScript in T04-03, JavaScript in T04-04). Implementation-specific sig hashes / full serialized locators are pinned in crate-local goldens, not here (neutrality for cross-language reuse).",
   "cases": [
     {
       "id": "parser.ts.declarations",
@@ -382,6 +382,327 @@
         "source": "T04-03 (authored)"
       },
       "language": "typescript",
+      "category": "unicode",
+      "source": "const s = \"café☕\";\nfunction café() {}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 42,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 22,
+          "span_end": 41,
+          "local_name": "café",
+          "kind": "function",
+          "anchor": "p:function:café",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.js.declarations",
+      "title": "Core JavaScript declaration kinds each become a symbol unit",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored); JavaScript adapter over tree-sitter-javascript"
+      },
+      "language": "javascript",
+      "category": "syntax",
+      "source": "export function foo(a) {}\nclass Bar {}\nfunction* gen() {}\nexport const g = (x) => x;\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 85,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 7,
+          "span_end": 25,
+          "local_name": "foo",
+          "kind": "function",
+          "anchor": "p:function:foo",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 26,
+          "span_end": 38,
+          "local_name": "Bar",
+          "kind": "class",
+          "anchor": "p:class:Bar",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 39,
+          "span_end": 57,
+          "local_name": "gen",
+          "kind": "function",
+          "anchor": "p:function:gen",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 71,
+          "span_end": 83,
+          "local_name": "g",
+          "kind": "const",
+          "anchor": "p:const:g",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.js.nesting",
+      "title": "JavaScript method and nested function parents",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored)"
+      },
+      "language": "javascript",
+      "category": "syntax",
+      "source": "class Host {\n  method(x) {}\n}\nfunction outer() {\n  function inner() {}\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 73,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 29,
+          "local_name": "Host",
+          "kind": "class",
+          "anchor": "p:class:Host",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 15,
+          "span_end": 27,
+          "local_name": "method",
+          "kind": "method",
+          "anchor": "p:class:Host/method:method",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 30,
+          "span_end": 72,
+          "local_name": "outer",
+          "kind": "function",
+          "anchor": "p:function:outer",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 51,
+          "span_end": 70,
+          "local_name": "inner",
+          "kind": "function",
+          "anchor": "p:function:outer/function:inner",
+          "parent": 3
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.js.anonymous",
+      "title": "Computed method names fall back to ordinal anchors",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored)"
+      },
+      "language": "javascript",
+      "category": "syntax",
+      "source": "class Foo {\n  bar() {}\n  [Symbol.iterator]() {}\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 50,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 49,
+          "local_name": "Foo",
+          "kind": "class",
+          "anchor": "p:class:Foo",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 14,
+          "span_end": 22,
+          "local_name": "bar",
+          "kind": "method",
+          "anchor": "p:class:Foo/method:bar",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 25,
+          "span_end": 47,
+          "local_name": null,
+          "kind": "method",
+          "anchor": "o:1",
+          "parent": 1
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.js.imports",
+      "title": "JavaScript module specifiers become classified unresolved references",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored)"
+      },
+      "language": "javascript",
+      "category": "syntax",
+      "source": "import { A } from \"./mod\";\nexport * from \"./re\";\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 49,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": [
+        {
+          "source_unit": 0,
+          "reference_text": "./mod",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "./re",
+          "reference_kind": "reexport"
+        }
+      ]
+    },
+    {
+      "id": "parser.js.empty",
+      "title": "An empty JavaScript file is a single empty file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored)"
+      },
+      "language": "javascript",
+      "category": "empty",
+      "source": "",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 0,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.js.whitespace",
+      "title": "A whitespace-only JavaScript file is a single file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored)"
+      },
+      "language": "javascript",
+      "category": "empty",
+      "source": "   \n\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 5,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.js.error",
+      "title": "Malformed JavaScript recovers symbols and yields a fallback chunk",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored)"
+      },
+      "language": "javascript",
+      "category": "error",
+      "source": "function ok() {}\nfunction @@@ broken(\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 38,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 16,
+          "local_name": "ok",
+          "kind": "function",
+          "anchor": "p:function:ok",
+          "parent": null
+        },
+        {
+          "unit_kind": "fallback_chunk",
+          "span_start": 17,
+          "span_end": 37,
+          "local_name": null,
+          "kind": "error",
+          "anchor": "o:2",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.js.unicode",
+      "title": "JavaScript byte spans are byte offsets across multi-byte characters",
+      "status": "active",
+      "provenance": {
+        "source": "T04-04 (authored)"
+      },
+      "language": "javascript",
       "category": "unicode",
       "source": "const s = \"café☕\";\nfunction café() {}\n",
       "expected_units": [

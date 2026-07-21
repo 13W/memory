@@ -391,7 +391,9 @@ As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
 - `grammar_version`/`query_version` are **our** boundary-version counters (not the upstream
   crate semver). T04-03 links the first real grammar (TypeScript, `tsx` variant) and
   **reconciles them to `@1`/`1`** against the pinned crates `tree-sitter 0.24` /
-  `tree-sitter-typescript 0.23` (recorded in `parse::fingerprint::descriptor`; ADR-0002). No
+  `tree-sitter-typescript 0.23`; T04-04 links the second (JavaScript) the same way against
+  `tree-sitter-javascript 0.23` — pinned at 0.23 (ABI 14), not 0.25 (ABI 15, which the 0.24
+  core rejects) (recorded in `parse::fingerprint::descriptor`; ADR-0002). No
   units are persisted before T04-06, so the `fingerprint.rs` goldens stay green — this is the
   deliberate, documented reconciliation the earlier rev anticipated, never a silent bump. A
   later grammar/query change that shifts unit boundaries is a deliberate version bump (a rebuild
