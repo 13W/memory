@@ -550,6 +550,21 @@ pub fn worktrees_of_repo(
     rows.collect()
 }
 
+/// Every `worktree_id` in the store, ascending (spec 03 §2.1).
+///
+/// A store-wide reader, not scoped to a repository. Two consumers rely on the
+/// complete set: retention's store-wide pin union (T06-02) and orphan-shard
+/// housekeeping (T06-03) — a `projection/<name>` directory whose `<name>` is not
+/// returned here has no worktree row and is an orphan shard (spec 05 §8).
+/// Ascending order makes the result deterministic.
+pub fn all_worktree_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT worktree_id FROM worktree ORDER BY worktree_id")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

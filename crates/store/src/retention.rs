@@ -509,10 +509,7 @@ fn store_wide_pinned(
     external: &ExternalPins,
     now_ms: i64,
 ) -> rusqlite::Result<BTreeSet<String>> {
-    let mut stmt = conn.prepare("SELECT worktree_id FROM worktree")?;
-    let worktrees = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let worktrees = crate::registry::all_worktree_ids(conn)?;
     let mut pinned = BTreeSet::new();
     for wt in &worktrees {
         pinned.extend(pinned_generation_roots(conn, wt, params, external, now_ms)?.generations);
