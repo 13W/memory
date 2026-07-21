@@ -14,6 +14,24 @@ changes only *schedule* work; correctness comes from authoritative reconcile.
 Fast-path cache: `(mtime, size, file_id)` per path; any mismatch or doubt escalates the file to
 content hashing. The fast-path cache is advisory only and lives in memory.
 
+As-built note (T05-02, `[SPEC]`): steps 1–2 of the pipeline (§2 — the authoritative tree scan and
+content-hash) are `local_rag_index::scan::scan`, which walks the worktree root with
+`ignore::WalkBuilder` and returns a canonical, `(normalized_path, display_path)`-sorted
+`ScanManifest` of indexable candidates. `ScanMode::Fast` consults the advisory `StatCache`
+(`StatKey = (mtime, size, file_id)`); a reuse requires all three equal **and** a known `file_id`
+(a missing inode is doubt → re-hash). `ScanMode::Strict` — the mandatory watcher-overflow / cold-
+start / periodic mode — ignores the cache and hashes every candidate. The manifest never carries
+mtime or cache state, so it is a deterministic function of the tree bytes; `content_hash` uses the
+store's `H(file_content)` so it is directly comparable to `file_revision.content_hash`. Two skip
+gates are applied here: `ignored` (native `ignore`-crate pruning — ignored files are absent from
+the manifest, no `skipped_file` row) and the stat-only `huge` gate (`content_hash = None`, bytes
+never read); the content-based reasons and the `skipped_file`/`file_revision`/generation writes are
+the builder (T05-03). Determinism guards: `git_global(false)` + `parents(false)` (no `$HOME` /
+above-root leakage), `follow_links(false)` + regular-files-only (symlinks/FIFOs/sockets excluded),
+and the internal `.git` is pruned unconditionally. Non-git worktrees set `require_git(false)` so
+`.gitignore` is still honored (§6 parity). An optional `prune_roots` excludes nested registered
+worktrees (the daemon supplies them, T05-04). No git binary/crate is used (guardrail until T15).
+
 ## 2. Reconcile pipeline `[FIXED]`
 
 Under the per-worktree write lock (single writer per worktree; store-level lockfile at L0):

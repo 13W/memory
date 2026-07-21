@@ -10,11 +10,12 @@ publish.workspace = true
 local-rag-core = { path = "../core" }
 local-rag-store = { path = "../store" }
 
-# gitignore matching for the `ignored` skip reason (spec 06 §2). See the
-# dependency policy in CONTRIBUTING.md for the justification, license, and the
-# recorded transitive set. T03-02 uses only the `ignore::gitignore` matcher, not
-# the parallel `Walk` (that is T05-02). `default-features = false` is set
-# defensively (this version ships no meaningful default features).
+# gitignore matching (spec 06 §2). See the dependency policy in CONTRIBUTING.md
+# for the justification, license, and the recorded transitive set. T03-02 uses the
+# `ignore::gitignore` matcher; T05-02 adds the authoritative tree walk
+# (`ignore::WalkBuilder`) for the reconcile candidate manifest. `default-features =
+# false` is set defensively (the crate's only feature is opt-in `simd-accel`;
+# `WalkBuilder`/`Walk` are core API, available without it).
 ignore = { version = "0.4", default-features = false }
 
 # The incremental parser (spec 06 §2.1 `[FIXED]` tree-sitter) and the first-release
