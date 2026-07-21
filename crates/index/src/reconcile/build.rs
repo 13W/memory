@@ -140,7 +140,7 @@ pub async fn build_generation(
     manifest: &ScanManifest,
     cfg: &ClassifierConfig,
     scanner: &Scanner,
-    uuids: &dyn UuidSource,
+    uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
 ) -> Result<BuildOutcome, BuildError> {
     let generation_id = uuids.next_uuid().to_string();
@@ -217,7 +217,7 @@ async fn run_build(
     manifest: &ScanManifest,
     cfg: &ClassifierConfig,
     scanner: &Scanner,
-    uuids: &dyn UuidSource,
+    uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
 ) -> Result<BuildOutcome, BuildErrorKind> {
     let mut out = BuildOutcome {

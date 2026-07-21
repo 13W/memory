@@ -44,14 +44,35 @@ tree-sitter-javascript = "0.23"
 tree-sitter-rust = "0.23"
 streaming-iterator = "0.1"
 
+# Runtime primitives for the reconcile scheduler/driver (T05-04, spec 06 §1): the
+# `select!` loop (macros), per-worktree task spawning (rt), debounce/periodic timers
+# (time), and the trigger channel (sync). `crates/store` links only `sync` (the
+# bounded write queue); the daemon (T15) selects the runtime flavor. See the
+# dependency policy / allowlist in CONTRIBUTING.md.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "sync",
+    "time",
+] }
+# Cross-platform filesystem watcher (spec 06 §1: "Watcher (`notify`) events"; the
+# `[FIXED]` principle is watcher = hint, reconcile = truth). `std` has no FS
+# notification API. Live watching is confined to `reconcile::watcher`; the pure
+# `WatchEvent → Trigger` mapping is what tests cover. `default-features = false`
+# drops the `crossbeam-channel` default (std `mpsc` suffices for the thin wrapper)
+# and keeps the transitive set minimal, mirroring `ignore`. See the dependency
+# allowlist in CONTRIBUTING.md.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
-# The `skipped ⇒ no occurrence` integration test drives the store's async
-# bounded writer, so the test harness needs a runtime and `#[tokio::test]`.
+# The reconcile/scheduler integration tests drive the store's async bounded writer
+# and the scheduler's debounce timers, so the harness needs a runtime, the
+# `#[tokio::test]` macro, and paused virtual time (`start_paused`/`advance`).
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
-    "sync",
+    "test-util",
 ] }
 # T04-03 is the first task to consume typed JSON fixtures (spec 14 §1 parser
 # family). `serde(derive)` is already approved (crates/core); `serde_json` is
