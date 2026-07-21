@@ -22,6 +22,30 @@ building ──▶ projection_ready ──▶ active ──▶ retiring ──�
 
 `retiring` is **never** consulted for routing `[FIXED]` — search resolves only the active tuple.
 
+As-built note (T05-01, `[SPEC]`): the generation lifecycle is `local_rag_store::registry::generation`
+(the `generation` table itself ships with `SCHEMA_V2`, T02-03). `allocate_generation` mints the
+`∅ → building` row with a per-worktree monotone `generation_number = MAX(number) + 1` over **all** of
+the worktree's rows (retiring/failed keep their numbers until GC, so numbers are never reused);
+`UNIQUE (worktree_id, generation_number)` (03 §2.1) is the structural backstop, and correctness of
+the read-compute-write under concurrency rests on the single global writer (03 §3), not a per-row
+lock. `GenerationState::check_transition` is the pure guard and realizes the exact legal set of the
+diagram above: `building → projection_ready`, `building → failed`, `projection_ready → active`,
+`projection_ready → failed`, `active → retiring`, plus idempotent self-transitions; every other move
+is rejected — in particular `active → failed` (the "error in reconcile/switch" edge fires from
+`building` on a build error and from `projection_ready` on a switch error, never from the
+already-serving `active`, T05-05) and `building → active` (must pass through `projection_ready`).
+`transition_generation` mirrors `transition_worktree_state` (04 §7): guarded read-then-write in one
+tx, a typed `GenerationTransitionError` (`UnknownGeneration` / `Illegal`) with **no mutation** on
+rejection, and a corrupt stored `state` surfacing as `rusqlite::Error::FromSqlConversionFailure`
+(never a silent default). The "exactly one `active` per worktree" invariant is **not** a schema
+constraint (the schema is frozen and there is no partial unique index); it is upheld *procedurally* by
+the projection switch that retires N before promoting N+1 in one tx (05 §5, a later task), and the
+`active_generations` reader — which returns only `state = 'active'` rows, so `retiring`/`failed` are
+never routed — is what makes the invariant observable/assertable (T05-01 tests the well-sequenced
+switch and a negative control). The `projection_ready → active` / `active → retiring` coupling to the
+same tx that clears `worktree_projection_state` is the later switch, not `transition_generation`
+alone.
+
 ## 2. Projection status (`worktree_projection_state.status`)
 
 ```

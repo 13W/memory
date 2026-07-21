@@ -10,13 +10,42 @@
 //! `source_blob`. A `skipped_file` therefore never gets an occurrence (spec 06
 //! §2.2).
 //!
-//! T03-01 stores what it is given: `occurrence_id` is a caller-supplied string
-//! here (its deterministic `H(occurrence_id, …)` derivation and the generation
-//! builder are group 05). Write operations take a [`Transaction`]; reads take a
-//! [`Connection`].
+//! [`insert_occurrence`] stores what it is given: the `occurrence_id` is a
+//! caller-supplied string (T03-01 verbatim contract). Its deterministic
+//! derivation [`occurrence_id`] — `H(occurrence_id: generation_id,
+//! normalized_path, unit_id)` (spec 03 §1.2) — is T05-01; the generation *builder*
+//! that mints and persists occurrences with it is T05-03. Write operations take a
+//! [`Transaction`]; reads take a [`Connection`].
 
+use local_rag_core::identity::Domain;
+use local_rag_core::identity::domain::hash;
 use rusqlite::types::Type;
 use rusqlite::{Connection, Error, OptionalExtension, Transaction, params};
+
+/// The deterministic `generation_unit_occurrence.occurrence_id` (spec 03 §1.2,
+/// §2.4): `H(occurrence_id: generation_id, normalized_path, unit_id)` — group 05.
+///
+/// The domain (`local-rag/1/occurrence_id`) fixes the field order
+/// `generation_id, normalized_path, unit_id` (spec 03 §1.2 table); all three are
+/// text / already-hex identities, so each is hashed as its exact UTF-8/ASCII bytes
+/// (the codebase's serialization convention). The id depends on nothing but its
+/// own tuple, so it is stable under retry/reconcile and independent of row
+/// insertion order (spec 03 §1.2 `[FIXED]`) — the property the generation builder
+/// (T05-03) relies on to re-derive identical ids for unchanged occurrences.
+///
+/// This is the *derivation* only; [`insert_occurrence`] still stores the id
+/// verbatim (its T03-01 contract). A caller binds the owned `String` and borrows
+/// it into a [`NewOccurrence`].
+pub fn occurrence_id(generation_id: &str, normalized_path: &str, unit_id: &str) -> String {
+    hash(
+        Domain::OccurrenceId,
+        &[
+            generation_id.as_bytes(),
+            normalized_path.as_bytes(),
+            unit_id.as_bytes(),
+        ],
+    )
+}
 
 /// Why a file was skipped from the searchable generation (spec 03 §2.4
 /// `skipped_file.reason`, policy in spec 06 §2.2 / 12 §2, §5).
@@ -384,5 +413,102 @@ mod tests {
         );
         // An absent (generation, path) is a clean `None`.
         assert_eq!(skip_reason(&conn, "g", "missing.rs").expect("read"), None);
+    }
+
+    // A realistic occurrence tuple: a UUIDv7-like generation id, a normalized
+    // path, and a UUIDv7-like unit id.
+    const G: &str = "018f0000-0000-7000-8000-000000000001";
+    const P: &str = "src/main.rs";
+    const U: &str = "018f0000-0000-7000-8000-0000000000a0";
+
+    /// `occurrence_id` only *forwards* its three fields, in the spec-fixed order
+    /// (spec 03 §1.2 table row `…/occurrence_id`), to the domain hasher — and pins
+    /// the resulting digest so a field reorder or domain drift at this layer is
+    /// caught. The digest is the 64 lowercase hex of BLAKE3.
+    #[test]
+    fn occurrence_id_matches_domain_hash_golden() {
+        let id = occurrence_id(G, P, U);
+
+        // Format: 64 lowercase hex characters.
+        assert_eq!(id.len(), 64, "BLAKE3 hex digest");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "lowercase hex only: {id}",
+        );
+
+        // Forwarding: identical to hashing the fields directly in table order.
+        assert_eq!(
+            id,
+            hash(
+                Domain::OccurrenceId,
+                &[G.as_bytes(), P.as_bytes(), U.as_bytes()]
+            ),
+            "occurrence_id forwards (generation_id, normalized_path, unit_id)",
+        );
+
+        // Golden: pins the exact digest against accidental field-order/domain drift.
+        assert_eq!(
+            id, "79e86eca6244de2766b201476681c17fd9476290ee1d30d1b3f93c74f82891c5",
+            "occurrence_id golden (spec 03 §1.2 `…/occurrence_id`)",
+        );
+    }
+
+    /// The id depends only on its own tuple: it is stable under retry (same inputs
+    /// → same output) and independent of the order in which occurrences are
+    /// processed (spec 03 §1.2 `[FIXED]`, the property T05-03's builder relies on).
+    #[test]
+    fn occurrence_id_is_retry_and_order_independent() {
+        // Retry stability.
+        assert_eq!(occurrence_id(G, P, U), occurrence_id(G, P, U));
+
+        // A list of distinct occurrences, hashed in two different processing
+        // orders, yields byte-identical per-tuple ids.
+        let tuples = [
+            (G, "src/a.rs", U),
+            (G, "src/b.rs", "018f0000-0000-7000-8000-0000000000b1"),
+            ("018f0000-0000-7000-8000-000000000002", P, U),
+        ];
+        let forward: Vec<String> = tuples
+            .iter()
+            .map(|(g, p, u)| occurrence_id(g, p, u))
+            .collect();
+        let reverse: Vec<String> = tuples
+            .iter()
+            .rev()
+            .map(|(g, p, u)| occurrence_id(g, p, u))
+            .collect();
+        for (i, (g, p, u)) in tuples.iter().enumerate() {
+            assert_eq!(forward[i], occurrence_id(g, p, u));
+            // The same tuple hashes identically regardless of position.
+            assert_eq!(forward[i], reverse[tuples.len() - 1 - i]);
+        }
+
+        // Distinct tuples → distinct ids (no collisions across the realistic set).
+        let mut sorted = forward.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            forward.len(),
+            "distinct tuples → distinct ids"
+        );
+    }
+
+    /// Length-prefixed field framing (spec 03 §1.2) makes field boundaries
+    /// unambiguous: shifting a byte across a field boundary changes the digest,
+    /// so `occurrence_id` cannot be spoofed by concatenation collisions.
+    #[test]
+    fn occurrence_id_field_boundaries_are_unambiguous() {
+        assert_ne!(
+            occurrence_id("ab", "c", U),
+            occurrence_id("a", "bc", U),
+            "moving a byte across the generation_id/normalized_path boundary",
+        );
+        assert_ne!(
+            occurrence_id(G, "pq", "r"),
+            occurrence_id(G, "p", "qr"),
+            "moving a byte across the normalized_path/unit_id boundary",
+        );
     }
 }
