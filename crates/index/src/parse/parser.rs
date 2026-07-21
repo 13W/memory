@@ -10,6 +10,9 @@
 //! The parse **output** contract — [`ParseOutput`], byte spans, parents,
 //! unresolved references — is defined in [`crate::parse::output`] (T04-03).
 
+use crate::parse::adapter::javascript::JavaScriptParser;
+use crate::parse::adapter::rust::RustParser;
+use crate::parse::adapter::typescript::TypeScriptParser;
 use crate::parse::fingerprint;
 use crate::parse::language::LanguageId;
 use crate::parse::output::ParseOutput;
@@ -34,5 +37,19 @@ pub trait LanguageParser {
     /// not normally override it.
     fn parser_fingerprint(&self) -> String {
         fingerprint::parser_fingerprint(self.language())
+    }
+}
+
+/// The production parser adapter for `language` (spec 06 §2.1).
+///
+/// The reconcile generation builder (group 05) selects a language by path
+/// ([`select_language`](crate::parse::select_language)) and calls this to obtain
+/// the adapter for it. Mirrors the fixtures' test helper; every closed-set
+/// [`LanguageId`] maps to exactly one adapter, so this is total (no `Option`).
+pub fn parser_for(language: LanguageId) -> Box<dyn LanguageParser> {
+    match language {
+        LanguageId::TypeScript => Box::new(TypeScriptParser::new()),
+        LanguageId::JavaScript => Box::new(JavaScriptParser::new()),
+        LanguageId::Rust => Box::new(RustParser::new()),
     }
 }

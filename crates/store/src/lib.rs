@@ -118,8 +118,8 @@ pub use code::{
     detect_newline_style, file_revision_id_by_content_key, insert_content_blob,
     insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
     insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
-    normalize, occurrence_id, parsed_unit_id_by_natural_key, prepare_source, skip_reason,
-    source_bytes,
+    normalize, occurrence_id, parsed_unit_id_by_natural_key, parsed_units_for_revision,
+    prepare_source, skip_reason, source_bytes,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
