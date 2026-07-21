@@ -413,8 +413,11 @@ impl std::error::Error for SweepError {
 /// Create the connection-local scratch tables and materialize the sweep sets.
 ///
 /// The scratch tables live in the `temp` schema (per-connection, never part of
-/// canonical `state.sqlite`, so a dry run over a read-only connection creates
-/// them without violating "mutate nothing"):
+/// canonical `state.sqlite`). Both [`run_sweep`] and the [`plan_sweep`] dry run
+/// create them on the single writer connection, confining every mutation to the
+/// `temp` schema — no canonical row and no main-database WAL frame is written, so
+/// a dry run satisfies "mutate nothing" (a read-only connection is `query_only`
+/// and could not create them):
 ///
 /// - `sweep_pinned` — the store-wide union of every worktree's pinned generation
 ///   roots (spec 06 §5, computed in Rust via [`pinned_generation_roots`]);
