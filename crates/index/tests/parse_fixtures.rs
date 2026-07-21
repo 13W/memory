@@ -19,8 +19,8 @@ use serde::Deserialize;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
-    JavaScriptParser, LanguageId, LanguageParser, SyntaxAnchor, SyntaxLocator, TypeScriptParser,
-    parser_fingerprint,
+    JavaScriptParser, LanguageId, LanguageParser, RustParser, SyntaxAnchor, SyntaxLocator,
+    TypeScriptParser, parser_fingerprint,
 };
 use local_rag_store::StateDb;
 use local_rag_store::code::{
@@ -106,6 +106,7 @@ fn parser_for(language: &str) -> Box<dyn LanguageParser> {
     match language {
         "typescript" => Box::new(TypeScriptParser::new()),
         "javascript" => Box::new(JavaScriptParser::new()),
+        "rust" => Box::new(RustParser::new()),
         other => panic!("no parser for fixture language {other:?}"),
     }
 }
@@ -166,16 +167,14 @@ fn parser_fixtures_match_expected_units_and_refs() {
         );
         *per_language.entry(case.language.clone()).or_default() += 1;
     }
-    // Both v0-authored languages must be exercised (TypeScript T04-03, JavaScript
-    // T04-04); Rust is T04-05.
-    assert!(
-        per_language.get("typescript").copied().unwrap_or(0) >= 4,
-        "expected the authored TypeScript cases"
-    );
-    assert!(
-        per_language.get("javascript").copied().unwrap_or(0) >= 4,
-        "expected the authored JavaScript cases"
-    );
+    // Every v0 language must be exercised (TypeScript T04-03, JavaScript T04-04,
+    // Rust T04-05).
+    for lang in ["typescript", "javascript", "rust"] {
+        assert!(
+            per_language.get(lang).copied().unwrap_or(0) >= 4,
+            "expected the authored {lang} cases"
+        );
+    }
 }
 
 #[test]
@@ -204,6 +203,29 @@ fn fingerprints_are_reconciled_after_linking_the_grammars() {
     assert_eq!(
         parser_fingerprint(LanguageId::JavaScript),
         "chunk=1;grammar=tree-sitter-javascript@1;lang=javascript;norm=1;queries=1"
+    );
+    assert_eq!(
+        parser_fingerprint(LanguageId::Rust),
+        "chunk=1;grammar=tree-sitter-rust@1;lang=rust;norm=1;queries=1"
+    );
+}
+
+#[test]
+fn every_language_has_a_distinct_fingerprint() {
+    // Cross-language fingerprint case (T04-05): byte-identical source under a
+    // different language never collides in `file_revision` because `lang=`/`grammar=`
+    // differ. All three v0 languages must render pairwise-distinct fingerprints.
+    let fps: Vec<String> = LanguageId::ALL
+        .iter()
+        .map(|&l| parser_fingerprint(l))
+        .collect();
+    let mut deduped = fps.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        fps.len(),
+        "every v0 language must have a distinct parser_fingerprint"
     );
 }
 

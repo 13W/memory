@@ -33,6 +33,14 @@ tree-sitter-typescript = "0.23"
 # with `tree-sitter`), so it adds no new transitive crate. See the dependency
 # allowlist in CONTRIBUTING.md.
 tree-sitter-javascript = "0.23"
+# The third-release language grammar (ADR-0001 dogfooding, T04-05). Pinned at 0.23
+# (ABI 14) for the same reason as the other two grammars: `tree-sitter-rust 0.24+`
+# ships an ABI-15 grammar that `tree-sitter 0.24` (max supported language ABI 14)
+# refuses to load — it would silently degrade to a file-only parse; 0.23.x is ABI 14
+# (the ABI-15 bump landed in the grammar's 0.24.0). Its only runtime dependency is
+# `tree-sitter-language` (already in the tree, shared with `tree-sitter`), so it adds
+# no new transitive crate. See the dependency allowlist in CONTRIBUTING.md.
+tree-sitter-rust = "0.23"
 streaming-iterator = "0.1"
 
 [dev-dependencies]

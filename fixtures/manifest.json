@@ -18,14 +18,15 @@
     {
       "name": "parser",
       "spec_ref": "14 §1.1",
-      "coverage": "partial",
+      "coverage": "full",
       "artifact": "parser/index.json",
       "provenance": [
         "src/indexer/parser.ts (v1 parser exists, exercised only via the 49-query benchmark)",
         "T04-03 authored TypeScript goldens (tree-sitter tsx adapter, ADR-0002)",
-        "T04-04 authored JavaScript goldens (tree-sitter-javascript adapter, ADR-0002)"
+        "T04-04 authored JavaScript goldens (tree-sitter-javascript adapter, ADR-0002)",
+        "T04-05 authored Rust goldens (tree-sitter-rust adapter, ADR-0002)"
       ],
-      "gaps": ["GAP-01"]
+      "gaps": []
     },
     {
       "name": "reconcile",
@@ -93,7 +94,7 @@
     {
       "id": "GAP-01",
       "family": "parser",
-      "description": "No v1 golden parser fixtures per language. O4 is now closed (ADR-0001). TypeScript goldens authored in T04-03 and JavaScript goldens in T04-04 (parser/index.json, ADR-0002); the remaining Rust goldens are authored in T04-05, closing this gap.",
+      "description": "RESOLVED (T04-05). No v1 golden parser fixtures per language existed. O4 was closed by ADR-0001; per-language tree-sitter goldens were then authored for the full v0 set — TypeScript (T04-03), JavaScript (T04-04), Rust (T04-05) — in parser/index.json (ADR-0002). Config/text universal-kind fixtures (config_section|text_section) belong to the later universal path (groups 05/08), not to this O4 gap.",
       "blocking": false,
       "resolves_in": "T04-03 (TypeScript), T04-04 (JavaScript), T04-05 (Rust)"
     },
