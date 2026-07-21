@@ -484,6 +484,22 @@ offset-free). The parse output is a pure, DB-free function `bytes -> {units, unr
 (`span.start` asc, `span.end` desc, `unit_kind`, `lang_kind`, `local_name`, `sig`). The graph
 half of O7 (`resolved_graph_edge.edge_kind`, `find_usages`/`get_dependencies`) remains `[OPEN]`.
 
+As-built parse-output **persistence** `[SPEC]` (realized by T04-06 in
+`crates/index/src/parse/persist.rs::persist_parse_output`, over new `create_or_reuse_parsed_unit`
+/ `delete_unresolved_references_for_revision` in `crates/store/src/code`): the content side of one
+file's parse (`content_blob`, `parsed_unit`, `unresolved_reference`) is written under a single
+atomic transaction, so any error rolls the whole file's graph back (no partial graph, 06 §2.1).
+It is idempotent by create-or-reuse: a `content_blob` reuses by its content-derived PK; a
+`parsed_unit` reuses by its natural key `UNIQUE (file_revision_id, unit_kind, syntax_locator,
+span_start, span_end)` — not by `unit_id`, which is a fresh UUIDv7 the caller mints and which is
+consumed only when a row is created. Because `unresolved_reference` has no natural key (a file may
+legitimately repeat a specifier), reference idempotence is a per-revision clear-then-reinsert, not
+per-row reuse. Re-persisting an unchanged revision therefore adds no duplicate rows and returns the
+*same* unit ids (the stability the deterministic `occurrence_id` of group 05 builds on). Units are
+inserted in the canonical order above, so a parent's row always precedes its children's
+`parent_unit_id` self-reference. Persisting generation membership (`generation_unit_occurrence`) is
+group 05, not this function.
+
 ### 2.5 Memory side
 
 ```sql

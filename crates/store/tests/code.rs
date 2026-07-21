@@ -14,10 +14,12 @@ use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::code::{
     EdgeResolution, NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit, NewResolvedEdge,
-    NewUnresolvedReference, NewlineStyle, SkipReason, SourceCompression, UnitKind,
+    NewUnresolvedReference, NewlineStyle, ParsedUnitOutcome, SkipReason, SourceCompression,
+    UnitKind, create_or_reuse_parsed_unit, delete_unresolved_references_for_revision,
     file_revision_id_by_content_key, insert_content_blob, insert_file_revision,
     insert_generation_file, insert_occurrence, insert_parsed_unit, insert_resolved_edge,
-    insert_skipped_file, insert_unresolved_reference, member_file_revision, skip_reason,
+    insert_skipped_file, insert_unresolved_reference, member_file_revision,
+    parsed_unit_id_by_natural_key, skip_reason,
 };
 use local_rag_store::registry::{WorktreeKind, create_repository, create_worktree};
 use local_rag_store::rusqlite::Error;
@@ -975,4 +977,141 @@ async fn source_blob_is_not_nullable() {
         .await
         .expect_err("null source_blob must be rejected");
     assert_eq!(extended_code(&err), Some(SQLITE_CONSTRAINT_NOTNULL));
+}
+
+/// T04-06: `create_or_reuse_parsed_unit` reuses by the `parsed_unit` natural key
+/// `(file_revision_id, unit_kind, syntax_locator, span_start, span_end)`, not by
+/// `unit_id` — a replayed parse (a different candidate id, same key) returns the
+/// existing id with no duplicate row.
+#[tokio::test]
+async fn create_or_reuse_parsed_unit_reuses_by_natural_key() {
+    let (_home, db) = open_state();
+    let rev = seed_revision(&db, 1, "ch", "fp").await;
+    let blob = uuid(30);
+    let u1 = uuid(40);
+    let u2 = uuid(41);
+
+    let (rev0, b0, a, c) = (rev.clone(), blob.clone(), u1.clone(), u2.clone());
+    let (first, second) = db
+        .writer()
+        .transaction(move |tx| {
+            insert_content_blob(
+                tx,
+                &NewContentBlob {
+                    blob_id: &b0,
+                    language: "rust",
+                    algo_version: 1,
+                    normalization_version: 1,
+                },
+                1000,
+            )?;
+            let base = NewParsedUnit {
+                unit_id: &a,
+                file_revision_id: &rev0,
+                unit_kind: UnitKind::Symbol,
+                syntax_locator: "fn:main",
+                blob_id: &b0,
+                span_start: 0,
+                span_end: 6,
+                local_name: Some("main"),
+                kind: Some("fn"),
+                parent_unit_id: None,
+            };
+            let first = create_or_reuse_parsed_unit(tx, &base)?;
+            // Same natural key, different candidate id → reuse the first row.
+            let second = create_or_reuse_parsed_unit(
+                tx,
+                &NewParsedUnit {
+                    unit_id: &c,
+                    ..base
+                },
+            )?;
+            Ok((first, second))
+        })
+        .await
+        .expect("create/reuse parsed unit");
+
+    assert_eq!(first, ParsedUnitOutcome::Created(u1.clone()));
+    assert_eq!(second, ParsedUnitOutcome::Reused(u1.clone()));
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        parsed_unit_id_by_natural_key(&read, &rev, UnitKind::Symbol, "fn:main", 0, 6)
+            .expect("lookup"),
+        Some(u1.clone()),
+    );
+    // A different span is a different natural key → absent.
+    assert_eq!(
+        parsed_unit_id_by_natural_key(&read, &rev, UnitKind::Symbol, "fn:main", 0, 5)
+            .expect("lookup"),
+        None,
+    );
+    let n: i64 = read
+        .query_row(
+            "SELECT count(*) FROM parsed_unit WHERE file_revision_id = ?1",
+            [&rev],
+            |r| r.get(0),
+        )
+        .expect("count units");
+    assert_eq!(n, 1, "reuse must not duplicate the row");
+}
+
+/// T04-06: `delete_unresolved_references_for_revision` removes only the target
+/// revision's rows (preserving legitimate multiplicity within it) and returns the
+/// count deleted — the basis of idempotent reference re-persistence.
+#[tokio::test]
+async fn delete_unresolved_references_for_revision_is_scoped() {
+    let (_home, db) = open_state();
+    let rev_a = seed_revision(&db, 1, "ch-a", "fp-a").await;
+    let rev_b = seed_revision(&db, 2, "ch-b", "fp-b").await;
+    let unit_a = seed_unit(&db, 3, &rev_a).await;
+    let unit_b = seed_unit(&db, 4, &rev_b).await;
+
+    let (ra, rb, ua, ub) = (rev_a.clone(), rev_b.clone(), unit_a, unit_b);
+    db.writer()
+        .transaction(move |tx| {
+            // A file may legitimately repeat a specifier; multiplicity is preserved.
+            for t in ["./x", "./x", "./y"] {
+                insert_unresolved_reference(
+                    tx,
+                    &NewUnresolvedReference {
+                        file_revision_id: &ra,
+                        source_unit_id: &ua,
+                        reference_text: t,
+                        reference_kind: "import",
+                    },
+                )?;
+            }
+            insert_unresolved_reference(
+                tx,
+                &NewUnresolvedReference {
+                    file_revision_id: &rb,
+                    source_unit_id: &ub,
+                    reference_text: "./z",
+                    reference_kind: "reexport",
+                },
+            )
+        })
+        .await
+        .expect("insert refs");
+
+    let ra2 = rev_a.clone();
+    let deleted = db
+        .writer()
+        .transaction(move |tx| delete_unresolved_references_for_revision(tx, &ra2))
+        .await
+        .expect("delete refs");
+    assert_eq!(deleted, 3, "all three of rev_a's refs are removed");
+
+    let read = db.open_read().expect("read conn");
+    let count = |rev: &str| -> i64 {
+        read.query_row(
+            "SELECT count(*) FROM unresolved_reference WHERE file_revision_id = ?1",
+            [rev],
+            |r| r.get(0),
+        )
+        .expect("count refs")
+    };
+    assert_eq!(count(&rev_a), 0);
+    assert_eq!(count(&rev_b), 1, "the other revision's refs are untouched");
 }

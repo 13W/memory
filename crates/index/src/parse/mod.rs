@@ -31,6 +31,7 @@ pub mod language;
 pub mod locator;
 pub mod output;
 pub mod parser;
+pub mod persist;
 pub mod signature;
 
 pub use adapter::javascript::JavaScriptParser;
@@ -44,3 +45,4 @@ pub use language::{LanguageId, select_language};
 pub use locator::{LocatorParseError, SyntaxAnchor, SyntaxLocator, SyntaxLocatorDraft};
 pub use output::{ByteSpan, ParseOutput, ParsedUnitDraft, ReferenceKind, UnresolvedRef};
 pub use parser::LanguageParser;
+pub use persist::{PersistOutcome, persist_parse_output};

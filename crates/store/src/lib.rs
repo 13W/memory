@@ -110,14 +110,15 @@ pub use cache::{
 pub use code::{
     ALGO_VERSION, BlobOutcome, DerivedContentBlob, EdgeResolution, NORMALIZATION_VERSION,
     NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit, NewResolvedEdge,
-    NewUnresolvedReference, NewlineStyle, PreparedSource, RevisionOutcome, SOURCE_ENCODING_UTF8,
-    SOURCE_ZSTD_LEVEL, SkipReason, SourceCompression, UnitKind, content_blob_exists,
-    content_blob_id, content_hash, create_or_reuse_content_blob, create_or_reuse_file_revision,
-    decode_source, derive_content_blob, detect_encoding, detect_newline_style,
-    file_revision_id_by_content_key, insert_content_blob, insert_file_revision,
-    insert_generation_file, insert_occurrence, insert_parsed_unit, insert_resolved_edge,
-    insert_skipped_file, insert_unresolved_reference, member_file_revision, normalize,
-    prepare_source, skip_reason, source_bytes,
+    NewUnresolvedReference, NewlineStyle, ParsedUnitOutcome, PreparedSource, RevisionOutcome,
+    SOURCE_ENCODING_UTF8, SOURCE_ZSTD_LEVEL, SkipReason, SourceCompression, UnitKind,
+    content_blob_exists, content_blob_id, content_hash, create_or_reuse_content_blob,
+    create_or_reuse_file_revision, create_or_reuse_parsed_unit, decode_source,
+    delete_unresolved_references_for_revision, derive_content_blob, detect_encoding,
+    detect_newline_style, file_revision_id_by_content_key, insert_content_blob,
+    insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
+    insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
+    normalize, parsed_unit_id_by_natural_key, prepare_source, skip_reason, source_bytes,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
