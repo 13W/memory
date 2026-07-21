@@ -29,6 +29,29 @@ pub const DEBOUNCE_MS: i64 = 500;
 /// (spec 06 §1): a backstop that re-establishes truth even if every event was lost.
 pub const PERIODIC_MS: i64 = 6 * 60 * 60 * 1000;
 
+/// The base retry backoff after a failed reconcile (spec 04 §1/§2 mandate "retry
+/// with backoff" but pin no number; this is the index-crate as-built value,
+/// alongside `DEBOUNCE_MS`/`PERIODIC_MS`, deliberately out of `core::config`) —
+/// `[SPEC]`. The floor for automatic retries grows exponentially from here.
+pub const RETRY_BACKOFF_BASE_MS: i64 = 1_000;
+
+/// The cap on the exponential retry backoff (spec 04 §1/§2) — `[SPEC]`.
+pub const RETRY_BACKOFF_MAX_MS: i64 = 5 * 60 * 1000;
+
+/// The backoff after `failures` consecutive failed reconciles: exponential
+/// (`RETRY_BACKOFF_BASE_MS · 2^(failures-1)`) capped at [`RETRY_BACKOFF_MAX_MS`];
+/// `0` failures → `0`. Pure and saturating (the exponent is clamped so the shift
+/// never overflows).
+fn backoff_delay(failures: u32) -> i64 {
+    if failures == 0 {
+        return 0;
+    }
+    let shift = (failures - 1).min(30);
+    RETRY_BACKOFF_BASE_MS
+        .saturating_mul(1_i64 << shift)
+        .min(RETRY_BACKOFF_MAX_MS)
+}
+
 /// The two tunable intervals of the scheduling engine (both `[SPEC]`, spec 06 §1).
 ///
 /// [`Default`] is the spec pair; tests may shrink them.
@@ -136,6 +159,11 @@ pub struct Debouncer {
     is_git: bool,
     pending: Option<Pending>,
     next_periodic_at: i64,
+    /// Consecutive failed reconciles since the last success (T05-05 observability).
+    consecutive_failures: u32,
+    /// The monotonic millisecond before which no *automatic* retry may fire; a
+    /// manual reindex clears it. `0` when healthy.
+    retry_backoff_until: i64,
 }
 
 impl Debouncer {
@@ -147,7 +175,38 @@ impl Debouncer {
             is_git,
             pending: None,
             next_periodic_at: now_ms.saturating_add(cfg.periodic_ms),
+            consecutive_failures: 0,
+            retry_backoff_until: 0,
         }
+    }
+
+    /// Record a failed reconcile at `now_ms` (T05-05): increment the failure counter
+    /// and push the earliest allowable **automatic** retry out by an exponential
+    /// backoff ([`backoff_delay`]). A [`Manual`](TriggerKind::Manual) reindex still
+    /// fires immediately — the floor gates only the fs/git/periodic/startup/overflow
+    /// retry path.
+    pub fn record_failure(&mut self, now_ms: i64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.retry_backoff_until = now_ms.saturating_add(backoff_delay(self.consecutive_failures));
+    }
+
+    /// Record a successful reconcile (T05-05): clear the failure counter and the
+    /// backoff floor.
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_backoff_until = 0;
+    }
+
+    /// Consecutive failed reconciles since the last success (`0` when healthy) —
+    /// the counter the driver surfaces in its `last_failure` observability record.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// The monotonic millisecond before which no automatic retry may fire (`0` when
+    /// healthy) — observability for the driver's backoff deadline.
+    pub fn retry_backoff_until(&self) -> i64 {
+        self.retry_backoff_until
     }
 
     /// Fold a trigger into the pending request (spec 06 §1). Coalesces into a single
@@ -157,6 +216,12 @@ impl Debouncer {
     pub fn record(&mut self, kind: TriggerKind, now_ms: i64) {
         if kind.is_git_only() && !self.is_git {
             return;
+        }
+        // A manual reindex is an explicit user force: it clears the automatic-retry
+        // backoff floor so it fires immediately even mid-backoff (the failure counter
+        // is left intact for observability until a reconcile actually succeeds).
+        if matches!(kind, TriggerKind::Manual) {
+            self.retry_backoff_until = 0;
         }
         let mode = kind.scan_mode();
         match &mut self.pending {
@@ -191,10 +256,16 @@ impl Debouncer {
     }
 
     /// The next monotonic millisecond the driver must wake at: the sooner of the
-    /// pending request's deadline and the next periodic backstop.
+    /// pending request's fire time and the next periodic backstop. A pending
+    /// request's fire time is its debounce/bypass deadline **floored by the
+    /// automatic-retry backoff** ([`retry_backoff_until`](Self::retry_backoff_until)),
+    /// so a failing worktree waits out the backoff instead of hot-looping.
     pub fn next_wake(&self) -> i64 {
         match self.pending {
-            Some(p) => p.due_at.min(self.next_periodic_at),
+            Some(p) => p
+                .due_at
+                .max(self.retry_backoff_until)
+                .min(self.next_periodic_at),
             None => self.next_periodic_at,
         }
     }
@@ -214,7 +285,10 @@ impl Debouncer {
             }
         }
         match self.pending {
-            Some(p) if now_ms >= p.due_at => {
+            // Fire only once both the request's own deadline and the automatic-retry
+            // backoff floor have elapsed (a manual reindex clears the floor, so it is
+            // never delayed here).
+            Some(p) if now_ms >= p.due_at && now_ms >= self.retry_backoff_until => {
                 self.pending = None;
                 Some(PlannedReconcile {
                     mode: p.mode,
@@ -379,5 +453,103 @@ mod tests {
         assert_eq!(TriggerKind::Periodic.scan_mode(), ScanMode::Strict);
         assert_eq!(TriggerKind::Manual.scan_mode(), ScanMode::Strict);
         assert_eq!(TriggerKind::WatcherOverflow.scan_mode(), ScanMode::Strict);
+    }
+
+    #[test]
+    fn backoff_grows_on_consecutive_failures() {
+        let mut d = Debouncer::new(cfg(), true, 0);
+        assert_eq!(d.consecutive_failures(), 0);
+        assert_eq!(d.retry_backoff_until(), 0, "healthy → no floor");
+
+        d.record_failure(0);
+        assert_eq!(d.consecutive_failures(), 1);
+        assert_eq!(
+            d.retry_backoff_until(),
+            RETRY_BACKOFF_BASE_MS,
+            "1st failure → base backoff",
+        );
+
+        d.record_failure(0);
+        assert_eq!(d.consecutive_failures(), 2);
+        assert_eq!(
+            d.retry_backoff_until(),
+            2 * RETRY_BACKOFF_BASE_MS,
+            "backoff doubles each consecutive failure",
+        );
+
+        d.record_failure(0);
+        assert_eq!(d.retry_backoff_until(), 4 * RETRY_BACKOFF_BASE_MS);
+
+        // Grows exponentially to the cap and never beyond.
+        for _ in 0..40 {
+            d.record_failure(0);
+        }
+        assert_eq!(d.retry_backoff_until(), RETRY_BACKOFF_MAX_MS, "capped");
+    }
+
+    #[test]
+    fn success_resets_backoff() {
+        let mut d = Debouncer::new(cfg(), true, 0);
+        d.record_failure(500);
+        assert!(d.consecutive_failures() > 0 && d.retry_backoff_until() > 0);
+        d.record_success();
+        assert_eq!(d.consecutive_failures(), 0, "success clears the counter");
+        assert_eq!(d.retry_backoff_until(), 0, "success clears the floor");
+    }
+
+    #[test]
+    fn backoff_floors_an_automatic_retry() {
+        let mut d = Debouncer::new(cfg(), true, 0);
+        // A failure at t=0 sets the floor at t=BASE (1000 ms).
+        d.record_failure(0);
+        assert_eq!(d.retry_backoff_until(), RETRY_BACKOFF_BASE_MS);
+
+        // A subsequent fs event debounces to t=600, but the backoff floor holds it.
+        d.record(TriggerKind::FsChange, 100);
+        assert_eq!(
+            d.next_wake(),
+            RETRY_BACKOFF_BASE_MS,
+            "the wake is floored by backoff, not the 600 ms debounce deadline",
+        );
+        assert_eq!(
+            d.take_due(600),
+            None,
+            "debounce elapsed but backoff has not"
+        );
+        assert_eq!(
+            d.take_due(RETRY_BACKOFF_BASE_MS),
+            Some(PlannedReconcile {
+                mode: ScanMode::Fast,
+                immediate: false,
+            }),
+            "the automatic retry fires once the backoff floor is reached",
+        );
+    }
+
+    #[test]
+    fn manual_bypasses_backoff() {
+        let mut d = Debouncer::new(cfg(), true, 0);
+        d.record_failure(0); // floor at 1000 ms, counter = 1
+        // A manual reindex at t=100 clears the floor and fires immediately.
+        d.record(TriggerKind::Manual, 100);
+        assert_eq!(
+            d.retry_backoff_until(),
+            0,
+            "manual clears the backoff floor"
+        );
+        assert_eq!(d.next_wake(), 100);
+        assert_eq!(
+            d.take_due(100),
+            Some(PlannedReconcile {
+                mode: ScanMode::Strict,
+                immediate: true,
+            }),
+            "a manual reindex fires mid-backoff",
+        );
+        assert_eq!(
+            d.consecutive_failures(),
+            1,
+            "the counter is preserved until a reconcile actually succeeds",
+        );
     }
 }

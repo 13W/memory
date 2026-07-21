@@ -64,6 +64,19 @@ tokio = { version = "1", default-features = false, features = [
 # allowlist in CONTRIBUTING.md.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
+# Optional, dev-only path crate (0 external sources): enabled ONLY by the
+# `failpoints` feature so the generation builder can host named crash/error
+# injection points at each build phase (spec 06 §2, T05-05 retry/failure
+# handling). Off by default → zero-cost; the release/distribution build never
+# links the test-support crate. Mirrors `crates/store`.
+local-rag-test-support = { path = "../test-support", optional = true }
+
+[features]
+# Compile the generation builder's named failpoint seams (spec 04 §1 build →
+# failed edge, T05-05). Off by default → zero-cost, and the release/distribution
+# build never links the test-support crate.
+failpoints = ["dep:local-rag-test-support"]
+
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
 # The reconcile/scheduler integration tests drive the store's async bounded writer
