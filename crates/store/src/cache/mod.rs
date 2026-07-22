@@ -15,6 +15,7 @@
 mod fts;
 mod open;
 mod text;
+mod validate;
 mod writer;
 
 pub use fts::{
@@ -26,6 +27,11 @@ pub use open::{CACHE_SCHEMA_VERSION, CacheOpenError, CacheOpenOutcome};
 pub use text::{
     BatchingLastUsed, LastUsedSink, NormalizedTextRow, delete_normalized_text, flush_last_used,
     get_normalized_text, insert_normalized_text, verify_cached_text,
+};
+pub use validate::{
+    FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsDivergence, FtsOpenOutcome,
+    FtsRebuildError, ValidationDepth, open_and_validate_fts, requires_index_unavailable,
+    should_rebuild_synchronously, validate_fts_cheap, validate_fts_strong,
 };
 pub use writer::{CacheWriteError, CacheWriter};
 

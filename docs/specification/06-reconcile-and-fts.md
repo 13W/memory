@@ -231,6 +231,35 @@ already identical), so skipping the delete would silently leave corrupt text unc
 empty (`tokenize_signature(&[])`) — plumbing real parameter/return-type text out of the
 tree-sitter adapters is deferred past this task, matching 09 §2's own as-built scope note.
 
+As-built note (T08-03, `[SPEC]`): `local_rag_store::cache::validate` (`crates/store/src/
+cache/validate.rs`) realizes the cheap/strong split literally as two functions,
+`validate_fts_cheap` (head-missing/generation/schema/tokenizer/count — no manifest
+parameter exists, so the cost boundary is enforced by the type signature, not convention)
+and `validate_fts_strong` (delegates to the cheap predicates first, then additionally
+compares an independently recomputed `fts_manifest_hash`). "Active generation" is read via
+`registry::worktree::current_generation` (`worktree.current_generation_id`), which the
+dense projection's `switch::commit_switch` already updates in the same final transaction as
+`worktree_projection_state.active_generation_id` (`crates/projection/src/switch.rs`), so
+the two never diverge and FTS validation needs no dependency on `crates/projection`.
+Because `fts_projection_head` carries no status/FSM column and `cache.sqlite` is the
+storage itself (no shard directory to quarantine, unlike 05 §7-§8's dense rebuild),
+"rebuild" is simply invoking T08-02's `materialize_fts` again — its existing single-cache-tx
+atomicity (delete → insert → head-last) already makes an interrupted rebuild leave the
+prior valid head in place, and the single bounded `CacheWriter` thread serializes any
+concurrent rebuild attempts (including cross-generation races) into a sequence of
+individually-valid commits; a resulting stale head is exactly what the next
+`validate_fts_cheap` call's generation check detects, so convergence needs no additional
+bookkeeping. The `< 2s` synchronous-rebuild estimate (`should_rebuild_synchronously`) is a
+provisional occurrence-count proxy (`FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD = 5_000`, not
+yet calibrated — T12-05), fed by a fresh `code::occurrence_count_for_generation` read of
+`state.sqlite`'s real active generation, never the (possibly-wrong) stale head's claimed
+count — and this read is not extra I/O, since `validate_fts_cheap` already requires it for
+the count predicate. The daemon-level `INDEX_UNAVAILABLE`/`degraded` vocabulary (spec 02
+§6, 09 §7) does not exist yet (group 15); this task ships only the FTS-side half
+(`FtsAvailability`, `requires_index_unavailable(fts, dense_available: bool)`), deliberately
+not a cross-subsystem `SearchAvailability` type, so `crates/store` never needs to know how
+dense availability is determined.
+
 ## 5. Retention & GC of canonical source `[FIXED]`
 
 Pin roots (a `file_revision`/generation is unreferenced only if reachable from none):
