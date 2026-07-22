@@ -100,6 +100,39 @@ Serialized by the per-worktree writer; the two axes are never applied simultaneo
 Crash between 2–4 leaves `status='updating'` (or an inconsistent head) — both are open-time
 detectable, both funnel into the single recovery path (§7).
 
+As-built note (T07-03, `[SPEC]`): the switch is `local_rag_projection::switch` (a new dependency
+of `local-rag-projection` on `local-rag-store`, foreseen by T07-01/T07-02's own doc comments). Four
+mechanics are realized concretely, all pre-scoped to later, already-planned groups rather than new
+deviations:
+
+- **§4's "every required representation kind of the model space"** is
+  `expected::REQUIRED_REPRESENTATION_KINDS`, a hardcoded `{code_raw, code_context}` pair — the real
+  per-model-space registry (`representation`/`model_space_representation`) is T11-01, and until it
+  ships v0 has exactly one seeded model space whose required set already *is* this pair (this
+  section's own parenthetical excludes `structural_description` pre-v0).
+- **Step 1's "vectors come from `embedding_cache`"** is realized through a new
+  `switch::VectorSource` seam — `vector(occurrence_id, representation_kind) -> Option<Vec<f32>>` —
+  standing in for the not-yet-built `embedding_cache` (T11-02). It has no "compute/embed" method, so
+  the switch itself cannot trigger re-embedding; it only reads whatever it is given, and only for
+  points missing from the shard.
+- **Step 3's `∪ changed`** is realized as empty: `ShardHandle` has no vector-read-back method, so
+  "does an already-present point's vector differ from desired" is not observable through the
+  contract; since `upsert` is idempotent by id, only `expected \ existing` is upserted. A point
+  already present under its deterministic id is trusted as-is; guarding against silent vector drift
+  beyond id equality is a validate-on-open concern (T07-04), not this switch's.
+- **Step 3's per-worktree WRITE lock** is the caller's responsibility — the lock hierarchy is
+  T09-01. `switch()` documents that callers must serialize invocations per worktree themselves.
+
+Retry is realized as simply calling `switch` again with the same target: the write-ahead's
+`Updating → Updating` is a legal self-transition (T07-02), and step 3 recomputes `existing :=
+shard.point_ids()` fresh from whatever the shard currently holds, so `expected \ existing` only
+redoes the missing part — no command-log replay, matching this section's `[FIXED]` principle.
+`commit_switch` pre-flights both generation-state moves (target `→ Active`, and — if applicable —
+the outgoing generation `→ Retiring`) with the pure `GenerationState::check_transition` *before* any
+write in the commit transaction, so a rejected commit (e.g. an unready target) leaves the
+transaction untouched rather than partially applying the projection-state row without the
+generation moves, or vice versa.
+
 ## 6. Validate-on-open `[FIXED]`
 
 Executed on **every** shard open (daemon start, LRU re-open, post-crash), before the shard may

@@ -21,6 +21,13 @@ const WRITE_HEAD_FP: &str = "projection.fake.write_head";
 
 /// Serialize access to the process-global failpoint registry so parallel tests
 /// never see each other's armings.
+///
+/// **Every test in this file must hold this guard**, not only the ones that
+/// arm/disarm a failpoint themselves (D-005): the registry is process-global,
+/// so while `head_is_last_operation_error_leaves_no_head` has
+/// `projection.fake.write_head` armed with `Action::Error`, any *other* test on
+/// another thread that calls `write_head` as ordinary setup — never expecting a
+/// failpoint — is hit by the same injected error and fails spuriously.
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -165,6 +172,7 @@ fn head_is_last_operation_survives_sigabrt() {
 
 #[test]
 fn inspect_reports_loaded_state() {
+    let _serial = serial();
     let home = TempHome::new().expect("temp home");
     let dir = home.join("projection").join("wt-1");
     let shard = FakeShard::open(&dir, params()).expect("open");
@@ -186,6 +194,7 @@ fn inspect_reports_loaded_state() {
 
 #[test]
 fn corrupt_drop_point_is_visible_after_reopen() {
+    let _serial = serial();
     let home = TempHome::new().expect("temp home");
     let dir = home.join("projection").join("wt-1");
     let shard = FakeShard::open(&dir, params()).expect("open");
@@ -212,6 +221,7 @@ fn corrupt_drop_point_is_visible_after_reopen() {
 
 #[test]
 fn corrupt_remove_head_is_visible_after_reopen() {
+    let _serial = serial();
     let home = TempHome::new().expect("temp home");
     let dir = home.join("projection").join("wt-1");
     let shard = FakeShard::open(&dir, params()).expect("open");
@@ -230,6 +240,7 @@ fn corrupt_remove_head_is_visible_after_reopen() {
 
 #[test]
 fn corrupt_swap_point_yields_equal_count_different_set() {
+    let _serial = serial();
     let home = TempHome::new().expect("temp home");
     let dir = home.join("projection").join("wt-1");
     let shard = FakeShard::open(&dir, params()).expect("open");
@@ -256,6 +267,7 @@ fn corrupt_swap_point_yields_equal_count_different_set() {
 
 #[test]
 fn corrupt_overwrite_head_makes_shard_unopenable() {
+    let _serial = serial();
     let home = TempHome::new().expect("temp home");
     let dir = home.join("projection").join("wt-1");
     let shard = FakeShard::open(&dir, params()).expect("open");
