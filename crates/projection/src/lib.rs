@@ -34,17 +34,32 @@
 //!   through the caller-supplied [`switch::VectorSource`] seam (standing in for
 //!   the not-yet-built `embedding_cache`, T11-02).
 //!
-//! Deliberately **not** here (owning cards): validate-on-open and rebuild
-//! (T07-04); the F1–F12 fault matrix itself (T07-05); the real per-worktree
-//! write lock (T09-01); the representation/model-space registry and the real
-//! `embedding_cache` (T11-01/T11-02). No real dense backend or dense/model SDK
-//! is coupled before T10.
+//! T07-04 adds **validate-on-open and rebuild** (spec 05 §6/§7, plus the
+//! quarantine-rotation half of §8 that D-004 deferred here):
+//!
+//! - [`validate`] — the pure predicate table ([`validate::validate`]) that
+//!   decides, from an already-read `worktree_projection_state` row and shard
+//!   head/count/manifest, whether a shard is trustworthy.
+//! - [`rebuild`] — [`rebuild::open_and_validate`] runs `validate` on open and,
+//!   on any divergence, repairs via [`rebuild::rebuild`]: destroy or quarantine
+//!   the old shard (quarantine only when it was unopenable — spec 05 §10 F12 —
+//!   kept for at most [`rebuild::QUARANTINE_RETENTION`] cycles), recreate it
+//!   from scratch against the **active** tuple (never the diff-based fast path
+//!   `switch` uses), through the same [`switch::VectorSource`] seam.
+//!
+//! Deliberately **not** here (owning cards): the F1–F12 fault matrix itself
+//! (T07-05); the real per-worktree write lock (T09-01); the
+//! representation/model-space registry and the real `embedding_cache`
+//! (T11-01/T11-02). No real dense backend or dense/model SDK is coupled before
+//! T10.
 
 pub mod contract;
 pub mod expected;
 pub mod fake;
 pub mod identity;
+pub mod rebuild;
 pub mod switch;
+pub mod validate;
 
 pub use contract::{
     DenseQuery, Hash32, PROJECTION_SCHEMA_VERSION, PointId, ProjectionError, ProjectionHead,
@@ -56,7 +71,12 @@ pub use expected::{
 };
 pub use fake::{FakeProjectionStore, FakeShard};
 pub use identity::{head, manifest_hash, projection_point_id};
+pub use rebuild::{
+    OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome,
+    open_and_validate,
+};
 pub use switch::{SwitchCommitError, SwitchError, SwitchOutcome, VectorSource, switch};
+pub use validate::{Divergence, validate};
 
 #[cfg(feature = "failpoints")]
 pub use fake::{Corruption, ShardInspection};
