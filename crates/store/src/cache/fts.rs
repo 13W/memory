@@ -1,5 +1,6 @@
-//! Versioned, code-aware lexical preprocessing and the FTS manifest identity
-//! (spec 09 §2, 03 §1.2/§4.3) — T08-01.
+//! Versioned, code-aware lexical preprocessing, the FTS manifest identity, and
+//! the generation materializer (spec 09 §2, 03 §1.2/§4.3, 06 §2/§4) — T08-01/
+//! T08-02.
 //!
 //! The FTS5 virtual table `fts_occurrences` (spec 03 §4.3, DDL in
 //! [`super::open`]) uses SQLite's built-in `unicode61` tokenizer, which only
@@ -9,10 +10,11 @@
 //! `extract_imports` would index as a single opaque token. [`tokenize_identifier`]
 //! and its column-specific siblings ([`tokenize_path`], [`tokenize_qualified_name`],
 //! [`tokenize_signature`]) do that splitting **app-side, before insert** (09 §2)
-//! so a search for `extract` or `imports` alone still matches. Insertion itself —
-//! the generation materializer that calls these functions and writes rows — is
-//! T08-02; this module ships the pure functions plus the deterministic
-//! [`fts_manifest_hash`] identity.
+//! so a search for `extract` or `imports` alone still matches. [`materialize_fts`]
+//! (T08-02) is the caller: it reads a generation's occurrences from
+//! `state.sqlite`, calls these tokenizers, and writes `fts_doc`/
+//! `fts_occurrences`/`fts_projection_head` in `cache.sqlite`. This module ships
+//! all of it, plus the deterministic [`fts_manifest_hash`] identity.
 //!
 //! ## Splitting algorithm
 //!
@@ -112,9 +114,23 @@
 //! only its split parts are emitted, since a raw fragment like
 //! `"(name: String)"` is not itself a meaningful search term.
 
+use std::collections::{HashMap, HashSet};
+use std::str::Utf8Error;
+
 use local_rag_core::identity::Domain;
 use local_rag_core::identity::domain;
+use rusqlite::{Connection, OptionalExtension, params};
 use unicode_normalization::UnicodeNormalization;
+
+use crate::code::{FtsSourceRow, derive_content_blob, occurrences_for_fts, source_bytes};
+use crate::state::{OpenError, StateDb};
+
+use super::CacheDb;
+use super::CacheOpenError;
+use super::CacheWriteError;
+use super::text::{
+    delete_normalized_text, get_normalized_text, insert_normalized_text, verify_cached_text,
+};
 
 /// `fts_projection_head.lexical_schema_version` (spec 03 §4.3) — bump when the
 /// `fts_doc`/`fts_occurrences`/`fts_projection_head` DDL shape changes in a way
@@ -331,6 +347,389 @@ pub fn fts_manifest_hash(
     fields.push(generation_id.as_bytes());
     fields.extend(ids.iter().map(|id| id.as_bytes()));
     domain::hash(Domain::FtsManifest, &fields)
+}
+
+/// A `fts_projection_head` row (spec 03 §4.3) — the per-worktree validity proof
+/// for the FTS view. A pure row accessor: interpreting "is this valid" against
+/// the active generation/binary constants (spec 06 §4's validation order) is
+/// T08-03, not this function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsProjectionHeadRow {
+    /// The worktree this head belongs to.
+    pub worktree_id: String,
+    /// The generation the head's rows were derived from.
+    pub generation_id: String,
+    /// The DDL-shape schema version stamped at write time.
+    pub lexical_schema_version: i64,
+    /// The tokenizer-rules version stamped at write time.
+    pub tokenizer_version: i64,
+    /// Number of `fts_occurrences` rows this head claims.
+    pub occurrence_count: i64,
+    /// `H(fts_manifest, …)` over the occurrence set (see [`fts_manifest_hash`]).
+    pub manifest_hash: String,
+    /// Last-write timestamp (ms).
+    pub updated_at: i64,
+}
+
+/// Read the `fts_projection_head` row for `worktree_id`, if one exists (spec 03
+/// §4.3). `None` before any successful [`materialize_fts`] call for this
+/// worktree.
+pub fn read_fts_projection_head(
+    conn: &Connection,
+    worktree_id: &str,
+) -> rusqlite::Result<Option<FtsProjectionHeadRow>> {
+    conn.query_row(
+        "SELECT worktree_id, generation_id, lexical_schema_version, tokenizer_version, \
+                occurrence_count, manifest_hash, updated_at \
+         FROM fts_projection_head WHERE worktree_id = ?1",
+        params![worktree_id],
+        |r| {
+            Ok(FtsProjectionHeadRow {
+                worktree_id: r.get(0)?,
+                generation_id: r.get(1)?,
+                lexical_schema_version: r.get(2)?,
+                tokenizer_version: r.get(3)?,
+                occurrence_count: r.get(4)?,
+                manifest_hash: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// The outcome of a successful [`materialize_fts`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsMaterializeOutcome {
+    /// Number of occurrences materialized (== the new `fts_projection_head.
+    /// occurrence_count`).
+    pub occurrence_count: u64,
+    /// The manifest hash written to `fts_projection_head` (== a fresh
+    /// [`fts_manifest_hash`] call over the same occurrence set).
+    pub manifest_hash: String,
+}
+
+/// Why [`materialize_fts`] failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum FtsMaterializeError {
+    /// Opening a `state.sqlite` read connection failed.
+    StateOpen(OpenError),
+    /// Opening a `cache.sqlite` read connection failed.
+    CacheOpen(CacheOpenError),
+    /// Reading `state.sqlite`'s occurrences/units/content-blobs/source bytes
+    /// failed.
+    StateRead(rusqlite::Error),
+    /// Reading `cache.sqlite`'s `normalized_text_cache` failed.
+    CacheRead(rusqlite::Error),
+    /// The final cache write transaction failed (rolled back; nothing changed).
+    Write(CacheWriteError),
+    /// A recomputed unit's byte span was not valid UTF-8. Never expected on
+    /// healthy data (tree-sitter spans land on character boundaries of
+    /// already-validated UTF-8 source) — surfaced as a typed error rather than
+    /// panicking, matching this crate's "rebuild on doubt" idiom elsewhere
+    /// (`source_bytes`, `skip_reason`).
+    InvalidUtf8 {
+        /// The blob whose recompute failed.
+        blob_id: String,
+        /// The underlying UTF-8 decode error.
+        source: Utf8Error,
+    },
+    /// A recomputed blob's re-derived identity did not match the `blob_id` it
+    /// was recomputed for. Never expected — `source_blob` is immutable once
+    /// written, so the same span/language always re-derives the same identity
+    /// — a mismatch means `state.sqlite`'s stored bytes diverged from what
+    /// originally produced this `blob_id` (disk-level corruption). Surfaced
+    /// distinctly rather than silently caching mismatched text under the wrong
+    /// key (same idiom as [`verify_cached_text`]).
+    BlobMismatch {
+        /// The `blob_id` the recompute was keyed on.
+        blob_id: String,
+        /// The identity the recompute actually produced.
+        recomputed_blob_id: String,
+    },
+}
+
+impl std::fmt::Display for FtsMaterializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FtsMaterializeError::StateOpen(e) => {
+                write!(
+                    f,
+                    "opening state.sqlite for FTS materialization failed: {e}"
+                )
+            }
+            FtsMaterializeError::CacheOpen(e) => {
+                write!(
+                    f,
+                    "opening cache.sqlite for FTS materialization failed: {e}"
+                )
+            }
+            FtsMaterializeError::StateRead(e) => {
+                write!(
+                    f,
+                    "reading state.sqlite for FTS materialization failed: {e}"
+                )
+            }
+            FtsMaterializeError::CacheRead(e) => {
+                write!(
+                    f,
+                    "reading cache.sqlite for FTS materialization failed: {e}"
+                )
+            }
+            FtsMaterializeError::Write(e) => write!(f, "FTS materialization write failed: {e}"),
+            FtsMaterializeError::InvalidUtf8 { blob_id, .. } => write!(
+                f,
+                "recomputed normalized text for blob {blob_id} is not valid UTF-8"
+            ),
+            FtsMaterializeError::BlobMismatch {
+                blob_id,
+                recomputed_blob_id,
+            } => write!(
+                f,
+                "recomputed blob id {recomputed_blob_id} does not match stored blob id {blob_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FtsMaterializeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FtsMaterializeError::StateOpen(e) => Some(e),
+            FtsMaterializeError::CacheOpen(e) => Some(e),
+            FtsMaterializeError::StateRead(e) | FtsMaterializeError::CacheRead(e) => Some(e),
+            FtsMaterializeError::Write(e) => Some(e),
+            FtsMaterializeError::InvalidUtf8 { source, .. } => Some(source),
+            FtsMaterializeError::BlobMismatch { .. } => None,
+        }
+    }
+}
+
+/// One occurrence's already-tokenized row, ready to insert (owned — built before
+/// the cache write transaction, per [`super::writer::CacheWriter::transaction`]'s
+/// `'static` bound).
+struct PreparedRow {
+    occurrence_id: String,
+    name: String,
+    qualified_name: String,
+    path: String,
+    signature: String,
+    body: String,
+}
+
+/// Materialize the FTS lexical view for `generation_id` in `worktree_id` (spec
+/// 06 §2/§4, T08-02): read the generation's occurrences from `state.sqlite`,
+/// resolve each occurrence's normalized body text via `cache.sqlite`'s
+/// `normalized_text_cache` (recomputing from `source_blob` where evicted or
+/// missing — see the module docs: this is the *steady state* for a cold cache,
+/// not a rare edge case), then replace the worktree's previous `fts_doc`/
+/// `fts_occurrences` rows with the new generation's complete set and write
+/// `fts_projection_head` **last** — all inside one cache transaction (spec 06
+/// §4 "single cache tx per generation update `[SPEC]`").
+///
+/// Because `occurrence_id` embeds `generation_id` (spec 03 §1.2), two
+/// generations of the same worktree never share an occurrence id, so there is
+/// nothing to incrementally diff: every call **fully replaces** the worktree's
+/// rows, mirroring spec 06 §4's FTS-rebuild recipe exactly (this task and a
+/// future rebuild-on-divergence, T08-03, are expected to share this same core).
+/// A failure at any point before the final `Ok` rolls back the whole
+/// transaction, so a prior successful generation's rows/head are left exactly
+/// as they were.
+pub async fn materialize_fts(
+    state: &StateDb,
+    cache: &CacheDb,
+    worktree_id: &str,
+    generation_id: &str,
+    now_ms: i64,
+) -> Result<FtsMaterializeOutcome, FtsMaterializeError> {
+    // 1. Read the generation's occurrences (state.sqlite) — fully owned before
+    //    any cache read/write, since a cache write-transaction closure cannot
+    //    borrow a state.sqlite connection (different connection/thread).
+    let sources = {
+        let read = state.open_read().map_err(FtsMaterializeError::StateOpen)?;
+        occurrences_for_fts(&read, generation_id).map_err(FtsMaterializeError::StateRead)?
+    };
+
+    // 2. Resolve each distinct blob's normalized text: a cache hit (verified),
+    //    or a candidate for recompute. One representative row per blob_id
+    //    (deterministically the first in occurrence_id order) is enough, since
+    //    content-addressing guarantees identical text for a shared blob_id.
+    let mut normalized_text: HashMap<String, String> = HashMap::new();
+    let mut to_recompute: Vec<&FtsSourceRow> = Vec::new();
+    {
+        let read = cache.open_read().map_err(FtsMaterializeError::CacheOpen)?;
+        let mut seen: HashSet<&str> = HashSet::new();
+        for row in &sources {
+            if !seen.insert(row.blob_id.as_str()) {
+                continue;
+            }
+            let cached =
+                get_normalized_text(&read, &row.blob_id).map_err(FtsMaterializeError::CacheRead)?;
+            match cached {
+                Some(hit)
+                    if verify_cached_text(&row.blob_id, &row.language, &hit.normalized_text) =>
+                {
+                    normalized_text.insert(row.blob_id.clone(), hit.normalized_text);
+                }
+                _ => to_recompute.push(row),
+            }
+        }
+    }
+
+    // 3. Recompute evicted/missing blobs from state.sqlite's exact source_blob,
+    //    re-sliced by the representative unit's own span (blob_id is per-unit,
+    //    not per-file — see module docs).
+    let mut recomputed: Vec<(String, String, i64)> = Vec::new();
+    if !to_recompute.is_empty() {
+        let read = state.open_read().map_err(FtsMaterializeError::StateOpen)?;
+        for row in to_recompute {
+            let bytes = source_bytes(&read, &row.file_revision_id)
+                .map_err(FtsMaterializeError::StateRead)?
+                .unwrap_or_default();
+            let start = row.span_start as usize;
+            let end = row.span_end as usize;
+            let slice = bytes.get(start..end).unwrap_or(&[]);
+            let text =
+                std::str::from_utf8(slice).map_err(|source| FtsMaterializeError::InvalidUtf8 {
+                    blob_id: row.blob_id.clone(),
+                    source,
+                })?;
+            let derived = derive_content_blob(&row.language, text);
+            if derived.blob_id != row.blob_id {
+                return Err(FtsMaterializeError::BlobMismatch {
+                    blob_id: row.blob_id.clone(),
+                    recomputed_blob_id: derived.blob_id,
+                });
+            }
+            normalized_text.insert(row.blob_id.clone(), derived.normalized_text.clone());
+            recomputed.push((
+                row.blob_id.clone(),
+                derived.normalized_text,
+                derived.byte_size,
+            ));
+        }
+    }
+
+    // 4. Build every occurrence's owned, tokenized row (spec 09 §2 columns).
+    //    `body` is the raw normalized text verbatim — FTS5's own `unicode61`
+    //    tokenizer splits it into words; spec 09 §2 only lists name/qualified/
+    //    path/signature as app-side-tokenized.
+    let mut prepared = Vec::with_capacity(sources.len());
+    for row in &sources {
+        let body = normalized_text
+            .get(&row.blob_id)
+            .cloned()
+            .unwrap_or_default();
+        prepared.push(PreparedRow {
+            occurrence_id: row.occurrence_id.clone(),
+            name: tokenize_identifier(row.local_name.as_deref().unwrap_or("")),
+            qualified_name: tokenize_qualified_name(row.qualified_name.as_deref()),
+            path: tokenize_path(&row.normalized_path),
+            signature: tokenize_signature(&[]),
+            body,
+        });
+    }
+    let occurrence_ids: Vec<&str> = sources.iter().map(|r| r.occurrence_id.as_str()).collect();
+    let manifest_hash = fts_manifest_hash(worktree_id, generation_id, &occurrence_ids);
+    let occurrence_count = sources.len() as u64;
+
+    // 5. One cache transaction: recomputed text → delete stale worktree rows →
+    //    insert fresh rows → write head last.
+    let (worktree, generation, manifest_hash_for_tx, count_for_tx) = (
+        worktree_id.to_string(),
+        generation_id.to_string(),
+        manifest_hash.clone(),
+        occurrence_count as i64,
+    );
+    cache
+        .writer()
+        .transaction(move |tx| {
+            for (blob_id, text, byte_size) in &recomputed {
+                // `insert_normalized_text`'s `ON CONFLICT` only bumps
+                // `last_used_at` (T03-04's contract: a conflicting row is
+                // assumed to already hold identical, content-addressed text).
+                // That assumption does not hold for a *corrupt* existing row —
+                // evict it first so the insert always lands the freshly
+                // recomputed text (a no-op delete when the row was merely
+                // absent).
+                delete_normalized_text(tx, blob_id)?;
+                insert_normalized_text(tx, blob_id, text, *byte_size, now_ms)?;
+            }
+
+            tx.execute(
+                "DELETE FROM fts_occurrences WHERE rowid IN \
+                   (SELECT fts_rowid FROM fts_doc WHERE worktree_id = ?1)",
+                params![worktree],
+            )?;
+            tx.execute(
+                "DELETE FROM fts_doc WHERE worktree_id = ?1",
+                params![worktree],
+            )?;
+
+            let mut next_rowid: i64 =
+                tx.query_row("SELECT COALESCE(MAX(fts_rowid), 0) FROM fts_doc", [], |r| {
+                    r.get(0)
+                })?;
+            for p in &prepared {
+                next_rowid += 1;
+                tx.execute(
+                    "INSERT INTO fts_doc (fts_rowid, occurrence_id, worktree_id, generation_id) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![next_rowid, p.occurrence_id, worktree, generation],
+                )?;
+                tx.execute(
+                    "INSERT INTO fts_occurrences(rowid, name, qualified_name, path, signature, body) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![next_rowid, p.name, p.qualified_name, p.path, p.signature, p.body],
+                )?;
+            }
+
+            // Failpoint seam: a kill/error here proves the whole transaction
+            // rolls back — the prior generation's rows/head (deleted above, but
+            // not yet committed) survive untouched (T08-02 "fail before head").
+            // `ToSqlConversionFailure` is the only `rusqlite::Error` variant that
+            // both takes an arbitrary error and needs no extra Cargo feature.
+            #[cfg(feature = "failpoints")]
+            local_rag_test_support::fail_point!(
+                "cache:fts_before_head",
+                Err(rusqlite::Error::ToSqlConversionFailure(
+                    "failpoint: cache:fts_before_head".into()
+                ))
+            );
+
+            tx.execute(
+                "INSERT INTO fts_projection_head \
+                   (worktree_id, generation_id, lexical_schema_version, tokenizer_version, \
+                    occurrence_count, manifest_hash, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(worktree_id) DO UPDATE SET \
+                   generation_id = excluded.generation_id, \
+                   lexical_schema_version = excluded.lexical_schema_version, \
+                   tokenizer_version = excluded.tokenizer_version, \
+                   occurrence_count = excluded.occurrence_count, \
+                   manifest_hash = excluded.manifest_hash, \
+                   updated_at = excluded.updated_at",
+                params![
+                    worktree,
+                    generation,
+                    LEXICAL_SCHEMA_VERSION,
+                    TOKENIZER_VERSION,
+                    count_for_tx,
+                    manifest_hash_for_tx,
+                    now_ms,
+                ],
+            )?;
+
+            Ok(())
+        })
+        .await
+        .map_err(FtsMaterializeError::Write)?;
+
+    Ok(FtsMaterializeOutcome {
+        occurrence_count,
+        manifest_hash,
+    })
 }
 
 #[cfg(test)]

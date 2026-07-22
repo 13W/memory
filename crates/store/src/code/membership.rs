@@ -22,6 +22,8 @@ use local_rag_core::identity::domain::hash;
 use rusqlite::types::Type;
 use rusqlite::{Connection, Error, OptionalExtension, Transaction, params};
 
+use super::revision::UnitKind;
+
 /// The deterministic `generation_unit_occurrence.occurrence_id` (spec 03 §1.2,
 /// §2.4): `H(occurrence_id: generation_id, normalized_path, unit_id)` — group 05.
 ///
@@ -352,6 +354,90 @@ pub fn occurrence_ids_for_generation(
     Ok(ids)
 }
 
+/// One occurrence's source data for FTS materialization (spec 06 §2/§4, T08-02):
+/// everything the FTS materializer (`cache::fts::materialize_fts`) needs from
+/// `state.sqlite` for one `generation_unit_occurrence` row, joined against its
+/// `parsed_unit` and `content_blob`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsSourceRow {
+    /// The deterministic, generation-scoped occurrence id.
+    pub occurrence_id: String,
+    /// The member path this occurrence belongs to.
+    pub normalized_path: String,
+    /// Fully-qualified name, if derived (always `None` on real data today — no
+    /// caller derives one yet, spec 06 §2 as-built note).
+    pub qualified_name: Option<String>,
+    /// The unit's kind (spec 03 §2.3). Carried for completeness/future use
+    /// (e.g. verifying "all kinds indexed", spec 09 §1); `fts_doc`/
+    /// `fts_occurrences` have no column for it.
+    pub unit_kind: UnitKind,
+    /// Optional local (unqualified) name — the `name` FTS column's source.
+    pub local_name: Option<String>,
+    /// The content blob whose normalized text is this occurrence's `body`.
+    pub blob_id: String,
+    /// The revision `blob_id` was derived from — needed only to recompute an
+    /// evicted `normalized_text_cache` row (re-slice `source_blob`), never for
+    /// the FTS columns themselves.
+    pub file_revision_id: String,
+    /// Byte offset of the unit's span start in `source_blob` (recompute-only).
+    pub span_start: i64,
+    /// Byte offset of the unit's span end in `source_blob` (recompute-only).
+    pub span_end: i64,
+    /// The content blob's language label.
+    pub language: String,
+}
+
+/// Every occurrence of `generation_id`, joined against `parsed_unit`/`content_blob`
+/// (spec 06 §2/§4, T08-02) — the source data the FTS materializer needs. Ordered
+/// by `occurrence_id` for reproducible output (occurrence identity is itself
+/// order-independent, spec 03 §1.2 `[FIXED]`).
+///
+/// The first multi-table join in this codebase: [`occurrence_ids_for_generation`]
+/// and the dense projection's `expected_points` (`local-rag-projection`) both read
+/// only bare occurrence ids, which is not enough to populate `fts_occurrences`'
+/// `name`/`path`/`qualified_name`/`body` columns.
+pub fn occurrences_for_fts(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<Vec<FtsSourceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT o.occurrence_id, o.normalized_path, o.qualified_name, \
+                pu.unit_kind, pu.local_name, pu.blob_id, \
+                pu.file_revision_id, pu.span_start, pu.span_end, \
+                cb.language \
+         FROM generation_unit_occurrence o \
+         JOIN parsed_unit pu ON pu.unit_id = o.unit_id \
+         JOIN content_blob cb ON cb.blob_id = pu.blob_id \
+         WHERE o.generation_id = ?1 \
+         ORDER BY o.occurrence_id",
+    )?;
+    let rows = stmt
+        .query_map(params![generation_id], |r| {
+            let unit_kind_raw: String = r.get(3)?;
+            let unit_kind = UnitKind::from_db(&unit_kind_raw).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    3,
+                    Type::Text,
+                    format!("invalid parsed_unit.unit_kind {unit_kind_raw:?}").into(),
+                )
+            })?;
+            Ok(FtsSourceRow {
+                occurrence_id: r.get(0)?,
+                normalized_path: r.get(1)?,
+                qualified_name: r.get(2)?,
+                unit_kind,
+                local_name: r.get(4)?,
+                blob_id: r.get(5)?,
+                file_revision_id: r.get(6)?,
+                span_start: r.get(7)?,
+                span_end: r.get(8)?,
+                language: r.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// The skip reason recorded for `normalized_path` in `generation_id`, if the file
 /// was skipped (spec 03 §2.4).
 ///
@@ -470,6 +556,84 @@ mod tests {
         assert_eq!(
             occurrence_ids_for_generation(&conn, "g2").expect("read"),
             vec!["zz".to_string()]
+        );
+    }
+
+    /// A minimal in-memory `generation_unit_occurrence ⋈ parsed_unit ⋈ content_blob`
+    /// schema — [`occurrences_for_fts`] only reads these three tables.
+    fn seed_fts_source_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE generation_unit_occurrence \
+               (occurrence_id TEXT, generation_id TEXT, normalized_path TEXT, \
+                unit_id TEXT, qualified_name TEXT);\n\
+             CREATE TABLE parsed_unit \
+               (unit_id TEXT, file_revision_id TEXT, unit_kind TEXT, blob_id TEXT, \
+                span_start INTEGER, span_end INTEGER, local_name TEXT);\n\
+             CREATE TABLE content_blob (blob_id TEXT, language TEXT);",
+        )
+        .expect("seed schema");
+    }
+
+    /// [`occurrences_for_fts`] joins all three tables, scopes by `generation_id`,
+    /// and orders by `occurrence_id`; an empty generation yields an empty list.
+    #[test]
+    fn occurrences_for_fts_joins_scopes_and_orders() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        seed_fts_source_schema(&conn);
+
+        assert_eq!(
+            occurrences_for_fts(&conn, "g-empty").expect("read"),
+            Vec::new()
+        );
+
+        conn.execute_batch(
+            "INSERT INTO content_blob VALUES ('blob-1', 'rust'), ('blob-2', 'rust');\n\
+             INSERT INTO parsed_unit VALUES \
+               ('u1', 'rev-1', 'symbol', 'blob-1', 0, 10, 'foo'), \
+               ('u2', 'rev-2', 'file', 'blob-2', 0, 20, NULL);\n\
+             INSERT INTO generation_unit_occurrence VALUES \
+               ('occ-b', 'g1', 'b.rs', 'u2', NULL), \
+               ('occ-a', 'g1', 'a.rs', 'u1', NULL), \
+               ('occ-other', 'g2', 'a.rs', 'u1', NULL);",
+        )
+        .expect("seed rows");
+
+        let rows = occurrences_for_fts(&conn, "g1").expect("read");
+        assert_eq!(rows.len(), 2, "scoped to g1, not g2");
+        assert_eq!(rows[0].occurrence_id, "occ-a", "ordered by occurrence_id");
+        assert_eq!(rows[0].normalized_path, "a.rs");
+        assert_eq!(rows[0].unit_kind, UnitKind::Symbol);
+        assert_eq!(rows[0].local_name.as_deref(), Some("foo"));
+        assert_eq!(rows[0].blob_id, "blob-1");
+        assert_eq!(rows[0].file_revision_id, "rev-1");
+        assert_eq!((rows[0].span_start, rows[0].span_end), (0, 10));
+        assert_eq!(rows[0].language, "rust");
+        assert_eq!(rows[0].qualified_name, None);
+
+        assert_eq!(rows[1].occurrence_id, "occ-b");
+        assert_eq!(rows[1].unit_kind, UnitKind::File);
+    }
+
+    /// A stored `parsed_unit.unit_kind` outside the CHECK domain (corruption)
+    /// surfaces as a typed conversion error, never a silent default (same idiom
+    /// as [`skip_reason_rejects_corrupt_enum`]).
+    #[test]
+    fn occurrences_for_fts_rejects_corrupt_unit_kind() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        seed_fts_source_schema(&conn);
+        conn.execute_batch(
+            "INSERT INTO content_blob VALUES ('blob-1', 'rust');\n\
+             INSERT INTO parsed_unit VALUES \
+               ('u1', 'rev-1', 'bogus_kind', 'blob-1', 0, 10, NULL);\n\
+             INSERT INTO generation_unit_occurrence VALUES \
+               ('occ-a', 'g1', 'a.rs', 'u1', NULL);",
+        )
+        .expect("seed corrupt row");
+
+        let bad = occurrences_for_fts(&conn, "g1");
+        assert!(
+            matches!(bad, Err(Error::FromSqlConversionFailure(3, Type::Text, _))),
+            "corrupt unit_kind → typed conversion failure, got {bad:?}",
         );
     }
 
