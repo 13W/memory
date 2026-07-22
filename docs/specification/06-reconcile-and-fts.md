@@ -201,6 +201,36 @@ FTS rebuild = delete worktree's `fts_doc` + `fts_occurrences` rows → re-derive
 `state.sqlite` occurrences + `normalized_text_cache` (recomputing normalized text from
 `source_blob` where evicted) → write head.
 
+As-built note (T08-02, `[SPEC]`): `local_rag_store::materialize_fts` (`crates/store/src/
+cache/fts.rs`) implements this recipe. Because `occurrence_id` embeds `generation_id`
+(03 §1.2), two generations of one worktree never share an occurrence id, so there is
+nothing to incrementally diff against — every call is the full-replace recipe above, not
+a row-level upsert/delete diff (unlike the dense projection's `switch()`, which diffs
+specifically to skip recomputing expensive embeddings; FTS tokenization has no comparable
+cost to amortize). This is also why T08-02 ("build/delta") and a future T08-03 rebuild
+share one materialization core: both reduce to "derive the complete set for a generation,
+replace the worktree's rows, write head last." The new store-side reader
+`code::occurrences_for_fts` joins `generation_unit_occurrence ⋈ parsed_unit ⋈ content_blob`
+(the first multi-table join in the crate) to get `unit_kind`/`local_name`/`blob_id`/
+`file_revision_id`/`span_start`/`span_end`/`language` per occurrence; `qualified_name` is
+read straight through (always `NULL` on real data today, §2's as-built note). The "single
+cache tx per generation update" is realized literally as one `CacheWriter::transaction`
+call: recompute-and-`insert_normalized_text` for any evicted/missing blob (this
+materializer is `normalized_text_cache`'s only production writer, so on a worktree's first
+FTS build essentially every blob takes this path — not a rare edge case) → delete the
+worktree's stale `fts_doc`/`fts_occurrences` rows → insert the fresh set (rowids assigned
+from a local `MAX(fts_rowid)+1` counter read once post-delete, not `last_insert_rowid()`,
+which is connection-global and would be corrupted by the interleaved
+`normalized_text_cache` inserts) → write `fts_projection_head` last. A stored
+`normalized_text_cache` row found corrupt (fails `verify_cached_text`) is evicted via
+`delete_normalized_text` before the recomputed text is re-inserted — `insert_normalized_text`'s
+own `ON CONFLICT` only bumps `last_used_at` (T03-04's contract assumes a conflicting row is
+already identical), so skipping the delete would silently leave corrupt text uncorrected.
+`body` is the occurrence's raw `normalized_text` verbatim (09 §2's as-built note lists only
+`name`/`qualified_name`/`path`/`signature` as app-side-tokenized). `signature` is always
+empty (`tokenize_signature(&[])`) — plumbing real parameter/return-type text out of the
+tree-sitter adapters is deferred past this task, matching 09 §2's own as-built scope note.
+
 ## 5. Retention & GC of canonical source `[FIXED]`
 
 Pin roots (a `file_revision`/generation is unreferenced only if reachable from none):

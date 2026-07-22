@@ -122,9 +122,22 @@
 //! `unicode61` tokenizer has nothing left to split on for it). [`fts_manifest_hash`]
 //! derives `fts_projection_head.manifest_hash` from the sorted-unique
 //! occurrence-id set (spec 03 §1.2), generation-scoped only (no
-//! `model_space_id` axis, unlike the dense projection's manifest). Row
-//! insertion (the generation materializer) is T08-02; per-search/at-open
-//! validation reading `fts_projection_head` is T08-03.
+//! `model_space_id` axis, unlike the dense projection's manifest).
+//!
+//! T08-02 adds the **generation materializer** ([`materialize_fts`], spec 06
+//! §2/§4): the new store-side reader [`code::occurrences_for_fts`] joins
+//! `generation_unit_occurrence ⋈ parsed_unit ⋈ content_blob` for a generation
+//! (the first multi-table join in this crate), resolving each occurrence's
+//! normalized body text via `normalized_text_cache` and recomputing it from
+//! `source_blob` where evicted or absent (today's steady state for a cold
+//! cache — this materializer is `normalized_text_cache`'s only production
+//! writer). Because `occurrence_id` embeds `generation_id` (spec 03 §1.2), two
+//! generations of one worktree never share an occurrence id, so every call
+//! **fully replaces** the worktree's `fts_doc`/`fts_occurrences` rows with the
+//! new generation's complete set and writes `fts_projection_head` **last**, all
+//! inside one cache transaction (spec 06 §4 "single cache tx per generation
+//! update"). [`read_fts_projection_head`] is a plain row accessor; per-search/
+//! at-open validation and rebuild-on-divergence are T08-03.
 //!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
@@ -143,10 +156,11 @@ mod state;
 
 pub use cache::{
     BatchingLastUsed, CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome,
-    CacheWriteError, CacheWriter, LEXICAL_SCHEMA_VERSION, LastUsedSink, NormalizedTextRow,
-    TOKENIZER_VERSION, delete_normalized_text, flush_last_used, fts_manifest_hash,
-    get_normalized_text, insert_normalized_text, tokenize_identifier, tokenize_path,
-    tokenize_qualified_name, tokenize_signature, verify_cached_text,
+    CacheWriteError, CacheWriter, FtsMaterializeError, FtsMaterializeOutcome, FtsProjectionHeadRow,
+    LEXICAL_SCHEMA_VERSION, LastUsedSink, NormalizedTextRow, TOKENIZER_VERSION,
+    delete_normalized_text, flush_last_used, fts_manifest_hash, get_normalized_text,
+    insert_normalized_text, materialize_fts, read_fts_projection_head, tokenize_identifier,
+    tokenize_path, tokenize_qualified_name, tokenize_signature, verify_cached_text,
 };
 pub use code::{
     ALGO_VERSION, BlobOutcome, DerivedContentBlob, EdgeResolution, NORMALIZATION_VERSION,
