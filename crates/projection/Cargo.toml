@@ -29,9 +29,15 @@ failpoints = ["dep:local-rag-test-support"]
 local-rag-test-support = { path = "../test-support" }
 # The switch's `state.sqlite` writer (`StateWriter::transaction`) is async; tests
 # drive it with `#[tokio::test]`, mirroring `crates/store`'s dev-dependency shape.
+# `sync` is added by T07-05's `fault_matrix.rs`: several async tests in one
+# binary arm the process-global failpoint registry, so they need an
+# async-aware mutex (`tokio::sync::Mutex`) to serialize — a plain
+# `std::sync::Mutex` guard held across `.await` is itself a bug
+# (`clippy::await_holding_lock`, see `switch_faults.rs`'s doc comment).
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
+    "sync",
 ] }
 
 [lints]

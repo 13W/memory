@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_projection::{
-    FakeProjectionStore, RepresentationKind, ShardParams, SwitchError, VectorSource, switch,
+    FakeProjectionStore, OpenOutcome, RepresentationKind, ShardParams, SwitchError, VectorSource,
+    open_and_validate, switch,
 };
 use local_rag_store::{
     DEFAULT_MODEL_SPACE_ID, GenerationState, NewContentBlob, NewFileRevision, NewOccurrence,
@@ -244,6 +245,26 @@ async fn backend_error_leaves_detectable_updating() {
         current_generation(&read, &wt.to_string()).expect("cur"),
         None
     );
+    drop(read);
+
+    // spec 05 §10 F1: this is the bootstrap case — no switch has ever
+    // committed, so there is no *active* tuple yet for `rebuild` to target.
+    // `open_and_validate` must recognize this and no-op rather than mis-fire;
+    // idempotent recovery for F1 is retrying `switch` itself, proven below.
+    let no_active = open_and_validate(
+        &db,
+        &FakeProjectionStore::new(),
+        &shard_dir,
+        &layout.quarantine_dir(),
+        params(),
+        wt,
+        &AlwaysVectors,
+        &uuids,
+        1500,
+    )
+    .await
+    .expect("open_and_validate");
+    assert_eq!(no_active, OpenOutcome::NoActiveTuple);
 
     // A clean retry (failpoint disarmed) now converges normally.
     let outcome = switch(
@@ -264,4 +285,20 @@ async fn backend_error_leaves_detectable_updating() {
         outcome.upserted, 2,
         "both required-kind points for the one occurrence"
     );
+
+    // Idempotent convergence: the recovered shard is now trustworthy.
+    let valid = open_and_validate(
+        &db,
+        &FakeProjectionStore::new(),
+        &shard_dir,
+        &layout.quarantine_dir(),
+        params(),
+        wt,
+        &AlwaysVectors,
+        &uuids,
+        3000,
+    )
+    .await
+    .expect("open_and_validate");
+    assert_eq!(valid, OpenOutcome::Valid);
 }

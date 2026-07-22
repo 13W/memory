@@ -242,3 +242,37 @@ idempotent. (This intentionally compresses rev 5's "recover from every intermedi
 | F12 | corruption making shard unopenable | open error → quarantine → rebuild |
 
 Corruption cases are **detection tests**, not recovery-variety tests. See 14 §3 for harness.
+
+As-built note (T07-05, `[SPEC]`): all 12 rows are executable, named tests, verified against
+`fixtures/fault/matrix.json` by `crates/projection/tests/fault_matrix_coverage.rs`'s
+mechanically-checked cross-reference (the "reusable artifact" this row's obligation asked for —
+the declarative fixture itself is unchanged, its schema locks `status` to `"declarative"`). F1
+(`switch_faults.rs`, T07-03) and F11/F12 (`rebuild_faults.rs`/`rebuild.rs`, T07-04) were already
+covered; F1's test was extended to also confirm `open_and_validate` recovers (it reports
+`NoActiveTuple` here specifically, since F1 is the bootstrap case — no switch has ever committed,
+so there is no active tuple yet for `rebuild` to target; idempotent recovery is retrying `switch`
+itself). F2–F10 are new, in `crates/projection/tests/fault_matrix.rs`:
+
+- F2/F3/F4 run a *second* `switch()` (after a first one committed a real head, so "stale" is
+  observable) failing at three distinct points. F4 needed a new production seam —
+  `projection.switch.before_commit` (`crates/projection/src/switch.rs`), fired right before the
+  final `state.sqlite` commit — since none of the fake shard's own seams (T07-01) fire between a
+  landed shard write and that commit.
+- F5–F10 corrupt an already-`clean` shard out of band (the existing `Corruption` API, T07-01) and
+  prove `open_and_validate` catches it at the *next* open; `switch()` is not involved. F10 is
+  literally F5's test under a different narrative (the row's own text: "same as F5 at next open").
+  F9's narrative point is *when* the divergence surfaces: the preceding `switch()` call returns
+  `Ok` with no error at all — only the separate, later `open_and_validate` call reveals it.
+- F6 honesty note: "partial point deletion with **intact catalog**" implies a backend whose
+  reported count stays stale relative to its actual data — a real-backend nuance the fake does not
+  model (`FakeShard::point_count` always reflects exactly what is loaded, so dropping a point
+  changes the count too). `validate` checks point count before manifest, so F6's test observes
+  `PointCountMismatch` rather than `ManifestMismatch` specifically; both are correct detections of
+  the same divergence. F8's test is what isolates `ManifestMismatch` alone (same count, different
+  IDs), matching the pure unit-test coverage already in `validate.rs` (T07-04).
+
+Every test in `fault_matrix.rs` arms, or is vulnerable to, the process-global failpoint registry
+(`local_rag_test_support::failpoint`), so all nine serialize on a `tokio::sync::Mutex` (an
+async-aware guard held across `.await`, unlike the `std::sync::Mutex` idiom `fake_faults.rs` uses
+for its synchronous tests) — omitting this for even one test reproduces exactly the class of
+cross-test interference D-005 found and fixed in T07-03.
