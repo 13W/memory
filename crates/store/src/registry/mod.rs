@@ -50,6 +50,7 @@
 //! (T05-01).
 
 mod generation;
+mod projection_state;
 mod repository;
 mod resolve;
 mod settings;
@@ -58,6 +59,14 @@ pub mod worktree;
 pub use generation::{
     GenerationState, GenerationTransitionError, IllegalGenerationTransition, active_generations,
     allocate_generation, generation_state, transition_generation,
+};
+
+pub(crate) use projection_state::SCHEMA_V4;
+pub use projection_state::{
+    DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,
+    PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation, ProjectionStateChange,
+    ProjectionStateError, ProjectionStateRow, ProjectionStatus, check_invariants,
+    default_model_space_id, insert_projection_state, projection_state, write_projection_state,
 };
 
 pub use repository::{

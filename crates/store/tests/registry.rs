@@ -370,8 +370,8 @@ async fn migration_produces_exact_registry_schema() {
         "index is partial on is_current = 1: {index_sql}",
     );
 
-    // Applied migrations: (1,"registry") — this task — plus (2,"worktree") and
-    // (3,"code"), appended by later groups.
+    // Applied migrations: (1,"registry") — this task — plus (2,"worktree"),
+    // (3,"code"), and (4,"projection"), appended by later groups.
     let mut stmt = read
         .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
         .expect("prepare migration rows");
@@ -386,8 +386,9 @@ async fn migration_produces_exact_registry_schema() {
             (1, "registry".to_string()),
             (2, "worktree".to_string()),
             (3, "code".to_string()),
+            (4, "projection".to_string()),
         ],
-        "the production set is [v1 registry, v2 worktree, v3 code] at T03-01",
+        "the production set is [v1 registry, v2 worktree, v3 code, v4 projection] at T07-02",
     );
 }
 
