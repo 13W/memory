@@ -142,6 +142,11 @@ pub enum SwitchError {
     /// written; the shard already reflects the target tuple (a later switch or
     /// rebuild will reconcile the state-row divergence).
     Commit(SwitchCommitError),
+    /// A named pre-commit failpoint fired (test-only, `failpoints` feature):
+    /// spec 05 §10 F4's kill point, between the shard write landing and the
+    /// final SQLite commit. Never present in a release build.
+    #[cfg(feature = "failpoints")]
+    Failpoint(&'static str),
 }
 
 impl fmt::Display for SwitchError {
@@ -164,6 +169,8 @@ impl fmt::Display for SwitchError {
                 representation_kind.as_str()
             ),
             SwitchError::Commit(e) => write!(f, "projection switch: commit rejected: {e}"),
+            #[cfg(feature = "failpoints")]
+            SwitchError::Failpoint(name) => write!(f, "projection switch: failpoint {name} fired"),
         }
     }
 }
@@ -178,6 +185,8 @@ impl std::error::Error for SwitchError {
             SwitchError::Backend(e) => Some(e),
             SwitchError::MissingVector { .. } => None,
             SwitchError::Commit(e) => Some(e),
+            #[cfg(feature = "failpoints")]
+            SwitchError::Failpoint(_) => None,
         }
     }
 }
@@ -413,6 +422,18 @@ pub async fn switch(
 
     // Step 4: COMMIT, one SQLite tx, after the backend; generation transition in
     // the same tx.
+    //
+    // Named seam for spec 05 §10 F4 ("kill after write_head, before SQLite
+    // commit"): the shard already reflects the target tuple in full; only the
+    // final tx is prevented from running, so `state.sqlite` is left exactly as
+    // the write-ahead set it (`status='updating'`) while the head is already
+    // ahead of it (ADR: T07-05).
+    #[cfg(feature = "failpoints")]
+    local_rag_test_support::fail_point!(
+        "projection.switch.before_commit",
+        Err(SwitchError::Failpoint("projection.switch.before_commit"))
+    );
+
     db.writer()
         .transaction(move |tx| commit_switch(tx, &wt, &gen_str, &ms_str, &op_str, now_ms))
         .await

@@ -129,9 +129,9 @@
     {
       "id": "GAP-06",
       "family": "fault",
-      "description": "Executable failpoint/kill-point scripts for the F1-F12 projection matrix (05 §10) and S1-S8 spool matrix (07 §7) are not present in v1 (v1 has no crash/kill/torn-write tests). Only the declarative matrices and v1 retry/rate-limit behavior are imported; executable scripts need the fail_point!-style harness.",
+      "description": "PARTIALLY RESOLVED (T07-05). Executable failpoint/kill-point scripts for the F1-F12 projection matrix (05 §10) and S1-S8 spool matrix (07 §7) were not present in v1 (v1 has no crash/kill/torn-write tests). The harness mechanism landed in T00-03; the F1-F12 projection matrix is now fully executable (crates/projection/tests/fault_matrix.rs + fault_matrix_coverage.rs's mechanically-checked cross-reference against matrix.json, plus the pre-existing switch_faults.rs/rebuild_faults.rs/rebuild.rs tests for F1/F11/F12). S1-S8 (spool kill matrix, 07 §7) remains open — it needs the spool_import_cursor table (T13-05) first.",
       "blocking": false,
-      "resolves_in": "T00-03 (harness), T07-05 (F1-F12), T13-06 (S1-S8)"
+      "resolves_in": "T00-03 (harness, done), T07-05 (F1-F12, done), T13-06 (S1-S8, open)"
     }
   ],
   "baseline": {

@@ -86,9 +86,13 @@ rewritten.
   `building → failed` injection for spec 04 §1 / T05-05 retry-failure tests); and
   `projection`'s fake shard (`projection.fake.{upsert,delete,write_head}` op-ordering
   seams plus the `inspect`/`corrupt` controls for the spec 05 §10 fault matrix,
-  T07-01). It is never enabled in a release or distribution build, so the shipped
-  binary never links `test-support`. `cargo xtask ci` runs each of those crates once
-  more with `--features failpoints` to lint and exercise those code paths.
+  T07-01) and, as of T07-05, the write-ahead switch's own
+  `projection.switch.before_commit` seam (fires after the shard write lands but
+  before the final `state.sqlite` commit — spec 05 §10 F4, the one kill point
+  none of the fake shard's own seams could reach). It is never enabled in a
+  release or distribution build, so the shipped binary never links
+  `test-support`. `cargo xtask ci` runs each of those crates once more with
+  `--features failpoints` to lint and exercise those code paths.
 
 ## Committing
 
