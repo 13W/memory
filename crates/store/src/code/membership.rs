@@ -438,6 +438,22 @@ pub fn occurrences_for_fts(
     Ok(rows)
 }
 
+/// The number of occurrences recorded for `generation_id` (spec 03 §2.4,
+/// T08-03) — a cheap `COUNT(*)`, served by the same `occurrence_by_gen` index
+/// as [`occurrence_ids_for_generation`], without materializing any row. Used
+/// by FTS validation (`cache::validate`) both as the per-search count-check
+/// input and as the fresh (never-stale) rebuild-cost estimate.
+pub fn occurrence_count_for_generation(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM generation_unit_occurrence WHERE generation_id = ?1",
+        params![generation_id],
+        |r| r.get(0),
+    )
+}
+
 /// The skip reason recorded for `normalized_path` in `generation_id`, if the file
 /// was skipped (spec 03 §2.4).
 ///
@@ -556,6 +572,45 @@ mod tests {
         assert_eq!(
             occurrence_ids_for_generation(&conn, "g2").expect("read"),
             vec!["zz".to_string()]
+        );
+    }
+
+    /// [`occurrence_count_for_generation`] counts only the target generation's
+    /// rows, and is `0` (not an error) for a generation with none.
+    #[test]
+    fn occurrence_count_for_generation_scopes_correctly() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE generation_unit_occurrence \
+               (occurrence_id TEXT, generation_id TEXT, normalized_path TEXT, unit_id TEXT);\n\
+             CREATE INDEX occurrence_by_gen ON generation_unit_occurrence(generation_id);",
+        )
+        .expect("seed schema");
+
+        assert_eq!(
+            occurrence_count_for_generation(&conn, "g-empty").expect("read"),
+            0
+        );
+
+        conn.execute_batch(
+            "INSERT INTO generation_unit_occurrence VALUES \
+               ('aa', 'g1', 'a.rs', 'u1'), \
+               ('bb', 'g1', 'b.rs', 'u2'), \
+               ('cc', 'g2', 'a.rs', 'u3');",
+        )
+        .expect("seed rows");
+
+        assert_eq!(
+            occurrence_count_for_generation(&conn, "g1").expect("read"),
+            2
+        );
+        assert_eq!(
+            occurrence_count_for_generation(&conn, "g2").expect("read"),
+            1
+        );
+        assert_eq!(
+            occurrence_count_for_generation(&conn, "g-missing").expect("read"),
+            0
         );
     }
 
