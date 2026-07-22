@@ -10,6 +10,7 @@
 //! [`SystemUuidV7`] wraps it with the wall clock and `/dev/urandom`.
 
 use std::fmt;
+use std::str::FromStr;
 
 /// A 128-bit UUID, stored as its 16 big-endian bytes.
 ///
@@ -60,6 +61,69 @@ impl fmt::Display for Uuid {
 impl fmt::Debug for Uuid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Uuid({self})")
+    }
+}
+
+/// A string could not be parsed as a canonical UUID (see [`Uuid`]'s [`FromStr`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UuidParseError {
+    reason: &'static str,
+}
+
+impl fmt::Display for UuidParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid UUID: {}", self.reason)
+    }
+}
+
+impl std::error::Error for UuidParseError {}
+
+impl FromStr for Uuid {
+    type Err = UuidParseError;
+
+    /// Parse the canonical 8-4-4-4-12 hyphenated form (RFC 9562 §4), the exact
+    /// output of [`fmt::Display`], so `uuid.to_string().parse()` round-trips.
+    /// Both hex cases are accepted; nothing else about the byte layout is
+    /// validated (version/variant are not required), because durable IDs are
+    /// stored and re-read verbatim as their `TEXT` form.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 36 {
+            return Err(UuidParseError {
+                reason: "expected 36 characters in 8-4-4-4-12 form",
+            });
+        }
+        let mut out = [0u8; 16];
+        let mut out_i = 0usize;
+        let mut hi: Option<u8> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                if b != b'-' {
+                    return Err(UuidParseError {
+                        reason: "missing '-' separator",
+                    });
+                }
+                continue;
+            }
+            let nibble = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => {
+                    return Err(UuidParseError {
+                        reason: "non-hex digit",
+                    });
+                }
+            };
+            match hi.take() {
+                None => hi = Some(nibble),
+                Some(h) => {
+                    out[out_i] = (h << 4) | nibble;
+                    out_i += 1;
+                }
+            }
+        }
+        Ok(Uuid(out))
     }
 }
 
@@ -188,6 +252,46 @@ mod tests {
         let groups: Vec<usize> = id.split('-').map(str::len).collect();
         assert_eq!(groups, vec![8, 4, 4, 4, 12]);
         assert!(id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn from_str_round_trips_display() {
+        for (ms, rand) in [
+            (0u64, [0u8; 10]),
+            (0x0123_4567_89AB, RAND),
+            (u64::MAX, [0xFFu8; 10]),
+        ] {
+            let uuid = uuidv7_from(ms, rand);
+            let text = uuid.to_string();
+            assert_eq!(text.parse::<Uuid>().expect("parse display form"), uuid);
+        }
+        // Upper-case hex parses to the same bytes as its lower-case Display form.
+        let uuid = uuidv7_from(0x0123_4567_89AB, RAND);
+        assert_eq!(
+            uuid.to_string()
+                .to_ascii_uppercase()
+                .parse::<Uuid>()
+                .expect("parse upper"),
+            uuid,
+        );
+    }
+
+    #[test]
+    fn from_str_rejects_malformed() {
+        let cases = [
+            "",                                      // empty
+            "01234567-89ab-7122-b344-5566778899a",   // 35 chars
+            "01234567-89ab-7122-b344-5566778899aaa", // 37 chars
+            "0123456789ab-7122-b344-55667788-99aa",  // dashes misplaced
+            "01234567:89ab:7122:b344:5566778899aa",  // wrong separators
+            "0123456g-89ab-7122-b344-5566778899aa",  // non-hex digit
+        ];
+        for case in cases {
+            assert!(
+                case.parse::<Uuid>().is_err(),
+                "expected {case:?} to be rejected",
+            );
+        }
     }
 
     #[cfg(unix)]
