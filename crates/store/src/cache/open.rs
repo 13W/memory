@@ -13,11 +13,14 @@
 //! 2. `cache_meta.cache_schema_version` unsupported → drop & recreate;
 //! 3. a corrupt/unreadable cache → drop & recreate ("rebuild on doubt").
 //!
-//! Per-worktree FTS validity (§4.4 step 3) and per-row `embedding_cache` checksums
-//! (step 4) are checked lazily elsewhere, not here. The `embedding_cache`/FTS
-//! tables are created by later tasks (T08/T11); this build creates `cache_meta`
-//! and `normalized_text_cache` (spec 03 §4.2, T03-04). Adding a table means
-//! bumping [`CACHE_SCHEMA_VERSION`] so an older cache is auto-rebuilt (§4.4 step 2).
+//! Per-worktree FTS *validity* (§4.4 step 3 — is the head fresh for the active
+//! generation) and per-row `embedding_cache` checksums (step 4) are checked
+//! lazily elsewhere, not here. This build creates `cache_meta`,
+//! `normalized_text_cache` (spec 03 §4.2, T03-04), and — as of T08-01 —
+//! `fts_doc`/`fts_occurrences`/`fts_projection_head` (spec 03 §4.3): the schema
+//! only, always empty until the generation materializer (T08-02) populates it.
+//! The `embedding_cache` table remains T11. Adding a table means bumping
+//! [`CACHE_SCHEMA_VERSION`] so an older cache is auto-rebuilt (§4.4 step 2).
 
 use std::fmt;
 use std::io;
@@ -38,7 +41,8 @@ const BUSY_TIMEOUT_MS: u64 = 5000;
 ///
 /// - `1`: `cache_meta` only (T01-05).
 /// - `2`: adds `normalized_text_cache` (T03-04).
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+/// - `3`: adds `fts_doc`, `fts_occurrences` (FTS5), `fts_projection_head` (T08-01).
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// The `cache_meta` binding table (spec 03 §4.1). Created on every (re)build.
 const CACHE_META_DDL: &str = "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
@@ -56,6 +60,50 @@ CREATE TABLE normalized_text_cache (
   byte_size        INTEGER NOT NULL,
   created_at       INTEGER NOT NULL,
   last_used_at     INTEGER NOT NULL
+);";
+
+/// `fts_doc` (spec 03 §4.3, T08-01): the explicit rowid-correlation and
+/// worktree/generation scoping side-table for `fts_occurrences`. An FTS5
+/// virtual table has no native way to express "which worktree/generation does
+/// this row belong to", so this table is both the join key
+/// (`fts_rowid == fts_occurrences.rowid`) and the scope later validation/search
+/// reads (06 §4, 09 §1) filter on.
+const FTS_DOC_DDL: &str = "\
+CREATE TABLE fts_doc (
+  fts_rowid      INTEGER PRIMARY KEY,
+  occurrence_id  TEXT NOT NULL UNIQUE,
+  worktree_id    TEXT NOT NULL,
+  generation_id  TEXT NOT NULL
+);
+CREATE INDEX fts_doc_by_wt ON fts_doc(worktree_id, generation_id);";
+
+/// The FTS5 virtual table (spec 03 §4.3, 09 §2). `unicode61 remove_diacritics 2`
+/// is FTS5's built-in tokenizer; app-side preprocessing
+/// ([`super::fts::tokenize_identifier`] and friends) does the code-aware
+/// camelCase/snake_case/kebab-case/path/qualified-name splitting **before**
+/// insert — this tokenizer only finishes plain Unicode word-boundary and
+/// diacritic folding on the already-split text. Requires SQLite compiled with
+/// `SQLITE_ENABLE_FTS5`, which this workspace's `bundled` rusqlite feature
+/// already turns on unconditionally (no separate Cargo feature needed).
+const FTS_OCCURRENCES_DDL: &str = "\
+CREATE VIRTUAL TABLE fts_occurrences USING fts5(
+  name, qualified_name, path, signature, body,
+  tokenize = 'unicode61 remove_diacritics 2'
+);";
+
+/// `fts_projection_head` (spec 03 §4.3): the per-worktree validity proof for
+/// the FTS view (06 §4's validation order). This task only creates the table;
+/// it is populated by the generation materializer (T08-02) and read by
+/// per-search/validate-on-open checks (T08-03).
+const FTS_PROJECTION_HEAD_DDL: &str = "\
+CREATE TABLE fts_projection_head (
+  worktree_id            TEXT PRIMARY KEY,
+  generation_id          TEXT NOT NULL,
+  lexical_schema_version INTEGER NOT NULL,
+  tokenizer_version      INTEGER NOT NULL,
+  occurrence_count       INTEGER NOT NULL,
+  manifest_hash          TEXT NOT NULL,
+  updated_at             INTEGER NOT NULL
 );";
 
 /// An error opening, validating, or rebuilding a `cache.sqlite` connection.
@@ -266,9 +314,10 @@ fn read_binding(conn: &Connection) -> Option<(String, u32)> {
     Some((uuid, version))
 }
 
-/// Create the cache schema (`cache_meta` + `normalized_text_cache`) and seed the
-/// binding rows in one transaction (all-or-nothing: a crash before commit leaves
-/// the fresh file unbound, so the next open rebuilds it).
+/// Create the cache schema (`cache_meta`, `normalized_text_cache`, `fts_doc`,
+/// `fts_occurrences`, `fts_projection_head`) and seed the binding rows in one
+/// transaction (all-or-nothing: a crash before commit leaves the fresh file
+/// unbound, so the next open rebuilds it).
 fn seed_binding(
     conn: &mut Connection,
     store_instance_uuid: &str,
@@ -277,6 +326,9 @@ fn seed_binding(
     let tx = conn.transaction()?;
     tx.execute_batch(CACHE_META_DDL)?;
     tx.execute_batch(NORMALIZED_TEXT_CACHE_DDL)?;
+    tx.execute_batch(FTS_DOC_DDL)?;
+    tx.execute_batch(FTS_OCCURRENCES_DDL)?;
+    tx.execute_batch(FTS_PROJECTION_HEAD_DDL)?;
     let rows: [(&str, String); 3] = [
         ("store_instance_uuid", store_instance_uuid.to_string()),
         ("cache_schema_version", CACHE_SCHEMA_VERSION.to_string()),

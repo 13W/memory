@@ -410,6 +410,7 @@ dependencies = [
 name = "local-rag-store"
 version = "0.0.0"
 dependencies = [
+ "casefold",
  "local-rag-core",
  "local-rag-test-support",
  "rusqlite",

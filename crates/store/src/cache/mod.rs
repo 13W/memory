@@ -12,10 +12,15 @@
 //! `store_settings` at daemon startup, 02 §4.1). This layer neither generates nor
 //! seeds that UUID — the UUIDv7 generator and its seeding land in later tasks.
 
+mod fts;
 mod open;
 mod text;
 mod writer;
 
+pub use fts::{
+    LEXICAL_SCHEMA_VERSION, TOKENIZER_VERSION, fts_manifest_hash, tokenize_identifier,
+    tokenize_path, tokenize_qualified_name, tokenize_signature,
+};
 pub use open::{CACHE_SCHEMA_VERSION, CacheOpenError, CacheOpenOutcome};
 pub use text::{
     BatchingLastUsed, LastUsedSink, NormalizedTextRow, delete_normalized_text, flush_last_used,
