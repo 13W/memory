@@ -305,7 +305,8 @@ fn repeated_run_is_noop() {
 
 /// End-to-end: `StateDb::open` bootstraps the framework tables and applies the
 /// real production set (registry migration v1 T02-02, worktree migration v2
-/// T02-03, code migration v3 T03-01), and a second open is a clean no-op.
+/// T02-03, code migration v3 T03-01, projection migration v4 T07-02), and a
+/// second open is a clean no-op.
 #[test]
 fn state_db_open_bootstraps_and_is_idempotent() {
     let (_home, layout) = temp_store();
@@ -330,7 +331,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         for t in ["worktree", "worktree_path", "generation"] {
             assert!(table_exists(&read, t), "worktree table {t} created");
         }
-        // … and v3 (code storage: content-shared §2.3 + generation membership §2.4).
+        // … v3 (code storage: content-shared §2.3 + generation membership §2.4) …
         for t in [
             "file_revision",
             "content_blob",
@@ -343,15 +344,45 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         ] {
             assert!(table_exists(&read, t), "code table {t} created");
         }
-        // Recorded as exactly three rows: (1,"registry"), (2,"worktree"), (3,"code").
+        // … and v4 (projection deployment state + minimal model registry, §2.2).
+        for t in ["model_space", "worktree_projection_state"] {
+            assert!(table_exists(&read, t), "projection table {t} created");
+        }
+        // The v4 seed: the default model space is `active` and pointed at by
+        // `store_settings.default_model_space_id` (spec 04 §3).
+        let default_id: String = read
+            .query_row(
+                "SELECT value FROM store_settings WHERE key = 'default_model_space_id'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("default_model_space_id seeded");
+        let (name, state): (String, String) = read
+            .query_row(
+                "SELECT display_name, state FROM model_space WHERE model_space_id = ?1",
+                [&default_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("default model space row");
+        assert_eq!(name, "default", "default model space display_name");
+        assert_eq!(state, "active", "default model space MUST be active");
+
+        // Recorded as exactly four rows: (1,"registry"), (2,"worktree"),
+        // (3,"code"), (4,"projection").
         let rows = migration_rows(&read);
-        assert_eq!(rows.len(), 3, "the production set is [v1,v2,v3] at T03-01");
+        assert_eq!(
+            rows.len(),
+            4,
+            "the production set is [v1,v2,v3,v4] at T07-02"
+        );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
         assert_eq!(rows[1].0, 2);
         assert_eq!(rows[1].1, "worktree");
         assert_eq!(rows[2].0, 3);
         assert_eq!(rows[2].1, "code");
+        assert_eq!(rows[3].0, 4);
+        assert_eq!(rows[3].1, "projection");
     }
     drop(db);
 
@@ -361,5 +392,5 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 3, "reopen adds no new migration rows");
+    assert_eq!(applied, 4, "reopen adds no new migration rows");
 }

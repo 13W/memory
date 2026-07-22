@@ -89,6 +89,20 @@
 //! lookup + insert. Building the `parser_fingerprint` from a real parser is T04-02
 //! and the normalized-text cache derived from these bytes is T03-04.
 //!
+//! T07-02 adds the **two-axis projection deployment state**
+//! ([`registry::projection_state`]): the version-4 migration creates `model_space`
+//! and `worktree_projection_state` (spec 03 §2.2) and seeds one default `active`
+//! model space, and the module ships the guard layer — the [`ProjectionStatus`]
+//! machine (`clean`/`updating`/`dirty`/`rebuilding`, spec 04 §2) with a pure
+//! `check_transition`, the pure two-axis `check_invariants` truth table
+//! (`clean ⇒ active == projected ∧ target NULL`; `updating ⇒ target ∧ op_id set`;
+//! only one axis moves per switch, spec 04 §8/05 §5 `[FIXED]`), and the guarded
+//! `write_projection_state` (read-then-write, no mutation on rejection). The
+//! representation registry (`representation`/`model_space_representation`, the
+//! canonical RepresentationKey, coverage, and the model-space build machine) is
+//! T11-01; the switch orchestration is T07-03 and validate-on-open/rebuild is
+//! T07-04.
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -139,6 +153,12 @@ pub use registry::{
     path_history, repo_data_policy, repo_settings, resolve, set_current_generation,
     set_repo_data_policy, set_repo_setting, transition_generation, transition_worktree_state,
     worktree_path_history, worktree_state, worktree_summary, worktrees_of_repo,
+};
+pub use registry::{
+    DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,
+    PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation, ProjectionStateChange,
+    ProjectionStateError, ProjectionStateRow, ProjectionStatus, check_invariants,
+    default_model_space_id, insert_projection_state, projection_state, write_projection_state,
 };
 pub use retention::{
     ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,
