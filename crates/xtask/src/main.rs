@@ -35,8 +35,9 @@ fn run_ci() -> ExitCode {
         // Feature-gated crash/error seams: the default steps above build with
         // `failpoints` OFF, so lint and run those code paths explicitly. Scoped to
         // each crate defining the feature — `local-rag-store` (migration crash seams,
-        // spec 13 §3) and `local-rag-index` (generation-builder phase seams, spec 04
-        // §1 build → failed edge, T05-05).
+        // spec 13 §3), `local-rag-index` (generation-builder phase seams, spec 04
+        // §1 build → failed edge, T05-05), and `local-rag-projection` (fake-shard
+        // fault matrix seams + inspect/corrupt controls, spec 05 §10, T07-01).
         &[
             "clippy",
             "-p",
@@ -61,6 +62,24 @@ fn run_ci() -> ExitCode {
             "warnings",
         ],
         &["test", "-p", "local-rag-index", "--features", "failpoints"],
+        &[
+            "clippy",
+            "-p",
+            "local-rag-projection",
+            "--all-targets",
+            "--features",
+            "failpoints",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "test",
+            "-p",
+            "local-rag-projection",
+            "--features",
+            "failpoints",
+        ],
     ];
 
     let cargo = env!("CARGO");

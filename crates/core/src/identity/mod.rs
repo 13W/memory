@@ -23,7 +23,7 @@ pub mod uuidv7;
 
 pub use domain::{Domain, HASH_SCHEMA_VERSION};
 pub use path::{Canonical, CaseSensitivity};
-pub use uuidv7::{Uuid, UuidSource, uuidv7_from};
+pub use uuidv7::{Uuid, UuidParseError, UuidSource, uuidv7_from};
 
 #[cfg(unix)]
 pub use uuidv7::SystemUuidV7;
