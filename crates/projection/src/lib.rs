@@ -21,24 +21,42 @@
 //!   files. Under the `failpoints` feature it also carries the fault-injection
 //!   controls the F1–F12 matrix needs (spec 05 §10, authored in T07-05).
 //!
-//! Deliberately **not** here (owning cards): the `worktree_projection_state`
-//! two-axis guards (T07-02); the write-ahead switch and the
-//! `expected_point_ids(state.sqlite)` derivation, which pulls in
-//! `local-rag-store` (T07-03); validate-on-open and rebuild (T07-04); and the
-//! F1–F12 fault matrix itself (T07-05). No real dense backend or dense/model
-//! SDK is coupled before T10 — this crate depends only on `local-rag-core`.
+//! T07-03 adds the **write-ahead switch** (spec 05 §5), the first module here to
+//! depend on `local-rag-store`:
+//!
+//! - [`expected`] — `expected_point_ids(state.sqlite)` (spec 05 §4): the
+//!   deterministic expected point set for a `(generation, model_space)` tuple,
+//!   derived by reading `generation_unit_occurrence` through `local-rag-store`.
+//! - [`switch`] — [`switch::switch`] drives one write-ahead → desired-set
+//!   reconcile → commit cycle over a [`ProjectionStore`]/[`ShardHandle`] and
+//!   `local-rag-store`'s `worktree_projection_state`/generation/worktree guards
+//!   (T07-02, `registry::generation`, `registry::set_current_generation`),
+//!   through the caller-supplied [`switch::VectorSource`] seam (standing in for
+//!   the not-yet-built `embedding_cache`, T11-02).
+//!
+//! Deliberately **not** here (owning cards): validate-on-open and rebuild
+//! (T07-04); the F1–F12 fault matrix itself (T07-05); the real per-worktree
+//! write lock (T09-01); the representation/model-space registry and the real
+//! `embedding_cache` (T11-01/T11-02). No real dense backend or dense/model SDK
+//! is coupled before T10.
 
 pub mod contract;
+pub mod expected;
 pub mod fake;
 pub mod identity;
+pub mod switch;
 
 pub use contract::{
     DenseQuery, Hash32, PROJECTION_SCHEMA_VERSION, PointId, ProjectionError, ProjectionHead,
     ProjectionPoint, ProjectionStore, RepresentationKind, Result, ScoredPoint, ShardHandle,
     ShardParams,
 };
+pub use expected::{
+    ExpectedPoint, REQUIRED_REPRESENTATION_KINDS, expected_point_ids, expected_points,
+};
 pub use fake::{FakeProjectionStore, FakeShard};
 pub use identity::{head, manifest_hash, projection_point_id};
+pub use switch::{SwitchCommitError, SwitchError, SwitchOutcome, VectorSource, switch};
 
 #[cfg(feature = "failpoints")]
 pub use fake::{Corruption, ShardInspection};

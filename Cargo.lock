@@ -386,7 +386,9 @@ name = "local-rag-projection"
 version = "0.0.0"
 dependencies = [
  "local-rag-core",
+ "local-rag-store",
  "local-rag-test-support",
+ "tokio",
 ]
 
 [[package]]

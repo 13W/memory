@@ -332,6 +332,26 @@ pub fn member_file_revision(
     .optional()
 }
 
+/// Every `occurrence_id` recorded for `generation_id`, ascending (spec 03 §2.4).
+///
+/// Served by the `occurrence_by_gen` index. Ordering is only for tidy,
+/// reproducible output — occurrence identity is order-independent (spec 03
+/// §1.2 `[FIXED]`) and the projection switch (T07-03) re-sorts/de-duplicates
+/// the point ids it derives from this list anyway.
+pub fn occurrence_ids_for_generation(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT occurrence_id FROM generation_unit_occurrence \
+         WHERE generation_id = ?1 ORDER BY occurrence_id",
+    )?;
+    let ids = stmt
+        .query_map(params![generation_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 /// The skip reason recorded for `normalized_path` in `generation_id`, if the file
 /// was skipped (spec 03 §2.4).
 ///
@@ -413,6 +433,44 @@ mod tests {
         );
         // An absent (generation, path) is a clean `None`.
         assert_eq!(skip_reason(&conn, "g", "missing.rs").expect("read"), None);
+    }
+
+    /// [`occurrence_ids_for_generation`] returns exactly the ids recorded for that
+    /// generation, sorted, and never another generation's rows.
+    #[test]
+    fn occurrence_ids_for_generation_scopes_and_sorts() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE generation_unit_occurrence \
+               (occurrence_id TEXT, generation_id TEXT, normalized_path TEXT, unit_id TEXT);\n\
+             CREATE INDEX occurrence_by_gen ON generation_unit_occurrence(generation_id);",
+        )
+        .expect("seed schema");
+
+        // Empty generation → empty list.
+        assert_eq!(
+            occurrence_ids_for_generation(&conn, "g-empty").expect("read"),
+            Vec::<String>::new()
+        );
+
+        conn.execute_batch(
+            "INSERT INTO generation_unit_occurrence VALUES \
+               ('cc', 'g1', 'b.rs', 'u1'), \
+               ('aa', 'g1', 'a.rs', 'u2'), \
+               ('bb', 'g1', 'c.rs', 'u3'), \
+               ('zz', 'g2', 'a.rs', 'u4');",
+        )
+        .expect("seed rows");
+
+        assert_eq!(
+            occurrence_ids_for_generation(&conn, "g1").expect("read"),
+            vec!["aa".to_string(), "bb".to_string(), "cc".to_string()],
+            "sorted ascending, scoped to g1"
+        );
+        assert_eq!(
+            occurrence_ids_for_generation(&conn, "g2").expect("read"),
+            vec!["zz".to_string()]
+        );
     }
 
     // A realistic occurrence tuple: a UUIDv7-like generation id, a normalized

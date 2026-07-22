@@ -100,8 +100,16 @@
 //! `write_projection_state` (read-then-write, no mutation on rejection). The
 //! representation registry (`representation`/`model_space_representation`, the
 //! canonical RepresentationKey, coverage, and the model-space build machine) is
-//! T11-01; the switch orchestration is T07-03 and validate-on-open/rebuild is
-//! T07-04.
+//! T11-01; validate-on-open/rebuild is T07-04.
+//!
+//! T07-03 adds the one store-side reader the projection switch needs
+//! ([`code::occurrence_ids_for_generation`]): every `occurrence_id` recorded for
+//! a generation, ascending, served by the existing `occurrence_by_gen` index. The
+//! switch orchestration itself — write-ahead → desired-set reconcile against a
+//! `ProjectionStore` shard → commit, spec 05 §5 — lives in `local-rag-projection`
+//! (`local_rag_projection::switch`), which depends on this crate for exactly this
+//! reader plus [`registry::projection_state`], [`registry::generation`], and
+//! [`registry::worktree`]'s `set_current_generation`.
 //!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
@@ -134,8 +142,8 @@ pub use code::{
     detect_newline_style, file_revision_id_by_content_key, insert_content_blob,
     insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
     insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
-    normalize, occurrence_id, parsed_unit_id_by_natural_key, parsed_units_for_revision,
-    prepare_source, skip_reason, source_bytes,
+    normalize, occurrence_id, occurrence_ids_for_generation, parsed_unit_id_by_natural_key,
+    parsed_units_for_revision, prepare_source, skip_reason, source_bytes,
 };
 pub use housekeeping::{
     HousekeepingError, ShardSweepReport, run_orphan_shard_sweep, sweep_orphan_shard_dirs,

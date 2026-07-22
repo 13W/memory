@@ -8,6 +8,11 @@ publish.workspace = true
 
 [dependencies]
 local-rag-core = { path = "../core" }
+# The write-ahead switch (T07-03, spec 05 §5) reads/writes `state.sqlite`:
+# `worktree_projection_state` (T07-02 guards), the generation machine, and
+# `worktree.current_generation_id` — all owned by `local-rag-store`. No new
+# external dependency; `rusqlite` types are used via `local_rag_store::rusqlite`.
+local-rag-store = { path = "../store" }
 # Optional, dev-only path crate (0 external sources): enabled ONLY by the
 # `failpoints` feature so the fake shard can host named crash-injection points
 # for the projection fault matrix (F1–F12, spec 05 §10; authored in T07-05).
@@ -22,6 +27,12 @@ failpoints = ["dep:local-rag-test-support"]
 
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
+# The switch's `state.sqlite` writer (`StateWriter::transaction`) is async; tests
+# drive it with `#[tokio::test]`, mirroring `crates/store`'s dev-dependency shape.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+] }
 
 [lints]
 workspace = true
