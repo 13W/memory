@@ -170,6 +170,36 @@ Rebuild MUST be idempotent (deterministic IDs + desired-set semantics). Missing 
 `embedding_cache` during rebuild → recompute via the embedding pipeline before head write
 (coverage guard); the shard never goes `clean` with a partial expected set.
 
+As-built note (T07-04, `[SPEC]`): validate-on-open and rebuild are
+`local_rag_projection::{validate, rebuild}`. `state.sqlite`'s FSM only allows `Dirty → Rebuilding`
+directly (spec 04 §2), never `Clean/Updating/Rebuilding → Rebuilding`, so the pseudocode's single
+`tx: status='rebuilding', …` line above is realized as **three** separate committed transactions:
+`mark_dirty` (whatever the current status, move to `dirty` and record the divergence reason as
+`last_error` — legal from every status, so a crash right here still re-enters the same path on the
+next open, §6), `begin_rebuild` (`dirty → rebuilding`, a fresh `projection_op_id`, and `target_*` is
+cleared — a rebuild always targets the **active** tuple and abandons any in-flight switch rather
+than resuming it), and `finish_rebuild` (`rebuilding → clean`, `projected := active`, `last_error`
+cleared). No generation-state transition happens in `finish_rebuild`: rebuild never changes *which*
+generation is active, only re-syncs the shard to match it. "destroy or quarantine … on suspicion of
+backend corruption" is realized as an exact boundary: quarantine (a raw directory rename, since an
+unopenable shard yields no `ShardHandle` to call `destroy` on) fires only for spec 05 §10 F12 (the
+shard could not be opened at all); every other detected divergence destroys the openable shard via
+`ShardHandle::destroy` before recreating it. Quarantine directories are named
+`<worktree_id>-<uuid>` with a fresh UUIDv7 suffix (lexicographic sort == chronological order), and a
+rotation step deletes the oldest same-worktree entries beyond `QUARANTINE_RETENTION = 2` immediately
+after each new quarantine event (§8's "kept ≤ 2 rebuild cycles" — D-004's disposition put this here).
+"Missing vectors … recompute via the embedding pipeline" is realized through T07-03's
+`VectorSource` seam (still not a real `embedding_cache`, T11-02): a miss surfaces as a typed
+`RebuildError::MissingVector` raised **before** any shard write in that attempt (built by collecting
+every point's vector into a `Vec` first, only calling `upsert` once the whole set is confirmed
+available), so the shard never goes `clean` with a partial expected set — the row is left at
+`rebuilding` for the next open to retry, exactly as a crash would leave it (spec 05 §10 F11: "crash
+during rebuild → `status='rebuilding'` → rebuild restarts"). A full rebuild is always
+destroy/quarantine-then-recreate, never a diff against the shard's existing content (that diff is
+`switch`'s fast path, §5) — this also means a rebuild that itself crashed and is retried simply
+destroys/quarantines again and recreates from scratch, which is trivially idempotent given
+deterministic point IDs and a pure `state.sqlite`-derived expected set.
+
 ## 8. Shard lifecycle follows registry lifecycle `[FIXED]`
 
 - attach/move of a worktree: same shard directory (keyed by `worktree_id`), never a second shard.
