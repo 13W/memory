@@ -749,6 +749,25 @@ CREATE TABLE fts_projection_head (                    -- validity proof for the 
 );
 ```
 
+As-built note (T08-01, `[SPEC]`): `fts_doc`/`fts_occurrences`/`fts_projection_head`
+are created byte-for-byte as above by the cache seed transaction
+(`local_rag_store::cache::open`), and `CACHE_SCHEMA_VERSION` is bumped to `3` —
+an older cache lacking these tables is auto-dropped-and-rebuilt on open (§4.4
+step 2). No new Cargo feature is required: `libsqlite3-sys`'s bundled build
+already compiles SQLite with `SQLITE_ENABLE_FTS5` unconditionally under the
+existing `bundled` rusqlite feature (verified in `libsqlite3-sys`'s `build.rs`;
+see CONTRIBUTING.md). The binary constants read at validation (06 §4) are
+`local_rag_store::LEXICAL_SCHEMA_VERSION`/`TOKENIZER_VERSION`, both `1` at this
+task. `local_rag_store::fts_manifest_hash(worktree_id, generation_id,
+occurrence_ids)` hashes `worktree_id, generation_id ‖ occurrence IDs sorted
+ascending bytewise and de-duplicated` through `Domain::FtsManifest` (already
+defined ahead of this task), mirroring
+`local_rag_projection::identity::manifest_hash`'s sorted-unique convention but
+with **no** `model_space_id` axis — the FTS view is generation-scoped only.
+Row insertion (the generation materializer) and per-search/at-open validation
+are T08-02/T08-03; this task ships schema plus pure identity/tokenizer
+functions only (09 §2 as-built note has the tokenizer detail).
+
 ### 4.4 Cache open-validation `[FIXED principle]`
 
 At daemon startup / cache open:

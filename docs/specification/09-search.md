@@ -33,6 +33,33 @@ invalidation ⇒ FTS rebuild):
 Ranking: `bm25(fts_occurrences, w_name, w_qualified, w_path, w_signature, w_body)` with
 default weights `4.0, 3.0, 1.5, 2.0, 1.0` `[SPEC — tuned by the 49-query benchmark]`.
 
+As-built note (T08-01, `[SPEC]`): the splitter is
+`local_rag_store::tokenize_identifier`/`tokenize_qualified_name`/`tokenize_path`/
+`tokenize_signature` (`crates/store/src/cache/fts.rs`). Splitting runs on the
+original casing before lowering — lowering first would destroy the
+lower/upper-case boundary signal the split depends on. Boundaries: a hard
+delimiter at any non-alphanumeric character (runs collapse, never emitted, so
+the same rule covers `_`/`-` and — reused for the qualified-name/path columns —
+`.`/`:`/`/`); within an alphanumeric run, lower→upper, an acronym run's last
+uppercase letter joining a following lowercase word (`HTTPServer` →
+`HTTP`+`Server`), and a letter↔digit transition in either direction
+(`parseHTML2Response` → `parse`+`HTML`+`2`+`Response`)
+`[SPEC — digit-boundary splitting is not spec-mandated; chosen for recall parity
+with the retained fused original]`. Each token is folded to lowercase via
+`casefold::simple_fold` (the codebase's existing case-insensitive-comparison
+primitive, spec 03 §1.3), not `str::to_lowercase()`, to avoid a length-changing
+full-casing surprise `[SPEC]`. A whole-atom "fused" token (the atom unsplit,
+lowered) is emitted only when the atom has no internal punctuation — `unicode61`
+already separates on punctuation, so re-emitting a punctuated fused string would
+only inflate term frequency `[SPEC]`; `tokenize_path`/`tokenize_qualified_name`
+make this fusion decision per path/qualifier component (split first), not once
+over the whole string, so a punctuation-free component (e.g. a `camelCase` file
+stem) still gets its own fused token. `tokenize_qualified_name(None)` (today's
+universal case — no v2 caller derives a qualified name yet, 06 §2) tokenizes to
+the empty string; `tokenize_signature` takes already-extracted fragments and
+emits only their split parts, never a fused whole fragment.
+`LEXICAL_SCHEMA_VERSION`/`TOKENIZER_VERSION` are both `1`.
+
 ## 3. Dense leg
 
 - Query embedding computed with the representation of the active model space; **content vs

@@ -111,6 +111,21 @@
 //! reader plus [`registry::projection_state`], [`registry::generation`], and
 //! [`registry::worktree`]'s `set_current_generation`.
 //!
+//! T08-01 adds the **FTS materialized-view schema and lexical preprocessing**
+//! (spec 03 §4.3, 09 §2): the version-3 cache schema creates `fts_doc`/
+//! `fts_occurrences` (FTS5)/`fts_projection_head`, and [`tokenize_identifier`]/
+//! [`tokenize_qualified_name`]/[`tokenize_path`]/[`tokenize_signature`]
+//! implement the versioned (`TOKENIZER_VERSION`) code-aware camelCase/
+//! snake_case/kebab-case splitting required before insert (splitting runs on
+//! original casing, each part folded via `casefold::simple_fold`; a
+//! punctuation-free atom also gets a fused whole-token, since FTS5's
+//! `unicode61` tokenizer has nothing left to split on for it). [`fts_manifest_hash`]
+//! derives `fts_projection_head.manifest_hash` from the sorted-unique
+//! occurrence-id set (spec 03 §1.2), generation-scoped only (no
+//! `model_space_id` axis, unlike the dense projection's manifest). Row
+//! insertion (the generation materializer) is T08-02; per-search/at-open
+//! validation reading `fts_projection_head` is T08-03.
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -128,8 +143,10 @@ mod state;
 
 pub use cache::{
     BatchingLastUsed, CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome,
-    CacheWriteError, CacheWriter, LastUsedSink, NormalizedTextRow, delete_normalized_text,
-    flush_last_used, get_normalized_text, insert_normalized_text, verify_cached_text,
+    CacheWriteError, CacheWriter, LEXICAL_SCHEMA_VERSION, LastUsedSink, NormalizedTextRow,
+    TOKENIZER_VERSION, delete_normalized_text, flush_last_used, fts_manifest_hash,
+    get_normalized_text, insert_normalized_text, tokenize_identifier, tokenize_path,
+    tokenize_qualified_name, tokenize_signature, verify_cached_text,
 };
 pub use code::{
     ALGO_VERSION, BlobOutcome, DerivedContentBlob, EdgeResolution, NORMALIZATION_VERSION,

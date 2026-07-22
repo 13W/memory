@@ -24,6 +24,13 @@ zstd = "0.13"
 # normalization. Already in Cargo.lock via local-rag-core (0 new external
 # sources). See CONTRIBUTING allowlist.
 unicode-normalization = "0.1"
+# Unicode simple case folding for the FTS tokenizer's "lowercased" token
+# emission (spec 09 §2, T08-01) — the same primitive local-rag-core already
+# uses for case-insensitive path identity. std's `to_lowercase` is full
+# Unicode lowering (can expand length); `simple_fold` is a strict 1:1 fold.
+# Already in Cargo.lock via local-rag-core (0 new external sources). See
+# CONTRIBUTING allowlist.
+casefold = "0.1"
 # Optional, dev-only path crate (0 external sources): enabled ONLY by the
 # `failpoints` feature so the migration runner can host named crash-injection
 # points for hard-kill (SIGABRT) resume tests. Never enabled in release/dist.
