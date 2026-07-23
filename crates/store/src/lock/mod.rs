@@ -10,9 +10,10 @@
 //!
 //! `L0` (`store.lock`) and `L3` (the shard-manager map) have no real
 //! synchronization primitive yet — see [`LockLevel`]'s docs. Adopting this
-//! hierarchy into the reconcile driver or the projection switch is later work
-//! (T09-04, group 15), not this module; the read side is adopted by
-//! `local_rag_search` (T09-03) via [`WorktreeLockRegistry::read_bounded`].
+//! hierarchy into the projection switch is later work (T11-05, group 11); the
+//! reconcile driver's own adoption has no dedicated task yet in the current
+//! plan. The read side is adopted by `local_rag_search` (T09-03) via
+//! [`WorktreeLockRegistry::read_bounded`].
 
 mod level;
 mod order;

@@ -44,10 +44,14 @@ local-rag-test-support = { path = "../test-support" }
 # async-aware mutex (`tokio::sync::Mutex`) to serialize — a plain
 # `std::sync::Mutex` guard held across `.await` is itself a bug
 # (`clippy::await_holding_lock`, see `switch_faults.rs`'s doc comment).
+# `time` is added by T09-04's `switch_concurrency.rs`: a `tokio::time::timeout`
+# wrap around the concurrent-switch load test makes "no deadlock" an explicit,
+# assertable property instead of relying on an external CI-level timeout.
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "sync",
+    "time",
 ] }
 
 [lints]
