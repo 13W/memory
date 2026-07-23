@@ -217,6 +217,48 @@ Rules:
 - `busy_timeout` is a backstop, not the design: within the daemon all writes go through the
   queues; direct write connections outside the queues are forbidden.
 
+As-built note (T09-01, `[SPEC]`): the hierarchy's typed primitive is `local_rag_store::lock`
+(`crates/store/src/lock/`). `LockLevel` has seven variants (`L0`…`L4b`); ordering always goes
+through `LockLevel::rank()`, never a derived `Ord` on the enum, because `L2Read`/`L2Write` and
+`L4a`/`L4b` **share a rank** — the table's own numbering treats each pair as siblings of one
+numbered level, not as two independently orderable levels (nesting one under the other is exactly
+as forbidden as nesting a level under itself). Order enforcement is `debug`/`cargo test`-only (via
+`debug_assert!`, compiled to nothing in `--release`, matching this crate's four other
+cost-boundary `debug_assert!` sites) against an ambient `tokio::task_local!` — **not**
+`thread_local!`: `L2.read` is meant to span an entire async pipeline across possible OS-thread
+migration on a multi-threaded runtime, and `task_local!`'s storage lives inside the polled future
+itself, swapped into a thread-local only for the duration of one poll. Because `task_local!`
+offers only scoped mutation (`scope`/`sync_scope`, no "set now, clear via `Drop`" API), the public
+acquisition shape is a **scoped closure/future** (`checked_scope_sync`/`checked_scope_async`,
+"run this critical section for me"), not an RAII guard returned to the caller — matching this
+crate's existing `StateWriter::transaction<F, R>(&self, f: F) -> Result<R, WriteError>` idiom.
+`checked_scope_sync` needs no running Tokio runtime (`LocalKey::sync_scope` is a plain synchronous
+swap), so the same mechanism serves `L1` (`MigrationLock::acquire`, never `.await`s) and each
+write-queue job dispatch (a plain `std::thread`) as well as the fully-async `L2`.
+
+`L2` is realized by `WorktreeLockRegistry` (`lock::worktree`): one `tokio::sync::RwLock<()>` per
+`worktree_id`, created on first use and kept for the registry's lifetime (`worktree_id`s are
+UUIDv7s, never reused, so a stale entry is at worst a few dozen bytes — eviction is `[OPEN]`,
+left for whichever task first owns a long-lived registry instance). `L1`
+(`crate::migrate::run`) and `L4a`/`L4b` (`StateWriter`/`CacheWriter`) are instrumented **in
+place** to actually participate in the order check — not a documentation-only mapping — per this
+section's "no exceptions." The write-queue instrumentation is literal: each job dispatch is
+wrapped in `checked_scope_sync(L4a|L4b, || job(&mut conn))`, which marks the writer thread as
+already holding the hierarchy's topmost rank for the job's duration — this is what turns "L4
+queues are leaves" from a construction accident into an enforced invariant, since *any* further
+acquisition attempted from inside a queued job fails the strictly-greater check and panics (proven
+by `crates/store/tests/lock.rs::{state,cache}_writer_job_cannot_acquire_another_lock`: the panic
+tears down the writer thread, observed by the caller as `WriterGone` on both the panicking call —
+its `oneshot` reply sender is dropped mid-unwind before replying — and any subsequent call, proving
+the thread actually died rather than hanging). `L0` (`store.lock`) and `L3` (the shard-manager
+map) ship as `LockLevel` variants only — no real synchronization primitive exists yet (`L0` is
+T15's daemon lifecycle; `L3` is T09-02's shard LRU manager) — the same "type before backend"
+precedent as T07-01's `ProjectionStore` trait; whichever task adds the real primitive calls the
+already-public `checked_scope_sync`/`checked_scope_async` around it, unchanged. Adopting
+`WorktreeLockRegistry` into the reconcile driver (`crates/index::reconcile::driver`, today's
+*structural*, lock-object-free realization of `L2`'s write side), the projection switch, or a
+search executor is explicitly **not** this task — T09-03/T09-04 and group 12/15 own that wiring.
+
 ## 6. Degraded modes & error taxonomy `[SPEC]`
 
 Degradation is always **explicit** in responses; nothing degrades silently `[FIXED]`.

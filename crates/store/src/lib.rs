@@ -139,6 +139,26 @@
 //! update"). [`read_fts_projection_head`] is a plain row accessor; per-search/
 //! at-open validation and rebuild-on-divergence are T08-03.
 //!
+//! T09-01 adds the **lock hierarchy** ([`lock`], spec 02 §5): [`LockLevel`]
+//! (`L0`…`L4b`, ranked so `L2Read`/`L2Write` and `L4a`/`L4b` share a rank —
+//! siblings, not independently orderable) plus `debug`/`cargo test`-only
+//! strict-order enforcement (a task may only acquire a strictly higher rank
+//! than any it already holds) via `tokio::task_local!` — task-local rather
+//! than thread-local because `L2.read` is meant to span an entire async
+//! pipeline (spec 06 §3) across possible OS-thread migration on a
+//! multi-threaded runtime. [`WorktreeLockRegistry`] realizes `L2` (a
+//! per-worktree `RwLock`, entries permanent for now — eviction is `[OPEN]`).
+//! `L1` (`migrate::run`) and `L4a`/`L4b` (`StateWriter`/`CacheWriter`) are
+//! instrumented in place to actually participate (spec 02 §5 says "no
+//! exceptions"); `L0`/`L3` ship as [`LockLevel`] variants only — no real
+//! primitive exists yet (`store.lock` is T15's daemon lifecycle; the
+//! shard-manager map is T09-02's). Because the write-queue job dispatch marks
+//! itself as already holding the hierarchy's topmost rank, "L4 queues are
+//! leaves" (spec 02 §5) is an enforced invariant: any lock acquisition
+//! attempted from inside a queued job fails the order check. Adopting the
+//! registry into the reconcile driver, the projection switch, or a search
+//! executor is later work (T09-03/T09-04, group 12/15), not this task.
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -149,6 +169,7 @@ mod cache;
 mod clock;
 pub mod code;
 pub mod housekeeping;
+pub mod lock;
 pub mod migrate;
 pub mod registry;
 pub mod retention;
@@ -184,6 +205,7 @@ pub use code::{
 pub use housekeeping::{
     HousekeepingError, ShardSweepReport, run_orphan_shard_sweep, sweep_orphan_shard_dirs,
 };
+pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use registry::{
     AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
