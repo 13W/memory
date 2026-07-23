@@ -69,8 +69,8 @@ rewritten.
 
 ## Workspace layout
 
-- Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `memory`,
-  `protocol`.
+- Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `search`,
+  `memory`, `protocol`.
 - Product binaries: `local-rag` (daemon + CLI), `local-rag-proxy` (stdio MCP
   proxy), `local-rag-hook` (spool writer).
 - Dev-only crates (workspace members, excluded from `default-members`, never

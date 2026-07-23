@@ -9,10 +9,10 @@
 //! `StateWriter`/`CacheWriter` (L4a/L4b, `crate::state`/`crate::cache`).
 //!
 //! `L0` (`store.lock`) and `L3` (the shard-manager map) have no real
-//! synchronization primitive yet — see [`LockLevel`]'s docs — and adopting
-//! this hierarchy into the reconcile driver, the projection switch, or a
-//! search executor is later work (T09-03/T09-04, group 12/15), not this
-//! module.
+//! synchronization primitive yet — see [`LockLevel`]'s docs. Adopting this
+//! hierarchy into the reconcile driver or the projection switch is later work
+//! (T09-04, group 15), not this module; the read side is adopted by
+//! `local_rag_search` (T09-03) via [`WorktreeLockRegistry::read_bounded`].
 
 mod level;
 mod order;
@@ -20,4 +20,4 @@ mod worktree;
 
 pub use level::LockLevel;
 pub use order::{OrderViolation, check_order, checked_scope_async, checked_scope_sync, held_level};
-pub use worktree::WorktreeLockRegistry;
+pub use worktree::{ReadTimedOut, WorktreeLockRegistry};

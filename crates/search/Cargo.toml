@@ -1,0 +1,31 @@
+[package]
+name = "local-rag-search"
+description = "Hybrid code-search read-path orchestration for local-rag (spec 09 §1 skeleton)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+local-rag-core = { path = "../core" }
+local-rag-protocol = { path = "../protocol" }
+local-rag-store = { path = "../store" }
+local-rag-projection = { path = "../projection" }
+
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
+# Integration tests drive the async `SearchEngine` pipeline end to end
+# (`state.sqlite` + `cache.sqlite` writers, `ShardManager` fills, the bounded
+# `L2.read` wait) and one test exercises a real `tokio::time::timeout` via
+# paused virtual time (`time`/`test-util`) — the only deterministic,
+# non-wall-clock way to prove a timeout fires.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "test-util",
+] }
+
+[lints]
+workspace = true

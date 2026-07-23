@@ -11,11 +11,12 @@
 //! [`yield_now`]: tokio::task::yield_now
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use local_rag_core::paths::StoreLayout;
-use local_rag_store::lock::checked_scope_sync;
+use local_rag_store::lock::{ReadTimedOut, checked_scope_sync};
 use local_rag_store::{
-    CacheDb, CacheWriteError, LockLevel, StateDb, WorktreeLockRegistry, WriteError,
+    CacheDb, CacheWriteError, LockLevel, StateDb, WorktreeLockRegistry, WriteError, held_level,
 };
 use local_rag_test_support::TempHome;
 
@@ -263,4 +264,70 @@ async fn cache_writer_job_cannot_acquire_another_lock() {
         matches!(second, Err(CacheWriteError::WriterGone)),
         "the writer thread must have actually terminated, got {second:?}"
     );
+}
+
+/// **T09-03 "bounded writer wait"** (uncontended case): with no writer
+/// holding `L2.write`, [`WorktreeLockRegistry::read_bounded`] succeeds
+/// promptly and `L2.read` is held for `body`'s duration.
+#[tokio::test]
+async fn read_bounded_succeeds_promptly_when_uncontended() {
+    let registry = WorktreeLockRegistry::new();
+    let result = registry
+        .read_bounded("wt-1", Duration::from_millis(50), async { held_level() })
+        .await;
+    assert_eq!(result, Ok(Some(LockLevel::L2Read)));
+}
+
+/// **T09-03 "bounded writer wait/BUSY_RETRY"**: a writer holding `L2.write`
+/// for longer than the bound makes a concurrent `read_bounded` time out
+/// (spec 02 §6: "search waits on L2.read (bounded); timeout → BUSY_RETRY").
+/// Uses paused virtual time (`start_paused = true` + [`tokio::time::advance`])
+/// — the only deterministic, non-wall-clock way to exercise a real
+/// `tokio::time::timeout`; no real sleep anywhere in this test.
+#[tokio::test(start_paused = true)]
+async fn read_bounded_times_out_while_a_writer_holds_the_lock() {
+    let registry = Arc::new(WorktreeLockRegistry::new());
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let reg_writer = registry.clone();
+    let writer_task = tokio::spawn(async move {
+        reg_writer
+            .write("wt-1", async move {
+                entered_tx.send(()).ok();
+                tokio::task::spawn_blocking(move || proceed_rx.recv().ok())
+                    .await
+                    .ok();
+            })
+            .await;
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv().expect("writer entered"))
+        .await
+        .expect("join entered-wait");
+
+    let reg_reader = registry.clone();
+    let read_task = tokio::spawn(async move {
+        reg_reader
+            .read_bounded("wt-1", Duration::from_millis(50), async { held_level() })
+            .await
+    });
+    // Give the reader real scheduling opportunities to run its synchronous
+    // prefix through to registering its `tokio::time::timeout` (no sleep —
+    // deterministic cooperative yielding, mirroring
+    // `crates/projection/tests/manager.rs`'s inflight-wait idiom).
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_millis(51)).await;
+
+    let result = read_task.await.expect("join read task");
+    assert_eq!(
+        result,
+        Err(ReadTimedOut),
+        "bounded read must time out while the writer holds L2.write"
+    );
+
+    proceed_tx.send(()).ok();
+    writer_task.await.expect("join writer task");
 }

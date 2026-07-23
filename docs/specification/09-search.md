@@ -21,6 +21,35 @@ search_code(query, mode, limit, name_pattern?)
 Indexed population: **document units of all kinds** (symbol/file/config/text/fallback) —
 anything less is a parity regression vs v1 `[FIXED]`.
 
+As-built note (T09-03, `[SPEC]`): `local_rag_search::SearchEngine::search_code`
+(`crates/search/src/pipeline.rs`, new crate `local-rag-search`, depending on `core`/`protocol`/
+`store`/`projection` — no existing crate claimed this scope; both `store::lock::worktree` and
+`projection::manager`'s own doc comments deferred "adopting into a search executor" here) realizes
+this pipeline's first two steps and the lock/validate/degrade skeleton around the remaining ones,
+**not yet the tuned content** of the legs themselves:
+
+- `resolve worktree from request context` → `local_rag_store::registry::resolve` (already built by
+  T02-04), called before any lock.
+- `L2.read for the WHOLE pipeline` / `resolve active tuple` → 02 §5's as-built note and 06 §3's
+  as-built note (above).
+- `validate fts_projection_head` → `open_and_validate_fts(.., ValidationDepth::Cheap, ..)` (06 §4),
+  mapped to `degraded: "dense_only"` per 02 §6.
+- `validate shard availability` → `ShardManager::acquire` (T09-02); any `AcquireError` (including
+  a rebuild-on-acquire that itself fails, e.g. a withheld vector) maps to `degraded: "lexical_only"`
+  per 02 §6, with **no internal retry** — retrying here would risk defeating `read_bounded`'s own
+  bounded-wait contract.
+- `legs per mode` / `optional name_pattern filter` / `graph/context enrichment`: **stubs** in this
+  task (`Stage::LexicalLeg`, `Stage::Enrichment` — present as pipeline stages an instrumented
+  observer can see run under the lock, but with no query/RRF/enrichment logic yet). The pipeline
+  always attempts both legs unconditionally, mirroring the default `hybrid` mode; `mode`/`limit`/
+  `name_pattern` are not yet request fields. The real BM25 query is T12-01, RRF/`results[]`/`legs`
+  scoring is T12-02/T12-03, and real enrichment is T12-04 — each replaces its stub stage in place,
+  still inside the same held `L2.read`.
+- `format results`: not yet — `SearchEngine::search_code` returns
+  `local_rag_search::PipelineSnapshot` (worktree/generation/model-space tuple, `degraded`,
+  `diagnostics`), the envelope skeleton `[SPEC]` this task owns, not §7's full response shape
+  below (T12-03 builds that on top).
+
 ## 2. Lexical leg — FTS5 `[FIXED]`
 
 App-side code-aware preprocessing before insert (versioned as `tokenizer_version`; bump ⇒ head
