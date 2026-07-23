@@ -279,6 +279,18 @@ substitute for the actual-content read that validation needs. Regression test:
 `strong_check_catches_swapped_occurrence_id_invisible_to_state_sqlite`
 (`crates/store/tests/fts_validate.rs`).
 
+As-built note (T08-04, `[SPEC]`): `crates/store/tests/fts_corruption.rs` is the corruption/
+staleness integration suite the card calls for — deleting an existing head, deleting some
+`fts_doc`/`fts_occurrences` rows, swapping one `occurrence_id` (D-006's own scenario, at suite
+scale), losing the whole `cache.sqlite` file, a concurrent validation burst, and a real
+previously-valid generation corrupted above `FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD` — each
+proven either fully self-healed or explicitly degraded without a cache mutation, with
+`state.sqlite` asserted unchanged in every repair scenario. Scope decision: no new declarative
+JSON fault-fixture family was added — `fixtures/fault/matrix.json` only declares the dense-
+projection `F` matrix (group 07) and group 13's spool `S` matrix; this suite has no v1 fidelity
+target and no pre-existing fixture obligation, so it follows T08-01's own precedent (golden-
+token tables as inline Rust, not a fixture family) rather than inventing an FTS-specific one.
+
 ## 5. Retention & GC of canonical source `[FIXED]`
 
 Pin roots (a `file_revision`/generation is unreferenced only if reachable from none):
