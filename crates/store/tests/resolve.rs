@@ -116,7 +116,7 @@ async fn observe_worktree_at(db: &StateDb, worktree_id: &str, path: &str, now: i
 async fn set_state(db: &StateDb, worktree_id: &str, to: WorktreeState) {
     let wt = worktree_id.to_string();
     db.writer()
-        .transaction(move |tx| transition_worktree_state(tx, &wt, to))
+        .transaction(move |tx| transition_worktree_state(tx, &wt, to, 2000))
         .await
         .expect("transition tx")
         .expect("legal transition");

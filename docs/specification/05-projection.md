@@ -214,6 +214,31 @@ deterministic point IDs and a pure `state.sqlite`-derived expected set.
   `active_model_space_id` is retiring/absent switches it to the default space via the standard
   switch protocol before serving dense search.
 
+As-built note (D-007, `[SPEC]`): the **grace-destroy** bullet above ("remove/detach: grace
+period `[SPEC: 7 days]`, then destroy") is
+`local_rag_store::housekeeping::run_expired_shard_sweep` (`crates/store/src/housekeeping.rs`),
+sitting beside T06-03's orphan sweep in the same module. Its clock is the
+`worktree.state_changed_at` column added by migration 5 (03 §2.1's D-007 note) — the missing
+foundation that made deviation D-004 defer this bullet out of T06-03 in the first place; gate
+G09 found that the deferral's named owners (groups 07/09) had both passed without it and no
+later card claimed it, so it is implemented here rather than deferred a second time.
+
+Shape: a pure predicate (`shard_destroy_due`) over `(state, state_changed_at)` plus an explicit
+`now_ms`/`grace_ms` supplied by the caller — no clock reaches the store, so the fake-clock tests
+are exact rather than approximate. `SHARD_DESTROY_GRACE_MS` is the section's 7-day default, a
+plain constant because no `config.toml` surface for it exists (02 §3.1); whichever task adds one
+threads it through the existing `grace_ms` parameter. Both `detached` and `removing` are
+eligible (the section says "remove/**detach**"), `active` never is, a stamp in the future (clock
+skew) is never due, and the boundary is inclusive so `grace_ms = 0` means "destroy now".
+
+Scope boundary, deliberately narrow: this destroys the **shard directory**, which is all this
+section ("Shard lifecycle follows registry lifecycle") governs. Deleting the `worktree` row
+itself — 04 §7's "deleted after shard/spool/GC cleanup" — additionally needs spool cleanup
+(group 13) and the registry cascade, and stays there; a row lingering in `removing` after its
+shard is gone simply makes later sweeps no-ops (the sweep is idempotent). Evicting a still-open
+handle for a destroyed shard is `ShardManager::remove` (T09-02), which the daemon wires to this
+sweep in group 15 — the same wiring deferral the orphan sweep already carries, not a new one.
+
 As-built note (T09-02, `[SPEC]`): the L3 shard-manager map (spec 02 §5) is
 `local_rag_projection::manager::ShardManager` (`crates/projection/src/manager.rs`). Ref-counted
 handles are plain `Arc<dyn ShardHandle>` — every method but `destroy` takes `&self` and the trait

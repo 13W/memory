@@ -12,9 +12,9 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use local_rag_core::paths::StoreLayout;
-use local_rag_store::StateDb;
 use local_rag_store::migrate::{Migration, MigrationError, run};
 use local_rag_store::rusqlite::Connection;
+use local_rag_store::{StateDb, create_repository, rusqlite, worktree_state_clocks};
 use local_rag_test_support::TempHome;
 
 // Synthetic migrations. Each creates a distinct table so "applied" is
@@ -367,13 +367,13 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(name, "default", "default model space display_name");
         assert_eq!(state, "active", "default model space MUST be active");
 
-        // Recorded as exactly four rows: (1,"registry"), (2,"worktree"),
-        // (3,"code"), (4,"projection").
+        // Recorded as exactly five rows: (1,"registry"), (2,"worktree"),
+        // (3,"code"), (4,"projection"), (5,"worktree_state_clock").
         let rows = migration_rows(&read);
         assert_eq!(
             rows.len(),
-            4,
-            "the production set is [v1,v2,v3,v4] at T07-02"
+            5,
+            "the production set is [v1,v2,v3,v4,v5] at D-007"
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
@@ -383,6 +383,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[2].1, "code");
         assert_eq!(rows[3].0, 4);
         assert_eq!(rows[3].1, "projection");
+        assert_eq!(rows[4].0, 5);
+        assert_eq!(rows[4].1, "worktree_state_clock");
     }
     drop(db);
 
@@ -392,5 +394,72 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 4, "reopen adds no new migration rows");
+    assert_eq!(applied, 5, "reopen adds no new migration rows");
+}
+
+/// D-007: migration 5 adds `worktree.state_changed_at` and backfills every
+/// pre-existing row from `last_seen_at`, so no row is left with a zero clock
+/// that would make its shard instantly eligible for grace destruction
+/// (spec 05 §8).
+///
+/// Applied against a store first migrated to version 4 only — the real upgrade
+/// path — rather than a fresh full-set store, which would never exercise the
+/// backfill (a fresh store has no rows to backfill).
+#[tokio::test]
+async fn migration_5_adds_and_backfills_the_worktree_state_clock() {
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+
+    // 1) Bring the store up to version 4 only, and seed a worktree there.
+    let up_to_v4: Vec<_> = local_rag_store::ALL
+        .iter()
+        .filter(|m| m.version <= 4)
+        .copied()
+        .collect();
+    {
+        let mut conn = rusqlite::Connection::open(layout.state_db()).expect("raw conn");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        let report =
+            run(&mut conn, &up_to_v4, &layout.migration_lock(), 1000).expect("migrate to v4");
+        assert_eq!(report.store_version, 4);
+
+        let tx = conn.transaction().expect("tx");
+        create_repository(&tx, "repo-1", None, 1000).expect("repo");
+        create_worktree_v4(&tx, "wt-1", "repo-1", 1000, 7777);
+        tx.commit().expect("commit");
+    }
+
+    // 2) Opening with the full production set applies migration 5.
+    let db = StateDb::open(layout.state_db()).expect("open applies v5");
+    let read = db.open_read().expect("read conn");
+
+    let clocks = worktree_state_clocks(&read).expect("read clocks");
+    assert_eq!(clocks.len(), 1);
+    assert_eq!(clocks[0].worktree_id, "wt-1");
+    assert_eq!(
+        clocks[0].state_changed_at, 7777,
+        "the pre-existing row is backfilled from last_seen_at, not left at 0"
+    );
+}
+
+/// A version-4-shaped `worktree` INSERT: the column list migration 5 has not
+/// added yet, with an explicit `last_seen_at` the backfill can be observed
+/// through. (`create_worktree` itself writes the post-migration column list, so
+/// it cannot be used against a version-4 store.)
+fn create_worktree_v4(
+    tx: &rusqlite::Transaction<'_>,
+    worktree_id: &str,
+    repo_id: &str,
+    created_at: i64,
+    last_seen_at: i64,
+) {
+    tx.execute(
+        "INSERT INTO worktree \
+           (worktree_id, repo_id, kind, current_generation_id, state, created_at, last_seen_at) \
+         VALUES (?1, ?2, 'main', NULL, 'active', ?3, ?4)",
+        rusqlite::params![worktree_id, repo_id, created_at, last_seen_at],
+    )
+    .expect("insert v4-shaped worktree row");
 }

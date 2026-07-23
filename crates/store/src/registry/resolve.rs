@@ -309,7 +309,7 @@ pub fn attach(
     }
     // 3) Drive it back to `active`. A `removing` worktree is terminal and not
     //    reattachable; the illegality is detected before any write.
-    match transition_worktree_state(tx, worktree_id, WorktreeState::Active)? {
+    match transition_worktree_state(tx, worktree_id, WorktreeState::Active, now_ms)? {
         Ok(()) => {}
         Err(WorktreeTransitionError::Illegal(ill)) => {
             return Ok(Err(AttachError::NotReattachable(ill)));

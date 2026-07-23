@@ -17,7 +17,7 @@ use local_rag_store::registry::{
     IllegalWorktreeTransition, WorktreeKind, WorktreeState, WorktreeTransitionError,
     create_repository, create_worktree, current_generation, current_worktree_path,
     find_worktrees_by_path_fingerprint, observe_worktree_path, transition_worktree_state,
-    worktree_path_history, worktree_state,
+    worktree_path_history, worktree_state, worktree_state_clocks,
 };
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{StateDb, WriteError};
@@ -98,15 +98,27 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
 }
 
 /// A convenience wrapper: transition and unwrap the outer (infrastructure)
-/// [`Result`], returning the inner domain [`Result`].
+/// [`Result`], returning the inner domain [`Result`]. Uses a fixed `now_ms` —
+/// tests that assert on the `state_changed_at` stamp itself (D-007) call
+/// [`transition_at`] instead.
 async fn transition(
     db: &StateDb,
     worktree_id: &str,
     to: WorktreeState,
 ) -> Result<(), WorktreeTransitionError> {
+    transition_at(db, worktree_id, to, 2000).await
+}
+
+/// [`transition`] with an explicit clock reading.
+async fn transition_at(
+    db: &StateDb,
+    worktree_id: &str,
+    to: WorktreeState,
+    now_ms: i64,
+) -> Result<(), WorktreeTransitionError> {
     let w = worktree_id.to_string();
     db.writer()
-        .transaction(move |tx| transition_worktree_state(tx, &w, to))
+        .transaction(move |tx| transition_worktree_state(tx, &w, to, now_ms))
         .await
         .expect("transition tx (infrastructure)")
 }
@@ -190,9 +202,12 @@ async fn worktree_has_no_path_derived_identity_column() {
         "state".to_string(),
         "created_at".to_string(),
         "last_seen_at".to_string(),
+        // Added by migration 5 (D-007): the clock spec 05 §8's shard grace
+        // period is measured from. A lifecycle timestamp, not a path.
+        "state_changed_at".to_string(),
     ];
     expected.sort();
-    assert_eq!(columns, expected, "exactly the seven §2.1 columns");
+    assert_eq!(columns, expected, "exactly the eight §2.1 columns");
     for forbidden in [
         "canonical_path",
         "observed_path",
@@ -556,4 +571,74 @@ async fn migration_produces_exact_worktree_schema() {
         )
         .expect("read worktree FKs");
     assert_eq!(fk_count, 2, "the two-column composite FK into generation");
+}
+
+// ---- D-007: the worktree state clock (spec 05 §8's grace-period input) ----
+
+/// A freshly created worktree's `state_changed_at` is its `created_at`: the
+/// column is never left at the migration's `0` default, which would make a
+/// brand-new worktree's shard look infinitely old to the grace sweep.
+#[tokio::test]
+async fn a_new_worktree_stamps_its_creation_time() {
+    let (_home, db) = open_state();
+    let (_repo, wt) = repo_with_worktree(&db, 1, WorktreeKind::Main).await;
+
+    let read = db.open_read().expect("read conn");
+    let clocks = worktree_state_clocks(&read).expect("read clocks");
+    assert_eq!(clocks.len(), 1);
+    assert_eq!(clocks[0].worktree_id, wt);
+    assert_eq!(clocks[0].state, WorktreeState::Active);
+    assert_eq!(clocks[0].state_changed_at, 1000, "stamped with created_at");
+}
+
+/// An effective transition restamps the clock; an idempotent self-transition
+/// does not (a crash/retry must never push the grace deadline forward), and a
+/// rejected illegal transition leaves it untouched along with everything else.
+#[tokio::test]
+async fn the_state_clock_moves_only_on_an_effective_transition() {
+    let (_home, db) = open_state();
+    let (_repo, wt) = repo_with_worktree(&db, 1, WorktreeKind::Main).await;
+
+    let clock_now = |db: &StateDb| {
+        let read = db.open_read().expect("read conn");
+        worktree_state_clocks(&read).expect("read clocks")[0].clone()
+    };
+
+    // active -> detached at 5000: restamped.
+    transition_at(&db, &wt, WorktreeState::Detached, 5000)
+        .await
+        .expect("active -> detached is legal");
+    let after = clock_now(&db);
+    assert_eq!(after.state, WorktreeState::Detached);
+    assert_eq!(after.state_changed_at, 5000);
+
+    // detached -> detached at 9000: a no-op, so the clock does NOT move.
+    transition_at(&db, &wt, WorktreeState::Detached, 9000)
+        .await
+        .expect("self-transition is an idempotent no-op");
+    assert_eq!(
+        clock_now(&db).state_changed_at,
+        5000,
+        "an idempotent self-transition must not extend the grace budget"
+    );
+
+    // detached -> removing at 7000: effective, so it restamps (even though the
+    // caller's clock reading here is earlier than the previous stamp — the
+    // column records "when this transition was applied", it is not a max()).
+    transition_at(&db, &wt, WorktreeState::Removing, 7000)
+        .await
+        .expect("detached -> removing is legal");
+    assert_eq!(clock_now(&db).state_changed_at, 7000);
+
+    // removing -> active at 12000: illegal, rejected, nothing mutated.
+    let err = transition_at(&db, &wt, WorktreeState::Active, 12_000)
+        .await
+        .expect_err("removing is terminal");
+    assert!(matches!(err, WorktreeTransitionError::Illegal(_)));
+    let unchanged = clock_now(&db);
+    assert_eq!(unchanged.state, WorktreeState::Removing);
+    assert_eq!(
+        unchanged.state_changed_at, 7000,
+        "a rejected transition mutates nothing, clock included"
+    );
 }

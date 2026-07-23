@@ -151,7 +151,9 @@ impl Migration {
 /// `parsed_unit` and the generation-membership tables (`code::SCHEMA_V3`);
 /// version 4 (T07-02) is the projection deployment state — `model_space` and
 /// `worktree_projection_state` plus the default model-space seed
-/// (`registry::SCHEMA_V4`). Each checksum is frozen once shipped (see
+/// (`registry::SCHEMA_V4`); version 5 (D-007) adds `worktree.state_changed_at`,
+/// the clock spec 05 §8's shard grace period is measured from
+/// (`registry::SCHEMA_V5`). Each checksum is frozen once shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
 pub const ALL: &[Migration] = &[
@@ -159,6 +161,7 @@ pub const ALL: &[Migration] = &[
     Migration::sql(2, "worktree", crate::registry::SCHEMA_V2),
     Migration::sql(3, "code", crate::code::SCHEMA_V3),
     Migration::sql(4, "projection", crate::registry::SCHEMA_V4),
+    Migration::sql(5, "worktree_state_clock", crate::registry::SCHEMA_V5),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

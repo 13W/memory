@@ -156,6 +156,7 @@ CREATE TABLE worktree (
   state                  TEXT NOT NULL CHECK (state IN ('active','detached','removing')),
   created_at             INTEGER NOT NULL,
   last_seen_at           INTEGER NOT NULL,
+  state_changed_at       INTEGER NOT NULL,            -- migration 5; 05 §8 grace clock [SPEC]
   -- composite FK proves the current generation belongs to THIS worktree [SPEC]:
   FOREIGN KEY (current_generation_id, worktree_id)
     REFERENCES generation(generation_id, worktree_id)
@@ -226,6 +227,25 @@ crash/retry that re-requests the current state safe (never a coercion, 04 preamb
 `generation` table ships here only as the worktree composite-FK seam — its builder, occurrence
 schema (§2.4), and state machine (04 §1) are group 05 — and `set_current_generation` is the
 worktree-side write that the FK guards against pointing at another worktree's generation.
+
+As-built note (D-007, `[SPEC]`): `worktree.state_changed_at` is **migration 5**
+(`schema_migrations` version `5`, name `worktree_state_clock`,
+`local_rag_store::registry::SCHEMA_V5`) — an `ALTER TABLE … ADD COLUMN` plus a backfill, not an
+edit to the frozen version-2 text above. It exists for exactly one normative requirement:
+05 §8's "remove/detach: grace period `[SPEC: 7 days]`, then destroy" needs a clock to measure
+from, and neither existing timestamp is one (`created_at` predates every transition;
+`last_seen_at` tracks *path observation*, not lifecycle). Semantics: the epoch-ms time of the
+row's most recent **effective** lifecycle transition (04 §7). `create_worktree` stamps
+`created_at`; `transition_worktree_state` restamps only when `from != to`, deliberately
+preserving its "self-transition is an idempotent no-op" contract — a crash/retry that
+re-requests the state a worktree is already in must not push the destruction deadline forward,
+or a retry loop could keep a doomed shard alive indefinitely. A `detached → active` reattach
+(`repo attach`) therefore *resets* the budget, which is the intended behavior: a worktree that
+comes back before the deadline keeps its shard. Pre-existing rows are backfilled from
+`last_seen_at` (the closest available lower bound on "last known in use"), never left at the
+`ALTER`'s `0` default, which would have made every existing shard instantly eligible for
+destruction. The store-wide reader is `worktree_state_clocks`; the sweep that consumes it is
+`local_rag_store::housekeeping::run_expired_shard_sweep` (see 05 §8's own D-007 note).
 
 As-built note (T02-04, `[SPEC]`): the request-root resolver and `repo attach` (spec 02 §3.3,
 04 §7) are a composition layer (`local_rag_store::registry::resolve`) over the T02-02/03
