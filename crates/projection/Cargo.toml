@@ -13,6 +13,16 @@ local-rag-core = { path = "../core" }
 # `worktree.current_generation_id` — all owned by `local-rag-store`. No new
 # external dependency; `rusqlite` types are used via `local_rag_store::rusqlite`.
 local-rag-store = { path = "../store" }
+# First normal-dependency tokio use in this crate (T09-02, spec 02 §5 L3):
+# `ShardManager`'s single-flight cell is `tokio::sync::OnceCell` and its
+# rebuild throttle is `tokio::sync::Semaphore` (both behind the `sync`
+# feature); background-rebuild cancellation needs `tokio::spawn`/
+# `task::AbortHandle` (behind `rt`). `rt`/`sync` add no transitive crate of
+# their own — tokio is already resolved via `local-rag-store` (whose own
+# `rt` addition, T09-01, made the same "0 new external packages" argument).
+# No runtime is constructed here; this crate only ever borrows one already
+# running (the daemon's, group 15, or `#[tokio::test]`'s in tests).
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
 # Optional, dev-only path crate (0 external sources): enabled ONLY by the
 # `failpoints` feature so the fake shard can host named crash-injection points
 # for the projection fault matrix (F1–F12, spec 05 §10; authored in T07-05).

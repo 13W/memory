@@ -9,8 +9,8 @@
 //! `seed_revision`/`seed_unit` pattern, folded into one `seed_occurrence`
 //! helper).
 
-use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
@@ -63,41 +63,52 @@ impl UuidSource for SeqUuidV7 {
 
 /// A test-only [`VectorSource`]: returns a fixed `DIMS`-wide vector for any
 /// `(occurrence_id, kind)` not explicitly [`block`](FakeVectors::block)ed, and
-/// records every key actually looked up.
+/// records every key actually looked up. `Mutex`-backed (not `RefCell`) so it
+/// is `Sync` — required by `switch`/`open_and_validate`'s
+/// `&(dyn VectorSource + Send + Sync)` parameter (T09-02, `crates/projection::
+/// manager` holds this reference across an `.await` inside a spawned task).
 struct FakeVectors {
-    blocked: RefCell<HashSet<(String, RepresentationKind)>>,
-    calls: RefCell<Vec<(String, RepresentationKind)>>,
+    blocked: Mutex<HashSet<(String, RepresentationKind)>>,
+    calls: Mutex<Vec<(String, RepresentationKind)>>,
 }
 
 impl FakeVectors {
     fn new() -> Self {
         Self {
-            blocked: RefCell::new(HashSet::new()),
-            calls: RefCell::new(Vec::new()),
+            blocked: Mutex::new(HashSet::new()),
+            calls: Mutex::new(Vec::new()),
         }
     }
 
     /// Make `vector()` return `None` for this key (models a coverage gap).
     fn block(&self, occurrence_id: &str, kind: RepresentationKind) {
         self.blocked
-            .borrow_mut()
+            .lock()
+            .expect("fake vectors mutex poisoned")
             .insert((occurrence_id.to_string(), kind));
     }
 
     /// Every `(occurrence_id, kind)` key looked up so far.
     fn calls(&self) -> HashSet<(String, RepresentationKind)> {
-        self.calls.borrow().iter().cloned().collect()
+        self.calls
+            .lock()
+            .expect("fake vectors mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
 impl VectorSource for FakeVectors {
     fn vector(&self, occurrence_id: &str, kind: RepresentationKind) -> Option<Vec<f32>> {
         self.calls
-            .borrow_mut()
+            .lock()
+            .expect("fake vectors mutex poisoned")
             .push((occurrence_id.to_string(), kind));
         if self
             .blocked
-            .borrow()
+            .lock()
+            .expect("fake vectors mutex poisoned")
             .contains(&(occurrence_id.to_string(), kind))
         {
             None

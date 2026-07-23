@@ -316,7 +316,7 @@ async fn rebuild(
     active_generation_id: Uuid,
     active_model_space_id: Uuid,
     cause: RebuildCause,
-    vectors: &dyn VectorSource,
+    vectors: &(dyn VectorSource + Send + Sync),
     uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
 ) -> Result<RebuildOutcome, RebuildError> {
@@ -430,7 +430,7 @@ pub async fn open_and_validate(
     quarantine_dir: &Path,
     shard_params: ShardParams,
     worktree_id: Uuid,
-    vectors: &dyn VectorSource,
+    vectors: &(dyn VectorSource + Send + Sync),
     uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
 ) -> Result<OpenOutcome, RebuildError> {

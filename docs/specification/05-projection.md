@@ -214,6 +214,43 @@ deterministic point IDs and a pure `state.sqlite`-derived expected set.
   `active_model_space_id` is retiring/absent switches it to the default space via the standard
   switch protocol before serving dense search.
 
+As-built note (T09-02, `[SPEC]`): the L3 shard-manager map (spec 02 §5) is
+`local_rag_projection::manager::ShardManager` (`crates/projection/src/manager.rs`). Ref-counted
+handles are plain `Arc<dyn ShardHandle>` — every method but `destroy` takes `&self` and the trait
+is already `Send + Sync`, so sharing is sound; the manager itself never calls `destroy` (spec 05
+§8's "eviction closes cold shards, only handles are evicted" — destroying on-disk state stays
+`rebuild()`'s job alone, as it already was). "In use" is decided by `Arc::strong_count == 1`
+(only the map's own copy remains), read under the L3 mutex (`checked_scope_sync(LockLevel::L3,
+…)`, T09-01) — race-free because any concurrent `acquire` for the same key must also take L3.
+Concurrent same-key opens single-flight through a `tokio::sync::OnceCell` per entry, held inside
+each map slot so L3 itself is taken only for the get-or-insert/evict step, released before any
+I/O (this section's own "L3 held only for the map lookup" — spec 02 §5). Eviction walks entries
+oldest-first and evicts while unheld, but **stops** at the first entry still in use or still
+filling rather than skipping ahead to a different victim — deferred, not substituted. Each cache
+miss/reopen fills via the existing `open_and_validate` (T07-04, unchanged) before the manager's
+own follow-up `open()`, so "validates every actual open/reopen" holds for free; a `[SPEC]`
+signature tightening was needed to make this compile — `VectorSource` usage sites now take
+`&(dyn VectorSource + Send + Sync)`, mirroring `UuidSource`'s own T05-03 usage-site tightening,
+since a fill's `open_and_validate` call runs inside a `tokio::spawn`ed task (needed so `remove`
+can cancel it independently of whichever caller's `acquire` triggered it) and holds that
+reference across an `.await`. The "one rebuild at a time per store" default is a
+`tokio::sync::Semaphore` with one permit around each fill; cancellation is a per-worktree
+`tokio::task::AbortHandle`, cooperative (takes effect at the fill's next `.await`) — safe because
+`rebuild()`'s three transactions (`mark_dirty`/`begin_rebuild`/`finish_rebuild`) are each
+independently committed on `StateWriter`'s dedicated OS thread (T09-01): an already-enqueued
+transaction always runs to completion regardless of the awaiting task's cancellation, so an
+aborted fill leaves `worktree_projection_state` exactly where a crash between the same two steps
+would — already proven self-healing by group 07's fault matrix. `remove` is a forced,
+manager-level API distinct from passive LRU eviction (ignores the in-use deferral, cancels any
+in-flight fill, drops the cache entry); it is deliberately **not** wired to the worktree
+registry's own removal lifecycle — that needs a `removed_at` migration that does not exist yet
+(D-004 deferred grace-destroy to "group 07/09" broadly, not this specific task). Also
+deliberately deferred, seam in place: dormant-worktree model migration above (needs the real
+model-space registry, T11-01) and adopting this manager into `switch`, the reconcile driver, or a
+search executor (T09-03/T09-04, group 12/15) — direct `store.open()` call sites elsewhere
+continue to race with this manager's own cache exactly as before this task, closed only *within*
+the manager, not store-wide.
+
 ## 9. `optimize` policy `[FIXED]`
 
 Triggered by metrics only — deleted/stale ratio, segment count, disk amplification, idle time,
