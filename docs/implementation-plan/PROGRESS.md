@@ -84,7 +84,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [x] T08-03 Реализовать validation, degradation и rebuild
 - [x] D-006 Исправить источник occurrence-count/manifest для FTS-валидации (cache вместо state.sqlite)
 - [x] T08-04 Добавить FTS corruption/staleness tests
-- [ ] G08 Сверка FTS consistency
+- [x] G08 Сверка FTS consistency
 
 ## 09 — Locking и shard lifecycle
 
@@ -189,7 +189,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 | G05 | PASS | строка G05 в «Task evidence» + трейс «G05 — трейс требование → artifact/test» ниже |
 | G06 | PASS | строка G06 в «Task evidence» + трейс «G06 — трейс требование → artifact/test» ниже |
 | G07 | PASS | строка G07 в «Task evidence» + трейс «G07 — трейс требование → artifact/test» ниже |
-| G08 | — | — |
+| G08 | PASS | строка G08 в «Task evidence» + трейс «G08 — трейс требование → artifact/test» ниже |
 | G09 | — | — |
 | G10 | — | — |
 | G11 | — | — |
@@ -206,6 +206,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 | ID | Commit/PR | Проверки | Результат/артефакт | Исполнитель/дата |
 | --- | --- | --- | --- | --- |
+| G08 | коммит `G08: Сверка FTS consistency (spec 06 §3-4, 09 §2, 14 [PASS])` (строка evidence в том же коммите) | `cargo test -p local-rag-store --lib cache::fts::` 11 OK; `cargo test -p local-rag-store --lib cache::validate::` 19 OK; `cargo test -p local-rag-store --test fts` 8 OK; `cargo test -p local-rag-store --test fts_materialize --features failpoints` 6 OK; `cargo test -p local-rag-store --test fts_validate` 8 OK; `cargo test -p local-rag-store --test fts_corruption` 6 OK (группа 08 итого 58/58, все существовавшие, гейт не добавлял тестов); `cargo fmt --check` чист; `cargo clippy --workspace --all-targets -- -D warnings` OK; `cargo clippy --workspace --all-targets --features failpoints -- -D warnings` OK; `cargo test --workspace` — 65 test-result блоков, 0 failed (вкл. doctests); `cargo xtask ci` — all checks passed; guardrails: `git diff --stat Cargo.lock` пусто, grep dense-backend SDK (`qdrant\|usearch\|onnxruntime\|candle\|ollama\|hnsw\|faiss\|milvus\|pinecone\|weaviate\|chroma`) по всем `Cargo.toml` = NONE | Полный трейс «требование → artifact/test» — см. секцию «G08 — трейс требование → artifact/test» ниже. Gate не писал ни продуктового кода, ни новых тестов — только сверка. Отклонений не обнаружено; `DEVIATIONS.md` D-001…D-006 остаются `resolved`; историческое evidence не переписывалось. Итог: **PASS** — группа 09 разблокирована | Claude Sonnet 5 / 2026-07-23 |
 | T08-04 | коммит `T08-04: FTS corruption/staleness tests (spec 06 §4)` (строка evidence в том же коммите) | `cargo test -p local-rag-store --test fts_corruption` 6 OK (`delete_head_row_is_rebuilt` — существовавший валидный head удалён напрямую → HeadMissing → синхронный rebuild → state.sqlite не тронут → повторный вызов даёт Valid; `delete_some_fts_rows_is_rebuilt` — удалена одна пара строк fts_doc/fts_occurrences при нетронутой голове → cheap ловит OccurrenceCountMismatch → rebuild восстанавливает точный исходный набор id; `swap_occurrence_id_keeps_count_equal_but_corrupts_manifest` — буквальный «equal count, different ID set» на 3 occurrences → Cheap намеренно Valid → Strong ловит и чинит; `delete_whole_cache_file_is_fully_restored` — удалены cache.sqlite/-wal/-shm (паттерн `cache.rs::recreate_is_idempotent_on_retry`), переоткрытие даёт `CacheOpenOutcome::Created`, Strong-валидация полностью восстанавливает исходный набор occurrence_id из одного state.sqlite; `concurrent_validation_rebuild_coalesces` — 3 конкурентных `open_and_validate_fts(Strong)` через `tokio::join!` (current-thread) на отсутствующей голове → все Ok(Valid|Rebuilt), итоговый набор — ровно исходный, без дублей; `corruption_above_threshold_defers_to_background_without_mutating_cache` — реальная ранее валидная generation с `FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD+1` occurrences испорчена (не bootstrap, в отличие от T08-03's теста) → DeferredBackground{OccurrenceCountMismatch}, cache остаётся испорченным, не мутирован, state.sqlite не тронут; каждый сценарий 1-4/6 явно снимает и сравнивает state.sqlite-снимок до/после); `cargo test -p local-rag-store --test fts_validate` 8 OK (регресс без изменений); `cargo test -p local-rag-store --lib cache::validate::` 19 OK; `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings` OK; `cargo clippy --workspace --all-targets --features failpoints -- -D warnings` OK; `cargo test --workspace` — все пакеты 0 failed; `cargo xtask ci` — passed; guardrails: `git diff --stat Cargo.lock` пусто, grep dense-backend SDK по Cargo.toml = NONE | Новый `crates/store/tests/fts_corruption.rs` (6 сценариев; см. Проверки). Scope-решение задокументировано as-built заметкой в `docs/specification/06-reconcile-and-fts.md` §4: без новой JSON fault-fixture семьи (`fixtures/fault/matrix.json` объявляет только dense-проекционную `F`-матрицу группы 07 и spool-`S`-матрицу группы 13; у этого набора нет v1-аналога и предзаявленного fixture-обязательства) — прецедент T08-01 (golden-токены — inline Rust, не fixture-семья). G08 — вне scope этой сессии | Claude Sonnet 5 / 2026-07-23 |
 | D-006 | коммит `D-006: cache-sourced FTS validation input (fix state-vs-cache count/manifest source)` (строка evidence в том же коммите) | `cargo build -p local-rag-store --lib` OK (0 warnings); `cargo test -p local-rag-store --lib cache::validate::` 19 OK (без изменения поведения относительно T08-03); `cargo test -p local-rag-store --test fts_validate` 8 OK (7 старых без изменений + новый `strong_check_catches_swapped_occurrence_id_invisible_to_state_sqlite`: прямой `UPDATE fts_doc SET occurrence_id=<fake>` на одну строку при неизменном count → `ValidationDepth::Cheap` → `Valid` (намеренно слеп по дизайну spec 06 §4) → `ValidationDepth::Strong` → `Rebuilt` → `fts_doc_occurrence_ids` подтверждает: оригинальный id восстановлен, поддельный исчез); `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings` OK; `cargo clippy --workspace --all-targets --features failpoints -- -D warnings` OK; `cargo test --workspace` — все пакеты 0 failed (включая doctests); `cargo xtask ci` — passed; guardrails: `git diff --stat Cargo.lock` пусто, grep dense-backend SDK (`qdrant\|milvus\|pinecone\|weaviate\|chroma\|faiss`) по `Cargo.toml` = NONE | Реальный дефект, найден и исправлен: `open_and_validate_fts` (`crates/store/src/cache/validate.rs`) путал state-sourced ожидание для generation (иммутабельное, structural sharing) с cache-sourced фактическим содержимым `fts_doc` (то, что реально валидируется) — обе проверки (cheap и strong) были слепы к прямой порче кэша при нетронутых `fts_projection_head`/`state.sqlite`. Фикс: два новых cache-side ридера `fts_doc_occurrence_count`/`fts_doc_occurrence_ids` (`crates/store/src/cache/fts.rs`), оркестратор теперь читает валидационный вход из них через `cache.open_read()`; state-sourced `occurrence_count_for_generation` остаётся, но только для `should_rebuild_synchronously`'s cost-estimate, читается отдельно и только после подтверждённого расхождения | Claude Sonnet 5 / 2026-07-23 |
 | T08-03 | коммит `T08-03: FTS validation, degradation и rebuild (spec 06 §4)` (строка evidence в том же коммите) | `cargo test -p local-rag-store --lib cache::validate::` 19 OK (`fully_consistent_state_is_valid`, `missing_head_fires` (обе функции), `generation_mismatch_fires`, `lexical_schema_version_mismatch_fires`, `tokenizer_version_mismatch_fires`, `occurrence_count_mismatch_fires`, `earlier_predicate_wins_over_later_ones`, `manifest_mismatch_fires_only_under_strong_check` (F8-эквивалент: cheap не видит — нет параметра — strong ловит), 4× diagnostics-message теста («fts_head: X mismatch (A != B)» дословно по spec 02 §6), 2× «empty FTS invalid» теста (честный 0==0 валиден; отсутствующий head невалиден даже на пустой generation), `should_rebuild_synchronously_respects_threshold`, 4× availability-комбинатор теста); `cargo test -p local-rag-store --lib code::membership::` — новый `occurrence_count_for_generation_scopes_correctly` в составе полного набора; `cargo test -p local-rag-store --test fts_validate` 7 OK (`bootstrap_before_any_generation_activated_is_no_active_generation`; `valid_head_after_materialize_is_reported_valid_with_no_rewrite` — `updated_at` не тронут повторно; `strong_validation_passes_immediately_after_a_real_rebuild` — независимый пересчёт manifest из state.sqlite, не тавтология; `stale_generation_head_self_heals` — generation B активирована без трогания кэша → GenerationMismatch → синхронный rebuild → Valid при повторе; `corrupted_manifest_with_matching_count_is_caught_only_by_strong_check` — прямая порча manifest_hash, cheap слеп, strong чинит; `above_threshold_occurrence_count_defers_to_background` — 5001 occurrences (bulk-seed в одной транзакции), HeadMissing, DeferredBackground без единой записи в fts_doc; `no_dense_leg_with_deferred_fts_requires_index_unavailable`); `cargo clippy -p local-rag-store --all-targets -- -D warnings` и то же с `--features failpoints` чисты; `cargo fmt --check` чист; `cargo test -p local-rag-store` (весь крейт) — 101 unit (82 старых+19 новых) + все integration test-result блоки OK; `cargo xtask ci` = all checks passed; guardrail: `git diff --stat Cargo.lock` пуст (0 новых зависимостей); grep `qdrant/usearch/onnxruntime/ort/candle/ollama/hnsw/faiss/reqwest/hyper/tonic/tokenizers` по `crates/*/Cargo.toml`+корневой = NONE | **Validation/degradation/rebuild для FTS (spec 06 §4) — новый файл `crates/store/src/cache/validate.rs`** (отдельно от `cache/fts.rs`, уже 908 строк — прямой прецедент такого разделения: `crates/projection`'s `validate.rs`/`rebuild.rs`). `FtsDivergence` (`HeadMissing`/`GenerationMismatch`/`LexicalSchemaVersionMismatch`/`TokenizerVersionMismatch`/`OccurrenceCountMismatch`/`ManifestMismatch`, first-match-wins, `Display` даёт `"fts_head: X mismatch (A != B)"` дословно по spec 02 §6). Cheap/strong split — spec 06 §4 `[SPEC split]` («manifest — on open + after rebuilds, count — per search») реализован как ДВЕ именованные функции (`validate_fts_cheap` физически не имеет параметра manifest — стоимостная граница в сигнатуре типа, не в соглашении; `validate_fts_strong` делегирует cheap-предикатам первым), а не одна функция с `Option<&str>` — прецедент того же стиля: `rebuild.rs`'s раздельные `mark_dirty`/`begin_rebuild`/`finish_rebuild`. **Активная generation читается из `registry::current_generation` (`worktree.current_generation_id`), НЕ из `worktree_projection_state`** — проверено напрямую: `crates/projection/src/switch.rs::commit_switch` пишет оба поля в одной транзакции тем же значением, так что FTS-валидация полностью развязана от two-axis projection FSM. Оркестратор `open_and_validate_fts` (`FtsOpenOutcome::NoActiveGeneration|Valid|Rebuilt|DeferredBackground`) — «rebuild» это просто повторный вызов T08-02's `materialize_fts` (никакого 3-фазного FSM-танца, в отличие от dense-проекции — обосновано тем, что `fts_projection_head` не имеет столбца статуса, а `cache.sqlite` и есть хранилище, нет shard-директории для quarantine; сходимость под конкурентностью — тот же аргумент, что уже документирован у `materialize_fts`: один `CacheWriter`-поток сериализует любые пересекающиеся транзакции). Оценка стоимости rebuild — новый лёгкий ридер `code::occurrence_count_for_generation` (COUNT(*), тот же индекс `occurrence_by_gen`) на СВЕЖЕЙ активной generation, не на «протухшем» head; `FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD = 5_000` — явно provisional-константа (не байт-калиброванная, задача T12-05), ближайший прецедент — `crates/projection::rebuild::QUARANTINE_RETENTION`. `FtsAvailability`/`requires_index_unavailable(fts, dense_available: bool)` — узкая FTS-локальная половина инварианта «оба leg-а недоступны → ошибка, не тишина» (spec 02 §6/09 §7); полная daemon-протокольная таксономия (`INDEX_UNAVAILABLE`, `degraded: "dense_only"`) сознательно НЕ изобретена — `crates/protocol` всё ещё 6-строчный скаффолд, это группа 12/15. **As-built `[SPEC]`** заметка добавлена в `06-reconcile-and-fts.md` §4 сразу после T08-02-заметки; `[FIXED]`-текст секции не тронут. Попутно исправлен мелкий недочёт T08-02: `FtsSourceRow`/`occurrences_for_fts` были реэкспортированы только в `code/mod.rs`, не в `lib.rs` — добавлены в общий список для консистентности (0 изменений поведения). Отклонений не обнаружено; `DEVIATIONS.md` D-001…D-005 остаются `resolved`; историческое evidence не переписывалось | Claude Sonnet 5 / 2026-07-22 |
@@ -937,6 +938,119 @@ Guardrail T10 — No premature backend coupling:
   группа 12.
 - Отклонений не обнаружено; `DEVIATIONS.md` D-001…D-005 остаются `resolved`; историческое
   evidence не переписывалось. Итог: **PASS** — группа 08 разблокирована.
+
+### G08 — трейс требование → artifact/test
+
+Дата 2026-07-23, исполнитель Claude Sonnet 5. Команды воспроизводимы из строки evidence G08
+выше. Все перечисленные тесты уже существовали в группе 08 (T08-01…T08-04, D-006) — gate не
+добавлял ни продуктового кода, ни новых тестов.
+
+Spec 03 §4.3 — FTS materialized view schema `[FIXED DDL]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `fts_doc`/`fts_occurrences`(FTS5)/`fts_projection_head` DDL byte-for-byte, `CACHE_SCHEMA_VERSION=3` | `cache/open.rs:72-107` (DDL constants), seed tx | `fts_tables_exist_after_open`, `fts_doc_by_wt_index_exists`, `fts5_module_is_compiled_in`, `fts_doc_rowid_round_trips_as_fts_occurrences_rowid` | as-built |
+| `fts_doc.occurrence_id` UNIQUE | schema constraint | `fts_doc_occurrence_id_is_unique` | as-built |
+| `manifest_hash = H(worktree_id, generation_id, sorted-dedup occurrence ids)`, no `model_space_id` axis (FTS is generation-scoped only) | `fts_manifest_hash` `cache/fts.rs:339` | `fts_manifest_binds_the_worktree`, `fts_manifest_binds_the_generation`, `fts_manifest_is_independent_of_order_and_duplicates`, `fts_manifest_hash_is_exact_golden`, `every_occurrence_id_changes_the_hash` | as-built |
+
+Spec 03 §4.4 step 3 — FTS validity is lazy, never checked at cache open `[FIXED principle]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Cache open only creates schema/binds meta; never calls `validate_fts_*`/`open_and_validate_fts` | `cache/open.rs` (grep-confirmed zero references to any `validate_fts`/`open_and_validate_fts` symbol) | структурно — открытие кэша не зависит от FTS-валидации | as-built |
+
+Spec 09 §1 — indexed population, all unit kinds `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Materializer agnostic to unit_kind — all 5 kinds present, incl. 2 not yet produced by any parser (`config_section`/`text_section`) | `materialize_fts`/`occurrences_for_fts` join | `all_unit_kinds_present_are_materialized_agnostically` (`fts_materialize.rs:332`) | as-built |
+
+Spec 09 §2 — Lexical leg app-side preprocessing/tokenizer/bm25 `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| camelCase/snake_case/kebab-case identifier split, original+parts, lowercased; qualified-name/path components as separate columns; signature tokens; versioned `tokenizer_version` | `tokenize_identifier/path/qualified_name/signature` `cache/fts.rs:272-325`; `LEXICAL_SCHEMA_VERSION`/`TOKENIZER_VERSION=1` | golden tables ×4 + `tokenize_identifier_handles_unicode`/`_normalizes_nfc_before_folding` | as-built |
+| `bm25(fts_occurrences, w_name, w_qualified, w_path, w_signature, w_body)` default weights `4.0,3.0,1.5,2.0,1.0` | `DEFAULT_WEIGHTS` `tests/fts.rs:100` (schema-level proof only — no production caller yet) | `bm25_weights_favor_the_declared_column_order`, `bm25_weight_order_is_actually_sensitive`, `bm25_rewards_multi_column_hits` | as-built at schema level; wiring into a real query executor — group 12 (T12-01) |
+
+Spec 06 §3 — Hybrid read consistency, per-worktree READ lock spans the whole pipeline `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `L2.read` spans FTS5 + dense + fusion + enrichment, released only after format | — no production `search_code` pipeline exists yet (`crates/protocol` still a 6-line scaffold) | — | отложено — T09-01/T09-03 (locking) + группа 12 (hybrid search), same deferral pattern as G07's per-worktree WRITE-lock row |
+
+Spec 06 §4 — FTS as an independently validated materialized view `[FIXED]` (core of this gate):
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Head is the validity proof, written **last** of any delta/rebuild, single cache tx per generation update | `materialize_fts` `cache/fts.rs:575-751` (head `INSERT` at `:737-749`; doc comment `:564` "last — all inside one cache transaction") | `fail_before_head_rolls_back_whole_tx` (armed failpoint immediately before the head write proves ordering + whole-tx rollback), `repeated_build_is_byte_identical` | as-built |
+| Validation predicate order: head-missing → generation → `lexical_schema_version` → `tokenizer_version` → count/manifest, first-match-wins | `FtsDivergence` `validate.rs:97`, `validate_fts_cheap`/`validate_fts_strong` `validate.rs:183-253` | `earlier_predicate_wins_over_later_ones`, `missing_head_fires`, `generation_mismatch_fires`, `lexical_schema_version_mismatch_fires`, `tokenizer_version_mismatch_fires`, `occurrence_count_mismatch_fires` | as-built |
+| Cheap/strong split `[SPEC split]`: manifest only on open + after rebuilds, count per search | `ValidationDepth` `validate.rs:336-343` (`Strong` doc-reserved for "cache-open-equivalent moments"); `validate_fts_cheap` has no manifest parameter — cost boundary enforced by the type signature | `manifest_mismatch_fires_only_under_strong_check`; `open_and_validate_fts` (`validate.rs:349`) takes `depth` explicitly, exercised both ways throughout `fts_validate.rs`/`fts_corruption.rs` | as-built (which call site passes `Cheap` vs `Strong` at which cadence is group 12/15 wiring — no production caller exists yet; the seam itself is complete and tested both ways) |
+| "Equal occurrence count, different ID set" caught only by manifest (the literal D-006 scenario) | independently recomputed `fts_manifest_hash` in the `Strong` branch, `validate.rs:383-397`, sourced from `cache::fts_doc_occurrence_ids` (cache-actual, not state-expected, D-006 fix) | unit: `manifest_mismatch_fires_only_under_strong_check`; integration: `strong_check_catches_swapped_occurrence_id_invisible_to_state_sqlite` (`fts_validate.rs:502`); corruption-suite scale: `swap_occurrence_id_keeps_count_equal_but_corrupts_manifest` (`fts_corruption.rs:472`) | as-built — D-006 regression, now covered 3× independently, all cache-sourced |
+| Invalid ⇒ rebuild sync (`<2s` estimate) **or** degrade + background rebuild with a diagnostic flag; empty FTS never silently valid | `should_rebuild_synchronously` `validate.rs:254` (`FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD=5_000`, explicitly provisional — T12-05); `FtsOpenOutcome::{Rebuilt,DeferredBackground}` `validate.rs:260`; `FtsAvailability`/`requires_index_unavailable` `validate.rs:432-446` | `above_threshold_occurrence_count_defers_to_background`, `corruption_above_threshold_defers_to_background_without_mutating_cache`, `no_dense_leg_with_deferred_fts_requires_index_unavailable`, `missing_head_is_invalid_even_when_generation_is_empty`, `empty_repo_with_matching_zero_count_head_is_valid` (the honest 0==0 case, kept distinct) | as-built |
+| Rebuild recipe: delete worktree's `fts_doc`+`fts_occurrences` → re-derive from `state.sqlite` occurrences + `normalized_text_cache` (recompute evicted from `source_blob`) → write head | `materialize_fts` full-replace, `cache/fts.rs:575-751` | `a_to_b_add_rename_delete_reflects_in_materialized_fts`, `evicted_normalized_text_is_recomputed_and_recached`, `delete_whole_cache_file_is_fully_restored` (also §14 rebuild acceptance gate), `delete_head_row_is_rebuilt`, `delete_some_fts_rows_is_rebuilt` | as-built |
+| Concurrent rebuild/validation converges without duplication | single bounded `CacheWriter` thread serializes overlapping cache transactions | `concurrent_validation_rebuild_coalesces` (3 concurrent `open_and_validate_fts(Strong)` via `tokio::join!`) | as-built |
+
+Spec 14 §1 fixture family #6 (fault-injection scripts) — no new FTS fixture family, reverified:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Family #6's own text cites only "(05 §10, 07 §7)" — the dense F-matrix and spool S-matrix; the FTS corruption suite carries no pre-existing fixture obligation | `06-reconcile-and-fts.md` T08-04 as-built note | `fts_corruption.rs` (6 inline-Rust scenarios, T08-01 golden-token precedent) | as-built — confirmed by rereading spec 14 §1 verbatim, not silently skipped |
+
+Spec 14 §2 acceptance gates (component-level here; formal numbers/full suite — T12-05/T17-05):
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| consistency: empty/partial/stale FTS detected via `fts_projection_head` | см. 06 §4 строки выше | — | as-built at component level |
+| rebuild: deleted cache fully restored from `state.sqlite` | — | `delete_whole_cache_file_is_fully_restored` | as-built |
+
+Spec 14 §3 — fault-injection suite's own "plus corruption cases as *detection* tests" clause:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| FTS corruption suite is direct-state-mutation style (not `fail_point!` kill-point style) — explicitly sanctioned by §3's own text, not a deviation from the F1–F12/S1–S8 `fail_point!`-matrix convention | `fts_corruption.rs` | 6 scenarios (delete head / delete rows / swap ID / delete whole cache / concurrent burst / above-threshold defer) | as-built |
+
+Spec 14 §4 — consistency tests, FTS staleness clause:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Drop cache after a switch; assert flagged degraded or rebuilt — never an empty lexical leg treated as valid | — | `delete_whole_cache_file_is_fully_restored`, `corruption_above_threshold_defers_to_background_without_mutating_cache` | as-built |
+| Generation-mixing under load / two-axis interleaving | — | — | вне scope FTS — dense projection, группа 07/09 |
+
+Guardrail T10 — no premature backend coupling (reverified for group 08):
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `Cargo.lock` unchanged across group 08 | `git diff --stat Cargo.lock` = пусто | — | as-built |
+| Нет qdrant/usearch/onnxruntime/candle/ollama/hnsw/faiss/milvus/pinecone/weaviate/chroma в `crates/*/Cargo.toml` | grep по всем манифестам = NONE | — | as-built |
+
+Заметки G08 (не отклонения):
+
+- Gate не писал ни продуктового кода, ни новых тестов. Все 58 тестов группы 08 (11 lib
+  `cache::fts::` + 19 lib `cache::validate::` + 8 `fts.rs` + 6 `fts_materialize.rs` + 8
+  `fts_validate.rs` + 6 `fts_corruption.rs`) уже существовали и были зафиксированы построчно
+  в evidence T08-01…T08-04/D-006 выше; полный `cargo test --workspace` = 65 test-result
+  блоков, 0 failed (включая doctests).
+- Явные пункты карточки G08 подтверждены: head-last (`materialize_fts` — head — последний
+  `INSERT` транзакции); generation-scoped occurrences (`occurrence_id` включает
+  `generation_id`, 03 §1.2, структурно исключает cross-generation коллизию); all unit kinds
+  (5/5, вкл. 2 сегодня не производимых парсером); version invalidation
+  (`lexical_schema_version`/`tokenizer_version` — раздельные, независимо тестируемые
+  предикаты); no silently empty lexical leg (`FtsAvailability`/`requires_index_unavailable` +
+  явный «0==0 valid, missing-head invalid even when generation empty» split); cache
+  deletion/rebuild acceptance case (`delete_whole_cache_file_is_fully_restored`) — зелёный.
+- `[OPEN]`/provisional осмотрены и НЕ закрыты молча: `FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD=
+  5_000` остаётся явно provisional, не байт-калиброванной константой — T12-05; bm25-веса
+  протестированы на схемном уровне точно по спеке, но реально используемый query executor —
+  group 12.
+- Отложено by-design (seam на месте, указывает на owning-карточки, не backlog): per-worktree
+  READ lock над всем search pipeline (06 §3) → T09-01/T09-03 + группа 12; выбор `Cheap` vs
+  `Strong` depth по конкретному вызову (open- vs per-search-cadence) → group 12/15 wiring
+  (сегодня нет ни одного production-вызывающего кода — только тесты выбирают depth напрямую);
+  формальные acceptance-числа 14 §2 (quality/latency/resources) и полный fault-injection
+  wiring в daemon-протокол → T12-05/T17-05; generation-mixing под нагрузкой / two-axis
+  interleaving (14 §4) → группа 07/09 (не FTS-scope, уже подтверждено на G07).
+- Отклонений не обнаружено; `DEVIATIONS.md` D-001…D-006 остаются `resolved`; историческое
+  evidence не переписывалось. Итог: **PASS** — группа 09 разблокирована.
 
 Примечания к T00-03:
 
