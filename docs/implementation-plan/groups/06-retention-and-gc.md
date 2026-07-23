@@ -29,9 +29,12 @@
 существуют) — `local_rag_store::housekeeping` (`sweep_orphan_shard_dirs` + `run_orphan_shard_sweep`);
 покрыты «unknown shard» и «repeated sweep idempotence». Остальные цели/тест-кейсы отложены в их
 owning-карточки, т.к. их подсистемы вводятся позже по `[FIXED]` roadmap (spec 15 §1): **quarantine
-rotation** → T07-04; **grace-destroy `removing`/`detached` shard** (нужна миграция `removed_at`) →
-группа 07/09 shard lifecycle; **spool-GC (14-day / committed cursor / uncommitted-retained)** →
-T13-05 (дубль spec 07 §6). См. `DEVIATIONS.md` D-004; G06 подтверждает деферал в owning-карточки.
+rotation** → T07-04 (выполнено); **grace-destroy `removing`/`detached` shard** (нужна миграция
+`removed_at`) → группа 07/09 shard lifecycle — **закрыто в D-007**: гейт G09 обнаружил, что оба
+названных владельца прошли без этой цели, и требование реализовано там (миграция 5
+`worktree.state_changed_at` + `run_expired_shard_sweep`); **spool-GC (14-day / committed cursor /
+uncommitted-retained)** → T13-05 (дубль spec 07 §6). См. `DEVIATIONS.md` D-004 и D-007;
+G06 подтверждает деферал в owning-карточки.
 
 ## G06 — Сверка rebuildability и retention
 

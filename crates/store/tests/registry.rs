@@ -371,7 +371,8 @@ async fn migration_produces_exact_registry_schema() {
     );
 
     // Applied migrations: (1,"registry") — this task — plus (2,"worktree"),
-    // (3,"code"), and (4,"projection"), appended by later groups.
+    // (3,"code"), (4,"projection"), and (5,"worktree_state_clock"), appended by
+    // later groups.
     let mut stmt = read
         .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
         .expect("prepare migration rows");
@@ -387,8 +388,10 @@ async fn migration_produces_exact_registry_schema() {
             (2, "worktree".to_string()),
             (3, "code".to_string()),
             (4, "projection".to_string()),
+            (5, "worktree_state_clock".to_string()),
         ],
-        "the production set is [v1 registry, v2 worktree, v3 code, v4 projection] at T07-02",
+        "the production set is [v1 registry, v2 worktree, v3 code, v4 projection, \
+         v5 worktree_state_clock] at D-007",
     );
 }
 

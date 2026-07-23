@@ -205,7 +205,9 @@ pub use code::{
     skip_reason, source_bytes,
 };
 pub use housekeeping::{
-    HousekeepingError, ShardSweepReport, run_orphan_shard_sweep, sweep_orphan_shard_dirs,
+    HousekeepingError, SHARD_DESTROY_GRACE_MS, ShardSweepReport, expired_shard_ids,
+    run_expired_shard_sweep, run_orphan_shard_sweep, shard_destroy_due, sweep_expired_shard_dirs,
+    sweep_orphan_shard_dirs,
 };
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
@@ -213,14 +215,15 @@ pub use registry::{
     AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
     IllegalGenerationTransition, IllegalWorktreeTransition, PathObservation, RequestRoot,
     Resolution, WorktreeKind, WorktreePathObservation, WorktreeRootFacts, WorktreeState,
-    WorktreeSummary, WorktreeTransitionError, active_generations, all_worktree_ids,
-    allocate_generation, attach, create_repository, create_worktree, current_generation,
-    current_path, current_worktree_path, effective_data_policy, find_repositories_by_remote,
-    find_repository_by_path, find_worktree_by_current_path, find_worktrees_by_path_fingerprint,
-    generation_state, get_repo_setting, observe_repository_path, observe_worktree_path,
-    path_history, repo_data_policy, repo_settings, resolve, set_current_generation,
-    set_repo_data_policy, set_repo_setting, transition_generation, transition_worktree_state,
-    worktree_path_history, worktree_state, worktree_summary, worktrees_of_repo,
+    WorktreeStateClock, WorktreeSummary, WorktreeTransitionError, active_generations,
+    all_worktree_ids, allocate_generation, attach, create_repository, create_worktree,
+    current_generation, current_path, current_worktree_path, effective_data_policy,
+    find_repositories_by_remote, find_repository_by_path, find_worktree_by_current_path,
+    find_worktrees_by_path_fingerprint, generation_state, get_repo_setting,
+    observe_repository_path, observe_worktree_path, path_history, repo_data_policy, repo_settings,
+    resolve, set_current_generation, set_repo_data_policy, set_repo_setting, transition_generation,
+    transition_worktree_state, worktree_path_history, worktree_state, worktree_state_clocks,
+    worktree_summary, worktrees_of_repo,
 };
 pub use registry::{
     DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,

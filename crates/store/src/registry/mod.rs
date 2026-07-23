@@ -23,6 +23,9 @@
 //!   proves the current generation belongs to its worktree — plus the worktree
 //!   operations and the explicit `active`/`detached`/`removing` state machine
 //!   (see [`worktree`]).
+//! - **worktree state clock** (D-007, version-5 `SCHEMA_V5`): `worktree
+//!   .state_changed_at`, the timestamp the shard-lifecycle grace period of
+//!   spec 05 §8 ("remove/detach: grace period, then destroy") is measured from.
 //!
 //! On top of those primitives sits the **resolution layer** (T02-04, module
 //! `resolve`): [`resolve()`] turns a request's `worktree_root` into
@@ -82,11 +85,11 @@ pub use settings::{
 };
 pub use worktree::{
     IllegalWorktreeTransition, WorktreeKind, WorktreePathObservation, WorktreeState,
-    WorktreeSummary, WorktreeTransitionError, all_worktree_ids, create_worktree,
-    current_generation, current_worktree_path, find_worktree_by_current_path,
+    WorktreeStateClock, WorktreeSummary, WorktreeTransitionError, all_worktree_ids,
+    create_worktree, current_generation, current_worktree_path, find_worktree_by_current_path,
     find_worktrees_by_path_fingerprint, observe_worktree_path, set_current_generation,
-    transition_worktree_state, worktree_path_history, worktree_state, worktree_summary,
-    worktrees_of_repo,
+    transition_worktree_state, worktree_path_history, worktree_state, worktree_state_clocks,
+    worktree_summary, worktrees_of_repo,
 };
 
 /// Version-1 migration DDL: the repository-side registry (spec 03 §2.1).
@@ -189,4 +192,30 @@ CREATE TABLE generation (
   UNIQUE (worktree_id, generation_number),
   UNIQUE (generation_id, worktree_id)                 -- target for composite FKs
 );
+";
+
+/// Version-5 migration DDL: the worktree **state clock** (spec 03 §2.1, D-007).
+///
+/// Adds `worktree.state_changed_at` — the epoch-ms timestamp of the row's most
+/// recent *effective* lifecycle transition (spec 04 §7's
+/// `active ⇄ detached`/`→ removing` machine). It exists for exactly one
+/// normative requirement: spec 05 §8's "remove/detach: grace period
+/// `[SPEC: 7 days]`, then destroy" needs a clock to measure the grace period
+/// from, and the version-2 `worktree` table has none — `created_at` predates
+/// any transition and `last_seen_at` tracks path observation, not lifecycle.
+/// Deviation D-007 records why this landed here rather than in group 06/07.
+///
+/// Existing rows are backfilled from `last_seen_at` (the closest available
+/// lower bound on "when this worktree was last known to be in use"), so no row
+/// is ever left with a zero clock that would make its shard instantly eligible
+/// for destruction. New rows stamp `created_at`
+/// ([`create_worktree`](worktree::create_worktree)).
+///
+/// **Frozen once shipped.** Like [`SCHEMA_V1`]/[`SCHEMA_V2`], the checksum is
+/// the SHA-256 of this text; any edit trips
+/// [`ChecksumDrift`](crate::migrate::MigrationError::ChecksumDrift) on an
+/// existing store. Future schema changes are new numbered migrations.
+pub(crate) const SCHEMA_V5: &str = "\
+ALTER TABLE worktree ADD COLUMN state_changed_at INTEGER NOT NULL DEFAULT 0;
+UPDATE worktree SET state_changed_at = last_seen_at;
 ";

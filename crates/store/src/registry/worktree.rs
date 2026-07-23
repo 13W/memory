@@ -212,6 +212,11 @@ pub struct WorktreeSummary {
 /// NULL). An unknown `repo_id` is rejected by the `worktree → repository` foreign
 /// key. Call [`observe_worktree_path`] to record where it lives and
 /// [`set_current_generation`] once a generation is active.
+///
+/// `state_changed_at` is stamped with `now_ms` too (D-007): a freshly created
+/// `active` worktree has "entered its current state" now, which keeps the
+/// column non-null and monotone from the very first row rather than needing a
+/// sentinel the grace-period reader would have to special-case.
 pub fn create_worktree(
     tx: &Transaction<'_>,
     worktree_id: &str,
@@ -221,8 +226,9 @@ pub fn create_worktree(
 ) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO worktree \
-           (worktree_id, repo_id, kind, current_generation_id, state, created_at, last_seen_at) \
-         VALUES (?1, ?2, ?3, NULL, 'active', ?4, ?4)",
+           (worktree_id, repo_id, kind, current_generation_id, state, created_at, last_seen_at, \
+            state_changed_at) \
+         VALUES (?1, ?2, ?3, NULL, 'active', ?4, ?4, ?4)",
         params![worktree_id, repo_id, kind.as_str(), now_ms],
     )?;
     Ok(())
@@ -317,16 +323,24 @@ pub fn set_current_generation(
 /// - an illegal transition → `Ok(Err(WorktreeTransitionError::Illegal(..)))`,
 ///   with **no mutation** (the illegality is detected before any write, so the
 ///   enclosing transaction commits a no-op);
-/// - a legal transition to a different state → the row's `state` is updated;
+/// - a legal transition to a different state → the row's `state` **and**
+///   `state_changed_at` (`now_ms`) are updated;
 /// - a legal self-transition (`X → X`) → a no-op success.
 ///
 /// Splitting infrastructure failure (retry) from domain rejection (do not retry)
 /// is deliberate. A stored `state` outside the CHECK domain (corruption) surfaces
 /// as the outer [`rusqlite::Error`].
+///
+/// `state_changed_at` is deliberately stamped **only on an effective change**
+/// (D-007), matching this function's existing "self-transition is an idempotent
+/// no-op" contract: a crash/retry that re-requests the state a worktree is
+/// already in must not push the shard-destruction grace period (spec 05 §8)
+/// forward, or a retry loop could keep a doomed shard alive indefinitely.
 pub fn transition_worktree_state(
     tx: &Transaction<'_>,
     worktree_id: &str,
     to: WorktreeState,
+    now_ms: i64,
 ) -> rusqlite::Result<Result<(), WorktreeTransitionError>> {
     let from: Option<WorktreeState> = tx
         .query_row(
@@ -355,8 +369,8 @@ pub fn transition_worktree_state(
 
     if from != to {
         tx.execute(
-            "UPDATE worktree SET state = ?2 WHERE worktree_id = ?1",
-            params![worktree_id, to.as_str()],
+            "UPDATE worktree SET state = ?2, state_changed_at = ?3 WHERE worktree_id = ?1",
+            params![worktree_id, to.as_str(), now_ms],
         )?;
     }
     Ok(Ok(()))
@@ -563,6 +577,54 @@ pub fn all_worktree_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// One worktree's lifecycle state plus the timestamp it entered it (D-007).
+///
+/// The input shape of spec 05 §8's shard grace period: "remove/detach: grace
+/// period `[SPEC: 7 days]`, then destroy". Deliberately a plain data row with no
+/// clock of its own so the eligibility predicate
+/// ([`shard_destroy_due`](crate::housekeeping::shard_destroy_due)) stays pure
+/// and table-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeStateClock {
+    /// The worktree's stable id.
+    pub worktree_id: String,
+    /// Its current lifecycle state (spec 04 §7).
+    pub state: WorktreeState,
+    /// When it entered `state`, epoch ms (`created_at` for a never-transitioned
+    /// row; `last_seen_at` for rows backfilled by migration 5).
+    pub state_changed_at: i64,
+}
+
+/// Every worktree's `(state, state_changed_at)` pair, ascending by id (D-007).
+///
+/// The store-wide reader behind the grace-period shard sweep
+/// ([`run_expired_shard_sweep`](crate::housekeeping::run_expired_shard_sweep)):
+/// it returns *all* worktrees, not just the non-`active` ones, so the sweep's
+/// eligibility decision lives in one pure predicate rather than being split
+/// between a SQL `WHERE` clause and Rust. Ascending order makes it
+/// deterministic.
+pub fn worktree_state_clocks(conn: &Connection) -> rusqlite::Result<Vec<WorktreeStateClock>> {
+    let mut stmt = conn.prepare(
+        "SELECT worktree_id, state, state_changed_at FROM worktree ORDER BY worktree_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let raw: String = r.get(1)?;
+        let state = WorktreeState::from_db(&raw).ok_or_else(|| {
+            Error::FromSqlConversionFailure(
+                1,
+                Type::Text,
+                format!("invalid worktree.state {raw:?}").into(),
+            )
+        })?;
+        Ok(WorktreeStateClock {
+            worktree_id: r.get(0)?,
+            state,
+            state_changed_at: r.get(2)?,
+        })
+    })?;
+    rows.collect()
 }
 
 #[cfg(test)]
