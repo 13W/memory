@@ -156,10 +156,10 @@
 //! itself as already holding the hierarchy's topmost rank, "L4 queues are
 //! leaves" (spec 02 §5) is an enforced invariant: any lock acquisition
 //! attempted from inside a queued job fails the order check. Adopting the
-//! registry into the reconcile driver or the projection switch is later work
-//! (T09-04, group 15), not this task; the read side is adopted by T09-03
-//! (`local_rag_search::SearchEngine`, `crates/search`) via
-//! [`lock::WorktreeLockRegistry::read_bounded`].
+//! registry into the projection switch is later work (T11-05, group 11); the
+//! reconcile driver's own adoption has no dedicated task yet in the current
+//! plan. The read side is adopted by T09-03 (`local_rag_search::SearchEngine`,
+//! `crates/search`) via [`lock::WorktreeLockRegistry::read_bounded`].
 //!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).

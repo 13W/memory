@@ -12,6 +12,15 @@ local-rag-protocol = { path = "../protocol" }
 local-rag-store = { path = "../store" }
 local-rag-projection = { path = "../projection" }
 
+[features]
+# Forwards to local-rag-projection's failpoints feature so named seams like
+# `projection.switch.before_commit` actually fire when linked into this
+# crate's test binaries (T09-04's `switch_failpoint_load.rs`). No optional
+# test-support dependency needed here — `local-rag-test-support` is already
+# an unconditional dev-dependency (used for `TempHome`), and dev-dependencies
+# apply regardless of which features are active.
+failpoints = ["local-rag-projection/failpoints"]
+
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
 # Integration tests drive the async `SearchEngine` pipeline end to end

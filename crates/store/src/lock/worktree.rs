@@ -3,10 +3,10 @@
 //! The write side of L2 already exists *structurally* today — one reconcile
 //! task per worktree (`local_rag_index::reconcile::driver`) serializes writes
 //! without an explicit lock object. This registry is the actual lock object:
-//! adopting it into that driver and the projection switch is later work
-//! (T09-04, group 15), not this module. [`WorktreeLockRegistry::read_bounded`]
-//! (T09-03) is the entry point `local_rag_search`'s pipeline uses for the read
-//! side (spec 06 §3).
+//! adopting it into the projection switch is later work (T11-05, group 11);
+//! the reconcile driver's own adoption has no dedicated task yet in the
+//! current plan. [`WorktreeLockRegistry::read_bounded`] (T09-03) is the entry
+//! point `local_rag_search`'s pipeline uses for the read side (spec 06 §3).
 
 use std::collections::HashMap;
 use std::future::Future;

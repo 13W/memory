@@ -91,8 +91,13 @@ rewritten.
   before the final `state.sqlite` commit — spec 05 §10 F4, the one kill point
   none of the fake shard's own seams could reach). It is never enabled in a
   release or distribution build, so the shipped binary never links
-  `test-support`. `cargo xtask ci` runs each of those crates once more with
-  `--features failpoints` to lint and exercise those code paths.
+  `test-support`. As of T09-04, `crates/search`'s own `failpoints` feature has
+  no seams of its own — it forwards to `local-rag-projection/failpoints` so
+  `projection.switch.before_commit` fires under a concurrent search load in
+  `crates/search/tests/switch_failpoint_load.rs` (`test-support` is already an
+  unconditional dev-dependency there, used for `TempHome`). `cargo xtask ci`
+  runs each of those crates once more with `--features failpoints` to lint
+  and exercise those code paths.
 
 ## Committing
 
