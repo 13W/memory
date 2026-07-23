@@ -1,0 +1,22 @@
+[package]
+name = "local-rag-spike-harness"
+description = "Backend-neutral conformance + benchmark harness for the T10 dense-backend spike (open question O1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Path deps into the product workspace: the harness runs candidates through the
+# *same* `[FIXED]` ProjectionStore contract the product uses (spec 05 §1), and the
+# fake backend is the first candidate exercised (it is a real working backend).
+local-rag-core = { path = "../../crates/core" }
+local-rag-projection = { path = "../../crates/projection" }
+# Typed spike-report (de)serialization; `deny_unknown_fields` makes deserialization
+# the schema check (same idiom as `crates/index`'s fixture models, T04-03). Both
+# are already approved in the product workspace, so no new crate family enters here.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+# Isolated dense-backend spike workspace (T10-01, roadmap step 11 / open question O1).
+#
+# This is a SEPARATE workspace from the repository root, with its own Cargo.lock,
+# and is `exclude`d from the root `[workspace]`. The reason is the T10 dependency
+# guardrail (CONTRIBUTING.md § Dependency policy, reconfirmed by gate G09): no
+# dense-vector / embedding SDK may enter the product workspace before the backend
+# is chosen. The candidate adapters this spike compares — brute-force (T10-02),
+# `usearch` (T10-03), Qdrant Edge (T10-04) — will pull real dense-vector crates;
+# keeping them in this lockfile means the product `Cargo.lock` stays free of them,
+# so "no premature backend coupling" is a structural fact, not a reviewer promise.
+# The winner is copied into the product workspace at T12-02.
+[workspace]
+resolver = "2"
+members = ["harness"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+# Mirror the root workspace's centralized lints (CONTRIBUTING.md).
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

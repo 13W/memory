@@ -1,5 +1,6 @@
 # Rust build output
 /target/
+/spike/target/
 **/*.rs.bk
 
 # Machine-local Claude Code configuration (never committed)

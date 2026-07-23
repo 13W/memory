@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+# `spike/` is a deliberately SEPARATE workspace (its own Cargo.lock), excluded here
+# so its future O1 dense-backend candidates (usearch, Qdrant Edge — T10-03/04) never
+# enter this workspace's lockfile. That isolation is what keeps the "no dense SDK
+# before T10" guardrail (CONTRIBUTING.md) mechanically checkable through G17.
+exclude = ["spike"]
 members = [
     "crates/core",
     "crates/store",
