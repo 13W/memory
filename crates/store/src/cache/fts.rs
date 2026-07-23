@@ -398,6 +398,42 @@ pub fn read_fts_projection_head(
     .optional()
 }
 
+/// The actual, current number of `fts_doc` rows for `worktree_id` (D-006,
+/// spec 06 §4) — the real content being validated. **Never** confuse this
+/// with `code::occurrence_count_for_generation`'s state-side count: that one
+/// reflects the source generation's immutable expected size (unchanged for
+/// the generation's whole lifetime, structural sharing) and cannot detect
+/// direct corruption/deletion of `fts_doc`/`fts_occurrences` rows — only this
+/// cache-side count can. `materialize_fts` always fully replaces a worktree's
+/// rows (T08-02), so at most one generation's rows exist per worktree at any
+/// time; `WHERE worktree_id = ?1` alone already yields "whatever cache.sqlite
+/// currently, actually holds." Served by the `fts_doc_by_wt` index.
+pub fn fts_doc_occurrence_count(conn: &Connection, worktree_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM fts_doc WHERE worktree_id = ?1",
+        params![worktree_id],
+        |r| r.get(0),
+    )
+}
+
+/// Every `occurrence_id` actually stored in `fts_doc` for `worktree_id`,
+/// ascending (D-006, spec 06 §4) — the real content a strong validation's
+/// manifest recompute must hash, never `code::occurrence_ids_for_generation`'s
+/// state-side set (see [`fts_doc_occurrence_count`]'s doc for why). Served by
+/// the `fts_doc_by_wt` index.
+pub fn fts_doc_occurrence_ids(
+    conn: &Connection,
+    worktree_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT occurrence_id FROM fts_doc WHERE worktree_id = ?1 ORDER BY occurrence_id",
+    )?;
+    let ids = stmt
+        .query_map(params![worktree_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 /// The outcome of a successful [`materialize_fts`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FtsMaterializeOutcome {

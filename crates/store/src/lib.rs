@@ -159,11 +159,12 @@ pub use cache::{
     CacheWriteError, CacheWriter, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability,
     FtsDivergence, FtsMaterializeError, FtsMaterializeOutcome, FtsOpenOutcome,
     FtsProjectionHeadRow, FtsRebuildError, LEXICAL_SCHEMA_VERSION, LastUsedSink, NormalizedTextRow,
-    TOKENIZER_VERSION, ValidationDepth, delete_normalized_text, flush_last_used, fts_manifest_hash,
-    get_normalized_text, insert_normalized_text, materialize_fts, open_and_validate_fts,
-    read_fts_projection_head, requires_index_unavailable, should_rebuild_synchronously,
-    tokenize_identifier, tokenize_path, tokenize_qualified_name, tokenize_signature,
-    validate_fts_cheap, validate_fts_strong, verify_cached_text,
+    TOKENIZER_VERSION, ValidationDepth, delete_normalized_text, flush_last_used,
+    fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash, get_normalized_text,
+    insert_normalized_text, materialize_fts, open_and_validate_fts, read_fts_projection_head,
+    requires_index_unavailable, should_rebuild_synchronously, tokenize_identifier, tokenize_path,
+    tokenize_qualified_name, tokenize_signature, validate_fts_cheap, validate_fts_strong,
+    verify_cached_text,
 };
 pub use code::{
     ALGO_VERSION, BlobOutcome, DerivedContentBlob, EdgeResolution, FtsSourceRow,

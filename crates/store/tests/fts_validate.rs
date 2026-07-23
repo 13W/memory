@@ -25,10 +25,10 @@ use local_rag_store::registry::{
 use local_rag_store::rusqlite;
 use local_rag_store::{
     CacheDb, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsDivergence, FtsOpenOutcome,
-    StateDb, ValidationDepth, derive_content_blob, fts_manifest_hash, insert_content_blob,
-    insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
-    materialize_fts, occurrence_id, occurrence_ids_for_generation, open_and_validate_fts,
-    read_fts_projection_head, requires_index_unavailable,
+    StateDb, ValidationDepth, derive_content_blob, fts_doc_occurrence_ids, fts_manifest_hash,
+    insert_content_blob, insert_file_revision, insert_generation_file, insert_occurrence,
+    insert_parsed_unit, materialize_fts, occurrence_id, occurrence_ids_for_generation,
+    open_and_validate_fts, read_fts_projection_head, requires_index_unavailable,
 };
 use local_rag_test_support::TempHome;
 
@@ -488,6 +488,80 @@ async fn above_threshold_occurrence_count_defers_to_background() {
         fts_doc_row_count(&cache),
         0,
         "no synchronous rebuild must have happened"
+    );
+}
+
+/// D-006 regression: before the fix, `open_and_validate_fts` sourced its
+/// "actual" occurrence count and manifest from `state.sqlite`'s immutable
+/// per-generation expectation instead of `cache.sqlite`'s real content, so a
+/// direct swap of one `fts_doc.occurrence_id` (row count unchanged) was
+/// invisible to both the cheap and the strong check — exactly the
+/// "equal-count, different ID set" corruption spec 06 §4's strong check
+/// exists to catch.
+#[tokio::test]
+async fn strong_check_catches_swapped_occurrence_id_invisible_to_state_sqlite() {
+    let (_home, state, cache) = open_both();
+    let wt = seed_worktree(&state, 140).await;
+    let gen_id = uuid(150);
+    seed_generation(&state, &wt, &gen_id, 1).await;
+    let rev_d = uuid(151);
+    let unit_d = uuid(152);
+    seed_file_content(&state, &rev_d, &unit_d, "fn d() {}", Some("d")).await;
+    let occ_d = seed_occurrence(&state, &gen_id, "d.rs", &rev_d, &unit_d).await;
+    let rev_e = uuid(153);
+    let unit_e = uuid(154);
+    seed_file_content(&state, &rev_e, &unit_e, "fn e() {}", Some("e")).await;
+    let occ_e = seed_occurrence(&state, &gen_id, "e.rs", &rev_e, &unit_e).await;
+    activate_generation(&state, &wt, &gen_id).await;
+
+    materialize_fts(&state, &cache, &wt, &gen_id, NOW)
+        .await
+        .expect("materialize");
+
+    // Swap one real occurrence_id for a fake one directly in fts_doc; the row
+    // count and fts_projection_head are left untouched.
+    let fake_id = "f".repeat(64);
+    let (w, real_id, fake) = (wt.clone(), occ_d.clone(), fake_id.clone());
+    cache
+        .writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE fts_doc SET occurrence_id = ?1 \
+                 WHERE worktree_id = ?2 AND occurrence_id = ?3",
+                rusqlite::params![fake, w, real_id],
+            )
+        })
+        .await
+        .expect("swap occurrence id");
+
+    let cheap = open_and_validate_fts(&state, &cache, &wt, ValidationDepth::Cheap, NOW + 100)
+        .await
+        .expect("cheap validation");
+    assert_eq!(
+        cheap,
+        FtsOpenOutcome::Valid,
+        "cheap check is deliberately blind to an equal-count id swap (spec 06 §4)"
+    );
+
+    let strong = open_and_validate_fts(&state, &cache, &wt, ValidationDepth::Strong, NOW + 200)
+        .await
+        .expect("strong validation");
+    match strong {
+        FtsOpenOutcome::Rebuilt(_) => {}
+        other => panic!("expected Rebuilt, got {other:?}"),
+    }
+
+    let ids = {
+        let read = cache.open_read().expect("read conn");
+        fts_doc_occurrence_ids(&read, &wt).expect("read occurrence ids")
+    };
+    assert!(
+        ids.contains(&occ_d) && ids.contains(&occ_e),
+        "rebuild must restore the real occurrence ids: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&fake_id),
+        "rebuild must remove the swapped-in fake id: {ids:?}"
     );
 }
 
