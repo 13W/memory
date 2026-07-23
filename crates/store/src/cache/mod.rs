@@ -20,8 +20,9 @@ mod writer;
 
 pub use fts::{
     FtsMaterializeError, FtsMaterializeOutcome, FtsProjectionHeadRow, LEXICAL_SCHEMA_VERSION,
-    TOKENIZER_VERSION, fts_manifest_hash, materialize_fts, read_fts_projection_head,
-    tokenize_identifier, tokenize_path, tokenize_qualified_name, tokenize_signature,
+    TOKENIZER_VERSION, fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash,
+    materialize_fts, read_fts_projection_head, tokenize_identifier, tokenize_path,
+    tokenize_qualified_name, tokenize_signature,
 };
 pub use open::{CACHE_SCHEMA_VERSION, CacheOpenError, CacheOpenOutcome};
 pub use text::{

@@ -251,14 +251,33 @@ individually-valid commits; a resulting stale head is exactly what the next
 `validate_fts_cheap` call's generation check detects, so convergence needs no additional
 bookkeeping. The `< 2s` synchronous-rebuild estimate (`should_rebuild_synchronously`) is a
 provisional occurrence-count proxy (`FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD = 5_000`, not
-yet calibrated — T12-05), fed by a fresh `code::occurrence_count_for_generation` read of
-`state.sqlite`'s real active generation, never the (possibly-wrong) stale head's claimed
-count — and this read is not extra I/O, since `validate_fts_cheap` already requires it for
-the count predicate. The daemon-level `INDEX_UNAVAILABLE`/`degraded` vocabulary (spec 02
+yet calibrated — T12-05). The daemon-level `INDEX_UNAVAILABLE`/`degraded` vocabulary (spec 02
 §6, 09 §7) does not exist yet (group 15); this task ships only the FTS-side half
 (`FtsAvailability`, `requires_index_unavailable(fts, dense_available: bool)`), deliberately
 not a cross-subsystem `SearchAvailability` type, so `crates/store` never needs to know how
 dense availability is determined.
+
+As-built note (D-006, `[SPEC]`): the T08-03 implementation above shipped a real defect —
+`open_and_validate_fts` fed **both** the cheap count predicate and the strong manifest
+predicate with `code::occurrence_count_for_generation`/`occurrence_ids_for_generation`
+reads of `state.sqlite`, i.e. the *expected* set for the active generation, not
+`cache.sqlite`'s actual current `fts_doc` content. Because `occurrence_id` embeds
+`generation_id` and a generation's occurrence set is immutable once `projection_ready`
+(structural sharing, 03 §1.2), that expectation never changes while the generation stays
+the same — so a direct corruption of `fts_doc`/`fts_occurrences` rows (delete, or swap an
+`occurrence_id` for another value while leaving the row count equal) that left
+`fts_projection_head` and `state.sqlite` untouched was invisible to **both** checks, not
+only the manifest one — including the literal "equal occurrence count, different ID set"
+case §4's strong check exists to catch. The fix adds two cache-side readers,
+`cache::fts_doc_occurrence_count`/`fts_doc_occurrence_ids` (`crates/store/src/cache/fts.rs`,
+served by the existing `fts_doc_by_wt` index), and re-sources both predicates' validation
+input from them via `cache.open_read()`. `code::occurrence_count_for_generation` is still
+read from `state.sqlite`, but only for `should_rebuild_synchronously`'s rebuild-cost
+estimate — a genuinely different question ("how expensive would re-deriving the source
+generation be") — and only *after* a divergence is already confirmed, so it can never again
+substitute for the actual-content read that validation needs. Regression test:
+`strong_check_catches_swapped_occurrence_id_invisible_to_state_sqlite`
+(`crates/store/tests/fts_validate.rs`).
 
 ## 5. Retention & GC of canonical source `[FIXED]`
 

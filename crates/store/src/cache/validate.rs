@@ -1,4 +1,5 @@
-//! FTS validation, degradation, and rebuild (spec 06 §4, 03 §4.3/§4.4) — T08-03.
+//! FTS validation, degradation, and rebuild (spec 06 §4, 03 §4.3/§4.4) —
+//! T08-03/D-006.
 //!
 //! [`validate_fts_cheap`]/[`validate_fts_strong`] are the pure predicate table
 //! spec 06 §4 names, split exactly the way the spec itself splits them: cheap
@@ -52,8 +53,30 @@
 //! ship only the FTS-local half of that invariant (never silently swallow "both
 //! legs down"), parameterized by a plain `bool` for the dense leg so this crate
 //! never needs to know how dense availability is determined.
+//!
+//! ## D-006: validation input must come from `cache.sqlite`, never `state.sqlite`
+//!
+//! [`open_and_validate_fts`] answers two genuinely different questions, and
+//! conflating their data sources was a real, shipped bug (D-006): "is the
+//! cache's *actual current content* trustworthy" (the count/manifest
+//! predicates) versus "how expensive would a real rebuild be" (the
+//! sync-vs-background decision). The first MUST be read from `cache.sqlite`
+//! itself — [`super::fts::fts_doc_occurrence_count`]/
+//! [`super::fts::fts_doc_occurrence_ids`] — because `code::
+//! occurrence_count_for_generation`/`code::occurrence_ids_for_generation`
+//! read `state.sqlite`'s expected set for the *source* generation, which is
+//! immutable for that generation's whole lifetime (structural sharing) and
+//! therefore **cannot change** in response to someone directly deleting or
+//! tampering with `fts_doc`/`fts_occurrences` rows while leaving
+//! `fts_projection_head` untouched — exactly the corruption spec 06 §4's
+//! strong check exists to catch (the literal "equal occurrence count,
+//! different ID set" case, a direct analogue of `local_rag_projection::
+//! validate::Divergence::ManifestMismatch`). The second question legitimately
+//! does want `state.sqlite`'s count (it estimates the cost of re-deriving the
+//! source generation from scratch) and is read separately, only once a
+//! divergence is already confirmed — never reused as the validation input.
 
-use crate::code::{occurrence_count_for_generation, occurrence_ids_for_generation};
+use crate::code::occurrence_count_for_generation;
 use crate::registry::current_generation;
 use crate::state::{OpenError, StateDb};
 
@@ -61,7 +84,8 @@ use super::CacheDb;
 use super::CacheOpenError;
 use super::fts::{
     FtsMaterializeError, FtsMaterializeOutcome, FtsProjectionHeadRow, LEXICAL_SCHEMA_VERSION,
-    TOKENIZER_VERSION, fts_manifest_hash, materialize_fts, read_fts_projection_head,
+    TOKENIZER_VERSION, fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash,
+    materialize_fts, read_fts_projection_head,
 };
 
 /// Why the FTS view was judged untrustworthy (spec 06 §4's predicate table, in
@@ -95,18 +119,28 @@ pub enum FtsDivergence {
         /// The version this binary produces ([`TOKENIZER_VERSION`]).
         binary: u32,
     },
-    /// The head's claimed occurrence count does not match a fresh count.
+    /// The head's claimed occurrence count does not match the FTS view's
+    /// actual current row count (D-006: `actual` MUST be a fresh
+    /// `cache::fts_doc_occurrence_count` read of `cache.sqlite`'s real
+    /// `fts_doc` rows for this worktree — never `code::
+    /// occurrence_count_for_generation`'s `state.sqlite`-sourced count for the
+    /// source generation, which is generation-invariant and cannot detect
+    /// direct corruption/deletion of cache rows).
     OccurrenceCountMismatch {
         /// The count the head claims.
         head: i64,
-        /// The actual, freshly-read count.
+        /// The FTS view's actual current row count.
         actual: i64,
     },
     /// Counts agree but the recomputed manifest hash does not match the
     /// head's — the strong check: catches an identical count with a differing
     /// occurrence-id set that a bare count comparison would miss (only
     /// reachable from [`validate_fts_strong`]; [`validate_fts_cheap`] has no
-    /// manifest parameter to compare).
+    /// manifest parameter to compare). D-006: the recomputed hash MUST be
+    /// derived from `cache::fts_doc_occurrence_ids`'s actual current cache
+    /// content — recomputing from `state.sqlite`'s expected set instead would
+    /// always reproduce the head's own (possibly-corrupted-around) value and
+    /// never detect this case at all.
     ManifestMismatch,
 }
 
@@ -254,9 +288,13 @@ pub enum FtsRebuildError {
     StateOpen(OpenError),
     /// Opening a `cache.sqlite` read connection failed.
     CacheOpen(CacheOpenError),
-    /// Reading `state.sqlite` (active generation, occurrence count/ids) failed.
+    /// Reading `state.sqlite` failed — the active generation, or (D-006) the
+    /// rebuild-cost estimate read only after a divergence is confirmed. Never
+    /// the validation input itself (that is cache-sourced; see `CacheRead`).
     StateRead(rusqlite::Error),
-    /// Reading `cache.sqlite`'s `fts_projection_head` failed.
+    /// Reading `cache.sqlite` failed — `fts_projection_head`, or (D-006) the
+    /// FTS view's actual current `fts_doc` row count/occurrence-ids, which is
+    /// the validation input for both cheap and strong checks.
     CacheRead(rusqlite::Error),
     /// The synchronous rebuild ([`materialize_fts`]) failed.
     Materialize(FtsMaterializeError),
@@ -327,30 +365,33 @@ pub async fn open_and_validate_fts(
         let read = cache.open_read().map_err(FtsRebuildError::CacheOpen)?;
         read_fts_projection_head(&read, worktree_id).map_err(FtsRebuildError::CacheRead)?
     };
-    let actual_occurrence_count = {
-        let read = state.open_read().map_err(FtsRebuildError::StateOpen)?;
-        occurrence_count_for_generation(&read, &active_generation_id)
-            .map_err(FtsRebuildError::StateRead)?
+    // D-006: the validation input is the cache's OWN actual current content,
+    // never state.sqlite's expectation for the source generation (see the
+    // module docs — that expectation is generation-invariant and cannot see
+    // direct cache-row corruption).
+    let actual_cache_occurrence_count = {
+        let read = cache.open_read().map_err(FtsRebuildError::CacheOpen)?;
+        fts_doc_occurrence_count(&read, worktree_id).map_err(FtsRebuildError::CacheRead)?
     };
 
     let divergence = match depth {
         ValidationDepth::Cheap => validate_fts_cheap(
             head.as_ref(),
             &active_generation_id,
-            actual_occurrence_count,
+            actual_cache_occurrence_count,
         ),
         ValidationDepth::Strong => {
             let manifest_hash = {
-                let read = state.open_read().map_err(FtsRebuildError::StateOpen)?;
-                let ids = occurrence_ids_for_generation(&read, &active_generation_id)
-                    .map_err(FtsRebuildError::StateRead)?;
+                let read = cache.open_read().map_err(FtsRebuildError::CacheOpen)?;
+                let ids = fts_doc_occurrence_ids(&read, worktree_id)
+                    .map_err(FtsRebuildError::CacheRead)?;
                 let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
                 fts_manifest_hash(worktree_id, &active_generation_id, &refs)
             };
             validate_fts_strong(
                 head.as_ref(),
                 &active_generation_id,
-                actual_occurrence_count,
+                actual_cache_occurrence_count,
                 &manifest_hash,
             )
         }
@@ -360,7 +401,17 @@ pub async fn open_and_validate_fts(
         return Ok(FtsOpenOutcome::Valid);
     };
 
-    if should_rebuild_synchronously(actual_occurrence_count as u64) {
+    // A genuinely different question from the validation input above ("how
+    // expensive would re-deriving the source generation be"), read only now
+    // that a divergence is confirmed — never conflated with the cache-sourced
+    // validation reads (D-006).
+    let rebuild_cost_estimate = {
+        let read = state.open_read().map_err(FtsRebuildError::StateOpen)?;
+        occurrence_count_for_generation(&read, &active_generation_id)
+            .map_err(FtsRebuildError::StateRead)?
+    };
+
+    if should_rebuild_synchronously(rebuild_cost_estimate as u64) {
         let outcome = materialize_fts(state, cache, worktree_id, &active_generation_id, now_ms)
             .await
             .map_err(FtsRebuildError::Materialize)?;
@@ -368,7 +419,7 @@ pub async fn open_and_validate_fts(
     } else {
         Ok(FtsOpenOutcome::DeferredBackground {
             divergence,
-            occurrence_count_estimate: actual_occurrence_count as u64,
+            occurrence_count_estimate: rebuild_cost_estimate as u64,
         })
     }
 }
