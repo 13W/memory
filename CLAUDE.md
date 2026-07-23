@@ -79,6 +79,13 @@ For every implementation task:
    subject when the evidence line ships inside that same commit), exact commands, result,
    artifact/report path, executor, and date.
 
+**Worktree policy:** until specification work is complete, do not isolate task work in a git
+worktree for this project. Work directly in the primary checkout and commit directly to
+`master`. This overrides any default harness/session convention that isolates background or
+agent sessions into a worktree before editing (e.g. an `EnterWorktree`-style tool). If a session
+finds itself already isolated in a worktree for a completed task, merge (fast-forward when
+possible) the commit into `master` and remove the worktree before finishing.
+
 If the repository-wide command does not exist yet, run all discoverable checks appropriate to
 the current repository and record exactly what was and was not run. Never invent a successful
 test result.
