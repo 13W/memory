@@ -76,13 +76,15 @@
 //! general, not this specific task). Also explicitly deferred, "seam in
 //! place, not silently closed": the dormant-worktree model migration (spec 05
 //! §8 `[FIXED]` — needs the real model-space registry, T11-01); and adopting
-//! this manager into [`crate::switch::switch`], the reconcile driver, or a
-//! search executor (T09-03/T09-04, group 12/15) — until then, direct
-//! `store.open()` call sites elsewhere in the codebase still race with this
-//! manager's own cache exactly as they did before this task (the fake
-//! backend's documented "two concurrent opens of one directory can clobber
-//! each other" hazard is closed only *within* the manager's cache, not
-//! store-wide).
+//! this manager into [`crate::switch::switch`] or the reconcile driver
+//! (T09-04, group 15) — until then, those direct `store.open()` call sites
+//! still race with this manager's own cache exactly as they did before this
+//! task (the fake backend's documented "two concurrent opens of one
+//! directory can clobber each other" hazard is closed only *within* the
+//! manager's cache, not store-wide). The search executor *is* adopted, by
+//! T09-03: `local_rag_search::SearchEngine::run_locked`
+//! (`crates/search/src/pipeline.rs`) calls [`acquire`](ShardManager::acquire)
+//! once per search, inside the caller's held `L2.read`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

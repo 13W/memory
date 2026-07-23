@@ -17,8 +17,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # (`lock::order`, T09-01, spec 02 §5 lock-order tracking) lives behind tokio's
 # own `rt` feature; `rt = []` in tokio's manifest adds no transitive crate —
 # only more of tokio's own code compiles in — so this still pulls no
-# runtime/net/mio dependency.
-tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
+# runtime/net/mio dependency. `time`: `tokio::time::timeout` for the bounded
+# L2.read wait (`lock::worktree::read_bounded`, T09-03, spec 02 §6
+# "search waits on L2.read (bounded); timeout → BUSY_RETRY") — like `rt`, adds
+# no transitive crate, only more of tokio's own code.
+tokio = { version = "1", default-features = false, features = ["sync", "rt", "time"] }
 # Exact-byte `source_blob` compression (spec 03 §2.3 `source_compression='zstd'`,
 # 12 §5). Vendors libzstd from source via `zstd-sys`/`cc` — bundled/offline like
 # rusqlite's SQLite. `std` has no zstd. See CONTRIBUTING allowlist.
@@ -49,11 +52,15 @@ failpoints = ["dep:local-rag-test-support"]
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
 # Test harness needs a runtime (incl. the blocking pool for `spawn_blocking`)
-# and the `#[tokio::test]` macro.
+# and the `#[tokio::test]` macro. `time`/`test-util`: paused virtual time
+# (`start_paused`/`advance`) for `read_bounded`'s timeout test (T09-03) — the
+# only deterministic, non-wall-clock way to exercise a real `tokio::time::timeout`.
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "sync",
+    "time",
+    "test-util",
 ] }
 
 [lints]

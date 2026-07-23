@@ -407,6 +407,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-rag-search"
+version = "0.0.0"
+dependencies = [
+ "local-rag-core",
+ "local-rag-projection",
+ "local-rag-protocol",
+ "local-rag-store",
+ "local-rag-test-support",
+ "tokio",
+]
+
+[[package]]
 name = "local-rag-store"
 version = "0.0.0"
 dependencies = [

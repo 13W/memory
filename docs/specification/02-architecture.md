@@ -256,8 +256,24 @@ T15's daemon lifecycle; `L3` is T09-02's shard LRU manager) — the same "type b
 precedent as T07-01's `ProjectionStore` trait; whichever task adds the real primitive calls the
 already-public `checked_scope_sync`/`checked_scope_async` around it, unchanged. Adopting
 `WorktreeLockRegistry` into the reconcile driver (`crates/index::reconcile::driver`, today's
-*structural*, lock-object-free realization of `L2`'s write side), the projection switch, or a
-search executor is explicitly **not** this task — T09-03/T09-04 and group 12/15 own that wiring.
+*structural*, lock-object-free realization of `L2`'s write side) or the projection switch is
+explicitly **not** this task — T09-04 and group 15 own that wiring; the read side is adopted by
+T09-03 (below).
+
+As-built note (T09-03, `[SPEC]`): `local_rag_search::SearchEngine::search_code`
+(`crates/search/src/pipeline.rs`) is the first caller of `WorktreeLockRegistry::read` — via a new
+sibling entry point, `WorktreeLockRegistry::read_bounded(worktree_id, wait, body)`
+(`crates/store/src/lock/worktree.rs`), added rather than wrapping `read` in a bare
+`tokio::time::timeout`: only the *wait for the guard* is bounded, so a `body` already in flight
+when the deadline would fire is never cancelled mid-pipeline — a plain `timeout` around the whole
+call would bound the pipeline's own execution time instead, which is a different (and wrong)
+thing to bound per this section's own "search waits on L2.read (bounded)" wording (§6). A timeout
+returns the typed `lock::ReadTimedOut`, mapped by the caller to `BUSY_RETRY` (§6, below). The
+wait budget is a plain `Duration` parameter (`local_rag_search::DEFAULT_L2_READ_WAIT_BUDGET =
+2000ms`, uncalibrated — no `config.toml` field exists for it per §3.1) supplied by the caller, not
+read from global config by the lock itself. `L3` is adopted the same call: `ShardManager::acquire`
+is invoked once per search, inside the held `L2.read`, exactly as this section's read-path rule
+requires ("L3 held only for the map lookup, released before the query"; unchanged from T09-02).
 
 ## 6. Degraded modes & error taxonomy `[SPEC]`
 
@@ -287,3 +303,25 @@ surface as `INCOMPATIBLE_STORE`, disambiguated by a `details` field (e.g.
 `store_version 3 > binary_max 2`, or `checksum drift at version 1`); a migration in
 progress surfaces as `MIGRATION_IN_PROGRESS`. The runner's own typed errors (13 §3) are
 finer-grained than the wire codes.
+
+As-built note (T09-03, `[SPEC]`): the canonical envelope's first concrete shape is
+`local_rag_protocol::{ErrorCode, ErrorEnvelope, DegradedMode}` (`crates/protocol/src/error.rs`) —
+`protocol` rather than `search`, since this vocabulary is shared by every daemon subsystem (memory
+tools too), not code-search-specific, and `protocol` already depends on nothing but `core`. Only
+three `ErrorCode` variants exist so far — `IndexUnavailable`, `WorktreeNotIndexed`, `BusyRetry`,
+the ones T09-03's search skeleton actually produces; `POLICY_BLOCKED_REMOTE`,
+`MIGRATION_IN_PROGRESS`, `STORE_LOCKED`, `INCOMPATIBLE_STORE` are left undefined until the task
+that actually detects each condition adds it (`#[non_exhaustive]` keeps this open without a
+breaking change). `retryable` is `true` only for `BusyRetry`. `details` stays a freeform
+`Option<String>` — no JSON (de)serialization is wired yet (`protocol` has no `serde` dependency),
+that remains group 15. `local_rag_search::SearchEngine::run_locked`
+(`crates/search/src/pipeline.rs`) implements this table's first three rows precisely: no active
+`worktree_projection_state` tuple ⇒ `WORKTREE_NOT_INDEXED` (checked before either leg is
+attempted, structurally distinguishing it from `INDEX_UNAVAILABLE`, which is only reachable once
+an active tuple exists but both legs fail against it); FTS invalid (`open_and_validate_fts`,
+`ValidationDepth::Cheap`, 06 §4) with dense healthy ⇒ `degraded: "dense_only"`; the converse ⇒
+`degraded: "lexical_only"`; both bad ⇒ `INDEX_UNAVAILABLE` with the two legs' diagnostic strings
+joined into `details`. `Resolution::Ambiguous` (02 §3.3 — a worktree resolvable only via an
+explicit `attach()`) is folded into `WORKTREE_NOT_INDEXED` for now: no dedicated code exists for it
+in this table, and the wire-facing outcome ("code search cannot proceed for this request") is the
+same either way — flagged as a judgment call, not a new taxonomy row.

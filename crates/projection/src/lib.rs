@@ -64,7 +64,8 @@
 //! dedicated OS thread is what makes cooperative task cancellation leave no
 //! torn write). See the module's own docs for the full design and its
 //! deliberately deferred scope (dormant-model-space migration, T11-01;
-//! adoption into `switch`/reconcile/search, T09-03/T09-04/group 12/15).
+//! adoption into `switch`/reconcile, T09-04/group 15). The search executor is
+//! adopted by T09-03 (`local_rag_search::SearchEngine`, `crates/search`).
 //!
 //! Deliberately **not** here (owning cards): the F1–F12 fault matrix itself
 //! (T07-05); the representation/model-space registry and the real

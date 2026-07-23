@@ -174,6 +174,21 @@ Otherwise the lexical leg could read generation N while dense reads an in-flight
 The read lock prevents *mixing*; it does **not** detect an incomplete lexical projection —
 that is the head's job (§4).
 
+As-built note (T09-03, `[SPEC]`): `local_rag_search::SearchEngine::search_code_instrumented`
+(`crates/search/src/pipeline.rs`) resolves the request's worktree (spec 02 §3.3) *before* taking
+any lock — consistent with spec 09 §1's own step ordering — then runs everything else, including
+resolving the active tuple, inside one `WorktreeLockRegistry::read_bounded` call: the entire
+`run_locked` async call tree (FTS validation, the dense `ShardManager::acquire` + query, and the
+lexical/enrichment stub stages) executes under the ambient `task_local!` L2.read marker the whole
+time, verified directly by an integration test that samples `local_rag_store::held_level()` from
+inside every stage (`crates/search/tests/pipeline.rs::
+lock_is_held_in_every_leg_of_a_successful_hybrid_search`). The active tuple itself is read via
+`local_rag_store::projection_state` (not `current_generation` alone) immediately after the lock is
+acquired — a true snapshot, never read before the lock. The lexical leg and enrichment step are
+still stubs (T12-01/T12-04); this task proves only that the lock spans wherever they will run, not
+their eventual content. Load-tested generation-mixing under concurrent switches is explicitly
+T09-04, not proven here.
+
 ## 4. FTS as an independently validated materialized view `[FIXED]`
 
 The FTS view lives in `cache.sqlite`, outside canonical transactions. Its validity proof is
