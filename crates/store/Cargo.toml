@@ -11,10 +11,14 @@ local-rag-core = { path = "../core" }
 # `bundled` compiles SQLite from source: reproducible, offline builds and a
 # self-contained binary with no system libsqlite3 dependency (spec 13 §1/§2).
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Only the `sync` feature: bounded `mpsc` + `oneshot` for the write queue
-# (spec 02 §5 L4). No runtime/net/mio in the library; the blocking SQLite
-# writer lives on a dedicated OS thread driven via `Receiver::blocking_recv`.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# `sync`: bounded `mpsc` + `oneshot` for the write queue (spec 02 §5 L4). No
+# net/mio in the library; the blocking SQLite writer lives on a dedicated OS
+# thread driven via `Receiver::blocking_recv`. `rt`: `tokio::task_local!`
+# (`lock::order`, T09-01, spec 02 §5 lock-order tracking) lives behind tokio's
+# own `rt` feature; `rt = []` in tokio's manifest adds no transitive crate —
+# only more of tokio's own code compiles in — so this still pulls no
+# runtime/net/mio dependency.
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
 # Exact-byte `source_blob` compression (spec 03 §2.3 `source_compression='zstd'`,
 # 12 §5). Vendors libzstd from source via `zstd-sys`/`cc` — bundled/offline like
 # rusqlite's SQLite. `std` has no zstd. See CONTRIBUTING allowlist.

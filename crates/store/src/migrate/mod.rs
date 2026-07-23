@@ -311,65 +311,71 @@ pub fn run(
     // L1: exclusive with normal operation, held for the rest of this call.
     let _guard = MigrationLock::acquire(lock_path)?;
 
-    bootstrap(conn)?;
+    // spec 02 §5: L1 is a real hierarchy participant, not a documentation-only
+    // mapping — any lock acquisition attempted from inside a migration step
+    // must fail the strict-order check (nothing outranks L1 except L2+).
+    crate::lock::checked_scope_sync(crate::lock::LockLevel::L1, move || {
+        bootstrap(conn)?;
 
-    let applied_history = read_applied(conn)?;
-    let store_version = applied_history
-        .iter()
-        .map(|(v, _, _)| *v)
-        .max()
-        .unwrap_or(0);
+        let applied_history = read_applied(conn)?;
+        let store_version = applied_history
+            .iter()
+            .map(|(v, _, _)| *v)
+            .max()
+            .unwrap_or(0);
 
-    // Compatibility: refuse a store newer than we support (spec 13 §3).
-    if store_version > binary_max {
-        return Err(MigrationError::IncompatibleStore {
-            store_version,
-            binary_max_version: binary_max,
-        });
-    }
+        // Compatibility: refuse a store newer than we support (spec 13 §3).
+        if store_version > binary_max {
+            return Err(MigrationError::IncompatibleStore {
+                store_version,
+                binary_max_version: binary_max,
+            });
+        }
 
-    // Drift / history: every already-applied version must exist in our set with
-    // a matching checksum (forward-only migrations are immutable once shipped).
-    for (version, name, found) in &applied_history {
-        match migrations.iter().find(|m| m.version == *version) {
-            Some(m) => {
-                let expected = m.checksum();
-                if expected != *found {
-                    return Err(MigrationError::ChecksumDrift {
-                        version: *version,
-                        name: name.clone(),
-                        expected,
-                        found: found.clone(),
-                    });
+        // Drift / history: every already-applied version must exist in our set
+        // with a matching checksum (forward-only migrations are immutable once
+        // shipped).
+        for (version, name, found) in &applied_history {
+            match migrations.iter().find(|m| m.version == *version) {
+                Some(m) => {
+                    let expected = m.checksum();
+                    if expected != *found {
+                        return Err(MigrationError::ChecksumDrift {
+                            version: *version,
+                            name: name.clone(),
+                            expected,
+                            found: found.clone(),
+                        });
+                    }
+                }
+                None => {
+                    return Err(MigrationError::UnknownAppliedVersion { version: *version });
                 }
             }
-            None => {
-                return Err(MigrationError::UnknownAppliedVersion { version: *version });
+        }
+
+        // `<root>/backups` — siblings of the lock/state files (used only by
+        // destructive migrations, created on demand).
+        let backups_dir = lock_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("backups");
+
+        // Apply pending migrations, ascending.
+        let mut applied = Vec::new();
+        for m in migrations.iter().filter(|m| m.version > store_version) {
+            if m.is_simple() {
+                apply_simple(conn, m, now_ms)?;
+            } else {
+                apply_complex(conn, m, &backups_dir, now_ms)?;
             }
+            applied.push(m.version);
         }
-    }
 
-    // `<root>/backups` — siblings of the lock/state files (used only by
-    // destructive migrations, created on demand).
-    let backups_dir = lock_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("backups");
-
-    // Apply pending migrations, ascending.
-    let mut applied = Vec::new();
-    for m in migrations.iter().filter(|m| m.version > store_version) {
-        if m.is_simple() {
-            apply_simple(conn, m, now_ms)?;
-        } else {
-            apply_complex(conn, m, &backups_dir, now_ms)?;
-        }
-        applied.push(m.version);
-    }
-
-    Ok(MigrationReport {
-        applied,
-        store_version: binary_max,
+        Ok(MigrationReport {
+            applied,
+            store_version: binary_max,
+        })
     })
 }
 

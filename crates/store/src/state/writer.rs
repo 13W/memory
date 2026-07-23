@@ -71,7 +71,11 @@ impl StateWriter {
                 // `blocking_recv` parks the OS thread (no runtime needed) until a
                 // job arrives; returns `None` once every sender is dropped.
                 while let Some(job) = receiver.blocking_recv() {
-                    job(&mut conn);
+                    // spec 02 §5: "L4 queues are leaves" — mark this thread as
+                    // already holding the hierarchy's topmost rank for the
+                    // job's duration, so any lock acquisition attempted from
+                    // inside `job` fails the strict-order check.
+                    crate::lock::checked_scope_sync(crate::lock::LockLevel::L4a, || job(&mut conn));
                 }
                 // Queue closed → drop the owned connection. Any in-flight
                 // transaction already committed or rolled back per job.
@@ -110,19 +114,22 @@ impl StateWriter {
         F: FnOnce(&Transaction<'_>) -> rusqlite::Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        let (resp_tx, resp_rx) = oneshot::channel::<Result<R, WriteError>>();
-        let job: Job = Box::new(move |conn: &mut Connection| {
-            let outcome = run_transaction(conn, f);
-            // The caller may have been cancelled (dropped `resp_rx`); ignore.
-            let _ = resp_tx.send(outcome);
-        });
-        // Backpressure point: pends while the bounded queue is full.
-        self.sender
-            .send(job)
-            .await
-            .map_err(|_| WriteError::WriterGone)?;
-        // Writer dropped the reply channel without sending → thread ended.
-        resp_rx.await.unwrap_or(Err(WriteError::WriterGone))
+        crate::lock::checked_scope_async(crate::lock::LockLevel::L4a, async move {
+            let (resp_tx, resp_rx) = oneshot::channel::<Result<R, WriteError>>();
+            let job: Job = Box::new(move |conn: &mut Connection| {
+                let outcome = run_transaction(conn, f);
+                // The caller may have been cancelled (dropped `resp_rx`); ignore.
+                let _ = resp_tx.send(outcome);
+            });
+            // Backpressure point: pends while the bounded queue is full.
+            self.sender
+                .send(job)
+                .await
+                .map_err(|_| WriteError::WriterGone)?;
+            // Writer dropped the reply channel without sending → thread ended.
+            resp_rx.await.unwrap_or(Err(WriteError::WriterGone))
+        })
+        .await
     }
 }
 
