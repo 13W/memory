@@ -47,16 +47,35 @@
 //!   from scratch against the **active** tuple (never the diff-based fast path
 //!   `switch` uses), through the same [`switch::VectorSource`] seam.
 //!
+//! T09-02 adds the **ref-counted shard LRU manager** ([`manager`], spec 02 §5
+//! L3, 05 §2/§8): [`manager::ShardManager`] sits in front of
+//! [`ProjectionStore::open`], bounding concurrently open shards
+//! (`max_open_shards`) behind a mutex held only for the map lookup/insert/
+//! evict step (spec 02 §5's L3 row, realized via `LockLevel::L3`/
+//! `checked_scope_sync`, T09-01), returning ref-counted `Arc<dyn ShardHandle>`
+//! handles, and routing every actual physical open/reopen through
+//! [`open_and_validate`] so a corrupt or evicted-then-reopened shard
+//! self-heals. Single-flight (`tokio::sync::OnceCell`) collapses concurrent
+//! `acquire`s of the same worktree into one physical open; a background
+//! rebuild spawned per fill (throttled to one at a time store-wide) can be
+//! cancelled by [`manager::ShardManager::remove`], safe by construction
+//! because `rebuild`'s three transactions are each independently committed
+//! (T09-01's finding that `state.sqlite` writes physically run on a
+//! dedicated OS thread is what makes cooperative task cancellation leave no
+//! torn write). See the module's own docs for the full design and its
+//! deliberately deferred scope (dormant-model-space migration, T11-01;
+//! adoption into `switch`/reconcile/search, T09-03/T09-04/group 12/15).
+//!
 //! Deliberately **not** here (owning cards): the F1–F12 fault matrix itself
-//! (T07-05); the real per-worktree write lock (T09-01); the
-//! representation/model-space registry and the real `embedding_cache`
-//! (T11-01/T11-02). No real dense backend or dense/model SDK is coupled before
-//! T10.
+//! (T07-05); the representation/model-space registry and the real
+//! `embedding_cache` (T11-01/T11-02). No real dense backend or dense/model
+//! SDK is coupled before T10.
 
 pub mod contract;
 pub mod expected;
 pub mod fake;
 pub mod identity;
+pub mod manager;
 pub mod rebuild;
 pub mod switch;
 pub mod validate;
@@ -71,6 +90,7 @@ pub use expected::{
 };
 pub use fake::{FakeProjectionStore, FakeShard};
 pub use identity::{head, manifest_hash, projection_point_id};
+pub use manager::{AcquireError, ShardManager};
 pub use rebuild::{
     OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome,
     open_and_validate,

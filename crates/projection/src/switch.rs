@@ -57,6 +57,13 @@ use crate::identity::head;
 /// into; it has deliberately no "compute/embed" method, so the switch itself can
 /// never trigger re-embedding — it only ever reads what it is given, and only
 /// for points not already present in the shard (see [`switch`]).
+///
+/// Every call site below takes `&(dyn VectorSource + Send + Sync)`, not a bare
+/// `&dyn VectorSource` — the trait itself carries no supertrait bound, matching
+/// [`local_rag_core::identity::UuidSource`]'s own usage-site-only tightening
+/// (T05-03): `open_and_validate`'s fill (T09-02, `crates/projection::manager`)
+/// holds this reference across an `.await` inside a `tokio::spawn`ed task, which
+/// requires `Send`, which for a `&T` reference requires `T: Sync`.
 pub trait VectorSource {
     /// The vector for `occurrence_id`'s `kind`, or `None` if it is not (yet)
     /// available. Spec 05 §5 step 0's precondition means this should not happen
@@ -345,7 +352,7 @@ pub async fn switch(
     worktree_id: Uuid,
     target_generation_id: Uuid,
     target_model_space_id: Uuid,
-    vectors: &dyn VectorSource,
+    vectors: &(dyn VectorSource + Send + Sync),
     uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
 ) -> Result<SwitchOutcome, SwitchError> {
