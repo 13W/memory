@@ -95,6 +95,30 @@ fn run_ci() -> ExitCode {
             "warnings",
         ],
         &["test", "-p", "local-rag-search", "--features", "failpoints"],
+        // The dense-backend spike (T10-01) is a SEPARATE workspace with its own
+        // Cargo.lock (`spike/`, `exclude`d from the root — CONTRIBUTING.md §
+        // Workspace layout), so `test --workspace` above never reaches it. Run its
+        // fmt/lint/tests explicitly by `--manifest-path` so the harness and its
+        // acceptance tests stay gated. Keeping it a distinct lockfile is what makes
+        // the "no dense SDK in the product lock" guardrail structural (its future
+        // usearch/Qdrant candidates never enter the root lock).
+        &[
+            "fmt",
+            "--manifest-path",
+            "spike/Cargo.toml",
+            "--all",
+            "--check",
+        ],
+        &[
+            "clippy",
+            "--manifest-path",
+            "spike/Cargo.toml",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &["test", "--manifest-path", "spike/Cargo.toml"],
     ];
 
     let cargo = env!("CARGO");

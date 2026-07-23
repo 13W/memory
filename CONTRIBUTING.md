@@ -98,6 +98,17 @@ rewritten.
   unconditional dev-dependency there, used for `TempHome`). `cargo xtask ci`
   runs each of those crates once more with `--features failpoints` to lint
   and exercise those code paths.
+- Isolated dev workspace `spike/` (T10-01): a **separate** Cargo workspace with
+  its **own `Cargo.lock`**, `exclude`d from the root `[workspace]`. It holds the
+  roadmap-step-11 dense-backend spike harness (open question O1) and, at
+  T10-02/03/04, the candidate adapters (brute-force / `usearch` / Qdrant Edge)
+  that pull real dense-vector crates. Keeping those in the spike's lockfile is
+  what makes the "no dense SDK in the product workspace before T10" rule above a
+  *structural* fact rather than a review promise — the product `Cargo.lock` never
+  resolves them. `cargo xtask ci` runs the spike's `fmt`/`clippy`/`test` by
+  `--manifest-path spike/Cargo.toml` (root `cargo test --workspace` does not reach
+  an excluded sub-workspace). The winning backend is promoted into the product
+  workspace at T12-02. Never distributed.
 
 ## Committing
 
