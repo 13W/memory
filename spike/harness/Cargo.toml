@@ -17,6 +17,17 @@ local-rag-projection = { path = "../../crates/projection" }
 # are already approved in the product workspace, so no new crate family enters here.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# T10-03: the second real dense-backend spike candidate (open question O1).
+# Apache-2.0, same as this project's other approved dependencies. Default
+# features stay on (pulls the `numkong` SIMD-kernel crate, also Apache-2.0,
+# same author/org) so the measured warm-search p95 reflects a realistic
+# configuration, not an artificially unaccelerated build. Compiles its C++
+# core via `cxx-build`/`cc` (verified locally: a C++17 toolchain is present) —
+# this is the first spike dependency needing a native compiler; `fake`/
+# `brute-force` needed none. Deliberately confined to THIS lockfile
+# (`spike/Cargo.lock`), never the product workspace's — see this crate's own
+# header comment and CONTRIBUTING.md § Dependency policy.
+usearch = "2.26"
 
 [lints]
 workspace = true
