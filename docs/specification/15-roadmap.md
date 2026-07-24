@@ -59,7 +59,7 @@ multiple generators; cross-generation matching; LSP graph; multi-harness; FreeBS
 
 | # | Question | Resolved by | Blocks |
 | --- | --- | --- | --- |
-| O1 | Dense backend (Qdrant Edge / usearch / brute-force) | step-11 spike | steps 12+ dense specifics only |
+| O1 | Dense backend (Qdrant Edge / usearch / brute-force) | **RESOLVED — ADR-0003 (T10-05): brute-force** | steps 12+ dense specifics only |
 | O2 | Gate numbers (quality/latency/resources; memory router P/R) | baseline runs | release criteria only |
 | O3 | Default embedding model + weights delivery; local generator crate | model evaluation + 10 §5 | init UX, router quality |
 | O4 | First-release language set | **RESOLVED — ADR-0001 (T04-01): TypeScript, JavaScript, Rust** | parser scope |

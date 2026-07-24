@@ -10,7 +10,8 @@ proof is re-established at every open.
 ## 1. `ProjectionStore` trait `[FIXED abstraction, signatures [SPEC]]`
 
 ```rust
-/// One dense shard = one worktree. Backend chosen at roadmap step 11 [OPEN].
+/// One dense shard = one worktree. Backend: brute-force linear scan over
+/// `embedding_cache` (ADR-0003, T10-05, closes O1).
 pub trait ProjectionStore: Send + Sync {
     /// Open (or create) the shard directory. MUST be cheap enough to run
     /// validate-on-open on every open. Never trusts on-disk state.
@@ -43,10 +44,27 @@ pub struct ProjectionHead {
 }
 ```
 
-Candidate backends for the step-11 spike: `qdrant-edge`, `usearch`, brute-force over
-`embedding_cache` `[OPEN]`. Per-worktree shard semantics hold for **any** backend `[FIXED]`.
-Filtered-HNSW is off the critical path (no tenant filter, no generation filter inside a shard)
-but is included in the spike matrix `[FIXED]`.
+Candidate backends evaluated by the step-11 spike: `qdrant-edge`, `usearch`, brute-force over
+`embedding_cache`. **Resolved (T10-05, ADR-0003): brute-force.** Per-worktree shard semantics
+hold for **any** backend `[FIXED]`. Filtered-HNSW is off the critical path (no tenant filter, no
+generation filter inside a shard) but is included in the spike matrix `[FIXED]`.
+
+As-built note (T10-05, `[SPEC]`, closes O1): brute-force linear scan is the v0 dense backend —
+[ADR-0003](../adr/0003-dense-backend-selection.md) has the full comparison. Decisive factors: it
+is the only candidate with zero new dependencies, recall that is exact by construction at any
+scale (no tuning-vs-recall tradeoff, unlike usearch's measured recall collapse from 0.98 @544
+points to 0.09 @50,000 on this spike's synthetic corpus), sub-millisecond `open`/`close`/
+`registry_startup` at every scale tested (this section's own "cheap enough for every open"
+requirement — Qdrant Edge measured 68–75 ms `open_ms` and 573–624 ms `registry_startup_ms`, two to
+four orders of magnitude worse), a clean corruption-detection story with no special-case blind
+spots (unlike Qdrant Edge, whose vendored 0.7.2 crate panics — an uncaught `Result`-bypassing
+panic, not a catchable error — on a corrupted structural id-tracker file), and no native-toolchain
+requirement at all (both real ANN candidates failed win32 build-smoke in-sandbox; brute-force is
+pure `std`). `usearch`'s recall risk is explicitly **not** proven irrelevant to real embeddings
+(synthetic i.i.d. vectors lack the cluster structure real code/text embeddings have) — it is
+simply unquantified until T11 exists, and was not worth betting the v0 backend on. `optimize()`
+is a documented no-op for this backend (§9's as-built note) — a flat array has no segment structure
+to compact. T12-02 integrates this candidate's design into the product workspace.
 
 As-built note (T10-02, `[SPEC]`): the brute-force spike candidate
 (`spike/harness/src/brute_force.rs`, isolated from the product's pre-T10
@@ -340,8 +358,13 @@ the manager, not store-wide.
 ## 9. `optimize` policy `[FIXED]`
 
 Triggered by metrics only — deleted/stale ratio, segment count, disk amplification, idle time,
-max query-latency impact — never "after every reconcile". Thresholds are backend-specific
-outputs of the step-11 spike `[OPEN]`.
+max query-latency impact — never "after every reconcile". Thresholds are backend-specific.
+
+As-built note (T10-05, `[SPEC]`, closes O1's `optimize`-threshold half): the chosen v0 backend
+(brute-force, ADR-0003) needs **no thresholds at all** — its `optimize()` is a documented no-op,
+since a wholesale-rewritten flat array has no segment/graph structure whose fragmentation could
+accrue. Recorded explicitly rather than left silently unresolved (O2: never invent a threshold
+that isn't needed).
 
 ## 10. Fault-detection matrix `[FIXED]`
 

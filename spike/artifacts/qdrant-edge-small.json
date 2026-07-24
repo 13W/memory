@@ -1,0 +1,57 @@
+{
+  "report_schema_version": 1,
+  "adapter": "qdrant-edge",
+  "dataset": {
+    "name": "small",
+    "dims": 768,
+    "points": 544,
+    "queries": 49,
+    "seed": 42
+  },
+  "platform": {
+    "target": "aarch64-macos",
+    "supported": true,
+    "reason": null
+  },
+  "metrics": {
+    "warm_search_p95_ms": 0.094917,
+    "ram_bytes_per_shard": null,
+    "open_ms": 75.31475,
+    "close_ms": 21.20225,
+    "registry_startup_ms": 624.307292,
+    "lru": null,
+    "durability": "validate-on-open: NOT detected — corruption left the manifest matching — a silently wrong index",
+    "filtered_hnsw_available": true,
+    "recall_at_k": 1.0
+  },
+  "conformance": {
+    "all_passed": false,
+    "cases": [
+      {
+        "name": "reopen_preserves_points_and_head",
+        "passed": true,
+        "detail": "544 points and head survived a reopen"
+      },
+      {
+        "name": "empty_shard_head_is_none_not_error",
+        "passed": true,
+        "detail": "a shard with no head reads back as a clean None"
+      },
+      {
+        "name": "head_manifest_matches_recomputed",
+        "passed": true,
+        "detail": "head manifest matches the value recomputed from actual point_ids"
+      },
+      {
+        "name": "manifest_detects_equal_count_different_set",
+        "passed": true,
+        "detail": "a same-count, different-set manifest hashes differently"
+      },
+      {
+        "name": "on_disk_corruption_is_detected",
+        "passed": false,
+        "detail": "corruption left the manifest matching — a silently wrong index"
+      }
+    ]
+  }
+}
