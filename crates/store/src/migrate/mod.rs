@@ -153,15 +153,18 @@ impl Migration {
 /// `worktree_projection_state` plus the default model-space seed
 /// (`registry::SCHEMA_V4`); version 5 (D-007) adds `worktree.state_changed_at`,
 /// the clock spec 05 §8's shard grace period is measured from
-/// (`registry::SCHEMA_V5`). Each checksum is frozen once shipped (see
-/// [`Migration::checksum`]); later schema changes are new entries here, never
-/// edits to an applied one.
+/// (`registry::SCHEMA_V5`); version 6 (T11-01) is the representation registry —
+/// `representation` and `model_space_representation`, the canonical six-field
+/// `RepresentationKey` (`registry::SCHEMA_V6`). Each checksum is frozen once
+/// shipped (see [`Migration::checksum`]); later schema changes are new entries
+/// here, never edits to an applied one.
 pub const ALL: &[Migration] = &[
     Migration::sql(1, "registry", crate::registry::SCHEMA_V1),
     Migration::sql(2, "worktree", crate::registry::SCHEMA_V2),
     Migration::sql(3, "code", crate::code::SCHEMA_V3),
     Migration::sql(4, "projection", crate::registry::SCHEMA_V4),
     Migration::sql(5, "worktree_state_clock", crate::registry::SCHEMA_V5),
+    Migration::sql(6, "representation", crate::registry::SCHEMA_V6),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

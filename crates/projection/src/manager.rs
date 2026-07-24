@@ -75,8 +75,10 @@
 //! does not exist yet, deferred by D-004 to "group 07/09 shard lifecycle" in
 //! general, not this specific task). Also explicitly deferred, "seam in
 //! place, not silently closed": the dormant-worktree model migration (spec 05
-//! §8 `[FIXED]` — needs the real model-space registry, T11-01); and adopting
-//! this manager into [`crate::switch::switch`] (T11-05, group 11) or the
+//! §8 `[FIXED]` — the real model-space registry it needs now exists,
+//! `local_rag_store::registry::representation`, T11-01, but wiring the
+//! migration itself is T11-05's); and adopting this manager into
+//! [`crate::switch::switch`] (T11-05, group 11) or the
 //! reconcile driver (no dedicated task yet in the current plan) — until then,
 //! those direct `store.open()` call sites still race with this manager's own
 //! cache exactly as they did before this task (the fake backend's documented

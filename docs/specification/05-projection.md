@@ -185,10 +185,14 @@ mechanics are realized concretely, all pre-scoped to later, already-planned grou
 deviations:
 
 - **§4's "every required representation kind of the model space"** is
-  `expected::REQUIRED_REPRESENTATION_KINDS`, a hardcoded `{code_raw, code_context}` pair — the real
-  per-model-space registry (`representation`/`model_space_representation`) is T11-01, and until it
-  ships v0 has exactly one seeded model space whose required set already *is* this pair (this
-  section's own parenthetical excludes `structural_description` pre-v0).
+  `expected::REQUIRED_REPRESENTATION_KINDS`, a hardcoded `{code_raw, code_context}` pair. The real
+  per-model-space registry (`representation`/`model_space_representation`, the canonical six-field
+  `RepresentationKey`, the `model_space` build-state machine, and the coverage data model) now exists
+  (`local_rag_store::registry::representation`, T11-01) — but `expected_point_ids` does not yet join
+  against it: today there is exactly one (T07-02-seeded) model space whose required set already *is*
+  this pair (this section's own parenthetical excludes `structural_description` pre-v0), and wiring
+  the lookup needs a working multi-model-space switch to actually exercise, which is T11-05's card
+  ("production model-axis uses standard projection switch") — named explicitly, not a silent gap.
 - **Step 1's "vectors come from `embedding_cache`"** is realized through a new
   `switch::VectorSource` seam — `vector(occurrence_id, representation_kind) -> Option<Vec<f32>>` —
   standing in for the not-yet-built `embedding_cache` (T11-02). It has no "compute/embed" method, so
@@ -211,6 +215,22 @@ the outgoing generation `→ Retiring`) with the pure `GenerationState::check_tr
 write in the commit transaction, so a rejected commit (e.g. an unready target) leaves the
 transaction untouched rather than partially applying the projection-state row without the
 generation moves, or vice versa.
+
+As-built note (T11-01, `[SPEC]`): the representation/model-space registry named above as a T07-03
+gap is now `local_rag_store::registry::representation` (migration 6, `SCHEMA_V6`) —
+`representation`/`model_space_representation` (spec 03 §2.2), a fresh crate-local
+`RepresentationKind` (`local-rag-store` has no dependency on `local-rag-projection`, so this is not
+the same Rust type as `crate::contract::RepresentationKind` above), the `ModelSpaceState` build
+machine (spec 04 §3, identical transition shape to `GenerationState`), and the `Coverage` advisory
+data model (`CoverageEntry{expected,ready,failed}` per required kind, `recompute_coverage` pure over
+caller-supplied counts, `Coverage::fully_covered` gating `transition_model_space`'s
+`building → projection_ready` edge). `model_space` itself and its seeded default row already existed
+(`SCHEMA_V4`, T07-02); this task added only the missing transition guard over it. Real per-subject
+coverage counting (walking occurrences/memory entries and `embedding_cache`) is T11-04's "resumable
+coverage backfill" card — this registry provides the shape and the completeness gate only. This task
+did **not** wire `expected::REQUIRED_REPRESENTATION_KINDS` or `switch::VectorSource` to the new
+registry (see the bullet above) — that stays T11-05's, once a real multi-model-space switch exists to
+exercise it.
 
 ## 6. Validate-on-open `[FIXED]`
 

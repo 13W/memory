@@ -38,6 +38,14 @@ unicode-normalization = "0.1"
 # Already in Cargo.lock via local-rag-core (0 new external sources). See
 # CONTRIBUTING allowlist.
 casefold = "0.1"
+# `model_space.coverage` advisory JSON (spec 03 §2.2, 10 §3, T11-01): a small,
+# fixed-shape map (representation kind -> {expected,ready,failed}). Hand-rolling
+# a JSON encoder/decoder for a nested map is disproportionate and error-prone
+# next to a well-audited, ubiquitous crate; `derive` types `CoverageEntry`
+# directly. Already in the workspace's dependency graph via `local-rag-core`
+# (`serde` with `derive`), so only `serde_json` itself is new to the lockfile.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Optional, dev-only path crate (0 external sources): enabled ONLY by the
 # `failpoints` feature so the migration runner can host named crash-injection
 # points for hard-kill (SIGABRT) resume tests. Never enabled in release/dist.

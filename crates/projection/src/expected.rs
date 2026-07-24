@@ -11,15 +11,19 @@
 //! every required representation kind of the model space that applies to code
 //! (`code_raw`, `code_context`; `structural_description` only when descriptions
 //! are enabled post-v0)". The real per-model-space registry —
-//! `representation`/`model_space_representation`, the canonical RepresentationKey,
-//! and required-coverage recomputation — is **T11-01** and does not exist yet
-//! (T07-02 seeded only one seam-only `model_space` row). `structural_description`
-//! is excluded from v0 by the spec's own parenthetical (descriptions are
-//! post-v0), and until T11-01 ships there is exactly one (seeded default) model
-//! space whose required set *is* `{code_raw, code_context}` — so
-//! [`REQUIRED_REPRESENTATION_KINDS`] hardcodes that pair rather than joining
-//! against a registry that isn't built yet. This is not a narrowing of the spec
-//! for v0; T11-01 replaces the constant with a real per-model-space lookup.
+//! `representation`/`model_space_representation`, the canonical
+//! `RepresentationKey`, and required-coverage recomputation — now exists
+//! (`local_rag_store::registry::representation`, **T11-01**), but this
+//! function does not yet join against it: `structural_description` is excluded
+//! from v0 by the spec's own parenthetical (descriptions are post-v0), and
+//! today there is exactly one (T07-02-seeded default) model space whose
+//! required set *is* `{code_raw, code_context}` — so
+//! [`REQUIRED_REPRESENTATION_KINDS`] still hardcodes that pair rather than
+//! joining against `model_space_representation`. This is not a narrowing of
+//! the spec for v0; wiring this lookup to the real registry needs a working
+//! multi-model-space switch to actually exercise, which is **T11-05**'s card
+//! ("production model-axis uses standard projection switch") — not bundled
+//! into T11-01, whose own card scopes only the registry itself.
 use local_rag_core::identity::Uuid;
 use local_rag_store::rusqlite::{self, Connection};
 

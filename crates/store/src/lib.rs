@@ -97,10 +97,20 @@
 //! `check_transition`, the pure two-axis `check_invariants` truth table
 //! (`clean ⇒ active == projected ∧ target NULL`; `updating ⇒ target ∧ op_id set`;
 //! only one axis moves per switch, spec 04 §8/05 §5 `[FIXED]`), and the guarded
-//! `write_projection_state` (read-then-write, no mutation on rejection). The
-//! representation registry (`representation`/`model_space_representation`, the
-//! canonical RepresentationKey, coverage, and the model-space build machine) is
-//! T11-01; validate-on-open/rebuild is T07-04.
+//! `write_projection_state` (read-then-write, no mutation on rejection).
+//! Validate-on-open/rebuild is T07-04.
+//!
+//! T11-01 adds the **representation registry** ([`registry::representation`],
+//! version-6 `SCHEMA_V6`): the `representation`/`model_space_representation`
+//! tables (spec 03 §2.2), the canonical six-field [`RepresentationKey`], and the
+//! `model_space` build-state machine ([`ModelSpaceState`], spec 04 §3) over the
+//! `model_space` table `SCHEMA_V4` already created. [`Coverage`]/
+//! [`recompute_coverage`] are the advisory-coverage data model and completeness
+//! gate ([`transition_model_space`] requires full coverage before
+//! `building → projection_ready`); real per-subject coverage counting against
+//! occurrences/`embedding_cache` is T11-04. Wiring `crates/projection`'s
+//! `expected::REQUIRED_REPRESENTATION_KINDS` placeholder to this registry is
+//! T11-05, once a working multi-model-space switch needs it.
 //!
 //! T07-03 adds the one store-side reader the projection switch needs
 //! ([`code::occurrence_ids_for_generation`]): every `occurrence_id` recorded for
@@ -224,6 +234,13 @@ pub use registry::{
     resolve, set_current_generation, set_repo_data_policy, set_repo_setting, transition_generation,
     transition_worktree_state, worktree_path_history, worktree_state, worktree_state_clocks,
     worktree_summary, worktrees_of_repo,
+};
+pub use registry::{
+    Coverage, CoverageEntry, DistanceMetric, IllegalModelSpaceTransition, ModelSpaceState,
+    ModelSpaceTransitionError, RepresentationKey, RepresentationKind, create_model_space,
+    eligible_as_target, model_space_required_kinds, model_space_state, recompute_coverage,
+    register_representation, representation_key, set_model_space_representation,
+    transition_model_space, write_model_space_coverage,
 };
 pub use registry::{
     DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,
