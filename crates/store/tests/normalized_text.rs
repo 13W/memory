@@ -120,8 +120,8 @@ fn regenerate_from_source(state: &StateDb, file_revision_id: &str) -> DerivedCon
 #[tokio::test]
 async fn normalized_text_cache_table_exists_after_open() {
     assert_eq!(
-        CACHE_SCHEMA_VERSION, 3,
-        "T08-01 bumps the cache schema further"
+        CACHE_SCHEMA_VERSION, 4,
+        "T08-01 bumps the cache schema further; T11-02 bumps it again"
     );
     let (_home, _state, cache) = open_both();
     // get_row panics if the table is missing; None here proves it exists & is empty.

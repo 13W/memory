@@ -180,6 +180,7 @@ pub use rusqlite;
 mod cache;
 mod clock;
 pub mod code;
+pub mod eviction;
 pub mod housekeeping;
 pub mod lock;
 pub mod migrate;
@@ -188,15 +189,19 @@ pub mod retention;
 mod state;
 
 pub use cache::{
-    BatchingLastUsed, CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError, CacheOpenOutcome,
-    CacheWriteError, CacheWriter, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability,
+    BatchingLastUsed, BatchingLastUsedEmbeddings, CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError,
+    CacheOpenOutcome, CacheWriteError, CacheWriter, EmbeddingCacheMeta, EmbeddingCacheRow,
+    EmbeddingDivergence, EmbeddingKey, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability,
     FtsDivergence, FtsMaterializeError, FtsMaterializeOutcome, FtsOpenOutcome,
-    FtsProjectionHeadRow, FtsRebuildError, LEXICAL_SCHEMA_VERSION, LastUsedSink, NormalizedTextRow,
-    TOKENIZER_VERSION, ValidationDepth, delete_normalized_text, flush_last_used,
-    fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash, get_normalized_text,
-    insert_normalized_text, materialize_fts, open_and_validate_fts, read_fts_projection_head,
-    requires_index_unavailable, should_rebuild_synchronously, tokenize_identifier, tokenize_path,
-    tokenize_qualified_name, tokenize_signature, validate_fts_cheap, validate_fts_strong,
+    FtsProjectionHeadRow, FtsRebuildError, LEXICAL_SCHEMA_VERSION, LastUsedSink,
+    LastUsedSinkEmbedding, NormalizedTextRow, SubjectKind, TOKENIZER_VERSION, ValidationDepth,
+    VectorLengthError, all_embedding_meta, decode_vector_le, delete_embedding,
+    delete_normalized_text, encode_vector_le, flush_last_used, flush_last_used_embeddings,
+    fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash, get_embedding,
+    get_normalized_text, insert_embedding, insert_normalized_text, materialize_fts,
+    open_and_validate_fts, read_fts_projection_head, requires_index_unavailable,
+    should_rebuild_synchronously, tokenize_identifier, tokenize_path, tokenize_qualified_name,
+    tokenize_signature, validate_fts_cheap, validate_fts_strong, verify_cached_embedding,
     verify_cached_text,
 };
 pub use code::{
@@ -204,15 +209,19 @@ pub use code::{
     NORMALIZATION_VERSION, NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit,
     NewResolvedEdge, NewUnresolvedReference, NewlineStyle, ParsedUnitOutcome, PreparedSource,
     RevisionOutcome, SOURCE_ENCODING_UTF8, SOURCE_ZSTD_LEVEL, SkipReason, SourceCompression,
-    UnitKind, content_blob_exists, content_blob_id, content_hash, create_or_reuse_content_blob,
-    create_or_reuse_file_revision, create_or_reuse_parsed_unit, decode_source,
-    delete_unresolved_references_for_revision, derive_content_blob, detect_encoding,
+    UnitKind, content_blob_exists, content_blob_id, content_blob_ids_for_generation, content_hash,
+    create_or_reuse_content_blob, create_or_reuse_file_revision, create_or_reuse_parsed_unit,
+    decode_source, delete_unresolved_references_for_revision, derive_content_blob, detect_encoding,
     detect_newline_style, file_revision_id_by_content_key, insert_content_blob,
     insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
     insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
     normalize, occurrence_count_for_generation, occurrence_id, occurrence_ids_for_generation,
     occurrences_for_fts, parsed_unit_id_by_natural_key, parsed_units_for_revision, prepare_source,
     skip_reason, source_bytes,
+};
+pub use eviction::{
+    EVICTION_BATCH_ROWS, EvictionError, EvictionParams, EvictionReport, rows_to_evict,
+    run_embedding_cache_eviction, store_wide_embedding_pins,
 };
 pub use housekeeping::{
     HousekeepingError, SHARD_DESTROY_GRACE_MS, ShardSweepReport, expired_shard_ids,
@@ -238,9 +247,9 @@ pub use registry::{
 pub use registry::{
     Coverage, CoverageEntry, DistanceMetric, IllegalModelSpaceTransition, ModelSpaceState,
     ModelSpaceTransitionError, RepresentationKey, RepresentationKind, create_model_space,
-    eligible_as_target, model_space_required_kinds, model_space_state, recompute_coverage,
-    register_representation, representation_key, set_model_space_representation,
-    transition_model_space, write_model_space_coverage,
+    eligible_as_target, model_space_required_kinds, model_space_required_representation_ids,
+    model_space_state, recompute_coverage, register_representation, representation_key,
+    set_model_space_representation, transition_model_space, write_model_space_coverage,
 };
 pub use registry::{
     DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,

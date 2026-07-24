@@ -15,11 +15,14 @@
 //!
 //! Per-worktree FTS *validity* (§4.4 step 3 — is the head fresh for the active
 //! generation) and per-row `embedding_cache` checksums (step 4) are checked
-//! lazily elsewhere, not here. This build creates `cache_meta`,
-//! `normalized_text_cache` (spec 03 §4.2, T03-04), and — as of T08-01 —
-//! `fts_doc`/`fts_occurrences`/`fts_projection_head` (spec 03 §4.3): the schema
-//! only, always empty until the generation materializer (T08-02) populates it.
-//! The `embedding_cache` table remains T11. Adding a table means bumping
+//! lazily elsewhere, not here — [`super::embedding::verify_cached_embedding`]
+//! (T11-02) is the per-row check step 4 names; cache-open only creates the
+//! table, it never validates its rows. This build creates `cache_meta`,
+//! `normalized_text_cache` (spec 03 §4.2, T03-04), `fts_doc`/`fts_occurrences`/
+//! `fts_projection_head` (spec 03 §4.3, T08-01), and — as of T11-02 —
+//! `embedding_cache` (spec 03 §4.2): the schema only; the generation
+//! materializer (T08-02) and the (not-yet-built, T11-03) embedder populate
+//! their respective tables. Adding a table means bumping
 //! [`CACHE_SCHEMA_VERSION`] so an older cache is auto-rebuilt (§4.4 step 2).
 
 use std::fmt;
@@ -42,7 +45,8 @@ const BUSY_TIMEOUT_MS: u64 = 5000;
 /// - `1`: `cache_meta` only (T01-05).
 /// - `2`: adds `normalized_text_cache` (T03-04).
 /// - `3`: adds `fts_doc`, `fts_occurrences` (FTS5), `fts_projection_head` (T08-01).
-pub const CACHE_SCHEMA_VERSION: u32 = 3;
+/// - `4`: adds `embedding_cache` (T11-02).
+pub const CACHE_SCHEMA_VERSION: u32 = 4;
 
 /// The `cache_meta` binding table (spec 03 §4.1). Created on every (re)build.
 const CACHE_META_DDL: &str = "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
@@ -105,6 +109,34 @@ CREATE TABLE fts_projection_head (
   manifest_hash          TEXT NOT NULL,
   updated_at             INTEGER NOT NULL
 );";
+
+/// `embedding_cache` (spec 03 §4.2, T11-02). `subject_hash` is domain-separated
+/// per `subject_kind` ([`super::embedding::SubjectKind`], spec 03 §1.2);
+/// `representation_id` is a **logical** FK (`state.representation`, a different
+/// database — never a real SQLite `FOREIGN KEY`, since `foreign_keys=OFF` here
+/// and there is no writable cross-DB `ATTACH`, spec 03 §1.4). `WITHOUT ROWID` is
+/// intentional: the composite primary key is already unique and total-order
+/// comparable, so a shadow rowid would be pure overhead. There is no checksum
+/// column on `normalized_text_cache`'s pattern here — unlike that table, this
+/// row's primary key (`subject_hash`) is derived from the *subject*, never from
+/// `vector_f32`, so a bit-flip in the vector bytes would be undetectable by
+/// re-deriving the key; `checksum` (`H` over the stored little-endian vector
+/// bytes) is the integrity check instead, verified lazily on read
+/// ([`super::embedding::verify_cached_embedding`]).
+const EMBEDDING_CACHE_DDL: &str = "\
+CREATE TABLE embedding_cache (
+  subject_kind       TEXT NOT NULL CHECK
+    (subject_kind IN ('content_blob','occurrence_context','memory_entry')),
+  subject_hash       TEXT NOT NULL,
+  representation_id  TEXT NOT NULL,
+  dimensions         INTEGER NOT NULL,
+  vector_f32         BLOB NOT NULL,
+  byte_size          INTEGER NOT NULL,
+  checksum           TEXT NOT NULL,
+  created_at         INTEGER NOT NULL,
+  last_used_at       INTEGER NOT NULL,
+  PRIMARY KEY (subject_kind, subject_hash, representation_id)
+) WITHOUT ROWID;";
 
 /// An error opening, validating, or rebuilding a `cache.sqlite` connection.
 #[derive(Debug)]
@@ -315,9 +347,9 @@ fn read_binding(conn: &Connection) -> Option<(String, u32)> {
 }
 
 /// Create the cache schema (`cache_meta`, `normalized_text_cache`, `fts_doc`,
-/// `fts_occurrences`, `fts_projection_head`) and seed the binding rows in one
-/// transaction (all-or-nothing: a crash before commit leaves the fresh file
-/// unbound, so the next open rebuilds it).
+/// `fts_occurrences`, `fts_projection_head`, `embedding_cache`) and seed the
+/// binding rows in one transaction (all-or-nothing: a crash before commit
+/// leaves the fresh file unbound, so the next open rebuilds it).
 fn seed_binding(
     conn: &mut Connection,
     store_instance_uuid: &str,
@@ -329,6 +361,7 @@ fn seed_binding(
     tx.execute_batch(FTS_DOC_DDL)?;
     tx.execute_batch(FTS_OCCURRENCES_DDL)?;
     tx.execute_batch(FTS_PROJECTION_HEAD_DDL)?;
+    tx.execute_batch(EMBEDDING_CACHE_DDL)?;
     let rows: [(&str, String); 3] = [
         ("store_instance_uuid", store_instance_uuid.to_string()),
         ("cache_schema_version", CACHE_SCHEMA_VERSION.to_string()),

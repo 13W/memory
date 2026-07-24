@@ -68,6 +68,15 @@ length framing of `encode` and `HASH_SCHEMA_VERSION: u32`. `content_blob_id`
 golden test pins the resulting digest and the width choice. The `content_blob` DB columns remain
 `INTEGER` (i64, SQLite affinity); only the hash pre-image narrows to `u32`.
 
+As-built note (T11-02, `[SPEC]`): the three `embedding_cache.subject_hash` domains now have typed
+constructors too (`local_rag_core::identity::domain::{subject_content_blob, subject_occurrence_context,
+subject_memory_entry}`), joining the single-field-fingerprint precedent above rather than being left
+to ad-hoc `hash()` call sites. `subject_content_blob` follows the existing single-field shape;
+`subject_occurrence_context`/`subject_memory_entry` are this codebase's first *typed* multi-field
+constructors (previously only the generic `hash` entry point handled multi-field domains). See spec
+03 §4.2's own as-built note for the field-shape and scope-boundary details (the real
+`occurrence_context` serialization stays `[OPEN]`, 09 §3).
+
 ### 1.3 Path canonicalization `[FIXED principle, details [SPEC]]`
 
 `normalized_path` (worktree-relative): `/` separators, no leading `./`, Unicode **NFC**; on
@@ -738,6 +747,38 @@ Batching seam (T03-04, `[SPEC]`, spec §3): the `last_used_at` updates required 
 serviced through a seam — `LastUsedSink`/`BatchingLastUsed` (dedup-to-latest in-memory buffer) +
 `flush_last_used` (one batched `UPDATE` transaction). The flush *cadence* (≤ 5 s / 500 rows) is a
 later reconcile/search task; T03-04 ships only the interface + accumulator + flush helper.
+
+As-built note (T11-02, `[SPEC]`): `embedding_cache` is created (byte-exact reproduction of the
+block above, `WITHOUT ROWID` preserved) by `local_rag_store::cache::open`'s seed transaction, and
+`CACHE_SCHEMA_VERSION` is bumped to `4` (`3`=+FTS, T08-01). `subject_hash` is produced by three
+typed constructors in `local_rag_core::identity::domain` — `subject_content_blob(blob_id)` (one
+field, §1.2), `subject_occurrence_context(context_version, serialization)` (two fields, version
+LE `u32`), `subject_memory_entry(memory_id, text)` (two fields, the table's own "`H(text)`" computed
+via `hash::sha256_hex`, not a domain-separated hash — no domain exists for raw memory text and the
+memory tables this would back do not exist before group 14). **`checksum` ("H over vector bytes")
+is a plain, non-domain-separated `hash::sha256_hex` digest, not a spec 03 §1.2 identity hash** — an
+explicit as-built decision: §1.2's domain table is for hashes things are looked up/deduped by
+(`subject_hash`, manifest hashes); the vector-bytes checksum has no identity role, only corruption
+detection, the same family `Migration::checksum` already uses. `vector_f32` is little-endian `f32`
+(`local_rag_store::cache::embedding::{encode_vector_le, decode_vector_le}`); `verify_cached_embedding`
+checks `dimensions`/`byte_size` against the decoded length before recomputing the checksum (cheap
+before expensive). The batching seam (`BatchingLastUsedEmbeddings`/`flush_last_used_embeddings`) is
+a second, composite-keyed type mirroring `normalized_text_cache`'s, since this table's key is the
+three-part `(subject_kind, subject_hash, representation_id)`, not a single `blob_id`.
+
+Eviction (T11-02, `[SPEC]`): `local_rag_store::eviction::run_embedding_cache_eviction` — LRU by
+`last_used_at` toward `embedding_cache_budget_mb` (`local_rag_core::config::StorageConfig`, already
+`[storage]`-configured, default 2048 MiB), batched (`EVICTION_BATCH_ROWS = 500`, mirroring the
+retention sweep's own `[SPEC]` batch ceiling), dry-run capable. Pins: a
+`(generation_id, model_space_id)` tuple is pinned from **both** the `active_*` and `target_*`
+columns of every worktree's `worktree_projection_state` row — `active_*` covers "an active
+projection tuple" and "a running rebuild" (rebuild always retargets the active tuple, never
+`target`, spec 05 §7); `target_*` is a deliberate, conservative superset (an in-flight `switch()`
+reads `embedding_cache` for the target tuple's missing points before committing, spec 05 §5 step 1).
+Only `code_raw` subjects are resolved to real pinned keys today (via the occurrence →
+`parsed_unit.blob_id` join and `subject_content_blob`); `code_context`'s subject format stays
+`[OPEN]` (09 §3, decided by the benchmark) and `memory`'s backing tables do not exist before group
+14 — both are skipped as a safe no-op, since no such `embedding_cache` row can exist yet either.
 
 ### 4.3 FTS materialized view
 

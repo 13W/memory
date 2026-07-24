@@ -29,6 +29,14 @@ drift are impossible by constraint `[FIXED]`. `embedding_cache` rows reference
 Representation kinds: `code_raw`, `code_context`, `structural_description` (post-v0),
 `memory`. Subject hashing per kind: 03 §1.2.
 
+As-built note (T11-02, `[SPEC]`): `embedding_cache` itself now exists
+(`local_rag_store::cache::embedding`, migration 4, spec 03 §4.2's own as-built note has the full
+detail — integrity/checksum, little-endian vectors, the batched `last_used_at` seam, and
+budget-LRU eviction with active/rebuild pins, `local_rag_store::eviction`). Real per-subject
+coverage counting against these rows (T11-04) and the local embedder provider that writes them
+(T11-03) are still separate, later tasks — T11-02 only shipped the cache and its own integrity/
+eviction guarantees.
+
 ## 3. Model spaces
 
 A model space bundles the representations that must be coherent together (at minimum
