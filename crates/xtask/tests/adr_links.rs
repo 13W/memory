@@ -129,6 +129,26 @@ fn syntax_locator_derivation_adr_is_well_formed() {
     );
 }
 
+#[test]
+fn dense_backend_adr_is_well_formed() {
+    let path = adr_dir().join("0003-dense-backend-selection.md");
+    let adr = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for section in ["## Status", "## Context", "## Decision", "## Consequences"] {
+        assert!(
+            adr.contains(section),
+            "ADR-0003 must contain a `{section}` section"
+        );
+    }
+    assert!(
+        adr.contains("Accepted"),
+        "ADR-0003 must record an Accepted status"
+    );
+    assert!(
+        adr.contains("O1"),
+        "ADR-0003 must reference the open question O1 it resolves"
+    );
+}
+
 /// Guard the resolver used above so a false "all links pass" can't hide behind a
 /// broken parser.
 #[test]

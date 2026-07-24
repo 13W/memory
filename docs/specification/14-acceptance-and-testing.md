@@ -142,3 +142,19 @@ candidate-specific test that targets the real structural identity-tracking file 
 found a genuine, separate robustness gap in the vendored `qdrant-edge` 0.7.2 crate: an
 uncaught panic on corrupted state, not a clean, catchable error. `ram_bytes_per_shard`/
 `lru` remain `None` for the same unchanged reasons as the other two candidates.
+
+As-built note (T10-05, `[SPEC]`, closes O1): the comparison is decided —
+[ADR-0003](../adr/0003-dense-backend-selection.md), brute-force. A same-machine,
+`--release`, matching-seed re-run of all three candidates at `small`/`representative`
+(`spike/artifacts/<adapter>-<dataset>.json`) filled the one gap left by T10-02 (brute-force's
+own metric matrix was never captured): `open_ms`/`close_ms`/`registry_startup_ms` stay
+sub-millisecond at both sizes (e.g. `open_ms=0.0088` @544, `0.0092` @50,000 — flat, since a
+fresh in-memory `Vec<f32>` has no size-dependent open cost), `warm_search_p95_ms` grows with
+corpus size as expected for linear scan (`0.353` @544 → `18.1` @50,000, still comfortably
+interactive), and `recall_at_k` stays `None` (exact by construction, spec 05 §1). `large`
+(500,000 points) was not re-run: T10-02/T10-04 already completed it and T10-03 already
+documented a 35+ minute non-completion, all with reproducing commands recorded in
+`PROGRESS.md` — repeating either result would not add information. The explicit weighted
+comparison (favoring correctness/robustness/simplicity over raw latency, per the "simplest
+candidate passing quality/platform/correctness gates" card requirement) and the full
+dependency/license audit are in the ADR, not duplicated here.
