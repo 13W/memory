@@ -56,6 +56,20 @@ here explicitly as this task's own working similarity metric, for a fair recall@
 comparison across T10-02/03/04; not a `[FIXED]` requirement on whichever backend the
 group ultimately chooses.
 
+As-built note (T10-03, `[SPEC]`): the `usearch` spike candidate
+(`spike/harness/src/usearch_backend.rs`) is built with `MetricKind::IP`, whose native
+distance is `1 - Σ(a[i]·b[i])` — a strictly decreasing function of the raw dot product.
+The adapter converts `score = -distance` on every search result (`usearch`'s own
+`Matches` are already sorted ascending by distance, so no re-sort is needed), matching
+the same "higher is closer" convention T10-02 pinned. `filtered_hnsw_available()`
+reports `true` — the first candidate to do so honestly (`usearch::Index::filtered_search`
+is real, predicate-during-traversal filtered-HNSW). `ScalarKind::F32` is used (no lossy
+quantization), so any recall gap is attributable to the approximate graph search itself.
+`connectivity`/`expansion_add`/`expansion_search` are left at usearch's own `0` sentinel
+(verified directly in the vendored `include/usearch/index_dense.hpp`: `0` is replaced by
+the library's internal defaults — 16/128/64 respectively — during construction, not
+literal zero-connectivity); no tuning constants are invented (O2).
+
 ## 2. Shard model
 
 - **One shard per worktree** `[FIXED]`: pure active-only semantics, isolated rebuild, no
@@ -70,6 +84,13 @@ group ultimately chooses.
 `projection_point_id = H(projection_point, worktree_id, occurrence_id, model_space_id,
 representation_kind)` (03 §1.2). Repeated upsert overwrites; repeated delete is a no-op.
 Backends needing 64/128-bit IDs derive them from the first 8/16 bytes of the digest `[SPEC]`.
+
+As-built note (T10-03, `[SPEC]`): `usearch` is the concrete case this sentence anticipated —
+its native key (`usearch::Key`) is `u64`. `spike/harness/src/usearch_backend.rs::derive_key`
+parses a `PointId`'s first 16 hex characters (its first 8 raw digest bytes) as one
+big-endian `u64`. A collision (two distinct point ids sharing a derived key) is never
+silently merged: the adapter checks both its persisted key map and the current upsert
+batch, and rejects the call with a typed error before mutating anything if one is found.
 
 ## 4. Expected point set
 
@@ -346,3 +367,15 @@ Every test in `fault_matrix.rs` arms, or is vulnerable to, the process-global fa
 async-aware guard held across `.await`, unlike the `std::sync::Mutex` idiom `fake_faults.rs` uses
 for its synchronous tests) — omitting this for even one test reproduces exactly the class of
 cross-test interference D-005 found and fixed in T07-03.
+
+As-built note (T10-03, `[SPEC]`): the T10 dense-backend spike's shared conformance suite
+(`spike/harness/src/conformance.rs`, run identically against fake/brute-force/`usearch`)
+structurally cannot reach the full F1–F12 matrix, since it drives a bare `ShardHandle`
+directly and never a `switch()`/`state.sqlite` cycle. Disposition: **F5–F8, F12** are
+exactly what the suite's reopen/head/manifest/corruption cases exercise generically for
+any candidate (equal-count-different-set is a pure manifest-hash property test; on-disk
+corruption is a backend-agnostic largest-file truncation). **F1–F4, F9–F11** are
+write-ahead-switch-driver or `state.sqlite`-registry-level concerns entirely out of a bare
+`ShardHandle`'s reach — already exhaustively covered above at product-crate scope
+(T07-05) against the fake backend, and not re-tested per spike candidate. This mirrors
+T10-02's identical disposition for its own "crash/reopen cases" test bullet.

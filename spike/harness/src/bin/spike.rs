@@ -9,14 +9,16 @@
 //! spike --adapter fake --dataset small --seed 42 --out spike/artifacts/fake-small.json
 //! ```
 //!
-//! `fake` (T10-01, dev scaffolding) and `brute-force` (T10-02, the first real
-//! spike candidate) exist so far; `--adapter` is already a switch so T10-03/04
-//! add `usearch`/Qdrant Edge without changing the runner's shape.
+//! `fake` (T10-01, dev scaffolding), `brute-force` (T10-02) and `usearch`
+//! (T10-03) exist so far; `--adapter` is already a switch so T10-04 adds
+//! Qdrant Edge without changing the runner's shape.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use local_rag_spike_harness::{BruteForceAdapter, FakeAdapter, SpikeAdapter, corpus, run_spike};
+use local_rag_spike_harness::{
+    BruteForceAdapter, FakeAdapter, SpikeAdapter, UsearchAdapter, corpus, run_spike,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -34,10 +36,11 @@ fn run() -> Result<(), String> {
     let adapter: Box<dyn SpikeAdapter> = match args.adapter.as_str() {
         "fake" => Box::new(FakeAdapter),
         "brute-force" => Box::new(BruteForceAdapter),
+        "usearch" => Box::new(UsearchAdapter),
         other => {
             return Err(format!(
-                "unknown adapter {other:?} (only `fake`/`brute-force` exist at T10-02; \
-                 usearch/qdrant arrive at T10-03/04)"
+                "unknown adapter {other:?} (fake/brute-force/usearch exist at T10-03; \
+                 qdrant arrives at T10-04)"
             ));
         }
     };

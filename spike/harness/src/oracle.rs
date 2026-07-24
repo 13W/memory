@@ -42,6 +42,24 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// Recall@k of `approx` against the independent exact-neighbour reference
+/// `exact` (T10-03, spec 14 §7 "recall vs oracle"): the fraction of `exact`'s
+/// point ids also present in `approx`, ignoring order and score value —
+/// recall@k cares about set overlap, not exact ranking agreement. Vacuously
+/// `1.0` when `exact` is empty (nothing to have missed).
+pub fn recall_at_k(exact: &[ScoredPoint], approx: &[ScoredPoint]) -> f64 {
+    if exact.is_empty() {
+        return 1.0;
+    }
+    let approx_ids: std::collections::HashSet<&str> =
+        approx.iter().map(|p| p.point_id.as_str()).collect();
+    let hits = exact
+        .iter()
+        .filter(|p| approx_ids.contains(p.point_id.as_str()))
+        .count();
+    hits as f64 / exact.len() as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +129,38 @@ mod tests {
             k: 5,
         };
         assert!(exact_top_k(&[], &query).is_empty());
+    }
+
+    fn scored(id: &str, score: f32) -> ScoredPoint {
+        ScoredPoint {
+            point_id: PointId::from_hex(id.to_string()),
+            score,
+        }
+    }
+
+    #[test]
+    fn recall_full_overlap_is_one() {
+        let exact = vec![scored("a", 3.0), scored("b", 2.0)];
+        let approx = vec![scored("b", 2.0), scored("a", 3.0)]; // order doesn't matter
+        assert_eq!(recall_at_k(&exact, &approx), 1.0);
+    }
+
+    #[test]
+    fn recall_no_overlap_is_zero() {
+        let exact = vec![scored("a", 3.0), scored("b", 2.0)];
+        let approx = vec![scored("x", 1.0), scored("y", 0.5)];
+        assert_eq!(recall_at_k(&exact, &approx), 0.0);
+    }
+
+    #[test]
+    fn recall_partial_overlap() {
+        let exact = vec![scored("a", 3.0), scored("b", 2.0), scored("c", 1.0)];
+        let approx = vec![scored("a", 3.0), scored("b", 2.0), scored("x", 0.1)];
+        assert_eq!(recall_at_k(&exact, &approx), 2.0 / 3.0);
+    }
+
+    #[test]
+    fn recall_with_empty_exact_is_vacuously_one() {
+        assert_eq!(recall_at_k(&[], &[scored("a", 1.0)]), 1.0);
     }
 }

@@ -35,6 +35,14 @@ production search integration:
   *reported* (`supported: false` + reason), never silently skipped.
 - **`spike` binary** — runs one adapter × one dataset, writes a JSON report.
 
+## Native build prerequisite (T10-03+)
+
+`usearch` (T10-03) is the first spike dependency needing a native compiler: its
+build script compiles a C++17 core via `cxx-build`/`cc`. `fake` (T10-01) and
+`brute-force` (T10-02) needed none. Verified locally against a Homebrew
+`clang++`/system `/usr/bin/c++` toolchain; no `cmake` step is required (`cxx-build`
+invokes the compiler directly).
+
 ## Run
 
 ```sh

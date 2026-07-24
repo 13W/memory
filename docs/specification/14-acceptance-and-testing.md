@@ -82,3 +82,26 @@ groups 12/15. Durability is the existing shared conformance corruption case
 definitionally exact, so a constant `1.0` would not be a measurement — but T10-02
 exposes a reusable exact-neighbor reference (`spike/harness/src/oracle.rs::exact_top_k`)
 for T10-03/04's own `recall_at_k` against it.
+
+As-built note (T10-03, `[SPEC]`): `recall_at_k` is now a genuine measurement for the
+`usearch` candidate, opt-in via a new `SpikeAdapter::reports_recall()` trait method
+(default `false`, so fake/brute-force are unaffected and still report `None` — this
+*extends*, not reverses, the T10-02 note above). `measure_metrics` computes it by
+reusing the warm-search loop's own results against `oracle::exact_top_k`, gated on the
+flag so exact-by-construction backends never pay for an oracle pass they didn't ask
+for. `filtered_hnsw_available` is `true` for `usearch` — the first candidate to report
+real filtered-HNSW support. Measured recall on the seeded `small` matrix dataset (544
+points, seed 42) is a stable **0.98** with default HNSW tuning (`connectivity`/
+`expansion_*` left at the library's own internal defaults, spec 05 §1). **Important
+caveat, load-bearing for T10-05**: recall degrades substantially with corpus size on
+this spike's *synthetic i.i.d. random* vectors — measured at dims=768 with default
+tuning: ~0.94 at 1,000 points, ~0.68 at 3,000, ~0.49 at 5,000, ~0.28 at 10,000, ~0.16 at
+20,000, ~0.09 at the `representative` matrix size (50,000). This is a smooth,
+monotonic curve (verified: `usearch::Index::size()` matches the adapter's own point
+count exactly at every scale tested — not a dropped-insert defect) consistent with a
+well-known property of graph-based ANN search: greedy traversal has no exploitable
+locality structure to follow in *unstructured* random vectors, unlike real code/text
+embeddings, which cluster semantically. This is a genuine measurement of this spike's
+synthetic corpus, not necessarily predictive of recall on real `embedding_cache`
+vectors once T11 exists — flagged explicitly so T10-05 does not read the `large`/
+`representative` recall numbers as a verdict on `usearch` itself without this context.
