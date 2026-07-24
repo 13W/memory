@@ -48,6 +48,14 @@ Candidate backends for the step-11 spike: `qdrant-edge`, `usearch`, brute-force 
 Filtered-HNSW is off the critical path (no tenant filter, no generation filter inside a shard)
 but is included in the spike matrix `[FIXED]`.
 
+As-built note (T10-02, `[SPEC]`): the brute-force spike candidate
+(`spike/harness/src/brute_force.rs`, isolated from the product's pre-T10
+`FakeProjectionStore` dev scaffolding) scores by **dot product**, "higher is closer" —
+the same convention `ScoredPoint`'s own doc and the fake backend already use. Pinned
+here explicitly as this task's own working similarity metric, for a fair recall@k
+comparison across T10-02/03/04; not a `[FIXED]` requirement on whichever backend the
+group ultimately chooses.
+
 ## 2. Shard model
 
 - **One shard per worktree** `[FIXED]`: pure active-only semantics, isolated rebuild, no

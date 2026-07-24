@@ -70,3 +70,15 @@ correctly escaped text; recall block never exceeds caps; delimiter collisions es
   startup with a large registry; LRU behavior; durability/validate-on-open semantics;
   platform support (win32); filtered-HNSW available. **Backend choice is fixed here, not
   earlier.**
+
+As-built note (T10-02, `[SPEC]`): for the brute-force candidate, warm search p95 /
+open / close / registry-startup are measured generically by
+`spike/harness/src/lib.rs::measure_metrics` (adapter-agnostic — the fake and future
+T10-03/04 candidates get `close_ms` populated the same way, for free). RAM/shard and
+LRU stay unmeasured (`None`) for the reasons T10-01 already documented: no approved
+portable RSS probe, and LRU needs `ShardManager` wiring that does not exist before
+groups 12/15. Durability is the existing shared conformance corruption case
+(`durability_summary`). `recall_at_k` stays `None` for brute-force itself — it is
+definitionally exact, so a constant `1.0` would not be a measurement — but T10-02
+exposes a reusable exact-neighbor reference (`spike/harness/src/oracle.rs::exact_top_k`)
+for T10-03/04's own `recall_at_k` against it.
