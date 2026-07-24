@@ -12,12 +12,19 @@
 //! `store_settings` at daemon startup, 02 §4.1). This layer neither generates nor
 //! seeds that UUID — the UUIDv7 generator and its seeding land in later tasks.
 
+mod embedding;
 mod fts;
 mod open;
 mod text;
 mod validate;
 mod writer;
 
+pub use embedding::{
+    BatchingLastUsedEmbeddings, EmbeddingCacheMeta, EmbeddingCacheRow, EmbeddingDivergence,
+    EmbeddingKey, LastUsedSinkEmbedding, SubjectKind, VectorLengthError, all_embedding_meta,
+    decode_vector_le, delete_embedding, encode_vector_le, flush_last_used_embeddings,
+    get_embedding, insert_embedding, verify_cached_embedding,
+};
 pub use fts::{
     FtsMaterializeError, FtsMaterializeOutcome, FtsProjectionHeadRow, LEXICAL_SCHEMA_VERSION,
     TOKENIZER_VERSION, fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash,

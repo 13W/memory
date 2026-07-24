@@ -85,9 +85,9 @@ pub(crate) use representation::SCHEMA_V6;
 pub use representation::{
     Coverage, CoverageEntry, DistanceMetric, IllegalModelSpaceTransition, ModelSpaceState,
     ModelSpaceTransitionError, RepresentationKey, RepresentationKind, create_model_space,
-    eligible_as_target, model_space_required_kinds, model_space_state, recompute_coverage,
-    register_representation, representation_key, set_model_space_representation,
-    transition_model_space, write_model_space_coverage,
+    eligible_as_target, model_space_required_kinds, model_space_required_representation_ids,
+    model_space_state, recompute_coverage, register_representation, representation_key,
+    set_model_space_representation, transition_model_space, write_model_space_coverage,
 };
 
 pub use repository::{

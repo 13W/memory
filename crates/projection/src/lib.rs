@@ -31,8 +31,9 @@
 //!   reconcile → commit cycle over a [`ProjectionStore`]/[`ShardHandle`] and
 //!   `local-rag-store`'s `worktree_projection_state`/generation/worktree guards
 //!   (T07-02, `registry::generation`, `registry::set_current_generation`),
-//!   through the caller-supplied [`switch::VectorSource`] seam (standing in for
-//!   the not-yet-built `embedding_cache`, T11-02).
+//!   through the caller-supplied [`switch::VectorSource`] seam (the real
+//!   `embedding_cache` table now exists, T11-02, `local_rag_store::cache::embedding`;
+//!   wiring a real `VectorSource` impl backed by it is T11-05's).
 //!
 //! T07-04 adds **validate-on-open and rebuild** (spec 05 §6/§7, plus the
 //! quarantine-rotation half of §8 that D-004 deferred here):
@@ -70,11 +71,12 @@
 //! T09-03 (`local_rag_search::SearchEngine`, `crates/search`).
 //!
 //! Deliberately **not** here (owning cards): the F1–F12 fault matrix itself
-//! (T07-05); the real `embedding_cache` (T11-02). The representation/
-//! model-space registry lives in `local-rag-store`
-//! (`local_rag_store::registry::representation`, T11-01) — this crate does not
-//! depend on it yet (see `expected`/`switch`'s own module docs). No real dense
-//! backend or dense/model SDK is coupled before T10.
+//! (T07-05). The real `embedding_cache` (T11-02,
+//! `local_rag_store::cache::embedding`) and the representation/model-space
+//! registry (T11-01, `local_rag_store::registry::representation`) both live in
+//! `local-rag-store` — this crate does not yet consume either (see
+//! `expected`/`switch`'s own module docs: wiring both is T11-05's). No real
+//! dense backend or dense/model SDK is coupled before T10.
 
 pub mod contract;
 pub mod expected;

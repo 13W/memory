@@ -354,6 +354,30 @@ pub fn occurrence_ids_for_generation(
     Ok(ids)
 }
 
+/// Every `(occurrence_id, blob_id)` pair for `generation_id`, joined through
+/// `parsed_unit` (spec 03 §2.4, T11-02). The content-shared identity a `code_raw`
+/// embedding subject hashes against ([`local_rag_core::identity::domain::subject_content_blob`]) —
+/// two occurrences with the same `blob_id` here resolve to the same subject hash
+/// (structural sharing, spec 06 §2).
+pub fn content_blob_ids_for_generation(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT guo.occurrence_id, pu.blob_id \
+         FROM generation_unit_occurrence guo \
+         JOIN parsed_unit pu ON pu.unit_id = guo.unit_id \
+         WHERE guo.generation_id = ?1 \
+         ORDER BY guo.occurrence_id",
+    )?;
+    let rows = stmt
+        .query_map(params![generation_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// One occurrence's source data for FTS materialization (spec 06 §2/§4, T08-02):
 /// everything the FTS materializer (`cache::fts::materialize_fts`) needs from
 /// `state.sqlite` for one `generation_unit_occurrence` row, joined against its

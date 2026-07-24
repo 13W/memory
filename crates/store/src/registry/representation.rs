@@ -557,6 +557,46 @@ pub fn model_space_required_kinds(
     .collect()
 }
 
+/// Every `(kind, representation_id)` pair `model_space_id` requires (`required
+/// = 1`), ascending by kind (spec 03 §2.2). Unlike [`model_space_required_kinds`],
+/// this also returns the concrete `representation_id` each kind resolves to —
+/// needed to address a specific `embedding_cache` row (T11-02's eviction-pin
+/// resolution: a pinned `(generation_id, model_space_id)` tuple must translate
+/// into concrete `embedding_cache` primary keys, which include
+/// `representation_id`, not just its kind).
+///
+/// A stored `representation_kind` outside the CHECK domain (corruption)
+/// surfaces as [`rusqlite::Error::FromSqlConversionFailure`], never a silent
+/// default.
+pub fn model_space_required_representation_ids(
+    conn: &Connection,
+    model_space_id: &str,
+) -> rusqlite::Result<Vec<(RepresentationKind, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT representation_kind, representation_id FROM model_space_representation \
+         WHERE model_space_id = ?1 AND required = 1 \
+         ORDER BY representation_kind",
+    )?;
+    let rows = stmt.query_map(params![model_space_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    rows.map(|row| {
+        row.and_then(|(raw, representation_id)| {
+            RepresentationKind::from_db(&raw)
+                .map(|kind| (kind, representation_id))
+                .ok_or_else(|| {
+                    Error::FromSqlConversionFailure(
+                        0,
+                        Type::Text,
+                        format!("invalid model_space_representation.representation_kind {raw:?}")
+                            .into(),
+                    )
+                })
+        })
+    })
+    .collect()
+}
+
 /// One representation kind's expected/ready/failed subject counts (spec 10
 /// §3's coverage shape).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

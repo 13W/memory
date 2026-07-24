@@ -22,7 +22,11 @@
 //!   a hardcoded pair, not a `model_space_representation` lookup — the real
 //!   registry now exists (T11-01), but wiring this lookup to it is T11-05's;
 //! - vectors come from a caller-supplied [`VectorSource`], not a real
-//!   `embedding_cache` (T11-02);
+//!   `embedding_cache` — the table now exists (T11-02,
+//!   `local_rag_store::cache::embedding`), but wiring a real `VectorSource`
+//!   impl backed by it is T11-05's, once a real multi-model-space switch
+//!   needs it (this crate depends on `local-rag-store`, so no cycle blocks
+//!   it — it just isn't this task's card);
 //! - the `∪ changed` term of spec 05 §5 step 3 is realized as empty — `ShardHandle`
 //!   has no vector-read-back, and `upsert` is idempotent by id, so only
 //!   `expected \ existing` is upserted;
@@ -54,10 +58,11 @@ use crate::identity::head;
 /// derive its [`crate::contract::PointId`] beyond the tuple itself
 /// (spec 05 §5 step 1: "vectors come from `embedding_cache`").
 ///
-/// This is the seam T11-02's real `embedding_cache`-backed implementation slots
-/// into; it has deliberately no "compute/embed" method, so the switch itself can
-/// never trigger re-embedding — it only ever reads what it is given, and only
-/// for points not already present in the shard (see [`switch`]).
+/// This is the seam a real `embedding_cache`-backed implementation slots into
+/// (the table itself now exists, T11-02; wiring it here is T11-05's); it has
+/// deliberately no "compute/embed" method, so the switch itself can never
+/// trigger re-embedding — it only ever reads what it is given, and only for
+/// points not already present in the shard (see [`switch`]).
 ///
 /// Every call site below takes `&(dyn VectorSource + Send + Sync)`, not a bare
 /// `&dyn VectorSource` — the trait itself carries no supertrait bound, matching

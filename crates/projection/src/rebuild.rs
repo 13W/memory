@@ -26,7 +26,8 @@
 //! ## Scope (T07-04)
 //!
 //! Vectors are sourced through T07-03's [`crate::switch::VectorSource`] seam
-//! (still not the real `embedding_cache`, T11-02): a missing vector surfaces as
+//! (the real `embedding_cache` table now exists, T11-02, but wiring a real
+//! `VectorSource` impl here is T11-05's): a missing vector surfaces as
 //! [`RebuildError::MissingVector`] **before** any shard write in this rebuild
 //! attempt, so the shard never goes `clean` with a partial expected set — the
 //! row is left at `status='rebuilding'` for the next open to retry, exactly

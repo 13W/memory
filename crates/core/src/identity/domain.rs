@@ -168,6 +168,54 @@ pub fn signature_fingerprint(canonical_descriptor: &str) -> String {
     )
 }
 
+/// `H(subject/content_blob, blob_id)` — an `embedding_cache.subject_hash` for the
+/// `content_blob` kind (spec 03 §1.2 / §4.2, T11-02). One field: the *already*
+/// content-derived [`crate::code`]-style `blob_id`, hashed as its lowercase ASCII
+/// bytes (the codebase's "already-hex identity" convention) — this is a second
+/// hash layer over `blob_id`, never a re-hash of the underlying normalized text.
+/// Two occurrences whose `parsed_unit.blob_id` coincide therefore resolve to the
+/// same subject hash and share one `embedding_cache` row (spec 03 §4.2's "content
+/// shares across occurrences" `[FIXED]`).
+pub fn subject_content_blob(blob_id: &str) -> String {
+    hash(Domain::SubjectContentBlob, &[blob_id.as_bytes()])
+}
+
+/// `H(subject/occurrence_context, context_version, serialization)` — an
+/// `embedding_cache.subject_hash` for the `occurrence_context` kind (spec 03 §1.2
+/// / §4.2, T11-02). `context_version` is little-endian `u32` (matching
+/// `content_blob_id`'s established version-field width); `serialization` is
+/// whatever opaque bytes the caller supplies.
+///
+/// The *real* context-serialization format (what "context" actually contains) is
+/// `[OPEN]` — spec 09 §3: "content vs context representation choice is decided by
+/// the benchmark" — nothing in this codebase defines it yet. This constructor
+/// only fixes the hash framing; two occurrences with distinct serializations
+/// never share a subject hash (spec 03 §4.2's "context does not [share]"
+/// `[FIXED]`), which is provable with any opaque serialization, real or
+/// synthetic.
+pub fn subject_occurrence_context(context_version: u32, serialization: &[u8]) -> String {
+    hash(
+        Domain::SubjectOccurrenceContext,
+        &[&context_version.to_le_bytes(), serialization],
+    )
+}
+
+/// `H(subject/memory_entry, memory_id, H(text))` — an `embedding_cache.subject_hash`
+/// for the `memory_entry` kind (spec 03 §1.2 / §4.2, T11-02). `memory_id` is
+/// hashed as its lowercase ASCII bytes (already-hex identity convention); the
+/// table's own `H(text)` inner hash is computed here via
+/// [`crate::hash::sha256_hex`] — the same non-domain-separated integrity-digest
+/// family the vector-bytes `embedding_cache.checksum` uses, not a spec 03 §1.2
+/// content-identity domain (no domain exists for raw memory text, and the memory
+/// tables this would back do not exist before group 14).
+pub fn subject_memory_entry(memory_id: &str, text: &str) -> String {
+    let text_hash = crate::hash::sha256_hex(text.as_bytes());
+    hash(
+        Domain::SubjectMemoryEntry,
+        &[memory_id.as_bytes(), text_hash.as_bytes()],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +422,96 @@ mod tests {
         assert_eq!(
             signature_fingerprint("fn\u{1f}foo\u{1f}(number)"),
             hash(Domain::SignatureFingerprint, &[b"fn\x1ffoo\x1f(number)"],),
+        );
+    }
+
+    // ---- Typed subject-hash constructors (T11-02) --------------------------
+    //
+    // Real field-shape tests, distinct from `golden_hashes_for_every_domain`
+    // above (which only proves domain separation of the raw enum against generic
+    // placeholder fields) — these pin the actual byte layout each constructor
+    // assembles ("hash golden each kind"). Golden hex constants below are pinned
+    // from this constructor's own output (via `hash`/`encode`, already proven
+    // against the published BLAKE3 reference vectors above), not hand-computed.
+
+    #[test]
+    fn subject_content_blob_matches_generic_single_field() {
+        assert_eq!(
+            subject_content_blob("blob-abc"),
+            hash(Domain::SubjectContentBlob, &[b"blob-abc"]),
+        );
+        assert_eq!(
+            subject_content_blob("blob-abc"),
+            "f0634bf5ed3c9dd6d0385323512199dde25cc05fe37799795c8c2c984835cbc8",
+        );
+    }
+
+    #[test]
+    fn subject_content_blob_shares_across_occurrences() {
+        // Two occurrences whose `parsed_unit.blob_id` coincide (structural
+        // sharing, spec 06 §2) resolve to the identical subject hash.
+        assert_eq!(
+            subject_content_blob("shared-blob"),
+            subject_content_blob("shared-blob")
+        );
+        assert_ne!(
+            subject_content_blob("blob-a"),
+            subject_content_blob("blob-b")
+        );
+    }
+
+    #[test]
+    fn subject_occurrence_context_matches_generic_two_fields() {
+        assert_eq!(
+            subject_occurrence_context(1, b"ctx-serialization"),
+            hash(
+                Domain::SubjectOccurrenceContext,
+                &[&1u32.to_le_bytes(), b"ctx-serialization"],
+            ),
+        );
+        assert_eq!(
+            subject_occurrence_context(1, b"ctx-serialization"),
+            "e78b81fe0cd199cbe131a33299e6cdc727b7b391b5c4c228240a6eb999ff7b67",
+        );
+    }
+
+    #[test]
+    fn subject_occurrence_context_does_not_share_across_distinct_serializations() {
+        // "context does not [share]" (spec 03 §4.2 [FIXED]) — provable with any
+        // opaque serialization, since the real context format is [OPEN] (09 §3).
+        let a = subject_occurrence_context(1, b"occurrence-A-context");
+        let b = subject_occurrence_context(1, b"occurrence-B-context");
+        assert_ne!(a, b);
+        // A version bump alone (same bytes) also changes the subject hash.
+        assert_ne!(
+            subject_occurrence_context(1, b"same-bytes"),
+            subject_occurrence_context(2, b"same-bytes"),
+        );
+    }
+
+    #[test]
+    fn subject_memory_entry_hashes_h_of_text_as_the_second_field() {
+        let text_hash = crate::hash::sha256_hex(b"remember this");
+        assert_eq!(
+            subject_memory_entry("memory-1", "remember this"),
+            hash(
+                Domain::SubjectMemoryEntry,
+                &[b"memory-1", text_hash.as_bytes()],
+            ),
+        );
+        assert_eq!(
+            subject_memory_entry("memory-1", "remember this"),
+            "fda86b18e0247136ff09c516dd0256a59a3b6bfaa128e60e2d2e09246194dbf8",
+        );
+        // Distinct text ⇒ distinct subject hash for the same memory_id.
+        assert_ne!(
+            subject_memory_entry("memory-1", "remember this"),
+            subject_memory_entry("memory-1", "remember something else"),
+        );
+        // Distinct memory_id ⇒ distinct subject hash for the same text.
+        assert_ne!(
+            subject_memory_entry("memory-1", "remember this"),
+            subject_memory_entry("memory-2", "remember this"),
         );
     }
 
