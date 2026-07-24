@@ -17,8 +17,10 @@
 //! explicit `supported: false` result — it is never a silent skip (the T10-01
 //! "unsupported platform reported, not skipped" requirement).
 
+pub mod brute_force;
 pub mod conformance;
 pub mod corpus;
+pub mod oracle;
 pub mod report;
 
 use std::io;
@@ -31,6 +33,7 @@ use crate::corpus::SeededDataset;
 use crate::report::{
     ConformanceReport, DatasetSummary, Metrics, PlatformSupport, REPORT_SCHEMA_VERSION, SpikeReport,
 };
+pub use brute_force::BruteForceAdapter;
 
 /// A spike candidate: a backend the harness can build and describe. Each of
 /// T10-02/03/04 adds one implementor in this workspace; the product workspace
@@ -138,6 +141,7 @@ pub fn run_spike(
         let measured = measure_metrics(&*store, dataset, &base.join("bench"))?;
         metrics.warm_search_p95_ms = measured.warm_search_p95_ms;
         metrics.open_ms = measured.open_ms;
+        metrics.close_ms = measured.close_ms;
         metrics.registry_startup_ms = measured.registry_startup_ms;
     }
 
@@ -156,11 +160,12 @@ pub fn run_spike(
 struct MeasuredTimings {
     warm_search_p95_ms: Option<f64>,
     open_ms: Option<f64>,
+    close_ms: Option<f64>,
     registry_startup_ms: Option<f64>,
 }
 
 /// Measure the timing metrics of spec 14 §7. Uses [`Instant`]; values are
-/// measurements, not assertions. RAM/close/LRU/recall are left `None` here (see
+/// measurements, not assertions. RAM/LRU/recall are left `None` here (see
 /// [`Metrics`] field docs for why each is a later refinement).
 fn measure_metrics(
     store: &dyn ProjectionStore,
@@ -194,6 +199,15 @@ fn measure_metrics(
     }
     let warm_search_p95_ms = percentile(&mut latencies_ms, 95.0);
 
+    // close: the trait exposes no distinct flush-then-release op, so this
+    // times dropping the handle — for a backend holding significant
+    // in-process state (e.g. brute-force's contiguous vector table) that is a
+    // real proxy for release cost, not a stand-in for some future backend's
+    // own explicit close.
+    let close_start = Instant::now();
+    drop(shard);
+    let close_ms = close_start.elapsed().as_secs_f64() * 1000.0;
+
     // registry startup: open a handful of shards and time it (spec 14 §7).
     let registry_startup_ms = {
         let start = Instant::now();
@@ -208,6 +222,7 @@ fn measure_metrics(
     Ok(MeasuredTimings {
         warm_search_p95_ms,
         open_ms: Some(open_ms),
+        close_ms: Some(close_ms),
         registry_startup_ms,
     })
 }
@@ -233,5 +248,31 @@ mod tests {
         assert_eq!(percentile(&mut [5.0], 95.0), Some(5.0));
         let mut xs: Vec<f64> = (1..=100).map(f64::from).collect();
         assert_eq!(percentile(&mut xs, 95.0), Some(95.0));
+    }
+
+    /// T10-02: `close_ms` is a new generic field on `measure_metrics`, wired
+    /// for every adapter. Only shape is asserted (`.is_some()`) — never a
+    /// value, matching this module's own house style for measurements.
+    #[test]
+    fn measure_metrics_populates_close_ms() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "local-rag-spike-harness-lib-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).expect("create scratch");
+
+        let dataset = crate::corpus::generate(&crate::corpus::TINY, 11);
+        let store = FakeProjectionStore::new();
+        let measured = measure_metrics(&store, &dataset, &base).expect("measure_metrics");
+
+        assert!(measured.open_ms.is_some());
+        assert!(measured.close_ms.is_some(), "close_ms must be populated");
+        assert!(measured.warm_search_p95_ms.is_some());
+        assert!(measured.registry_startup_ms.is_some());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
