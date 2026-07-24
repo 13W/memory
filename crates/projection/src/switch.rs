@@ -19,7 +19,8 @@
 //! note for the full reasoning):
 //!
 //! - the required representation-kind set is [`crate::expected::REQUIRED_REPRESENTATION_KINDS`],
-//!   a hardcoded pair, not a `model_space_representation` lookup (T11-01);
+//!   a hardcoded pair, not a `model_space_representation` lookup — the real
+//!   registry now exists (T11-01), but wiring this lookup to it is T11-05's;
 //! - vectors come from a caller-supplied [`VectorSource`], not a real
 //!   `embedding_cache` (T11-02);
 //! - the `∪ changed` term of spec 05 §5 step 3 is realized as empty — `ShardHandle`

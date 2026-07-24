@@ -63,16 +63,18 @@
 //! (T09-01's finding that `state.sqlite` writes physically run on a
 //! dedicated OS thread is what makes cooperative task cancellation leave no
 //! torn write). See the module's own docs for the full design and its
-//! deliberately deferred scope (dormant-model-space migration, T11-01;
-//! adoption into `switch`, T11-05/group 11 — the reconcile driver's own
-//! adoption has no dedicated task yet in the current plan). The search
-//! executor is adopted by T09-03 (`local_rag_search::SearchEngine`,
-//! `crates/search`).
+//! deliberately deferred scope (dormant-model-space migration and adoption
+//! into `switch`, both T11-05/group 11 — the real model-space registry T11-05
+//! needs already exists, T11-01; the reconcile driver's own adoption has no
+//! dedicated task yet in the current plan). The search executor is adopted by
+//! T09-03 (`local_rag_search::SearchEngine`, `crates/search`).
 //!
 //! Deliberately **not** here (owning cards): the F1–F12 fault matrix itself
-//! (T07-05); the representation/model-space registry and the real
-//! `embedding_cache` (T11-01/T11-02). No real dense backend or dense/model
-//! SDK is coupled before T10.
+//! (T07-05); the real `embedding_cache` (T11-02). The representation/
+//! model-space registry lives in `local-rag-store`
+//! (`local_rag_store::registry::representation`, T11-01) — this crate does not
+//! depend on it yet (see `expected`/`switch`'s own module docs). No real dense
+//! backend or dense/model SDK is coupled before T10.
 
 pub mod contract;
 pub mod expected;

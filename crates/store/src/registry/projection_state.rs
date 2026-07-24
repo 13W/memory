@@ -25,8 +25,9 @@
 //! (`store_settings.default_model_space_id`, which spec 04 §3 requires be
 //! `active`). The full representation registry — the `representation` and
 //! `model_space_representation` tables, the canonical six-field RepresentationKey,
-//! required-coverage recomputation, and the `model_space` build-state machine —
-//! is **T11-01** ("Representation/model-space registry"). The switch orchestration
+//! the coverage data model, and the `model_space` build-state machine — is
+//! [`super::representation`] (T11-01, "Representation/model-space registry",
+//! version-6 `SCHEMA_V6`). The switch orchestration
 //! that sits *between* a write-ahead and a commit (desired-set reconcile against
 //! the fake backend) is **T07-03**, composed in `local_rag_projection::switch`
 //! over this module's guarded primitives; validate-on-open, `mark_dirty`, and the

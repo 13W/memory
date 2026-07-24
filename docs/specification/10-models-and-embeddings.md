@@ -36,6 +36,26 @@ A model space bundles the representations that must be coherent together (at min
 expected/ready set per **required** representation kind — not just a failed counter `[FIXED]`;
 stored advisory JSON, always recomputable from `state.sqlite` × `embedding_cache`.
 
+As-built note (T11-01, `[SPEC]`): both sections are `local_rag_store::registry::representation`
+(migration 6, `SCHEMA_V6`). §2's canonical `RepresentationKey` is a six-field struct (`kind`,
+`representation_version`, `normalization_version`, `model_id`, `dimensions`, `distance_metric`);
+`register_representation` is a single atomic `INSERT ... ON CONFLICT (the six fields) DO UPDATE ...
+RETURNING representation_id`, so a duplicate key converges on the first-registered id rather than
+erroring — the constraint alone would only prevent a second row, not hand back the existing one.
+§3's build machine (`ModelSpaceState`) is byte-for-byte the same transition shape as 04 §1's
+Generation machine (`building → projection_ready → active → retiring`, plus
+`building|projection_ready → failed`); `eligible_as_target` is `true` only for `Active`, so an
+incomplete or retiring model space can never become a switch target. Coverage
+(`CoverageEntry{expected,ready,failed}` per required kind) is tracked only for kinds
+`model_space_representation` marks `required`; `recompute_coverage` is a pure function over
+caller-supplied counts (real per-subject counting against `embedding_cache` is T11-04's backfill
+worker, not this registry's job), and `transition_model_space` requires
+`Coverage::fully_covered` before allowing `building → projection_ready`. `model_space` itself and its
+default-`active` seed already existed (T07-02, `SCHEMA_V4`); T11-01 added only the missing state
+machine over it. This task did not wire `crates/projection`'s hardcoded
+`REQUIRED_REPRESENTATION_KINDS` constant to this registry — that is T11-05's, once a real
+multi-model-space switch needs it (05 §4/§5's own as-built notes carry the same forward reference).
+
 ## 4. Model migration — double-buffer via model spaces `[FIXED]`
 
 Changing the embedding model (or dimensions/metric/normalization):

@@ -26,6 +26,14 @@
 //! - **worktree state clock** (D-007, version-5 `SCHEMA_V5`): `worktree
 //!   .state_changed_at`, the timestamp the shard-lifecycle grace period of
 //!   spec 05 §8 ("remove/detach: grace period, then destroy") is measured from.
+//! - **representation registry** (T11-01, version-6 `SCHEMA_V6`, module
+//!   [`representation`]): the `representation`/`model_space_representation`
+//!   tables (spec 03 §2.2), the canonical six-field `RepresentationKey`
+//!   ([`RepresentationKey`]), the `model_space` build-state machine
+//!   ([`ModelSpaceState`], spec 04 §3 — `model_space` and its default-`active`
+//!   seed already existed from `SCHEMA_V4`, T07-02; this adds the missing
+//!   transition guard over it), and the [`Coverage`] advisory-JSON data model
+//!   + completeness gate. Real per-subject coverage counting is T11-04.
 //!
 //! On top of those primitives sits the **resolution layer** (T02-04, module
 //! `resolve`): [`resolve()`] turns a request's `worktree_root` into
@@ -55,6 +63,7 @@
 mod generation;
 mod projection_state;
 mod repository;
+mod representation;
 mod resolve;
 mod settings;
 pub mod worktree;
@@ -70,6 +79,15 @@ pub use projection_state::{
     PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation, ProjectionStateChange,
     ProjectionStateError, ProjectionStateRow, ProjectionStatus, check_invariants,
     default_model_space_id, insert_projection_state, projection_state, write_projection_state,
+};
+
+pub(crate) use representation::SCHEMA_V6;
+pub use representation::{
+    Coverage, CoverageEntry, DistanceMetric, IllegalModelSpaceTransition, ModelSpaceState,
+    ModelSpaceTransitionError, RepresentationKey, RepresentationKind, create_model_space,
+    eligible_as_target, model_space_required_kinds, model_space_state, recompute_coverage,
+    register_representation, representation_key, set_model_space_representation,
+    transition_model_space, write_model_space_coverage,
 };
 
 pub use repository::{

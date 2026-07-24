@@ -305,8 +305,8 @@ fn repeated_run_is_noop() {
 
 /// End-to-end: `StateDb::open` bootstraps the framework tables and applies the
 /// real production set (registry migration v1 T02-02, worktree migration v2
-/// T02-03, code migration v3 T03-01, projection migration v4 T07-02), and a
-/// second open is a clean no-op.
+/// T02-03, code migration v3 T03-01, projection migration v4 T07-02,
+/// representation migration v6 T11-01), and a second open is a clean no-op.
 #[test]
 fn state_db_open_bootstraps_and_is_idempotent() {
     let (_home, layout) = temp_store();
@@ -344,9 +344,13 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         ] {
             assert!(table_exists(&read, t), "code table {t} created");
         }
-        // … and v4 (projection deployment state + minimal model registry, §2.2).
+        // … v4 (projection deployment state + minimal model registry, §2.2) …
         for t in ["model_space", "worktree_projection_state"] {
             assert!(table_exists(&read, t), "projection table {t} created");
+        }
+        // … and v6 (representation registry, T11-01, §2.2).
+        for t in ["representation", "model_space_representation"] {
+            assert!(table_exists(&read, t), "representation table {t} created");
         }
         // The v4 seed: the default model space is `active` and pointed at by
         // `store_settings.default_model_space_id` (spec 04 §3).
@@ -367,13 +371,14 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(name, "default", "default model space display_name");
         assert_eq!(state, "active", "default model space MUST be active");
 
-        // Recorded as exactly five rows: (1,"registry"), (2,"worktree"),
-        // (3,"code"), (4,"projection"), (5,"worktree_state_clock").
+        // Recorded as exactly six rows: (1,"registry"), (2,"worktree"),
+        // (3,"code"), (4,"projection"), (5,"worktree_state_clock"),
+        // (6,"representation").
         let rows = migration_rows(&read);
         assert_eq!(
             rows.len(),
-            5,
-            "the production set is [v1,v2,v3,v4,v5] at D-007"
+            6,
+            "the production set is [v1,v2,v3,v4,v5,v6] at T11-01"
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
@@ -385,6 +390,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[3].1, "projection");
         assert_eq!(rows[4].0, 5);
         assert_eq!(rows[4].1, "worktree_state_clock");
+        assert_eq!(rows[5].0, 6);
+        assert_eq!(rows[5].1, "representation");
     }
     drop(db);
 
@@ -394,7 +401,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 5, "reopen adds no new migration rows");
+    assert_eq!(applied, 6, "reopen adds no new migration rows");
 }
 
 /// D-007: migration 5 adds `worktree.state_changed_at` and backfills every
