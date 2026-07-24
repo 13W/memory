@@ -55,11 +55,16 @@ use rusqlite::Connection;
 /// [`CacheWriter`] handle is dropped. As with state, a killed writer only ever
 /// loses an uncommitted transaction — and for the cache even a lost *committed*
 /// write is recoverable, since the whole store is rebuildable from state.
+///
+/// Dropping a `CacheDb` closes the queue but does **not** wait for the writer
+/// thread to finish closing its connection. Use [`CacheDb::close`] when the next
+/// step depends on this instance having fully let go of the files (D-009).
 #[derive(Debug)]
 pub struct CacheDb {
     path: PathBuf,
     writer: CacheWriter,
     outcome: CacheOpenOutcome,
+    join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CacheDb {
@@ -93,12 +98,41 @@ impl CacheDb {
         let path = path.into();
         let (conn, outcome) =
             open::open_and_bind(&path, store_instance_uuid, crate::clock::system_now_ms())?;
-        let writer = writer::CacheWriter::spawn(conn, capacity).map_err(CacheOpenError::Spawn)?;
+        let (writer, join) =
+            writer::CacheWriter::spawn(conn, capacity).map_err(CacheOpenError::Spawn)?;
         Ok(Self {
             path,
             writer,
             outcome,
+            join: Some(join),
         })
+    }
+
+    /// Close the write path and **wait** for the writer thread to drop its
+    /// connection.
+    ///
+    /// Ordinary `drop` is asynchronous: it closes the queue and lets the writer
+    /// thread finish on its own, which is correct for a process that is going
+    /// away (spec 02 §4.3 leaves graceful drain to the daemon, T15). It is *not*
+    /// enough when something else immediately re-opens the very same path: SQLite
+    /// checkpoints and unlinks `-wal`/`-shm` as the last connection closes, so a
+    /// reader of the newly opened instance can observe the previous instance's
+    /// teardown as a short read (`SQLITE_IOERR_SHORT_READ`) — a real, reproducible
+    /// race found by D-009.
+    ///
+    /// Blocks until every [`CacheWriter`] clone handed out by this instance has
+    /// been dropped; if a clone is still alive, the queue never closes and this
+    /// call waits for it.
+    pub fn close(mut self) {
+        let join = self.join.take();
+        // Drop this instance (and with it the writer handle it owns) so the queue
+        // closes, then wait for the thread to exit.
+        drop(self);
+        if let Some(join) = join {
+            // A panicking writer thread is already reported by its own unwind; the
+            // caller of `close` only needs the "it is finished" guarantee.
+            let _ = join.join();
+        }
     }
 
     /// The single write path into `cache.sqlite`.

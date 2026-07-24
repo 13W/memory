@@ -853,6 +853,16 @@ next open rebuilds — idempotent convergence, `state.sqlite` never touched. The
 startup, §4.1 / 02 §4.1); seeding that value into state is deferred to the UUIDv7 generator
 (step 2) and daemon wiring (step 15).
 
+Close semantics (D-009, `[SPEC]`): dropping a `CacheDb` closes the write queue but does **not**
+wait for the writer thread to finish closing its connection — asynchronous teardown is the
+deliberate design (02 §4.3 leaves graceful drain to the daemon, T15). `CacheDb::close` is the
+*waiting* variant, and it is required before anything unlinks or recreates the same path:
+SQLite opens `-wal`/`-shm` **by name**, so a still-closing connection can checkpoint/unlink the
+sidecars of a *newly created* database at that path, leaving it empty and its readers seeing
+`SQLITE_IOERR_SHORT_READ`. This matters for the recreate path above (and for tests that model an
+interrupted rebuild); the daemon, which holds one instance per path for its lifetime, is
+unaffected.
+
 ## 5. Migration boundaries `[FIXED]`
 
 The identity model is migration-ready: deferred features (LLM descriptions, reranker, full

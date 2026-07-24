@@ -304,6 +304,16 @@ surface as `INCOMPATIBLE_STORE`, disambiguated by a `details` field (e.g.
 progress surfaces as `MIGRATION_IN_PROGRESS`. The runner's own typed errors (13 §3) are
 finer-grained than the wire codes.
 
+As-built note (T11-03, `[SPEC]`): `ErrorCode::PolicyBlockedRemote` (`POLICY_BLOCKED_REMOTE`) now
+exists — added by the task that first detects the condition, per the T09-03 note below. It is
+produced by the central remote-policy guard in the embedding provider pool
+(`local_rag_embed::policy`, 10 §1 / 12 §1) when the effective `data_policy` leaves no selectable
+provider because every candidate is remote. `retryable = false` (the same request under the same
+policy is refused identically) and `details` names the refused providers, so the diagnostic states
+*which* selection was blocked. The "local fallback if defined" column is satisfied structurally:
+the guard filters candidates **before** selection, so a local provider present in the pool is
+simply chosen and no refusal is raised at all.
+
 As-built note (T09-03, `[SPEC]`): the canonical envelope's first concrete shape is
 `local_rag_protocol::{ErrorCode, ErrorEnvelope, DegradedMode}` (`crates/protocol/src/error.rs`) —
 `protocol` rather than `search`, since this vocabulary is shared by every daemon subsystem (memory

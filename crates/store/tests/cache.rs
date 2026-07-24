@@ -2,8 +2,12 @@
 //! recreation (spec 03 §1.4, §4, §4.4; 02 §5 L4b; 13 §3).
 //!
 //! All tests are deterministic: no network, no `$HOME` dependency (isolated
-//! [`TempHome`]), and no wall-clock sleeps. Reopen-based tests fully drop the
-//! prior [`CacheDb`] before reopening; the backpressure test gates the writer
+//! [`TempHome`]), and no wall-clock sleeps. Reopen-based tests close the prior
+//! [`CacheDb`] with [`CacheDb::close`] — a *waiting* close — before reopening or
+//! unlinking the path: a plain drop only closes the write queue, letting the
+//! writer thread tear its connection down concurrently, and SQLite opens
+//! `-wal`/`-shm` **by name**, so that teardown can land on the files the next
+//! instance just created (D-009); the backpressure test gates the writer
 //! thread with std channels and polls the blocked producer exactly once. The
 //! hard-kill test uses a named failpoint + a real `SIGABRT` child, never a sleep.
 
@@ -198,6 +202,7 @@ async fn uuid_mismatch_rebuilds() {
     {
         let db = open_cache(&layout, UUID_A, 8);
         write_probe(&db).await;
+        db.close();
     }
 
     let db = open_cache(&layout, UUID_B, 8);
@@ -228,6 +233,7 @@ async fn schema_version_mismatch_rebuilds() {
     {
         let db = open_cache(&layout, UUID_A, 8);
         write_probe(&db).await;
+        db.close();
     }
 
     // Poke an unsupported schema version straight into the file (a future binary
@@ -311,6 +317,7 @@ async fn state_untouched_on_cache_rebuild() {
     {
         let db = open_cache(&layout, UUID_A, 8);
         write_probe(&db).await;
+        db.close();
     }
     let db = open_cache(&layout, UUID_B, 8);
     assert_eq!(db.outcome(), CacheOpenOutcome::Recreated);
@@ -429,6 +436,7 @@ async fn recreate_is_idempotent_on_retry() {
     {
         let db = open_cache(&layout, UUID_A, 8);
         write_probe(&db).await;
+        db.close();
     }
 
     // Model a crash mid-rebuild: the cache files are gone.
@@ -448,6 +456,7 @@ async fn recreate_is_idempotent_on_retry() {
             cache_meta(&db, "store_instance_uuid").as_deref(),
             Some(UUID_A)
         );
+        db.close();
     }
     let db = open_cache(&layout, UUID_A, 8);
     assert_eq!(
@@ -459,6 +468,61 @@ async fn recreate_is_idempotent_on_retry() {
         cache_meta(&db, "store_instance_uuid").as_deref(),
         Some(UUID_A)
     );
+    db.close();
+}
+
+/// D-009 regression: [`CacheDb::close`] must *wait* for the writer thread, so a
+/// caller may unlink and recreate the path immediately afterwards.
+///
+/// Without that barrier the previous instance's detached writer is still closing
+/// its connection while the next instance creates a new database at the same
+/// path; because SQLite opens `-wal`/`-shm` **by name**, the old teardown lands
+/// on the *new* instance's sidecars, leaving an empty database whose reader gets
+/// `SQLITE_IOERR_SHORT_READ`. Measured before the fix: 6 of 16 concurrent
+/// processes failed; after it, 0 of 16.
+///
+/// The loop is the whole point — one iteration would pass even with the race, so
+/// this repeats the unlink/recreate cycle and asserts every round is readable
+/// through an independent read-only connection.
+#[tokio::test]
+async fn close_lets_the_path_be_unlinked_and_recreated_immediately() {
+    let (_home, layout) = temp_store();
+    let path = layout.cache_db();
+
+    for round in 0..8 {
+        let db = open_cache(&layout, UUID_A, 8);
+        write_probe(&db).await;
+        assert!(probe_present(&db), "round {round}: probe written");
+        // The barrier under test: after this returns, nothing of this instance
+        // may touch the files any more.
+        db.close();
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(append(&path, suffix));
+        }
+
+        let rebuilt = open_cache(&layout, UUID_A, 8);
+        assert_eq!(
+            rebuilt.outcome(),
+            CacheOpenOutcome::Created,
+            "round {round}: unlinked cache is rebuilt"
+        );
+        assert_eq!(
+            cache_meta(&rebuilt, "store_instance_uuid").as_deref(),
+            Some(UUID_A),
+            "round {round}: the rebuilt cache is readable through a fresh \
+             read-only connection"
+        );
+        assert!(
+            !probe_present(&rebuilt),
+            "round {round}: the rebuilt cache starts empty"
+        );
+        rebuilt.close();
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(append(&path, suffix));
+        }
+    }
 }
 
 /// D-003 regression: the read-helper error classifiers discriminate correctly, so

@@ -149,6 +149,55 @@ fn dense_backend_adr_is_well_formed() {
     );
 }
 
+#[test]
+fn default_embedding_model_adr_is_well_formed() {
+    let path = adr_dir().join("0004-default-embedding-model.md");
+    let adr = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for section in ["## Status", "## Context", "## Decision", "## Consequences"] {
+        assert!(
+            adr.contains(section),
+            "ADR-0004 must contain a `{section}` section"
+        );
+    }
+    assert!(
+        adr.contains("Accepted"),
+        "ADR-0004 must record an Accepted status"
+    );
+    assert!(
+        adr.contains("O3"),
+        "ADR-0004 must reference the open question O3 it partially resolves"
+    );
+    // It closes only the embedding half; the generator half must stay visible
+    // until T14-07 (group 11's gate checks exactly this).
+    assert!(
+        adr.contains("T14-07"),
+        "ADR-0004 must keep O3's generator half visible with its owning task"
+    );
+    assert!(
+        adr.contains("T11-06"),
+        "ADR-0004 must name the task that owns weights delivery"
+    );
+}
+
+/// The ADR's measurement artifact must exist and stay machine-readable: the
+/// decision cites numbers, and a citation to a missing or unparsable file is not
+/// evidence.
+#[test]
+fn default_embedding_model_adr_artifact_is_present_and_parsable() {
+    let path = adr_dir().join("artifacts/0004-embedding-measurements.json");
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(raw.trim_start().starts_with('{'), "artifact must be JSON");
+    for key in [
+        "\"measurements\"",
+        "\"host\"",
+        "\"method\"",
+        "embeddinggemma-300m",
+        "jina-embeddings-v2-base-code",
+    ] {
+        assert!(raw.contains(key), "artifact must record {key}");
+    }
+}
+
 /// Guard the resolver used above so a false "all links pass" can't hide behind a
 /// broken parser.
 #[test]

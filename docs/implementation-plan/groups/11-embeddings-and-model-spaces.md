@@ -44,6 +44,16 @@ spec 03 §2.2/§4.2; 04 §3; 05 §8; 10; 12 §1; 15 O3.
   fully offline reopen; no weights in npm.
 - **Тесты:** bad checksum, interrupted download, existing valid asset, missing `.ok`, offline
   launch; platform path. Network tests use local fixture server only.
+- **Добавлено D-008 (T11-03):** здесь же реализуется **in-process ONNX-провайдер выбранной
+  ADR-0004 модели** (`embeddinggemma-300m`, 768d, cosine) — выбор рантайма `fastembed` vs
+  `Candle` (spec 10 §1) принадлежит этой карточке, поскольку связывать рантайм раньше весов
+  нечем. Консьюмерская половина контракта (`local_rag_embed::require_model_assets`, `.ok`-маркер,
+  типизированный `ModelAssetsMissing`) уже существует с T11-03 — провайдер обязан ходить через
+  неё, а не проверять файлы сам. Инсталлятор обязан показать и сохранить лицензию модели
+  (Gemma Terms of Use — не OSI) в `models/embeddinggemma-300m/manifest.json` (spec 10 §5).
+- **Тесты (добавлено D-008):** провайдер отдаёт `ModelAssetsMissing` без единого сетевого вызова,
+  когда `.ok` отсутствует; после установки — offline-инференс, чьи `key()` и длина векторов
+  совпадают с зарегистрированным `representation` (тот же контракт, что проверяет пул T11-03).
 
 ## G11 — Сверка model migration
 
