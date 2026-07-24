@@ -100,15 +100,26 @@ rewritten.
   and exercise those code paths.
 - Isolated dev workspace `spike/` (T10-01): a **separate** Cargo workspace with
   its **own `Cargo.lock`**, `exclude`d from the root `[workspace]`. It holds the
-  roadmap-step-11 dense-backend spike harness (open question O1) and, at
-  T10-02/03/04, the candidate adapters (brute-force / `usearch` / Qdrant Edge)
+  roadmap-step-11 dense-backend spike harness (open question O1) and the
+  candidate adapters (brute-force T10-02, `usearch` T10-03, Qdrant Edge T10-04)
   that pull real dense-vector crates. Keeping those in the spike's lockfile is
   what makes the "no dense SDK in the product workspace before T10" rule above a
   *structural* fact rather than a review promise — the product `Cargo.lock` never
-  resolves them. `cargo xtask ci` runs the spike's `fmt`/`clippy`/`test` by
-  `--manifest-path spike/Cargo.toml` (root `cargo test --workspace` does not reach
-  an excluded sub-workspace). The winning backend is promoted into the product
-  workspace at T12-02. Never distributed.
+  resolves them. Two members as of T10-04: `harness` (the shared conformance/
+  benchmark harness plus the brute-force/usearch candidates, both cheap enough
+  to live as modules there) and `qdrant-edge` (isolated in its own crate: the
+  `qdrant-edge` dependency republishes the *actual* Qdrant server's WAL/segment
+  storage engine, ~80 transitive dependencies — a different risk class from
+  usearch's compact C++ library, isolated so a build/platform problem there can
+  never make `harness`'s already-passing candidates uncompilable; `qdrant-edge`
+  depends on `harness`, so it ships its own `spike` binary rather than a match
+  arm in `harness`'s). `cargo xtask ci` runs the spike's `fmt` blanket across the
+  whole workspace, and `clippy`/`test` scoped per member (`-p
+  local-rag-spike-harness`, `-p local-rag-spike-qdrant-edge`) so a problem in
+  one candidate's build doesn't mask the other's pass/fail signal (root `cargo
+  test --workspace` does not reach an excluded sub-workspace at all). The
+  winning backend is promoted into the product workspace at T12-02. Never
+  distributed.
 
 ## Committing
 

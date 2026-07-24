@@ -70,6 +70,24 @@ quantization), so any recall gap is attributable to the approximate graph search
 the library's internal defaults — 16/128/64 respectively — during construction, not
 literal zero-connectivity); no tuning constants are invented (O2).
 
+As-built note (T10-04, `[SPEC]`): the Qdrant Edge spike candidate
+(`spike/qdrant-edge/src/lib.rs`) is built with `Distance::Dot`. Verified directly in the
+vendored source: `DotProductMetric::postprocess` is a literal identity (`fn
+postprocess(score) { score }`) and `similarity` is the raw, unsigned dot product — **no
+score transformation is needed at all**, the simplest of the three real candidates
+(contrast usearch's `score = -distance`). `filtered_hnsw_available()` reports `true`;
+unlike usearch's separate `filtered_search` method, payload filtering is a first-order
+parameter on every Qdrant search/scroll/count call — arguably the most "native"
+filtered-HNSW story of the three. `ScalarKind`-equivalent quantization is left disabled
+(no `quantization_config`), same no-invented-tuning-constants discipline as usearch's
+HNSW sentinel. Found during T10-04 testing, load-bearing for T10-05 (spec 14 §7 carries
+the full as-built note): this candidate's on-disk corruption-detection story differs
+qualitatively from the other two — point identity/count tracking lives in a small,
+separate structural file, decoupled from the (fixed-capacity, preallocated) vector
+storage files the shared conformance suite's generic corruption case targets, and
+directly corrupting that structural file surfaces an uncaught panic inside the vendored
+`qdrant-edge` 0.7.2 crate rather than a clean, catchable error.
+
 ## 2. Shard model
 
 - **One shard per worktree** `[FIXED]`: pure active-only semantics, isolated rebuild, no
@@ -91,6 +109,20 @@ parses a `PointId`'s first 16 hex characters (its first 8 raw digest bytes) as o
 big-endian `u64`. A collision (two distinct point ids sharing a derived key) is never
 silently merged: the adapter checks both its persisted key map and the current upsert
 batch, and rejects the call with a typed error before mutating anything if one is found.
+
+As-built note (T10-04, `[SPEC]`): Qdrant Edge is the concrete case for this sentence's
+"...or 16 bytes" clause — its native id (`qdrant_edge::PointId`, i.e. `ExtendedPointId`)
+supports a full 128-bit UUID, not just a 64-bit numeric key. `spike/qdrant-edge/src/
+lib.rs::derive_uuid` parses a `PointId`'s first 32 hex characters (its first 16 raw digest
+bytes) as one big-endian `u128`. Deliberately **no explicit collision guard** here (unlike
+usearch's cheap in-memory hashmap check): checking would need a real backend I/O call per
+point against a 128-bit keyspace, at the same trust level this codebase already places in
+unguarded UUIDv7 identity elsewhere (`worktree_id`, `generation_id` — also 128-bit, never
+collision-guarded). The asymmetry with T10-03 isn't "128 bits is safer alone" — the *cost*
+of checking is categorically different (persisted I/O vs. a free hashmap lookup). A
+genuine collision would not be silently invisible even so: it would merge two point ids
+into one Qdrant point, and `point_count()`/manifest recomputation would report one fewer
+point than upserted.
 
 ## 4. Expected point set
 
@@ -379,3 +411,17 @@ write-ahead-switch-driver or `state.sqlite`-registry-level concerns entirely out
 `ShardHandle`'s reach — already exhaustively covered above at product-crate scope
 (T07-05) against the fake backend, and not re-tested per spike candidate. This mirrors
 T10-02's identical disposition for its own "crash/reopen cases" test bullet.
+
+As-built note (T10-04, `[SPEC]`): Qdrant Edge is the one candidate where the shared
+suite's F5/F8/F12-shaped corruption case (largest-file truncation) does **not** reach a
+detectable divergence at `TINY` scale — its vector/payload/WAL storage uses fixed-capacity
+preallocated files (verified empirically: even truncating the largest such file to 0 bytes
+still reopens with the original point count intact), because point identity/count tracking
+lives in a separate, small structural file the largest-file heuristic never targets (unlike
+brute-force/usearch, where the largest file *is* the identity-bearing one). A dedicated
+candidate-specific test (`spike/qdrant-edge/src/lib.rs::
+corrupting_the_id_tracker_panics_instead_of_erroring_cleanly`) directly corrupts that
+structural file instead and finds a genuine, separate robustness gap in the vendored
+`qdrant-edge` 0.7.2 crate: an uncaught panic, not a clean `Result::Err` — a real finding for
+T10-05, not a defect in this adapter or a `DEVIATIONS.md`-worthy mismatch with this
+project's own normative behavior (no backend is chosen yet).

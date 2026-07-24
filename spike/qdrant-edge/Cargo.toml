@@ -1,0 +1,33 @@
+[package]
+name = "local-rag-spike-qdrant-edge"
+description = "Qdrant Edge (embedded, no-daemon) ProjectionStore spike candidate (open question O1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Path deps into the product workspace, same reasoning as `harness`'s own: this
+# candidate runs through the *same* `[FIXED]` ProjectionStore contract (spec 05
+# §1) the product uses.
+local-rag-core = { path = "../../crates/core" }
+local-rag-projection = { path = "../../crates/projection" }
+# The shared spike harness: `SpikeAdapter`, `oracle::{exact_top_k, recall_at_k}`,
+# `conformance::run_conformance`, `corpus`, `report` types. This crate depends on
+# `harness`, never the other way — see spike/Cargo.toml's own header comment for
+# why (harness's `bin/spike.rs` would otherwise need to depend on this crate too,
+# a cycle).
+local-rag-spike-harness = { path = "../harness" }
+# T10-04: the third real dense-backend spike candidate (open question O1).
+# Apache-2.0. Isolated in its own crate (not a module in `harness`, unlike
+# brute-force/usearch) because it republishes the *actual* Qdrant server's
+# WAL/segment storage engine (~80 transitive dependencies: tokio, tonic, rayon,
+# BM25 tokenization, geo, Linux-specific io-uring/cgroups-rs/procfs) rather than
+# a compact purpose-built library — a different risk class than usearch's ~20
+# crates / ~13s build, and isolating it means a build/platform problem here
+# never makes the already-passing brute-force/usearch candidates uncompilable.
+qdrant-edge = "0.7"
+serde_json = "1"
+
+[lints]
+workspace = true

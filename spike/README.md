@@ -41,17 +41,36 @@ production search integration:
 build script compiles a C++17 core via `cxx-build`/`cc`. `fake` (T10-01) and
 `brute-force` (T10-02) needed none. Verified locally against a Homebrew
 `clang++`/system `/usr/bin/c++` toolchain; no `cmake` step is required (`cxx-build`
-invokes the compiler directly).
+invokes the compiler directly). `qdrant-edge` (T10-04) is pure Rust (plus a system
+`protoc`, needed transitively by `tonic`/`prost-build` even though the embedded
+API itself never touches networking) — verified locally, builds in under a minute.
+
+## Two crates, two binaries (T10-04)
+
+`qdrant-edge` republishes the *actual* Qdrant server's WAL/segment storage engine
+(~80 transitive dependencies) rather than a compact purpose-built library like
+`usearch` — a different risk class, isolated in its own workspace member,
+`spike/qdrant-edge/`, so a build/platform problem there can never make the
+`harness` crate's already-passing fake/brute-force/usearch candidates
+uncompilable. `qdrant-edge` (the crate) depends on `harness` (for `SpikeAdapter`/
+`oracle`/`conformance`), so `harness` cannot depend back — the Qdrant Edge
+candidate ships its own `spike` binary in `spike/qdrant-edge/src/bin/spike.rs`
+(same flags) rather than a 4th match arm in `harness`'s.
 
 ## Run
 
 ```sh
-# Tests (also run by `cargo xtask ci` from the repo root):
-cargo test --manifest-path spike/Cargo.toml
+# Tests (also run by `cargo xtask ci` from the repo root, fmt blanket / clippy+test per crate):
+cargo test --manifest-path spike/Cargo.toml -p local-rag-spike-harness
+cargo test --manifest-path spike/Cargo.toml -p local-rag-spike-qdrant-edge
 
 # Generate a benchmark report artifact:
 cargo run --manifest-path spike/Cargo.toml --bin spike -- \
     --adapter fake --dataset small --seed 42 --out spike/artifacts/fake-small.json
+
+# Qdrant Edge runs via its own crate/binary:
+cargo run --manifest-path spike/Cargo.toml -p local-rag-spike-qdrant-edge --bin spike -- \
+    --dataset small --seed 42 --out spike/artifacts/qdrant-edge-small.json
 ```
 
 `spike/artifacts/` holds committed, reproducible spike outputs. Timing/RAM numbers

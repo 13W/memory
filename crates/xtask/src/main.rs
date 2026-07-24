@@ -97,11 +97,9 @@ fn run_ci() -> ExitCode {
         &["test", "-p", "local-rag-search", "--features", "failpoints"],
         // The dense-backend spike (T10-01) is a SEPARATE workspace with its own
         // Cargo.lock (`spike/`, `exclude`d from the root — CONTRIBUTING.md §
-        // Workspace layout), so `test --workspace` above never reaches it. Run its
-        // fmt/lint/tests explicitly by `--manifest-path` so the harness and its
-        // acceptance tests stay gated. Keeping it a distinct lockfile is what makes
-        // the "no dense SDK in the product lock" guardrail structural (its future
-        // usearch/Qdrant candidates never enter the root lock).
+        // Workspace layout), so `test --workspace` above never reaches it. `fmt`
+        // stays blanket across the whole spike workspace (formatting doesn't
+        // require successful compilation, so there is no isolation gap to close).
         &[
             "fmt",
             "--manifest-path",
@@ -109,16 +107,53 @@ fn run_ci() -> ExitCode {
             "--all",
             "--check",
         ],
+        // `clippy`/`test` are scoped per spike workspace member (T10-04), not
+        // blanket: `local-rag-spike-qdrant-edge` republishes the actual Qdrant
+        // server's WAL/segment engine (~80 transitive dependencies) in its own
+        // crate specifically so a build/platform problem there can never make
+        // `local-rag-spike-harness` (fake/brute-force/usearch, all already
+        // passing) uncompilable — but a single blanket `test --manifest-path`
+        // step would still report one combined pass/fail bit either way, so it
+        // is split here into two step-pairs (harness first) to preserve each
+        // candidate's own signal, mirroring the existing `--features
+        // failpoints` per-crate steps above for `store`/`index`/`projection`/
+        // `search`.
         &[
             "clippy",
             "--manifest-path",
             "spike/Cargo.toml",
+            "-p",
+            "local-rag-spike-harness",
             "--all-targets",
             "--",
             "-D",
             "warnings",
         ],
-        &["test", "--manifest-path", "spike/Cargo.toml"],
+        &[
+            "test",
+            "--manifest-path",
+            "spike/Cargo.toml",
+            "-p",
+            "local-rag-spike-harness",
+        ],
+        &[
+            "clippy",
+            "--manifest-path",
+            "spike/Cargo.toml",
+            "-p",
+            "local-rag-spike-qdrant-edge",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "test",
+            "--manifest-path",
+            "spike/Cargo.toml",
+            "-p",
+            "local-rag-spike-qdrant-edge",
+        ],
     ];
 
     let cargo = env!("CARGO");

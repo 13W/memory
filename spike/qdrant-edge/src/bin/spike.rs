@@ -1,28 +1,19 @@
-//! The spike benchmark runner (T10-01).
+//! The Qdrant Edge spike benchmark runner (T10-04).
 //!
-//! Runs one candidate adapter against one matrix dataset, then writes a
-//! [`SpikeReport`](local_rag_spike_harness::report::SpikeReport) — conformance
-//! plus the measured 14 §7 metric matrix — as pretty JSON to `--out` (or stdout).
-//! The timing numbers are reproducible *artifacts*, not test assertions.
+//! Mirrors `local-rag-spike-harness`'s own `spike` binary (same flags/output
+//! shape), but lives in this crate rather than adding a match arm to that
+//! one — see `spike/qdrant-edge/src/lib.rs`'s module doc for why (this crate
+//! depends on the harness, so the harness cannot depend back on it).
 //!
 //! ```text
-//! spike --adapter fake --dataset small --seed 42 --out spike/artifacts/fake-small.json
+//! spike --dataset small --seed 42 --out spike/artifacts/qdrant-edge-small.json
 //! ```
-//!
-//! `fake` (T10-01, dev scaffolding), `brute-force` (T10-02) and `usearch`
-//! (T10-03) run through this binary. Qdrant Edge (T10-04) does **not** — it
-//! lives in the sibling `spike/qdrant-edge` crate with its own `spike`
-//! binary, because that crate depends on this one (for [`SpikeAdapter`]/
-//! `oracle`/`conformance`) and a dependency can't run back the other way.
-//! Run it via `cargo run --manifest-path spike/Cargo.toml -p
-//! local-rag-spike-qdrant-edge --bin spike -- --dataset small --seed 42`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use local_rag_spike_harness::{
-    BruteForceAdapter, FakeAdapter, SpikeAdapter, UsearchAdapter, corpus, run_spike,
-};
+use local_rag_spike_harness::{SpikeAdapter, corpus, run_spike};
+use local_rag_spike_qdrant_edge::QdrantEdgeAdapter;
 
 fn main() -> ExitCode {
     match run() {
@@ -37,17 +28,16 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args().skip(1))?;
 
-    let adapter: Box<dyn SpikeAdapter> = match args.adapter.as_str() {
-        "fake" => Box::new(FakeAdapter),
-        "brute-force" => Box::new(BruteForceAdapter),
-        "usearch" => Box::new(UsearchAdapter),
-        other => {
-            return Err(format!(
-                "unknown adapter {other:?} (fake/brute-force/usearch run through this binary; \
-                 qdrant-edge lives in the sibling spike/qdrant-edge crate's own `spike` binary)"
-            ));
-        }
-    };
+    // Only one candidate lives in this crate; `--adapter` is kept for flag
+    // parity with the harness's own binary rather than dropped.
+    if args.adapter != "qdrant-edge" {
+        return Err(format!(
+            "unknown adapter {:?} (only `qdrant-edge` exists in this binary; \
+             fake/brute-force/usearch run via the harness crate's own `spike` binary)",
+            args.adapter
+        ));
+    }
+    let adapter: Box<dyn SpikeAdapter> = Box::new(QdrantEdgeAdapter);
 
     let spec = corpus::spec_by_name(&args.dataset).ok_or_else(|| {
         format!(
@@ -92,7 +82,10 @@ fn scratch_dir() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("local-rag-spike-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "local-rag-spike-qdrant-edge-{}-{n}",
+        std::process::id()
+    ))
 }
 
 /// Parsed command-line arguments.
@@ -105,7 +98,7 @@ struct Args {
 
 impl Args {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let mut adapter = "fake".to_string();
+        let mut adapter = "qdrant-edge".to_string();
         let mut dataset = "small".to_string();
         let mut seed = 42u64;
         let mut out = None;

@@ -284,24 +284,47 @@ fn recompute_manifest(
     ))
 }
 
-/// Truncate the largest regular file in `dir` to half its length — a
+/// Find the largest regular file anywhere under `dir`, recursing into
+/// subdirectories (T10-04, `[SPEC]`-level fix found during planning, before any
+/// candidate exercised the broken path): a flat, non-recursive scan was
+/// invisible for brute-force/usearch (both single-directory layouts) but
+/// Qdrant Edge nests its real data under `wal/`/`segments/<id>/...` — a
+/// non-recursive walk would silently corrupt an irrelevant top-level file
+/// (e.g. `head` or `edge_config.json`) instead of real backend data, making the
+/// corruption case pass for the wrong reason or not detect anything at all.
+/// Symlinks are not followed: `DirEntry::file_type` reports a symlink's own
+/// type (neither file nor dir), so a symlink is simply skipped rather than
+/// walked into — avoiding a possible symlink loop.
+fn find_largest_regular_file(dir: &Path) -> io::Result<Option<(std::path::PathBuf, u64)>> {
+    let mut largest: Option<(std::path::PathBuf, u64)> = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let len = entry.metadata()?.len();
+            if largest.as_ref().is_none_or(|(_, best)| len > *best) {
+                largest = Some((entry.path(), len));
+            }
+        }
+    }
+    Ok(largest)
+}
+
+/// Truncate the largest regular file anywhere under `dir` (searched
+/// recursively, see [`find_largest_regular_file`]) to half its length — a
 /// backend-agnostic corruption of the shard's data. For a file-based backend the
 /// largest file is the point data, so this either drops points (a count/manifest
 /// mismatch) or breaks a record (an unopenable shard); both are detectable.
 fn corrupt_largest_regular_file(dir: &Path) -> io::Result<()> {
-    let mut largest: Option<(std::path::PathBuf, u64)> = None;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let meta = entry.metadata()?;
-        if !meta.is_file() {
-            continue;
-        }
-        let len = meta.len();
-        if largest.as_ref().is_none_or(|(_, best)| len > *best) {
-            largest = Some((entry.path(), len));
-        }
-    }
-    let (path, len) = largest.ok_or_else(|| {
+    let (path, len) = find_largest_regular_file(dir)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "shard directory has no regular file",
@@ -317,4 +340,64 @@ fn corrupt_largest_regular_file(dir: &Path) -> io::Result<()> {
 /// probe, re-exported so the bin does not duplicate the shape).
 pub fn first_query(dataset: &SeededDataset) -> Option<DenseQuery> {
     dataset.queries.first().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Scratch {
+        path: std::path::PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "local-rag-spike-conformance-test-{}-{n}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create scratch");
+            Self { path }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// T10-04: a deeply-nested larger file must win over a shallow smaller one
+    /// — the regression this fix targets (Qdrant Edge nests its real data
+    /// under `wal/`/`segments/<id>/...`, unlike the flat brute-force/usearch
+    /// layouts that never exercised the non-recursive bug).
+    #[test]
+    fn find_largest_regular_file_recurses_into_subdirectories() {
+        let scratch = Scratch::new();
+        fs::write(scratch.path.join("shallow_small"), vec![0u8; 16]).expect("write shallow");
+
+        let nested = scratch.path.join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested dirs");
+        let deep_large = nested.join("deep_large");
+        fs::write(&deep_large, vec![0u8; 1024]).expect("write deep");
+
+        let (path, len) = find_largest_regular_file(&scratch.path)
+            .expect("scan")
+            .expect("a largest file must be found");
+        assert_eq!(path, deep_large);
+        assert_eq!(len, 1024);
+    }
+
+    #[test]
+    fn find_largest_regular_file_on_empty_dir_is_none() {
+        let scratch = Scratch::new();
+        assert!(
+            find_largest_regular_file(&scratch.path)
+                .expect("scan")
+                .is_none()
+        );
+    }
 }

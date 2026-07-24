@@ -105,3 +105,40 @@ embeddings, which cluster semantically. This is a genuine measurement of this sp
 synthetic corpus, not necessarily predictive of recall on real `embedding_cache`
 vectors once T11 exists — flagged explicitly so T10-05 does not read the `large`/
 `representative` recall numbers as a verdict on `usearch` itself without this context.
+
+As-built note (T10-04, `[SPEC]`): `recall_at_k` is likewise a genuine measurement for
+the Qdrant Edge candidate (`reports_recall() -> true`, same opt-in machinery). No score
+transform is applied (`Distance::Dot`'s `postprocess_score` is a verified identity — see
+spec 05 §1's as-built note), the simplest scoring story of the three real candidates.
+`filtered_hnsw_available` is `true` — arguably the most "native" of the three, since
+payload filtering is a first-order parameter on every search/scroll/count call rather
+than a separate method. Measured recall on the seeded `small` matrix dataset (544
+points, seed 42) is a stable `1.0`, comfortably clearing the calibrated 0.9 lower bound
+(`spike/qdrant-edge/tests/qdrant_edge.rs::search_recall_clears_a_reasonable_lower_bound`);
+**`representative` (50,000 points) also measured a stable `1.0`**.
+
+**Important caveat, load-bearing for T10-05 — "plain until optimized"**: unlike usearch
+(a live HNSW graph from the first insert), a freshly created Qdrant Edge segment is
+"plain" (exact, unindexed, full-scan) until `EdgeShard::optimize()` runs **and** the
+segment already exceeds the crate's own default 10,000 KB indexing threshold. Neither
+this spike's `measure_metrics` nor a real product `switch()`/rebuild calls `optimize()`
+automatically (spec 05 §9 `[FIXED]`: "triggered by metrics only... never after every
+reconcile") — so the `1.0` recall measured at both `small` and `representative` reflects
+**exact search**, not this backend's approximate/HNSW behavior, and is not directly
+comparable to usearch's own (genuinely approximate, at every scale) recall numbers
+without this context. This is not a spike-harness artifact — it is exactly how this
+candidate would behave in the real product architecture, and arguably a better fit for
+spec 05 §9's own principle than usearch's always-live-graph model. `optimize()` itself
+is wired to the real `EdgeShard::optimize()` (found during T10-04 implementation, not a
+no-op as originally planned) and verified safe on a segment large enough to actually
+cross the indexing threshold
+(`spike/qdrant-edge/src/lib.rs::optimize_handles_a_segment_above_the_indexing_threshold`).
+
+**Important caveat, load-bearing for T10-05**: the shared conformance suite's generic
+on-disk corruption case does not produce a detected divergence for this candidate at
+`TINY` scale — its vector/payload/WAL storage uses fixed-capacity preallocated files
+immune to truncation-based corruption (see spec 05 §1/§10's as-built notes) — and a
+candidate-specific test that targets the real structural identity-tracking file instead
+found a genuine, separate robustness gap in the vendored `qdrant-edge` 0.7.2 crate: an
+uncaught panic on corrupted state, not a clean, catchable error. `ram_bytes_per_shard`/
+`lru` remain `None` for the same unchanged reasons as the other two candidates.
