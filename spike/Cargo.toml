@@ -9,9 +9,24 @@
 # keeping them in this lockfile means the product `Cargo.lock` stays free of them,
 # so "no premature backend coupling" is a structural fact, not a reviewer promise.
 # The winner is copied into the product workspace at T12-02.
+#
+# Two members as of T10-04: `harness` (shared conformance/benchmark harness plus
+# the brute-force/usearch candidates, both cheap enough to live as modules there
+# — T10-02 added zero new deps, T10-03's usearch built in ~13s with ~20 transitive
+# crates) and `qdrant-edge` (isolated in its own crate: the `qdrant-edge` crate
+# republishes the *actual* Qdrant server's WAL/segment storage engine, ~80
+# transitive dependencies — a different risk class than usearch's compact C++
+# library, and one a module inside `harness` would let make the *entire* spike
+# workspace uncompilable, including the already-passing brute-force/usearch
+# candidates, on any build/platform trouble). `qdrant-edge` depends on `harness`
+# (for `SpikeAdapter`/`oracle`/`conformance`), so it cannot depend back — it ships
+# its own `spike` binary rather than adding a 4th match arm to `harness`'s.
+# `crates/xtask` runs `fmt` blanket across the whole workspace, but `clippy`/`test`
+# per-member (`-p ...-harness`, `-p ...-qdrant-edge`) so a problem in one
+# candidate's build doesn't mask the other's pass/fail signal.
 [workspace]
 resolver = "2"
-members = ["harness"]
+members = ["harness", "qdrant-edge"]
 
 [workspace.package]
 version = "0.0.0"
