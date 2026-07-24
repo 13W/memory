@@ -30,7 +30,13 @@ After the initial `cargo fetch`, the full check runs **offline**.
 - `Cargo.lock` is committed for reproducible builds.
 - No dense-vector or embedding-model SDK enters the workspace before the T10
   comparative spike / T11 embeddings work (see `docs/implementation-plan`).
-  Nothing may couple to a concrete dense backend before then.
+  Nothing may couple to a concrete dense backend before then. As of T11-03 the
+  embedding-model half of that rule is still in force by construction:
+  ADR-0004 selects the default model, but the ONNX runtime that loads it —
+  together with the weights themselves — arrives with the model-asset installer
+  (T11-06, spec 10 §5), so `crates/embed` links **no** model or network SDK
+  today and a test asserts that structurally
+  (`crates/embed/tests/offline_smoke.rs`).
 - New dependencies require justification (why the standard library is
   insufficient) and a license check; prefer `std` and small, well-vetted crates.
 - Lints are centralized in `[workspace.lints]`; each crate opts in via
@@ -59,7 +65,7 @@ the license check. Additions require a new row here.
 | `tree-sitter-javascript` | `crates/index` | The second-release language grammar (ADR-0001, T04-04); ships generated C parser tables compiled by `cc`. Pinned at **0.23** (not the newer 0.25) for ABI compatibility: the 0.25 grammar is ABI **15**, which `tree-sitter 0.24` (max supported language ABI 14) refuses to load — it would silently degrade to a file-only parse; 0.23.x is ABI 14, the same reason `tree-sitter-typescript` is held at 0.23. Its only runtime dependency is `tree-sitter-language` (already in the tree, shared with `tree-sitter`), so it adds **no new transitive crate**; build-time `cc` reused. Not a dense-backend/model/network SDK. | MIT |
 | `tree-sitter-rust` | `crates/index` | The third-release language grammar (ADR-0001 dogfooding, T04-05); ships generated C parser tables compiled by `cc`. Pinned at **0.23** (not 0.24) for ABI compatibility: the grammar's 0.24 line is ABI **15**, which `tree-sitter 0.24` (max supported language ABI 14) refuses to load — it would silently degrade to a file-only parse; 0.23.x is ABI 14, the same reason the TypeScript/JavaScript grammars are held at 0.23. Its only runtime dependency is `tree-sitter-language` (already in the tree, shared with `tree-sitter`), so it adds **no new transitive crate**; build-time `cc` reused. Not a dense-backend/model/network SDK. | MIT |
 | `streaming-iterator` | `crates/index` | tree-sitter 0.24 yields query matches as a `StreamingIterator`; driving `QueryCursor::matches` needs the trait in scope (also a transitive dep of `tree-sitter`, promoted to direct). Zero transitive dependencies. Not a dense-backend/model/network SDK. | MIT OR Apache-2.0 |
-| `serde_json` (dev-dependency) | `crates/index` (tests only) | T04-03 is the first task to consume typed JSON fixtures (the parser family, spec 14 §1.1); typed models with `#[serde(deny_unknown_fields)]` make deserialization the schema check, so no runtime `jsonschema` dep is needed. Dev-only — the shipped binary never links it. `serde` (`derive`) is already approved (crates/core). Native-linking transitive set: `itoa`, `zmij`, and `memchr`/`serde`/`serde_core` (reused). None are dense-backend/model/network SDKs. | MIT OR Apache-2.0 |
+| `serde_json` (dev-dependency) | `crates/index` and `crates/embed` (tests only) | T04-03 is the first task to consume typed JSON fixtures (the parser family, spec 14 §1.1); typed models with `#[serde(deny_unknown_fields)]` make deserialization the schema check, so no runtime `jsonschema` dep is needed. T11-03 reuses it for the same reason on the `fault.llm.*` family (`fixtures/fault/index.json`), which carries the v1 provider retry contract spec 10 §1 inherits — already in `Cargo.lock`, so **0 new external sources**. Dev-only — the shipped binary never links it. `serde` (`derive`) is already approved (crates/core). Native-linking transitive set: `itoa`, `zmij`, and `memchr`/`serde`/`serde_core` (reused). None are dense-backend/model/network SDKs. | MIT OR Apache-2.0 |
 | `notify` (`default-features = false`, feature `macos_fsevent`) | `crates/index` | The reconcile scheduler needs filesystem-change notifications (spec 06 §1: "Watcher (`notify`) events"; the `[FIXED]` principle is watcher = hint, reconcile = truth). `std` has no FS-notification API. Live watching is confined to `reconcile::watcher`; the pure `WatchEvent → Trigger` mapping is what the tests cover, and the OS watcher itself is never in the CI suite (its event timing is not reproducible). `default-features = false` drops the `crossbeam-channel` default (the thin wrapper uses `std`/tokio channels), keeping the set minimal like `ignore`. Runtime crates compiled on the targets this project ships: `notify` (CC0-1.0) + `notify-types` (MIT OR Apache-2.0); on macOS `fsevent-sys` (MIT); on Linux `inotify` + `inotify-sys` (ISC) and `mio` (MIT). Reused (already in the tree): `bitflags`, `libc`, `log`, `walkdir`, `same-file`. `Cargo.lock` additionally records — but never compiles for v0's macOS/Linux targets — `kqueue`/`kqueue-sys` (MIT, BSD), the `windows-sys`/`windows-targets`/`windows_*` family (MIT OR Apache-2.0, `cfg(windows)`), and `wasi` (wasm), gated exactly like rusqlite's wasm subtree. Not a dense-backend/model/network SDK. | CC0-1.0 |
 
 The earlier "zero external sources" property (T00-02) is therefore superseded by
@@ -69,8 +75,11 @@ rewritten.
 
 ## Workspace layout
 
-- Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `search`,
-  `memory`, `protocol`.
+- Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `embed`,
+  `search`, `memory`, `protocol`. `embed` (T11-03) is the embedding provider
+  pool — the `Embedder` contract, the central remote-policy guard, primary/
+  fallback + retry, and the in-process default provider. It depends only on
+  other workspace crates.
 - Product binaries: `local-rag` (daemon + CLI), `local-rag-proxy` (stdio MCP
   proxy), `local-rag-hook` (spool writer).
 - Dev-only crates (workspace members, excluded from `default-members`, never

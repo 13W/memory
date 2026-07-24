@@ -349,6 +349,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-rag-embed"
+version = "0.0.0"
+dependencies = [
+ "local-rag-core",
+ "local-rag-protocol",
+ "local-rag-store",
+ "local-rag-test-support",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "local-rag-hook"
 version = "0.0.0"
 dependencies = [

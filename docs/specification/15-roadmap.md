@@ -61,7 +61,7 @@ multiple generators; cross-generation matching; LSP graph; multi-harness; FreeBS
 | --- | --- | --- | --- |
 | O1 | Dense backend (Qdrant Edge / usearch / brute-force) | **RESOLVED — ADR-0003 (T10-05): brute-force** | steps 12+ dense specifics only |
 | O2 | Gate numbers (quality/latency/resources; memory router P/R) | baseline runs | release criteria only |
-| O3 | Default embedding model + weights delivery; local generator crate | model evaluation + 10 §5 | init UX, router quality |
+| O3 | Default embedding model + weights delivery; local generator crate | **embedding model RESOLVED — ADR-0004 (T11-03): `embeddinggemma-300m`, 768d, cosine**; weights delivery still open (T11-06, 10 §5); local generator crate still open (T14-07) | init UX, router quality |
 | O4 | First-release language set | **RESOLVED — ADR-0001 (T04-01): TypeScript, JavaScript, Rust** | parser scope |
 | O5 | v1 memory migration vs clean start | product decision before GA | 13 §3 last step |
 | O6 | Retention K / T for retired generations | usage metrics | GC defaults |

@@ -1,12 +1,14 @@
 //! The canonical daemon-protocol error/degraded vocabulary (spec 02 §6) — T09-03.
 //!
 //! Shared by every daemon subsystem (code search, memory, ...), not just code
-//! search — hence living here rather than in `local-rag-search`. Only the
-//! three [`ErrorCode`] variants T09-03's search skeleton needs are defined;
-//! spec 02 §6's remaining rows (`POLICY_BLOCKED_REMOTE`, `MIGRATION_IN_PROGRESS`,
-//! `STORE_LOCKED`, `INCOMPATIBLE_STORE`) belong to the later tasks that
-//! actually detect those conditions — adding them here ahead of that would be
-//! unused, undead code.
+//! search — hence living here rather than in `local-rag-search`. Variants are
+//! added by the task that first *detects* the condition, never ahead of it
+//! (that would be unused, undead code): T09-03's search skeleton defined the
+//! first three, and T11-03's embedding provider pool added
+//! `POLICY_BLOCKED_REMOTE` — it is the central remote-policy guard (spec 12 §1,
+//! 10 §1) and therefore the first code that can refuse a call on policy
+//! grounds. Spec 02 §6's remaining rows (`MIGRATION_IN_PROGRESS`,
+//! `STORE_LOCKED`, `INCOMPATIBLE_STORE`) still belong to their own later tasks.
 //!
 //! [`ErrorEnvelope`] is the wire shape `{code, message, retryable, details?}`;
 //! `details` stays a freeform `Option<String>` (spec marks its shape
@@ -26,6 +28,10 @@ pub enum ErrorCode {
     /// A generation/model-space switch is in flight and the bounded wait on
     /// `L2.read` elapsed (spec 02 §6).
     BusyRetry,
+    /// The effective `data_policy` forbids the remote call the operation would
+    /// need (spec 02 §6, 12 §1). Refused, never silently downgraded to a
+    /// weaker policy or to a different provider class.
+    PolicyBlockedRemote,
 }
 
 impl ErrorCode {
@@ -35,6 +41,7 @@ impl ErrorCode {
             ErrorCode::IndexUnavailable => "INDEX_UNAVAILABLE",
             ErrorCode::WorktreeNotIndexed => "WORKTREE_NOT_INDEXED",
             ErrorCode::BusyRetry => "BUSY_RETRY",
+            ErrorCode::PolicyBlockedRemote => "POLICY_BLOCKED_REMOTE",
         }
     }
 }
@@ -135,6 +142,10 @@ mod tests {
             "WORKTREE_NOT_INDEXED"
         );
         assert_eq!(ErrorCode::BusyRetry.as_str(), "BUSY_RETRY");
+        assert_eq!(
+            ErrorCode::PolicyBlockedRemote.as_str(),
+            "POLICY_BLOCKED_REMOTE"
+        );
     }
 
     #[test]

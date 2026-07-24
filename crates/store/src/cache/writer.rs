@@ -68,9 +68,16 @@ impl CacheWriter {
     /// Spawn the cache writer thread over `conn` with a bounded queue of
     /// `capacity` (clamped to at least 1, since a zero-capacity channel is
     /// invalid).
-    pub(super) fn spawn(conn: Connection, capacity: usize) -> io::Result<Self> {
+    /// Returns the handle plus the writer thread's `JoinHandle`, which
+    /// [`CacheDb::close`](super::CacheDb::close) uses to wait for the owned
+    /// connection to actually close (D-009). Callers that never close simply
+    /// drop the join handle, detaching the thread as before.
+    pub(super) fn spawn(
+        conn: Connection,
+        capacity: usize,
+    ) -> io::Result<(Self, std::thread::JoinHandle<()>)> {
         let (sender, mut receiver) = mpsc::channel::<Job>(capacity.max(1));
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("local-rag-cache-writer".to_string())
             .spawn(move || {
                 let mut conn = conn;
@@ -86,7 +93,7 @@ impl CacheWriter {
                 // Queue closed → drop the owned connection. Any in-flight
                 // transaction already committed or rolled back per job.
             })?;
-        Ok(Self { sender })
+        Ok((Self { sender }, join))
     }
 
     /// The maximum depth of the bounded write queue.

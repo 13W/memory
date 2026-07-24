@@ -19,6 +19,43 @@ Primary/fallback + retry semantics inherited from the v1 behavioral contract `[F
 Every remote call is gated by the effective `data_policy` (02 §3.2) *before* the provider is
 selected; `local_only` never falls back to remote.
 
+As-built note (T11-03, `[SPEC]`): the pool is `local_rag_embed`
+(`crates/embed`, workspace crate depending only on `core`/`store`/`protocol`).
+
+* **Trait**: [`Embedder`] is exactly the two `[FIXED]` methods above. Locality is deliberately
+  *not* a trait method — it lives on the pool's `ProviderEntry` (`local()`/`remote()`), so the
+  guard's input cannot be supplied by the provider being guarded.
+* **Shapes** (the spec names but does not shape them): `EmbedRequest { kind, texts }` is a batch
+  by construction (the `[FIXED]` return type is `Vec<Vector>`), and results are **positional** —
+  `result[i]` embeds `texts[i]`, `result.len() == texts.len()`. The pool enforces both, plus
+  "every vector has exactly `key().dimensions` components", turning a provider's contract
+  violation into a typed `ResultCountMismatch`/`DimensionMismatch` instead of letting a malformed
+  vector reach `embedding_cache` (whose key is the subject, not the position). `Vector` is a
+  newtype so a raw vector is never confused with §4.2's little-endian *bytes*. An empty batch is
+  answered without selecting a provider.
+* **Order of operations**: guard → primary/fallback → retry. The guard filters candidates before
+  selection (`allows(policy, locality)`), so under `local_only` a remote provider is never
+  invoked — not even as a fallback — and a remote-only pool yields
+  `EmbedError::PolicyBlockedRemote`, whose protocol envelope is the new
+  `ErrorCode::PolicyBlockedRemote` (02 §6). The *effective* policy is computed by the caller via
+  `local_rag_store::effective_data_policy` (T02-05) and never recomputed or relaxed here. The
+  remaining policies differ in payload semantics (metadata-only/redaction/full), which stay
+  T16-01's card; this task ships the seam and the one `[FIXED]` rule that is testable today.
+* **Retry numbers** (`[SPEC]`, the spec pins none): 4 attempts per provider — the same budget the
+  imported v1 fixtures use — with a 250 ms exponential floor doubling to a 4 s cap, the shape 02
+  §4.2 already fixed for the proxy handshake, chosen because both are short user-facing
+  operations. A server-supplied hint (`Retry-After`, or v1's "retry in Xs" body hint) wins over
+  the floor but is still capped, so a hostile provider cannot park a worker thread. A permanent
+  failure is never retried; it falls through to the next provider. The seven `fault.llm.*` cases
+  of `fixtures/fault/index.json` are replayed case-by-case in `crates/embed/tests/retry.rs`.
+* **In-process default**: `HashingEmbedder` — deterministic feature hashing, no ML runtime, no
+  weights, no network — registered under its own bootstrap `model_id` `local-hashing-v1`. It
+  makes "the local backend is the working default" literally true today and is the deterministic
+  model fixture the tests embed with. The ONNX provider for the model ADR-0004 selects arrives
+  with its weights in T11-06 (§5); the split is recorded as `D-008`. Because `model_id` is one of
+  the six canonical key fields (03 §2.2), bootstrap vectors can never be mistaken for production
+  ones.
+
 ## 2. Representations registry
 
 `representation` rows are the canonical serialization of `RepresentationKey`
@@ -90,6 +127,21 @@ Weights are **not** in npm. `local-rag init --download-models`: checksum-verifie
 atomic download (`.part` → fsync → rename → `.ok` marker), offline operation afterwards.
 `models/<model_id>/manifest.json` records source, size, sha256, license. Default model choice
 and delivery details `[OPEN]`. ORT bundling verified before the final CI matrix `[FIXED]`.
+
+As-built note (T11-03, `[SPEC]`): the **default model choice** half of that `[OPEN]` is resolved —
+**`embeddinggemma-300m`, 768 dimensions, cosine** (ADR-0004, which records the measured candidate
+comparison, the explicit criteria weights, and the runner-up
+`jina-embeddings-v2-base-code` should the Gemma terms or the T12-05 gate force a switch; a switch
+costs one model-space migration per §4, not a redesign). Delivery details — which quantization is
+fetched, the runtime that loads it (`fastembed` vs `Candle`, §1), and the installer itself — remain
+`[OPEN]`/T11-06; quantization is a delivery choice and does not change `RepresentationKey`.
+The installer MUST surface and persist the model's license (Gemma Terms of Use, not an OSI license)
+in `models/embeddinggemma-300m/manifest.json`, which is what makes a non-redistributed,
+user-downloaded non-OSI default acceptable here.
+
+The consumer half of the `.ok` contract already exists: `local_rag_embed::require_model_assets`
+treats a model directory as usable **only** with its `.ok` marker present (a `.part`/half-renamed
+download is "missing"), returning a typed `ModelAssetsMissing` and performing no network access.
 
 ## 6. Memory relevance backend
 

@@ -1,0 +1,33 @@
+[package]
+name = "local-rag-embed"
+description = "Embedding provider pool for local-rag: local-first Embedder providers, policy guard, retry/fallback (spec 10 §1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+local-rag-core = { path = "../core" }
+local-rag-protocol = { path = "../protocol" }
+local-rag-store = { path = "../store" }
+
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
+# The v1 provider retry/backoff contract (spec 10 §1 "inherited from the v1
+# behavioral contract") is imported as typed fixtures — `fixtures/fault/index.json`,
+# family `fault.llm.*`. Deserializing them with `#[serde(deny_unknown_fields)]`
+# makes the fixture schema the test's own schema check, exactly like
+# `crates/index`'s parser goldens. Dev-only: the shipped binary never links it.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# One test drives the store's real effective-policy fold, whose write path is
+# `StateWriter::transaction` (an async fn in `crates/store`), so its test needs
+# an executor. Dev-only, exactly like `crates/projection`'s and
+# `crates/search`'s; the library itself pulls no tokio dependency.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+] }
+
+[lints]
+workspace = true
