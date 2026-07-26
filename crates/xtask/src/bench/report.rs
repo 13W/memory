@@ -116,6 +116,12 @@ pub struct Provenance {
     /// filename.
     #[serde(default = "default_dense_kind")]
     pub dense_kind: String,
+    /// The lexical leg's fusion weight (D-018). Like `dense_kind`, two runs that
+    /// differ only here measure different *rankings* of the same candidates, so
+    /// the number travels with the metrics instead of living in a filename.
+    /// Absent in artifacts recorded before D-018 — those are all `1.0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_lexical_weight: Option<f64>,
     /// How many files were indexed.
     pub files_indexed: usize,
     /// How many occurrences the generation holds.
@@ -236,6 +242,9 @@ impl BenchReport {
         out.push_str(&format!("| Model | `{}` |\n", p.model_id));
         out.push_str(&format!("| Mode | `{}` |\n", p.mode));
         out.push_str(&format!("| Dense representation | `{}` |\n", p.dense_kind));
+        if let Some(weight) = p.fusion_lexical_weight {
+            out.push_str(&format!("| Lexical fusion weight | {weight:.4} |\n"));
+        }
         out.push_str(&format!(
             "| Corpus size | {} files, {} occurrences |\n",
             p.files_indexed, p.occurrences
@@ -314,6 +323,7 @@ mod tests {
             model_id: "embeddinggemma-300m".to_string(),
             mode: "hybrid".to_string(),
             dense_kind: "code_raw".to_string(),
+            fusion_lexical_weight: None,
             files_indexed: 96,
             occurrences: 544,
             host: "aarch64-apple-darwin".to_string(),

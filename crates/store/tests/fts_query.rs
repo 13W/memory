@@ -1043,3 +1043,120 @@ async fn explicit_weights_are_applied_by_the_ranking_query() {
     .expect("inverted-weight query");
     assert_eq!(ids(&inverted), vec![body_row, name_row]);
 }
+
+/// D-018: a term the corpus is saturated with stops pulling documents into the
+/// candidate list at all.
+///
+/// The seeded index holds one document that genuinely answers the query
+/// (`retry backoff`) and six that merely contain the word `request`, which is
+/// therefore in more than half of them. Before the selective-terms filter every
+/// one of those six entered the lexical leg's candidates and, through fusion,
+/// got a vote against the dense leg's ordering (spec 09 §4). Now only the real
+/// match comes back — and the term is dropped for being non-selective, not for
+/// being on any word list.
+#[tokio::test]
+async fn a_saturated_term_no_longer_pulls_documents_into_the_candidates() {
+    let (_home, cache) = open_cache();
+    let wt = uuid(1);
+    let generation = uuid(2);
+
+    let answer = occ(1);
+    insert_row(
+        &cache,
+        1,
+        &answer,
+        &wt,
+        &generation,
+        Columns {
+            name: "retry",
+            body: "retry request with backoff",
+            ..Columns::default()
+        },
+    )
+    .await;
+    // Six documents holding only the saturated term: 7 documents total, so
+    // `request` sits in 7/7 and `backoff` in 1/7.
+    for i in 0..6u8 {
+        insert_row(
+            &cache,
+            10 + i as i64,
+            &occ(50 + i),
+            &wt,
+            &generation,
+            Columns {
+                body: "request",
+                ..Columns::default()
+            },
+        )
+        .await;
+    }
+
+    let hits = leg(&cache, &wt, &generation, "retry request backoff", None, 5);
+    assert_eq!(
+        ids(&hits),
+        vec![answer],
+        "only the document matching the selective terms is a candidate"
+    );
+
+    // The same query with the selective terms removed still finds everything —
+    // the filter is about which terms are asked for, not about the index.
+    let read = cache.open_read().expect("cache read conn");
+    let unfiltered =
+        fts_match_expression("retry request backoff", None).expect("unfiltered expression");
+    let all = query_fts(
+        &read,
+        &wt,
+        &generation,
+        &unfiltered,
+        BM25_DEFAULT_WEIGHTS,
+        50,
+    )
+    .expect("unfiltered query");
+    assert_eq!(all.len(), 7, "the saturated term matches every document");
+}
+
+/// A query made only of saturated terms still searches: the rarest one
+/// survives, so noise reduction never turns a query into silence.
+#[tokio::test]
+async fn an_all_saturated_query_still_runs_on_its_rarest_term() {
+    let (_home, cache) = open_cache();
+    let wt = uuid(1);
+    let generation = uuid(2);
+
+    // `alpha` is in all four documents, `beta` in three: both are saturated
+    // (> 4/2), so the fallback must pick `beta` and return exactly its rows.
+    let with_beta = [occ(1), occ(2), occ(3)];
+    for (i, id) in with_beta.iter().enumerate() {
+        insert_row(
+            &cache,
+            1 + i as i64,
+            id,
+            &wt,
+            &generation,
+            Columns {
+                body: "alpha beta",
+                ..Columns::default()
+            },
+        )
+        .await;
+    }
+    insert_row(
+        &cache,
+        4,
+        &occ(9),
+        &wt,
+        &generation,
+        Columns {
+            body: "alpha",
+            ..Columns::default()
+        },
+    )
+    .await;
+
+    let hits = leg(&cache, &wt, &generation, "alpha beta", None, 10);
+    let mut got = ids(&hits);
+    got.sort();
+    let mut expected = with_beta.to_vec();
+    expected.sort();
+    assert_eq!(got, expected, "the rarest term is the one that survives");
+}

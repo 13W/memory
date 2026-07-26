@@ -38,9 +38,18 @@ As-built note (T12-05, `[SPEC]`): the `quality` row's `X`/`Y` are now set —
 stated justification ("tuning changes are versioned"). They are derived from the **agreed v1
 baseline**, deliberately not from the first v2 run: that run regressed, and deriving a threshold
 from a regressed measurement would encode the regression as acceptable (O2). The gate consequently
-**fails on today's v2** — MRR 0.5646 vs the 0.6963 baseline, Recall@5 0.7755 — which is registered
-as `D-016` (`blocked`, product decision) rather than papered over. The `latency`/`resources`/
-`memory-quality` rows remain `[BASELINE]`-pending (T14-07, T17-05).
+**failed on the first v2 run** — MRR 0.5646 vs the 0.6963 baseline, Recall@5 0.7755 — which was
+registered as `D-016` rather than papered over. The `latency`/`resources`/`memory-quality` rows
+remain `[BASELINE]`-pending (T14-07, T17-05).
+
+As-built note (D-018, `[SPEC]`): **the `quality` gate now passes on the shipped default mode** —
+MRR 0.7007 against the 0.6963 baseline, Recall@5 0.8367 against the 0.80 floor. It got there by
+holding the thresholds still and fixing what they measured: `D-016` (corpus scope and the 1024-token
+window), `D-017` (the provider read the graph's raw token states instead of the model's own pooled
+output) and `D-018` (unweighted RRF let a weak lexical leg outvote a strong dense one). The product
+decision the gate's failure was initially blocked on was never taken, because the failure turned
+out to be three defects rather than a quality ceiling — which is the argument for deriving
+thresholds from an agreed baseline rather than from the first run that misses them.
 
 ## 3. Fault-injection suite `[FIXED]`
 

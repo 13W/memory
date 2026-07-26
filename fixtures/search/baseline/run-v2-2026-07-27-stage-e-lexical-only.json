@@ -1,0 +1,400 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "v2_commit": "2cd4dd3",
+    "corpus_path": "/opt/soft/local-rag/src",
+    "corpus_commit": "31dfba2",
+    "corpus_subdir": "src",
+    "corpus_version": "1.0.0",
+    "model_id": "embeddinggemma-300m",
+    "mode": "lexical",
+    "dense_kind": "code_raw",
+    "fusion_lexical_weight": 0.23750000000000004,
+    "files_indexed": 93,
+    "occurrences": 545,
+    "host": "aarch64-macos"
+  },
+  "metrics": {
+    "hit_at_1": 0.30612244897959184,
+    "hit_at_3": 0.5510204081632653,
+    "hit_at_5": 0.6326530612244898,
+    "mrr": 0.4343537414965986,
+    "recall_at_5": 0.6326530612244898
+  },
+  "baseline": {
+    "hit_at_1": 0.5918367346938775,
+    "hit_at_3": 0.7959183673469388,
+    "hit_at_5": 0.8367346938775511,
+    "mrr": 0.6962585034013605
+  },
+  "diff": {
+    "hit_at_1": -0.2857142857142857,
+    "hit_at_3": -0.24489795918367352,
+    "hit_at_5": -0.20408163265306123,
+    "mrr": -0.2619047619047619
+  },
+  "per_query": [
+    {
+      "id": "sc-01",
+      "group": "embedder",
+      "rank": 4,
+      "matched_path": "embedder.ts",
+      "matched_name": "embedBatch",
+      "returned": 5
+    },
+    {
+      "id": "sc-02",
+      "group": "embedder",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-03",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "embedder.ts",
+      "matched_name": "embedOllama",
+      "returned": 5
+    },
+    {
+      "id": "sc-04",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "embedder.ts",
+      "matched_name": "embedOpenAI",
+      "returned": 5
+    },
+    {
+      "id": "sc-05",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "embedder.ts",
+      "matched_name": "embedVoyage",
+      "returned": 5
+    },
+    {
+      "id": "sc-06",
+      "group": "embedder",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-07",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "embedder.ts",
+      "matched_name": "generateDescription",
+      "returned": 5
+    },
+    {
+      "id": "sc-08",
+      "group": "embedder",
+      "rank": 3,
+      "matched_path": "embedder.ts",
+      "matched_name": "llmFilter",
+      "returned": 5
+    },
+    {
+      "id": "sc-09",
+      "group": "embedder",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-10",
+      "group": "embedder",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-11",
+      "group": "search_code",
+      "rank": 1,
+      "matched_path": "tools/search_code.ts",
+      "matched_name": "searchCodeTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-12",
+      "group": "search_code",
+      "rank": 3,
+      "matched_path": "tools/search_code.ts",
+      "matched_name": "searchCodeTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-13",
+      "group": "search_code",
+      "rank": 3,
+      "matched_path": "tools/search_code.ts",
+      "matched_name": "SearchCodeArgs",
+      "returned": 5
+    },
+    {
+      "id": "sc-14",
+      "group": "indexer",
+      "rank": 1,
+      "matched_path": "indexer/indexer.ts",
+      "matched_name": "indexAll",
+      "returned": 5
+    },
+    {
+      "id": "sc-15",
+      "group": "indexer",
+      "rank": 2,
+      "matched_path": "indexer/indexer.ts",
+      "matched_name": "_indexFileImpl",
+      "returned": 5
+    },
+    {
+      "id": "sc-16",
+      "group": "indexer",
+      "rank": 1,
+      "matched_path": "indexer/indexer.ts",
+      "matched_name": "buildEmbedContext",
+      "returned": 5
+    },
+    {
+      "id": "sc-17",
+      "group": "indexer",
+      "rank": 1,
+      "matched_path": "indexer/indexer.ts",
+      "matched_name": "collectFiles",
+      "returned": 5
+    },
+    {
+      "id": "sc-18",
+      "group": "indexer",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-19",
+      "group": "parser",
+      "rank": 2,
+      "matched_path": "indexer/parser.ts",
+      "matched_name": "parseFile",
+      "returned": 5
+    },
+    {
+      "id": "sc-20",
+      "group": "parser",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-21",
+      "group": "parser",
+      "rank": 2,
+      "matched_path": "indexer/parser.ts",
+      "matched_name": "extractDoc",
+      "returned": 5
+    },
+    {
+      "id": "sc-22",
+      "group": "parser",
+      "rank": 2,
+      "matched_path": "indexer/parser.ts",
+      "matched_name": "parseYaml",
+      "returned": 5
+    },
+    {
+      "id": "sc-23",
+      "group": "parser",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-24",
+      "group": "parser",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-25",
+      "group": "types",
+      "rank": 1,
+      "matched_path": "types.ts",
+      "matched_name": "CodeChunkPayload",
+      "returned": 5
+    },
+    {
+      "id": "sc-26",
+      "group": "types",
+      "rank": 2,
+      "matched_path": "types.ts",
+      "matched_name": "CodeChunkPayload",
+      "returned": 5
+    },
+    {
+      "id": "sc-27",
+      "group": "qdrant",
+      "rank": 1,
+      "matched_path": "qdrant.ts",
+      "matched_name": "ensureCodeChunks",
+      "returned": 5
+    },
+    {
+      "id": "sc-28",
+      "group": "qdrant",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-29",
+      "group": "qdrant",
+      "rank": 4,
+      "matched_path": "qdrant.ts",
+      "matched_name": "ensureCollections",
+      "returned": 5
+    },
+    {
+      "id": "sc-30",
+      "group": "config",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-31",
+      "group": "storage",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-32",
+      "group": "storage",
+      "rank": 5,
+      "matched_path": "storage.ts",
+      "matched_name": "getReverseDeps",
+      "returned": 5
+    },
+    {
+      "id": "sc-33",
+      "group": "storage",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-34",
+      "group": "storage",
+      "rank": 2,
+      "matched_path": "storage.ts",
+      "matched_name": "topFilesByRevDeps",
+      "returned": 5
+    },
+    {
+      "id": "sc-35",
+      "group": "server",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-36",
+      "group": "server",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-37",
+      "group": "tools",
+      "rank": 3,
+      "matched_path": "tools/remember.ts",
+      "matched_name": "rememberTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-38",
+      "group": "tools",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-39",
+      "group": "tools",
+      "rank": 1,
+      "matched_path": "tools/get_file_context.ts",
+      "matched_name": "getFileContextTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-40",
+      "group": "tools",
+      "rank": 2,
+      "matched_path": "tools/get_dependencies.ts",
+      "matched_name": "getDependenciesTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-41",
+      "group": "tools",
+      "rank": 1,
+      "matched_path": "tools/project_overview.ts",
+      "matched_name": "projectOverviewTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-42",
+      "group": "tools",
+      "rank": 4,
+      "matched_path": "tools/stats.ts",
+      "matched_name": "statsTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-43",
+      "group": "tools",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-44",
+      "group": "util",
+      "rank": 1,
+      "matched_path": "util.ts",
+      "matched_name": "storeMemory",
+      "returned": 5
+    },
+    {
+      "id": "sc-45",
+      "group": "util",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-46",
+      "group": "scoring",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-47",
+      "group": "scoring",
+      "rank": 2,
+      "matched_path": "scoring.ts",
+      "matched_name": "timeDecay",
+      "returned": 5
+    },
+    {
+      "id": "sc-48",
+      "group": "indexer_cli",
+      "rank": 1,
+      "matched_path": "indexer/cli.ts",
+      "matched_name": "expandRoots",
+      "returned": 5
+    },
+    {
+      "id": "sc-49",
+      "group": "bin",
+      "rank": 1,
+      "matched_path": "bin.ts",
+      "matched_name": "",
+      "returned": 5
+    }
+  ],
+  "latency": {
+    "index_ms": 1395,
+    "embed_ms": 242787,
+    "search_p50_ms": 2.2899589999999996,
+    "search_p95_ms": 2.611209
+  }
+}

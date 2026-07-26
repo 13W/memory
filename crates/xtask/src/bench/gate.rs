@@ -159,6 +159,7 @@ mod tests {
                 corpus_version: "1.0.0".to_string(),
                 corpus_subdir: None,
                 dense_kind: "code_raw".to_string(),
+                fusion_lexical_weight: None,
                 model_id: "m".to_string(),
                 mode: "hybrid".to_string(),
                 files_indexed: 1,

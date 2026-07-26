@@ -26,13 +26,14 @@ fn main() -> ExitCode {
 }
 
 /// `cargo xtask bench --corpus <dir> [--out <path>] [--mode hybrid|lexical|code]`
-/// `[--dense-kind code_raw|code_context]`
+/// `[--dense-kind code_raw|code_context] [--lexical-weight w[,w…]]`
 fn run_bench() -> ExitCode {
     let mut corpus_dir: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut mode = local_rag_protocol::SearchMode::Hybrid;
     let mut subdir: Option<String> = None;
     let mut dense_kind = local_rag_store::RepresentationKind::CodeRaw;
+    let mut lexical_weights: Vec<f64> = Vec::new();
 
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
@@ -61,6 +62,21 @@ fn run_bench() -> ExitCode {
                     }
                 }
             }
+            "--lexical-weight" => {
+                let Some(raw) = args.next() else {
+                    eprintln!("--lexical-weight needs a value (comma-separated for a sweep)");
+                    return ExitCode::from(2);
+                };
+                for piece in raw.split(',') {
+                    match piece.trim().parse::<f64>() {
+                        Ok(w) if w >= 0.0 && w.is_finite() => lexical_weights.push(w),
+                        _ => {
+                            eprintln!("--lexical-weight takes finite weights >= 0, got {piece:?}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+            }
             "--mode" => {
                 let Some(raw) = args.next() else {
                     eprintln!("--mode needs a value");
@@ -84,7 +100,8 @@ fn run_bench() -> ExitCode {
     let Some(corpus_dir) = corpus_dir else {
         eprintln!(
             "usage: cargo xtask bench --corpus <dir> [--subdir <rel>] [--out <path>] \
-             [--mode <mode>] [--dense-kind code_raw|code_context]"
+             [--mode <mode>] [--dense-kind code_raw|code_context] \
+             [--lexical-weight w[,w...]]"
         );
         return ExitCode::from(2);
     };
@@ -97,62 +114,85 @@ fn run_bench() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = match runtime.block_on(bench::run::run(&bench::run::Options {
+    let sweep = !lexical_weights.is_empty() && lexical_weights.len() > 1;
+    let reports = match runtime.block_on(bench::run::run(&bench::run::Options {
         corpus_dir,
         subdir,
         mode,
         dense_kind,
+        lexical_weights,
     })) {
-        Ok(report) => report,
+        Ok(reports) => reports,
         Err(e) => {
             eprintln!("bench: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let json = serde_json::to_string_pretty(&report).expect("report serializes");
-    if let Err(e) = std::fs::write(&out, json + "\n") {
-        eprintln!("bench: writing {}: {e}", out.display());
-        return ExitCode::FAILURE;
-    }
-    let md_path = out.with_extension("report.md");
-    if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
-        eprintln!("bench: writing {}: {e}", md_path.display());
-        return ExitCode::FAILURE;
-    }
-    eprintln!("bench: wrote {} and {}", out.display(), md_path.display());
+    // A sweep writes one artifact per point, suffixed by the weight, so no run
+    // silently overwrites another's numbers.
+    let mut all_passed = true;
+    for report in &reports {
+        let out = if sweep {
+            let weight = report.provenance.fusion_lexical_weight.unwrap_or(1.0);
+            let stem = out
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "run-v2".to_string());
+            out.with_file_name(format!("{stem}-lw{:.3}.json", weight))
+        } else {
+            out.clone()
+        };
+        let json = serde_json::to_string_pretty(report).expect("report serializes");
+        if let Err(e) = std::fs::write(&out, json + "\n") {
+            eprintln!("bench: writing {}: {e}", out.display());
+            return ExitCode::FAILURE;
+        }
+        let md_path = out.with_extension("report.md");
+        if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
+            eprintln!("bench: writing {}: {e}", md_path.display());
+            return ExitCode::FAILURE;
+        }
+        eprintln!("bench: wrote {} and {}", out.display(), md_path.display());
 
-    eprintln!(
-        "[bench] Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (v1: {:.4}/{:.4}/{:.4}/{:.4})",
-        report.metrics.hit_at_1,
-        report.metrics.hit_at_3,
-        report.metrics.hit_at_5,
-        report.metrics.mrr,
-        report.baseline.hit_at_1,
-        report.baseline.hit_at_3,
-        report.baseline.hit_at_5,
-        report.baseline.mrr,
-    );
+        eprintln!(
+            "[bench] lexical_weight={:.4} Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} \
+             (v1: {:.4}/{:.4}/{:.4}/{:.4})",
+            report.provenance.fusion_lexical_weight.unwrap_or(1.0),
+            report.metrics.hit_at_1,
+            report.metrics.hit_at_3,
+            report.metrics.hit_at_5,
+            report.metrics.mrr,
+            report.baseline.hit_at_1,
+            report.baseline.hit_at_3,
+            report.baseline.hit_at_5,
+            report.baseline.mrr,
+        );
 
-    // The gate only runs once thresholds exist; before that the run *is* the
-    // evidence they are derived from (O2: collect metrics, never invent them).
-    match bench::gate::Thresholds::load(&bench::thresholds_path()) {
-        Ok(thresholds) => {
-            let outcome = bench::gate::evaluate(&report, &thresholds);
-            if outcome.passed() {
-                eprintln!("[bench] gate: PASS");
-                ExitCode::SUCCESS
-            } else {
-                for violation in &outcome.violations {
-                    eprintln!("[bench] gate: {violation}");
+        // The gate only runs once thresholds exist; before that the run *is* the
+        // evidence they are derived from (O2: collect metrics, never invent them).
+        match bench::gate::Thresholds::load(&bench::thresholds_path()) {
+            Ok(thresholds) => {
+                let outcome = bench::gate::evaluate(report, &thresholds);
+                if outcome.passed() {
+                    eprintln!("[bench] gate: PASS");
+                } else {
+                    for violation in &outcome.violations {
+                        eprintln!("[bench] gate: {violation}");
+                    }
+                    all_passed = false;
                 }
-                ExitCode::FAILURE
+            }
+            Err(e) => {
+                eprintln!("[bench] gate: skipped (no thresholds yet: {e})");
             }
         }
-        Err(e) => {
-            eprintln!("[bench] gate: skipped (no thresholds yet: {e})");
-            ExitCode::SUCCESS
-        }
+    }
+
+    if all_passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

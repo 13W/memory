@@ -53,7 +53,7 @@ use local_rag_store::{
 };
 
 use crate::context::file_context;
-use crate::fusion::{FusedHit, rrf};
+use crate::fusion::{FusedHit, FusionWeights, rrf};
 use crate::overview::{OverviewCache, compute as compute_overview};
 use crate::snippet::cut_batch;
 
@@ -326,6 +326,9 @@ pub struct SearchEngine {
     /// The representation the dense leg searches over. `code_raw` in v0 (spec 09
     /// §3); see [`with_dense_kind`](Self::with_dense_kind).
     dense_kind: RepresentationKind,
+    /// How much each leg's rank counts when the two are fused (spec 09 §4,
+    /// D-018); see [`with_fusion_weights`](Self::with_fusion_weights).
+    fusion_weights: FusionWeights,
 }
 
 impl SearchEngine {
@@ -368,6 +371,7 @@ impl SearchEngine {
             overviews: OverviewCache::default(),
             read_wait_budget,
             dense_kind: RepresentationKind::CodeRaw,
+            fusion_weights: FusionWeights::default(),
         }
     }
 
@@ -383,6 +387,18 @@ impl SearchEngine {
     #[must_use]
     pub fn with_dense_kind(mut self, kind: RepresentationKind) -> Self {
         self.dense_kind = kind;
+        self
+    }
+
+    /// Fuse the legs with `weights` instead of [`FusionWeights::default`].
+    ///
+    /// The default is derived, not tuned (D-018), and this seam is what lets the
+    /// benchmark *check* it against neighbouring policies without a second
+    /// engine or a request field: weights are a property of how this deployment
+    /// ranks, never of an individual query.
+    #[must_use]
+    pub fn with_fusion_weights(mut self, weights: FusionWeights) -> Self {
+        self.fusion_weights = weights;
         self
     }
 
@@ -689,7 +705,7 @@ impl SearchEngine {
         // the presentable metadata spec 09 §7 lists is assembled below.
         observer.on_stage(Stage::Enrichment);
 
-        let fused = rrf(&lexical, &dense, request.limit);
+        let fused = rrf(&lexical, &dense, request.limit, self.fusion_weights);
         let response = self.build_response(&generation_id, fused, degraded, &mut diagnostics)?;
 
         Ok(Ok(PipelineSnapshot {

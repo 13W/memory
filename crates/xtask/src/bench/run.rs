@@ -38,7 +38,9 @@ use local_rag_projection::{
     representation_key_for, shard_dir, switch,
 };
 use local_rag_protocol::SearchMode;
-use local_rag_search::{QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest};
+use local_rag_search::{
+    FusionWeights, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest,
+};
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, RepresentationKey, RepresentationKind, RequestRoot,
     RetentionParams, StateDb, WorktreeKind, WorktreeLockRegistry, WorktreeRootFacts,
@@ -169,10 +171,23 @@ pub struct Options {
     /// runs are independent measurements of the same corpus rather than one run
     /// with two kinds competing for the same candidate depth.
     pub dense_kind: RepresentationKind,
+    /// Lexical fusion weights to evaluate (D-018). Empty means "just the shipped
+    /// default".
+    ///
+    /// Several weights are evaluated **inside one run** because indexing and
+    /// embedding the corpus costs ~5 minutes while re-scoring the 49 queries
+    /// costs ~6 seconds: a sweep that re-embedded per point would spend an hour
+    /// proving something about the last stage of the pipeline. Every point
+    /// therefore sees byte-identical candidates, which is also what makes the
+    /// comparison between them mean anything.
+    pub lexical_weights: Vec<f64>,
 }
 
-/// Run the benchmark end to end.
-pub async fn run(options: &Options) -> Result<BenchReport, String> {
+/// Run the benchmark end to end, once per requested fusion weight.
+///
+/// The returned reports are in the order the weights were given; a run with no
+/// explicit weights yields exactly one, at the shipped default.
+pub async fn run(options: &Options) -> Result<Vec<BenchReport>, String> {
     let corpus =
         Corpus::load(&crate::bench::corpus_fixture_path()).map_err(|e| format!("corpus: {e}"))?;
 
@@ -354,110 +369,132 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
     .await
     .map_err(|e| format!("materialize fts: {e}"))?;
 
-    // 6. Run the 49 queries.
-    let engine = SearchEngine::with_embedder(
-        state.clone(),
-        cache.clone(),
-        Arc::new(WorktreeLockRegistry::new()),
-        Arc::new(ShardManager::new(
-            state.clone(),
-            Arc::new(BruteForceProjectionStore::new()),
-            layout.clone(),
-            params,
-            Arc::new(NoVectors),
-            uuids.clone(),
-            8,
-        )),
-        Arc::new(PoolQueryEmbedder {
-            embedder: embedder.clone(),
-            kind: options.dense_kind,
-        }),
-        std::time::Duration::from_secs(30),
-    )
-    .with_dense_kind(projection_kind(options.dense_kind));
+    // 6. Run the 49 queries, once per requested fusion weight (D-018). The
+    //    corpus is indexed and embedded exactly once above, so the points differ
+    //    in nothing but how the two legs' ranks are combined.
+    let weights: Vec<FusionWeights> = if options.lexical_weights.is_empty() {
+        vec![FusionWeights::default()]
+    } else {
+        options
+            .lexical_weights
+            .iter()
+            .map(|lexical| FusionWeights {
+                lexical: *lexical,
+                dense: 1.0,
+            })
+            .collect()
+    };
     let request_root = request_root(&root);
+    let mut reports = Vec::with_capacity(weights.len());
 
-    let mut per_query = Vec::with_capacity(corpus.queries.len());
-    let mut ranks = Vec::with_capacity(corpus.queries.len());
-    let mut timings_ms: Vec<f64> = Vec::new();
+    for fusion_weights in weights {
+        let engine = SearchEngine::with_embedder(
+            state.clone(),
+            cache.clone(),
+            Arc::new(WorktreeLockRegistry::new()),
+            Arc::new(ShardManager::new(
+                state.clone(),
+                Arc::new(BruteForceProjectionStore::new()),
+                layout.clone(),
+                params,
+                Arc::new(NoVectors),
+                uuids.clone(),
+                8,
+            )),
+            Arc::new(PoolQueryEmbedder {
+                embedder: embedder.clone(),
+                kind: options.dense_kind,
+            }),
+            std::time::Duration::from_secs(30),
+        )
+        .with_dense_kind(projection_kind(options.dense_kind))
+        .with_fusion_weights(fusion_weights);
 
-    for query in &corpus.queries {
-        let mut candidates = Vec::new();
-        let mut returned = 0usize;
-        for pass in 0..(WARMUP_PASSES + TIMED_PASSES) {
-            let started = Instant::now();
-            let response = engine
-                .search_code(
-                    SearchRequest {
-                        root: request_root.clone(),
-                        query: query.query.clone(),
-                        mode: options.mode,
-                        limit: QUERY_LIMIT,
-                        name_pattern: None,
-                    },
-                    now_ms,
-                )
-                .await
-                .map_err(|e| format!("search {}: {e}", query.id))?
-                .map_err(|e| format!("search {}: {}", query.id, e.code))?;
-            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-            if pass >= WARMUP_PASSES {
-                timings_ms.push(elapsed);
+        let mut per_query = Vec::with_capacity(corpus.queries.len());
+        let mut ranks = Vec::with_capacity(corpus.queries.len());
+        let mut timings_ms: Vec<f64> = Vec::new();
+
+        for query in &corpus.queries {
+            let mut candidates = Vec::new();
+            let mut returned = 0usize;
+            for pass in 0..(WARMUP_PASSES + TIMED_PASSES) {
+                let started = Instant::now();
+                let response = engine
+                    .search_code(
+                        SearchRequest {
+                            root: request_root.clone(),
+                            query: query.query.clone(),
+                            mode: options.mode,
+                            limit: QUERY_LIMIT,
+                            name_pattern: None,
+                        },
+                        now_ms,
+                    )
+                    .await
+                    .map_err(|e| format!("search {}: {e}", query.id))?
+                    .map_err(|e| format!("search {}: {}", query.id, e.code))?;
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                if pass >= WARMUP_PASSES {
+                    timings_ms.push(elapsed);
+                }
+                returned = response.results.len();
+                candidates = response
+                    .results
+                    .iter()
+                    .map(|r| Candidate {
+                        path: r.path.clone(),
+                        name: r.name.clone(),
+                    })
+                    .collect();
             }
-            returned = response.results.len();
-            candidates = response
-                .results
-                .iter()
-                .map(|r| Candidate {
-                    path: r.path.clone(),
-                    name: r.name.clone(),
-                })
-                .collect();
+
+            let rank = rank_of_match(query, &candidates);
+            let matched = rank.and_then(|r| candidates.get(r - 1));
+            per_query.push(QueryResult {
+                id: query.id.clone(),
+                group: query.group.clone(),
+                rank,
+                matched_path: matched.map(|c| c.path.clone()),
+                matched_name: matched.map(|c| c.name.clone()),
+                returned,
+                v1_rank: None,
+            });
+            ranks.push(rank);
         }
 
-        let rank = rank_of_match(query, &candidates);
-        let matched = rank.and_then(|r| candidates.get(r - 1));
-        per_query.push(QueryResult {
-            id: query.id.clone(),
-            group: query.group.clone(),
-            rank,
-            matched_path: matched.map(|c| c.path.clone()),
-            matched_name: matched.map(|c| c.name.clone()),
-            returned,
-            v1_rank: None,
-        });
-        ranks.push(rank);
+        let metrics: Metrics = aggregate(&ranks);
+        let latency = Latency {
+            index_ms,
+            embed_ms,
+            search_p50_ms: percentile(&mut timings_ms.clone(), 0.50),
+            search_p95_ms: percentile(&mut timings_ms.clone(), 0.95),
+        };
+
+        reports.push(BenchReport::new(
+            Provenance {
+                v2_commit: git_short_head(Path::new(".")).unwrap_or_else(|| "unknown".to_string()),
+                corpus_path: root.display().to_string(),
+                // The *checkout*'s commit, not the subdirectory's — `git -C <subdir>`
+                // still resolves to the repository, but naming the checkout is what a
+                // reader needs to reproduce the run.
+                corpus_commit: git_short_head(&checkout).unwrap_or_else(|| "unknown".to_string()),
+                corpus_subdir: options.subdir.clone(),
+                dense_kind: options.dense_kind.as_str().to_string(),
+                fusion_lexical_weight: Some(fusion_weights.lexical),
+                corpus_version: corpus.version.clone(),
+                model_id: entry.model_id.to_string(),
+                mode: options.mode.as_str().to_string(),
+                files_indexed: report.build.files_indexed,
+                occurrences: report.build.occurrences,
+                host: std::env::consts::ARCH.to_string() + "-" + std::env::consts::OS,
+            },
+            metrics,
+            per_query,
+            latency,
+        ));
     }
 
-    let metrics: Metrics = aggregate(&ranks);
-    let latency = Latency {
-        index_ms,
-        embed_ms,
-        search_p50_ms: percentile(&mut timings_ms.clone(), 0.50),
-        search_p95_ms: percentile(&mut timings_ms.clone(), 0.95),
-    };
-
-    Ok(BenchReport::new(
-        Provenance {
-            v2_commit: git_short_head(Path::new(".")).unwrap_or_else(|| "unknown".to_string()),
-            corpus_path: root.display().to_string(),
-            // The *checkout*'s commit, not the subdirectory's — `git -C <subdir>`
-            // still resolves to the repository, but naming the checkout is what a
-            // reader needs to reproduce the run.
-            corpus_commit: git_short_head(&checkout).unwrap_or_else(|| "unknown".to_string()),
-            corpus_subdir: options.subdir.clone(),
-            dense_kind: options.dense_kind.as_str().to_string(),
-            corpus_version: corpus.version.clone(),
-            model_id: entry.model_id.to_string(),
-            mode: options.mode.as_str().to_string(),
-            files_indexed: report.build.files_indexed,
-            occurrences: report.build.occurrences,
-            host: std::env::consts::ARCH.to_string() + "-" + std::env::consts::OS,
-        },
-        metrics,
-        per_query,
-        latency,
-    ))
+    Ok(reports)
 }
 
 /// A [`local_rag_projection::VectorSource`] that supplies nothing.
