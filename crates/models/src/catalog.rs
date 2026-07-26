@@ -87,10 +87,17 @@ impl ModelCatalogEntry {
 
     /// The canonical representation key this model's `code_raw` vectors carry
     /// (ADR-0004's decision, byte-for-byte).
+    ///
+    /// `representation_version = 2` since D-016: the sequence window moved from
+    /// 256 to 1024 tokens (`crate::onnx::MAX_SEQUENCE_TOKENS`), which changes the
+    /// vectors a long unit gets. The window is not itself a key field, so this
+    /// version is what keeps `embedding_cache` from serving 256-token vectors as
+    /// though they were 1024-token ones — the field exists precisely to make such
+    /// a change addressable instead of silent.
     pub fn representation_key(&self) -> RepresentationKey {
         RepresentationKey {
             kind: RepresentationKind::CodeRaw,
-            representation_version: 1,
+            representation_version: 2,
             normalization_version: 1,
             model_id: self.model_id.to_string(),
             dimensions: self.dimensions,

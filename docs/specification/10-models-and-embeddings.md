@@ -74,6 +74,23 @@ coverage counting against these rows (T11-04) and the local embedder provider th
 (T11-03) are still separate, later tasks — T11-02 only shipped the cache and its own integrity/
 eviction guarantees.
 
+
+As-built note (D-016, `[SPEC]`): the ONNX provider's sequence window is
+`local_rag_models::MAX_SEQUENCE_TOKENS = 1024`, raised from the 256 ADR-0004
+measured with. The v1 baseline this project is gated against truncated embedding
+input at 3000 *characters* (`scripts/benchmark.ts::MODEL_CONFIGS`) — roughly
+750–1000 tokens of code — so a 256-token window was cutting about three times more
+aggressively than the thing being compared to, and part of the measured quality gap
+was the truncation rather than the retrieval. 1024 covers v1's window and still sits
+at half of EmbeddingGemma's 2048-token context; measured effect on the 49-query
+benchmark was +0.0102 MRR.
+
+The window is **not** one of the six `RepresentationKey` fields, so changing it alone
+would have produced different vectors under an unchanged `representation_id` and let
+`embedding_cache` serve 256-token rows as valid 1024-token ones. `representation_version`
+therefore moves `1 → 2` in the same change — that field exists precisely to make a
+vector-affecting change outside the other five addressable instead of silent.
+
 ## 3. Model spaces
 
 A model space bundles the representations that must be coherent together (at minimum

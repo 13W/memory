@@ -99,6 +99,11 @@ pub struct Provenance {
     pub corpus_path: String,
     /// The corpus checkout's commit.
     pub corpus_commit: String,
+    /// The subdirectory that was indexed, when the run restricted the corpus
+    /// (D-016). `None` means the whole checkout — two runs that differ only here
+    /// measure different corpora, so it belongs in the provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus_subdir: Option<String>,
     /// The query-corpus fixture version the run was scored against.
     pub corpus_version: String,
     /// The embedding model id.
@@ -293,6 +298,7 @@ mod tests {
             corpus_path: "/opt/soft/local-rag".to_string(),
             corpus_commit: "31dfba2".to_string(),
             corpus_version: "1.0.0".to_string(),
+            corpus_subdir: Some("src".to_string()),
             model_id: "embeddinggemma-300m".to_string(),
             mode: "hybrid".to_string(),
             files_indexed: 96,

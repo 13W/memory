@@ -399,6 +399,9 @@ pub struct FtsSourceRow {
     pub unit_kind: UnitKind,
     /// Optional local (unqualified) name — the `name` FTS column's source.
     pub local_name: Option<String>,
+    /// The language-level kind (`function`, `class`, …) when the grammar exposes
+    /// one. Unused by FTS; carried for the `code_context` envelope (D-016).
+    pub lang_kind: Option<String>,
     /// The content blob whose normalized text is this occurrence's `body`.
     pub blob_id: String,
     /// The revision `blob_id` was derived from — needed only to recompute an
@@ -428,7 +431,7 @@ pub fn occurrences_for_fts(
 ) -> rusqlite::Result<Vec<FtsSourceRow>> {
     let mut stmt = conn.prepare(
         "SELECT o.occurrence_id, o.normalized_path, o.qualified_name, \
-                pu.unit_kind, pu.local_name, pu.blob_id, \
+                pu.unit_kind, pu.local_name, pu.kind, pu.blob_id, \
                 pu.file_revision_id, pu.span_start, pu.span_end, \
                 cb.language \
          FROM generation_unit_occurrence o \
@@ -453,11 +456,12 @@ pub fn occurrences_for_fts(
                 qualified_name: r.get(2)?,
                 unit_kind,
                 local_name: r.get(4)?,
-                blob_id: r.get(5)?,
-                file_revision_id: r.get(6)?,
-                span_start: r.get(7)?,
-                span_end: r.get(8)?,
-                language: r.get(9)?,
+                lang_kind: r.get(5)?,
+                blob_id: r.get(6)?,
+                file_revision_id: r.get(7)?,
+                span_start: r.get(8)?,
+                span_end: r.get(9)?,
+                language: r.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -843,7 +847,7 @@ mod tests {
                 unit_id TEXT, qualified_name TEXT);\n\
              CREATE TABLE parsed_unit \
                (unit_id TEXT, file_revision_id TEXT, unit_kind TEXT, blob_id TEXT, \
-                span_start INTEGER, span_end INTEGER, local_name TEXT);\n\
+                span_start INTEGER, span_end INTEGER, local_name TEXT, kind TEXT);\n\
              CREATE TABLE content_blob (blob_id TEXT, language TEXT);",
         )
         .expect("seed schema");
@@ -864,8 +868,8 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO content_blob VALUES ('blob-1', 'rust'), ('blob-2', 'rust');\n\
              INSERT INTO parsed_unit VALUES \
-               ('u1', 'rev-1', 'symbol', 'blob-1', 0, 10, 'foo'), \
-               ('u2', 'rev-2', 'file', 'blob-2', 0, 20, NULL);\n\
+               ('u1', 'rev-1', 'symbol', 'blob-1', 0, 10, 'foo', 'function'), \
+               ('u2', 'rev-2', 'file', 'blob-2', 0, 20, NULL, NULL);\n\
              INSERT INTO generation_unit_occurrence VALUES \
                ('occ-b', 'g1', 'b.rs', 'u2', NULL), \
                ('occ-a', 'g1', 'a.rs', 'u1', NULL), \
@@ -899,7 +903,7 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO content_blob VALUES ('blob-1', 'rust');\n\
              INSERT INTO parsed_unit VALUES \
-               ('u1', 'rev-1', 'bogus_kind', 'blob-1', 0, 10, NULL);\n\
+               ('u1', 'rev-1', 'bogus_kind', 'blob-1', 0, 10, NULL, NULL);\n\
              INSERT INTO generation_unit_occurrence VALUES \
                ('occ-a', 'g1', 'a.rs', 'u1', NULL);",
         )

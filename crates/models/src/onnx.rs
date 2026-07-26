@@ -37,10 +37,22 @@ use tokenizers::Tokenizer;
 
 use crate::catalog::ModelCatalogEntry;
 
-/// Tokens per sequence. Longer inputs are truncated, matching how the ADR-0004
-/// measurements were taken (`max_length = 256`), and long code units are already
-/// split into `parsed_unit` spans upstream.
-pub const MAX_SEQUENCE_TOKENS: usize = 256;
+/// Tokens per sequence; longer inputs are truncated.
+///
+/// Raised from 256 to 1024 by D-016. The 256 that ADR-0004 measured with was
+/// silently cutting embedded text about three times more aggressively than the
+/// v1 baseline this project is measured against, which truncated at 3000
+/// *characters* (`scripts/benchmark.ts::MODEL_CONFIGS`) — roughly 750–1000 tokens
+/// of code. Comparing retrieval quality across that gap measures the truncation,
+/// not the retrieval. 1024 covers v1's window with room to spare and still sits
+/// at half of EmbeddingGemma's 2048-token context.
+///
+/// The window is **not** one of the six `RepresentationKey` fields, so changing
+/// it would otherwise produce different vectors under an unchanged
+/// `representation_id` and let `embedding_cache` serve incomparable rows as
+/// valid. `ModelCatalogEntry::representation_key`'s `representation_version` is
+/// bumped in the same change for exactly that reason.
+pub const MAX_SEQUENCE_TOKENS: usize = 1024;
 
 /// Why the ONNX provider could not be created.
 #[derive(Debug)]
