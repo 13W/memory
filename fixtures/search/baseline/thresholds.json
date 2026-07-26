@@ -1,0 +1,8 @@
+{
+  "_comment": "Spec 14 §2's `quality` gate thresholds (open question O2's search half), consumed by `crates/xtask/src/bench/gate.rs`. Versioned deliberately: a retune is a reviewable diff with a stated justification, never an edited literal in code (T12-05's 'tuning changes are versioned').",
+  "schema_version": 1,
+  "mrr_regression_budget": 0.03,
+  "min_recall_at_5": 0.8,
+  "derivation": "Derived from the AGREED v1 baseline (MRR 0.6963, Recall@5 0.8367), NOT from the first v2 run — that run regressed (MRR 0.5646, Recall@5 0.7755, see run-v2-2026-07-26.json and D-016), and deriving a threshold from a regressed measurement would encode the regression as acceptable. The budget of 0.03 MRR is ~4% relative, wide enough to absorb the run-to-run jitter of a 49-query single-relevant corpus (one query moving between rank 1 and rank 2 shifts MRR by ~0.010) but far narrower than the 0.1317 gap observed today. The Recall@5 floor of 0.80 sits just under the v1 baseline's 0.8367, leaving room for two queries to drop out of the top 5 without tripping the gate. These numbers are PROVISIONAL: T17-05 may revise them once v0 search quality is settled, and any revision belongs in this file with its own justification.",
+  "derived_from": "fixtures/search/baseline/baseline.md (v1 @ 31dfba2, embeddinggemma:300m, 2026-07-16)"
+}

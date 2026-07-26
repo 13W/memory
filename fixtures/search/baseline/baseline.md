@@ -34,13 +34,68 @@ Raw evidence: `run-embeddinggemma-300m-2026-07-16.json` and `.report.md` in this
 | Query embed | 4008 ms (49 queries) |
 | Search | 229 ms (49 queries) |
 
-## v2 gate thresholds — TBD
+## v2 gate thresholds `[SPEC]`
 
-| Threshold | Status |
-| --- | --- |
-| MRR regression budget `X` (v2 not worse than v1 by more than X) | TBD |
-| `Recall@5 ≥ Y` | TBD |
-| warm-search p95 latency | TBD |
+Set in `thresholds.json` (versioned, machine-read by `cargo xtask bench`):
+
+| Threshold | Value | Where it comes from |
+| --- | --- | --- |
+| MRR regression budget `X` | **0.03** | ~4% relative to the v1 MRR; one query moving between rank 1 and 2 shifts MRR by ~0.010 on a 49-query corpus, so this absorbs jitter without absorbing a real regression |
+| `Recall@5 ≥ Y` | **0.80** | just under v1's 0.8367 — two queries may drop out of the top 5 |
+| warm-search p95 latency | still TBD | measured (see below) but T17-05 owns the latency gate |
+
+Derived from **this v1 baseline**, deliberately not from the first v2 run: that
+run regressed, and deriving a threshold from a regressed measurement would encode
+the regression as acceptable (O2: collect metrics, never invent thresholds).
+
+## v2 measurement — 2026-07-26 `[BASELINE]`
+
+Recorded by `cargo xtask bench` (T12-05) against the **same corpus checkout the
+v1 baseline used** (`/opt/soft/local-rag` @ `31dfba2`) and the same model family
+(`embeddinggemma-300m`, local ONNX). Raw artifacts: `run-v2-2026-07-26.json` /
+`.report.md`, plus per-leg diagnostics `…-code-only.json` and
+`…-lexical-only.json`.
+
+| Run | Hit@1 | Hit@3 | Hit@5 / Recall@5 | MRR |
+| --- | --- | --- | --- | --- |
+| **v1 baseline** (dense) | 0.5918 | 0.7959 | 0.8367 | 0.6963 |
+| **v2 hybrid** | 0.4286 | 0.6939 | 0.7755 | **0.5646** |
+| v2 dense only (`--mode code`) | 0.3265 | 0.6939 | 0.7551 | 0.4939 |
+| v2 lexical only (`--mode lexical`) | 0.3061 | 0.5306 | 0.6735 | 0.4374 |
+
+Corpus as indexed by v2: 101 files, 581 occurrences (v1: 96 files, 544 chunks).
+Latency: index 1.7 s, embed 61.4 s (569 subjects), warm search p50 122.6 ms /
+p95 126.1 ms — search time is dominated by per-query ONNX inference, which runs
+inside the held `L2.read` (09 §3's as-built note).
+
+**The gate fails on this run**: MRR regressed 0.1316 against a 0.03 budget, and
+Recall@5 is 0.7755 against a 0.80 floor. That is the gate working, not a gate
+misconfiguration — see `DEVIATIONS.md` D-016, which is `blocked` on a product
+decision.
+
+### What the per-leg split rules in and out
+
+- **Fusion is not the problem.** Hybrid (0.5646) beats both of its own legs
+  (dense 0.4939, lexical 0.4374), so RRF is adding what it is supposed to add.
+- **The gap is the dense leg.** v2's dense-only MRR (0.4939) sits 0.2024 below
+  v1's dense-only baseline (0.6963), which is essentially the whole regression.
+  Same model family, same corpus, same queries, and neither v1 nor v2 applies
+  EmbeddingGemma's task prefixes — so the difference is in *what text gets
+  embedded*, not in how it is searched.
+- **Leading candidate: v1 embedded documentation, v2 does not.** v1's chunker
+  attached each symbol's preceding JSDoc/`//` block to the embedded text
+  (`src/indexer/parser.ts::extractDoc`/`extractJsDoc`/`extractLineComments`);
+  v2's tree-sitter adapters carry no comment handling at all, so a unit's
+  embedded text is bare code. For a corpus whose queries are natural-language
+  descriptions ("retry embedding request on failure with backoff"), the doc
+  comment is precisely the matching text.
+- **Secondary candidates, unmeasured**: the installed weights are
+  `model_quantized.onnx` (v1 went through Ollama's own build), and
+  `MAX_SEQUENCE_TOKENS = 256` truncates long units.
+
+None of these is fixed here: changing what a unit's text contains alters
+`content_blob` derivation and invalidates every cache, which is well outside
+T12-05's card.
 
 ## Notes / gaps
 

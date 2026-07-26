@@ -3,16 +3,123 @@
 //!
 //! `cargo xtask ci` runs the full quality gate documented in `CONTRIBUTING.md`,
 //! failing on the first step that fails.
+//!
+//! `cargo xtask bench` runs the 49-query search benchmark (spec 14 §7, T12-05).
+//! It is **not** part of `ci`: it needs model weights and a corpus checkout that
+//! the repository does not ship.
 
+mod bench;
+
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("ci") => run_ci(),
+        Some("bench") => run_bench(),
         other => {
-            eprintln!("usage: cargo xtask ci");
+            eprintln!("usage: cargo xtask <ci|bench>");
             eprintln!("unknown task: {}", other.unwrap_or("<none>"));
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `cargo xtask bench --corpus <dir> [--out <path>] [--mode hybrid|lexical|code]`
+fn run_bench() -> ExitCode {
+    let mut corpus_dir: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut mode = local_rag_protocol::SearchMode::Hybrid;
+
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--corpus" => corpus_dir = args.next().map(PathBuf::from),
+            "--out" => out = args.next().map(PathBuf::from),
+            "--mode" => {
+                let Some(raw) = args.next() else {
+                    eprintln!("--mode needs a value");
+                    return ExitCode::from(2);
+                };
+                match local_rag_protocol::SearchMode::from_wire(&raw) {
+                    Some(m) => mode = m,
+                    None => {
+                        eprintln!("unknown mode {raw:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("unknown argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(corpus_dir) = corpus_dir else {
+        eprintln!("usage: cargo xtask bench --corpus <dir> [--out <path>] [--mode <mode>]");
+        return ExitCode::from(2);
+    };
+    let out = out.unwrap_or_else(|| bench::baseline_dir().join("run-v2.json"));
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("bench: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match runtime.block_on(bench::run::run(&bench::run::Options { corpus_dir, mode }))
+    {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("bench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let json = serde_json::to_string_pretty(&report).expect("report serializes");
+    if let Err(e) = std::fs::write(&out, json + "\n") {
+        eprintln!("bench: writing {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+    let md_path = out.with_extension("report.md");
+    if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
+        eprintln!("bench: writing {}: {e}", md_path.display());
+        return ExitCode::FAILURE;
+    }
+    eprintln!("bench: wrote {} and {}", out.display(), md_path.display());
+
+    eprintln!(
+        "[bench] Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (v1: {:.4}/{:.4}/{:.4}/{:.4})",
+        report.metrics.hit_at_1,
+        report.metrics.hit_at_3,
+        report.metrics.hit_at_5,
+        report.metrics.mrr,
+        report.baseline.hit_at_1,
+        report.baseline.hit_at_3,
+        report.baseline.hit_at_5,
+        report.baseline.mrr,
+    );
+
+    // The gate only runs once thresholds exist; before that the run *is* the
+    // evidence they are derived from (O2: collect metrics, never invent them).
+    match bench::gate::Thresholds::load(&bench::thresholds_path()) {
+        Ok(thresholds) => {
+            let outcome = bench::gate::evaluate(&report, &thresholds);
+            if outcome.passed() {
+                eprintln!("[bench] gate: PASS");
+                ExitCode::SUCCESS
+            } else {
+                for violation in &outcome.violations {
+                    eprintln!("[bench] gate: {violation}");
+                }
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("[bench] gate: skipped (no thresholds yet: {e})");
+            ExitCode::SUCCESS
         }
     }
 }

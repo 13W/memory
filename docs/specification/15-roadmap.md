@@ -60,7 +60,7 @@ multiple generators; cross-generation matching; LSP graph; multi-harness; FreeBS
 | # | Question | Resolved by | Blocks |
 | --- | --- | --- | --- |
 | O1 | Dense backend (Qdrant Edge / usearch / brute-force) | **RESOLVED — ADR-0003 (T10-05): brute-force** | steps 12+ dense specifics only |
-| O2 | Gate numbers (quality/latency/resources; memory router P/R) | baseline runs | release criteria only |
+| O2 | Gate numbers (quality/latency/resources; memory router P/R) | **search quality PARTIALLY RESOLVED (T12-05): `X = 0.03` MRR budget, `Y = 0.80` Recall@5, versioned in `fixtures/search/baseline/thresholds.json` and derived from the agreed v1 baseline — the first v2 run fails them, see `D-016` (blocked)**; latency/resources/memory-router numbers still from baseline runs (T14-07, T17-05) | release criteria only |
 | O3 | Default embedding model + weights delivery; local generator crate | **embedding model RESOLVED — ADR-0004 (T11-03): `embeddinggemma-300m`, 768d, cosine**; **weights delivery RESOLVED — ADR-0005 (T11-06): `ort` + `load-dynamic`, q8, pinned-digest atomic installer** (closes `D-008`); local generator crate still open (T14-07) | init UX, router quality |
 | O4 | First-release language set | **RESOLVED — ADR-0001 (T04-01): TypeScript, JavaScript, Rust** | parser scope |
 | O5 | v1 memory migration vs clean start | product decision before GA | 13 §3 last step |
