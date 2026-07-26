@@ -32,6 +32,16 @@
 //! - **spool GC (sessions absent > 14 days with fully committed cursors, spec 07
 //!   §6)** → group 13 / T13-05 (needs the `spool_import_cursor` table).
 //!
+//! ## Added later: unreferenced model-space directories (deviation D-011)
+//!
+//! T11-05 split a worktree's shard root one level deeper, per model space
+//! (`projection/<worktree_id>/<model_space_id>/`, spec 05 §2). That created a
+//! class of garbage neither sweep above can see — after a worktree migrates
+//! A → B (spec 10 §4 steps 4–6) the worktree is alive and `active`, so its root
+//! is neither orphaned nor expired, yet A's directory is dead. Gate G11 found the
+//! requirement ("shard lifecycle follows registry lifecycle", spec 05 §8) had no
+//! owning card, so [`run_unreferenced_space_sweep`] joins the two above here.
+//!
 //! # Idempotence & resume
 //!
 //! The sweep is a pure function of the current filesystem and the live worktree
@@ -40,14 +50,17 @@
 //! again. Triggering it at startup and periodically is the daemon's job (group 15);
 //! this module ships the idempotent, dry-run-capable sweep it will call.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
 
 use local_rag_core::paths::StoreLayout;
 
-use crate::registry::{WorktreeState, WorktreeStateClock, all_worktree_ids, worktree_state_clocks};
+use crate::registry::{
+    WorktreeState, WorktreeStateClock, all_worktree_ids, referenced_model_space_ids,
+    worktree_state_clocks,
+};
 use crate::state::{OpenError, StateDb};
 
 /// How long a `detached`/`removing` worktree's shard is retained before it is
@@ -236,6 +249,102 @@ pub fn run_orphan_shard_sweep(
     sweep_orphan_shard_dirs(&layout.projection_dir(), &live, dry_run).map_err(HousekeepingError::Io)
 }
 
+/// Remove every `projection/<worktree_id>/<model_space_id>` directory whose
+/// space is no longer referenced by that worktree's projection state (spec 05
+/// §8, D-011).
+///
+/// `referenced` maps a `worktree_id` to the model space ids its
+/// `worktree_projection_state` row names in **any** column
+/// ([`referenced_model_space_ids`](crate::referenced_model_space_ids)) — spec 04
+/// §3's own liveness phrase. A space directory outside that set is the shard of a
+/// model space the worktree has migrated off (spec 10 §4 step 6): dead weight
+/// that no other sweep reclaims, because the worktree itself is alive and the
+/// root directory is therefore neither orphaned ([`sweep_orphan_shard_dirs`]) nor
+/// expired ([`sweep_expired_shard_dirs`]).
+///
+/// Conservative in the two ways that matter, both mirroring the sweeps above:
+///
+/// - a worktree root **absent from `referenced`** (no projection state row at
+///   all) is skipped wholesale rather than emptied — a worktree mid-bootstrap has
+///   nothing to project, and a root with no worktree row is the orphan sweep's
+///   business, not this one's;
+/// - only directories are candidates, and non-UTF-8 names — which can never equal
+///   a `model_space_id` — are retained.
+///
+/// Race-free against a switch in flight without any locking: spec 05 §5 commits
+/// the write-ahead (which sets `target_model_space_id`) *before* the backend is
+/// touched, so a target space is referenced from before its directory exists.
+///
+/// `removed` entries are `"<worktree_id>/<model_space_id>"` — the sweep works one
+/// level deeper than its two siblings, so a bare name would be ambiguous.
+pub fn sweep_unreferenced_space_dirs(
+    projection_dir: &Path,
+    referenced: &BTreeMap<String, BTreeSet<String>>,
+    dry_run: bool,
+) -> io::Result<ShardSweepReport> {
+    let mut removed = Vec::new();
+    let mut retained: u64 = 0;
+
+    let roots = match fs::read_dir(projection_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(ShardSweepReport {
+                removed,
+                retained,
+                dry_run,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+
+    for root in roots {
+        let root = root?;
+        if !root.file_type()?.is_dir() {
+            retained += 1;
+            continue;
+        }
+        let root_name = root.file_name();
+        let Some(root_name) = root_name.to_str() else {
+            retained += 1;
+            continue;
+        };
+        // No projection state row ⇒ this sweep has no opinion about the root's
+        // contents (see the conservative rules above).
+        let Some(live) = referenced.get(root_name) else {
+            retained += 1;
+            continue;
+        };
+
+        for space in fs::read_dir(root.path())? {
+            let space = space?;
+            if !space.file_type()?.is_dir() {
+                retained += 1;
+                continue;
+            }
+            let space_name = space.file_name();
+            let Some(space_name) = space_name.to_str() else {
+                retained += 1;
+                continue;
+            };
+            if live.contains(space_name) {
+                retained += 1;
+                continue;
+            }
+            removed.push(format!("{root_name}/{space_name}"));
+            if !dry_run {
+                fs::remove_dir_all(space.path())?;
+            }
+        }
+    }
+
+    removed.sort();
+    Ok(ShardSweepReport {
+        removed,
+        retained,
+        dry_run,
+    })
+}
+
 /// Whether `clock`'s worktree has been out of service long enough for its shard
 /// to be destroyed (spec 05 §8: "remove/detach: grace period `[SPEC: 7 days]`,
 /// then destroy"), D-007.
@@ -313,6 +422,44 @@ pub fn run_expired_shard_sweep(
     let clocks = worktree_state_clocks(&conn).map_err(HousekeepingError::Sqlite)?;
     let doomed = expired_shard_ids(&clocks, now_ms, grace_ms);
     sweep_expired_shard_dirs(&layout.projection_dir(), &doomed, dry_run)
+        .map_err(HousekeepingError::Io)
+}
+
+/// Destroy every per-model-space shard directory a live worktree no longer
+/// references (spec 05 §8 "shard lifecycle follows registry lifecycle", spec 10
+/// §4 step 6), D-011.
+///
+/// Reads each worktree's referenced model space set through a read-only
+/// connection and delegates to [`sweep_unreferenced_space_dirs`]. Idempotent and
+/// safe to run at startup and periodically alongside the two sibling sweeps;
+/// `dry_run` reports without deleting.
+///
+/// **Why a third sweep.** T11-05 split a worktree's shard root one level deeper,
+/// per model space (`projection/<worktree_id>/<model_space_id>/`, spec 05 §2),
+/// which is what makes 10 §4's `[FIXED]` "different dimensions ⇒ never in place"
+/// and "until step 4 commits … that worktree still runs A entirely" mechanical.
+/// The cost is a new class of garbage the two existing sweeps cannot see: after a
+/// worktree migrates A → B, both are on disk, the worktree is alive, and its root
+/// is neither orphaned nor expired. On the *generation* axis the equivalent stale
+/// data is reclaimed inside the switch itself (step 3's
+/// `delete(existing \ expected)` runs against the same directory); the model axis
+/// has no such step by construction, so the reclamation is here.
+///
+/// **Scope boundary:** this removes shard *directories*. The `model_space` row
+/// itself may be deleted only under spec 04 §3's stricter store-wide rule (no row
+/// references it in any column **and** no `embedding_cache` pins remain); no code
+/// deletes model space rows today, and whichever task adds one owns that
+/// precondition. Evicting a still-open handle for a destroyed directory is
+/// `ShardManager::remove` (T09-02), wired by the daemon in group 15 — the same
+/// wiring deferral the two sibling sweeps already carry.
+pub fn run_unreferenced_space_sweep(
+    db: &StateDb,
+    layout: &StoreLayout,
+    dry_run: bool,
+) -> Result<ShardSweepReport, HousekeepingError> {
+    let conn = db.open_read().map_err(HousekeepingError::Open)?;
+    let referenced = referenced_model_space_ids(&conn).map_err(HousekeepingError::Sqlite)?;
+    sweep_unreferenced_space_dirs(&layout.projection_dir(), &referenced, dry_run)
         .map_err(HousekeepingError::Io)
 }
 
@@ -538,6 +685,137 @@ mod tests {
         assert_eq!(report.removed, vec!["wt-doomed".to_string()]);
         assert!(report.dry_run);
         assert!(dir.join("wt-doomed").is_dir(), "dry run must not delete");
+    }
+
+    // ---- D-011: unreferenced per-model-space shard directories (spec 05 §8) ----
+
+    /// Create `projection/<wt>/<space>` with a file inside.
+    fn space_shard(dir: &Path, wt: &str, space: &str) {
+        let d = dir.join(wt).join(space);
+        fs::create_dir_all(&d).expect("mkdir space shard");
+        fs::write(d.join("segment.bin"), b"x").expect("write shard file");
+    }
+
+    fn referenced(pairs: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
+        pairs
+            .iter()
+            .map(|(wt, spaces)| {
+                (
+                    (*wt).to_string(),
+                    spaces.iter().map(|s| (*s).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The core case: after a worktree migrated `space-a → space-b`, the outgoing
+    /// space's directory is reclaimed and the referenced one is kept.
+    #[test]
+    fn unreferenced_space_dir_removed_referenced_retained() {
+        let (_home, dir) = proj_dir();
+        space_shard(&dir, "wt", "space-a");
+        space_shard(&dir, "wt", "space-b");
+
+        let report =
+            sweep_unreferenced_space_dirs(&dir, &referenced(&[("wt", &["space-b"])]), false)
+                .expect("sweep");
+
+        assert_eq!(report.removed, vec!["wt/space-a".to_string()]);
+        assert!(!dir.join("wt").join("space-a").exists());
+        assert!(dir.join("wt").join("space-b").is_dir());
+    }
+
+    /// Every column counts, not just `active`: a switch in flight has its target
+    /// (and its outgoing `projected`) directory referenced, so a sweep racing a
+    /// migration can never delete either side of the double buffer.
+    #[test]
+    fn a_switch_in_flight_keeps_both_buffers() {
+        let (_home, dir) = proj_dir();
+        space_shard(&dir, "wt", "space-a");
+        space_shard(&dir, "wt", "space-b");
+        space_shard(&dir, "wt", "space-dead");
+
+        // active/projected = A (still serving), target = B (write-ahead committed).
+        let report = sweep_unreferenced_space_dirs(
+            &dir,
+            &referenced(&[("wt", &["space-a", "space-b"])]),
+            false,
+        )
+        .expect("sweep");
+
+        assert_eq!(report.removed, vec!["wt/space-dead".to_string()]);
+        assert!(dir.join("wt").join("space-a").is_dir(), "outgoing retained");
+        assert!(dir.join("wt").join("space-b").is_dir(), "target retained");
+    }
+
+    /// A worktree root with **no projection state row** is skipped wholesale —
+    /// this sweep has no opinion about it (the orphan sweep owns that case).
+    /// Distinct from a row whose columns are all NULL, which does empty the root.
+    #[test]
+    fn a_root_without_a_row_is_skipped_but_an_empty_row_is_not() {
+        let (_home, dir) = proj_dir();
+        space_shard(&dir, "wt-no-row", "space-a");
+        space_shard(&dir, "wt-empty-row", "space-a");
+
+        let report =
+            sweep_unreferenced_space_dirs(&dir, &referenced(&[("wt-empty-row", &[])]), false)
+                .expect("sweep");
+
+        assert_eq!(report.removed, vec!["wt-empty-row/space-a".to_string()]);
+        assert!(
+            dir.join("wt-no-row").join("space-a").is_dir(),
+            "a root with no projection state row is left entirely alone"
+        );
+    }
+
+    #[test]
+    fn unreferenced_space_sweep_dry_run_and_idempotence() {
+        let (_home, dir) = proj_dir();
+        space_shard(&dir, "wt", "space-a");
+        let live = referenced(&[("wt", &[])]);
+
+        let dry = sweep_unreferenced_space_dirs(&dir, &live, true).expect("dry run");
+        assert!(dry.dry_run);
+        assert_eq!(dry.removed, vec!["wt/space-a".to_string()]);
+        assert!(dir.join("wt").join("space-a").is_dir(), "dry run keeps it");
+
+        let first = sweep_unreferenced_space_dirs(&dir, &live, false).expect("first");
+        assert_eq!(first.removed, vec!["wt/space-a".to_string()]);
+
+        let second = sweep_unreferenced_space_dirs(&dir, &live, false).expect("second");
+        assert!(second.is_empty(), "second sweep is a no-op: {second:?}");
+        assert!(
+            dir.join("wt").is_dir(),
+            "the root itself is never removed by this sweep"
+        );
+    }
+
+    /// Stray files at either level are never candidates, and a missing
+    /// `projection/` yields an empty report — the same conservative rules the two
+    /// sibling sweeps follow.
+    #[test]
+    fn unreferenced_space_sweep_is_conservative() {
+        let (_home, dir) = proj_dir();
+        space_shard(&dir, "wt", "space-a");
+        fs::write(dir.join("stray.txt"), b"x").expect("stray at root level");
+        fs::write(dir.join("wt").join("stray.txt"), b"x").expect("stray inside a root");
+
+        let report =
+            sweep_unreferenced_space_dirs(&dir, &referenced(&[("wt", &["space-a"])]), false)
+                .expect("sweep");
+        assert!(report.is_empty(), "nothing unreferenced: {report:?}");
+        assert!(dir.join("stray.txt").is_file());
+        assert!(dir.join("wt").join("stray.txt").is_file());
+
+        let home = TempHome::new().expect("temp home");
+        let missing = sweep_unreferenced_space_dirs(
+            &home.join("projection"),
+            &referenced(&[("wt", &[])]),
+            false,
+        )
+        .expect("sweep");
+        assert!(missing.is_empty());
+        assert_eq!(missing.retained, 0);
     }
 
     /// A `removing` row whose shard is already gone (a prior sweep, or a

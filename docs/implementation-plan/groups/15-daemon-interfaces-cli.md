@@ -51,6 +51,17 @@ spec 02 §1/§4/§6; 11; 13 §4.
   command surface delegates typed APIs.
 - **Тесты:** CLI parse snapshots, service lifecycle, attach ambiguity, reindex/rebuild errors,
   JSON-friendly output where documented.
+- **Добавлено D-013 (G11):** `init` обязан **зарегистрировать `code_raw`-представление дефолтного
+  model space** (`local_rag_embed::register_embedder_representation` + `set_model_space_representation`,
+  required = true) для установленной ADR-0004 модели — spec 10 §3 «a model space bundles … at
+  minimum `code_raw` + `memory` in v0». Сегодня seeded space (`SCHEMA_V4`) `active`, но пуст, и
+  свежий стор отказывает `NoCodeRepresentation`/`NoShardParams`. Миграцией это делать нельзя:
+  `model_id` — решение ADR-0004, зашивать его в DDL значит захардкодить то, ради миграции чего
+  существует 10 §4, и заставить каждый стор заявлять модель, чьи веса могли не скачиваться.
+  `memory`-половина — группа 14.
+- **Тесты (добавлено D-013):** после `init` дефолтный space требует `code_raw`, его
+  `RepresentationKey` совпадает с `key()` установленного провайдера, а `params_for_model_space`
+  отдаёт `dimensions` этой модели; повторный `init` идемпотентен (тот же `representation_id`).
 
 ## T15-08 — Memory/privacy/diagnostic CLI
 

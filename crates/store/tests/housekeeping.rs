@@ -19,10 +19,12 @@ use std::fs;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::registry::{
-    WorktreeKind, WorktreeState, create_repository, create_worktree, transition_worktree_state,
+    WorktreeKind, WorktreeState, allocate_generation, create_repository, create_worktree,
+    insert_projection_state, transition_worktree_state,
 };
 use local_rag_store::{
     SHARD_DESTROY_GRACE_MS, StateDb, run_expired_shard_sweep, run_orphan_shard_sweep,
+    run_unreferenced_space_sweep,
 };
 use local_rag_test_support::TempHome;
 
@@ -352,6 +354,226 @@ async fn expired_sweep_dry_run_then_idempotent_real_run() {
         second.is_empty(),
         "the row still says `removing`, but its shard is gone: {second:?}"
     );
+}
+
+// ---- D-011: unreferenced per-model-space shard directories (spec 05 §8, 10 §4) ----
+
+/// Insert an extra model space row in the given state (raw — the registry's own
+/// guarded constructors are exercised in `tests/representation.rs`).
+async fn insert_model_space(db: &StateDb, id: &str, state: &str) {
+    let (i, s) = (id.to_string(), state.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO model_space (model_space_id, display_name, state, created_at, \
+                 updated_at) VALUES (?1, ?2, ?3, 1000, 1000)",
+                local_rag_store::rusqlite::params![i, format!("space-{i}"), s],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("insert model space");
+}
+
+/// Allocate one generation (born `building`) for `worktree_id`; returns its id.
+async fn allocate(db: &StateDb, worktree_id: &str, seed: u8) -> String {
+    let genr = uuid(seed);
+    let (w, g) = (worktree_id.to_string(), genr.clone());
+    db.writer()
+        .transaction(move |tx| allocate_generation(tx, &w, &g, CREATED_AT).map(|_| ()))
+        .await
+        .expect("allocate generation");
+    genr
+}
+
+/// Point a worktree's projection state at `(generation, model_space)` on all
+/// three tuples — the shape a completed switch leaves behind.
+async fn project_onto(db: &StateDb, worktree_id: &str, generation_id: &str, model_space_id: &str) {
+    let w = worktree_id.to_string();
+    db.writer()
+        .transaction(move |tx| insert_projection_state(tx, &w, CREATED_AT))
+        .await
+        .expect("init projection state");
+
+    let (w, g, m) = (
+        worktree_id.to_string(),
+        generation_id.to_string(),
+        model_space_id.to_string(),
+    );
+    db.writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE worktree_projection_state \
+                 SET active_generation_id = ?2, active_model_space_id = ?3, \
+                     projected_generation_id = ?2, projected_model_space_id = ?3 \
+                 WHERE worktree_id = ?1",
+                local_rag_store::rusqlite::params![w, g, m],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("point projection state");
+}
+
+/// Create `projection/<wt>/<space>` with a file inside.
+fn make_space_shard(layout: &StoreLayout, wt: &str, space: &str) {
+    let dir = layout.projection_shard_space(wt, space);
+    fs::create_dir_all(&dir).expect("mkdir space shard");
+    fs::write(dir.join("segment.bin"), b"x").expect("write shard file");
+}
+
+/// The requirement in one test: a live worktree that migrated off model space A
+/// (spec 10 §4 steps 4–6) has A's shard directory reclaimed, while the space it
+/// actually runs keeps its own — and the two older sweeps see nothing to do,
+/// which is precisely why this third one exists.
+#[tokio::test]
+async fn a_migrated_away_model_space_shard_is_reclaimed() {
+    let (_home, layout, db) = open_state();
+    let repo = repository(&db, 1).await;
+    let wt = worktree_in(&db, &repo, 10, WorktreeState::Active).await;
+
+    let space_a = uuid(50);
+    let space_b = uuid(51);
+    insert_model_space(&db, &space_a, "retiring").await;
+    insert_model_space(&db, &space_b, "active").await;
+    let generation = allocate(&db, &wt, 60).await;
+    project_onto(&db, &wt, &generation, &space_b).await;
+
+    make_space_shard(&layout, &wt, &space_a);
+    make_space_shard(&layout, &wt, &space_b);
+
+    // Neither existing sweep can see this garbage: the worktree is alive
+    // (not an orphan) and `active` (never expired).
+    let orphans = run_orphan_shard_sweep(&db, &layout, false).expect("orphan sweep");
+    assert!(orphans.is_empty(), "root is worktree-backed: {orphans:?}");
+    let expired = run_expired_shard_sweep(&db, &layout, i64::MAX, 0, false).expect("expired sweep");
+    assert!(expired.is_empty(), "worktree is active: {expired:?}");
+    assert!(layout.projection_shard_space(&wt, &space_a).is_dir());
+
+    let report = run_unreferenced_space_sweep(&db, &layout, false).expect("space sweep");
+
+    assert_eq!(report.removed, vec![format!("{wt}/{space_a}")]);
+    assert!(
+        !layout.projection_shard_space(&wt, &space_a).exists(),
+        "the space the worktree migrated off is reclaimed"
+    );
+    assert!(
+        layout.projection_shard_space(&wt, &space_b).is_dir(),
+        "the space it runs is untouched"
+    );
+    assert!(
+        layout.projection_shard(&wt).is_dir(),
+        "the worktree's shard root itself survives (spec 05 §8: keyed by worktree_id)"
+    );
+}
+
+/// A migration in flight is safe without any lock: spec 05 §5 commits the
+/// write-ahead (`target_model_space_id`) before the backend is touched, so both
+/// buffers are referenced for the whole switch.
+#[tokio::test]
+async fn a_switch_in_flight_is_never_swept() {
+    let (_home, layout, db) = open_state();
+    let repo = repository(&db, 1).await;
+    let wt = worktree_in(&db, &repo, 10, WorktreeState::Active).await;
+
+    let space_a = uuid(50);
+    let space_b = uuid(51);
+    insert_model_space(&db, &space_a, "active").await;
+    insert_model_space(&db, &space_b, "active").await;
+    let generation = allocate(&db, &wt, 60).await;
+    project_onto(&db, &wt, &generation, &space_a).await;
+
+    // The write-ahead: target set, backend not yet touched.
+    let (w, g, m) = (wt.clone(), generation.clone(), space_b.clone());
+    db.writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE worktree_projection_state \
+                 SET target_generation_id = ?2, target_model_space_id = ?3, status = 'updating' \
+                 WHERE worktree_id = ?1",
+                local_rag_store::rusqlite::params![w, g, m],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("write-ahead");
+
+    make_space_shard(&layout, &wt, &space_a);
+    make_space_shard(&layout, &wt, &space_b);
+
+    let report = run_unreferenced_space_sweep(&db, &layout, false).expect("space sweep");
+
+    assert!(report.is_empty(), "both buffers referenced: {report:?}");
+    assert!(layout.projection_shard_space(&wt, &space_a).is_dir());
+    assert!(layout.projection_shard_space(&wt, &space_b).is_dir());
+}
+
+/// Dry run, then a real run, then a repeat: the sweep is reportable and
+/// idempotent like its two siblings.
+#[tokio::test]
+async fn space_sweep_dry_run_then_idempotent_real_run() {
+    let (_home, layout, db) = open_state();
+    let repo = repository(&db, 1).await;
+    let wt = worktree_in(&db, &repo, 10, WorktreeState::Active).await;
+
+    let space_a = uuid(50);
+    let space_b = uuid(51);
+    insert_model_space(&db, &space_a, "retiring").await;
+    insert_model_space(&db, &space_b, "active").await;
+    let generation = allocate(&db, &wt, 60).await;
+    project_onto(&db, &wt, &generation, &space_b).await;
+    make_space_shard(&layout, &wt, &space_a);
+
+    let dry = run_unreferenced_space_sweep(&db, &layout, true).expect("dry run");
+    assert!(dry.dry_run);
+    assert_eq!(dry.removed, vec![format!("{wt}/{space_a}")]);
+    assert!(layout.projection_shard_space(&wt, &space_a).is_dir());
+
+    let first = run_unreferenced_space_sweep(&db, &layout, false).expect("first");
+    assert_eq!(first.removed, vec![format!("{wt}/{space_a}")]);
+
+    let second = run_unreferenced_space_sweep(&db, &layout, false).expect("second");
+    assert!(second.is_empty(), "second run is a no-op: {second:?}");
+}
+
+/// The three sweeps do not overlap: each takes exactly its own class of garbage
+/// in one pass over the same store.
+#[tokio::test]
+async fn the_three_sweeps_partition_the_work() {
+    let (_home, layout, db) = open_state();
+    let repo = repository(&db, 1).await;
+
+    let changed_at = 10_000i64;
+    let wt_live = worktree_in_at(&db, &repo, 10, WorktreeState::Active, changed_at).await;
+    let wt_removing = worktree_in_at(&db, &repo, 11, WorktreeState::Removing, changed_at).await;
+
+    let space_a = uuid(50);
+    let space_b = uuid(51);
+    insert_model_space(&db, &space_a, "retiring").await;
+    insert_model_space(&db, &space_b, "active").await;
+    let generation = allocate(&db, &wt_live, 60).await;
+    project_onto(&db, &wt_live, &generation, &space_b).await;
+
+    make_space_shard(&layout, &wt_live, &space_a); // unreferenced space
+    make_space_shard(&layout, &wt_live, &space_b); // live
+    make_shard(&layout, &wt_removing); // past its grace period
+    make_shard(&layout, "orphan-shard"); // no worktree row
+
+    let spaces = run_unreferenced_space_sweep(&db, &layout, false).expect("space sweep");
+    assert_eq!(spaces.removed, vec![format!("{wt_live}/{space_a}")]);
+
+    let now = changed_at + SHARD_DESTROY_GRACE_MS;
+    let expired = run_expired_shard_sweep(&db, &layout, now, SHARD_DESTROY_GRACE_MS, false)
+        .expect("expired sweep");
+    assert_eq!(expired.removed, vec![wt_removing.clone()]);
+
+    let orphans = run_orphan_shard_sweep(&db, &layout, false).expect("orphan sweep");
+    assert_eq!(orphans.removed, vec!["orphan-shard".to_string()]);
+
+    // Only the live pair survives.
+    assert!(layout.projection_shard_space(&wt_live, &space_b).is_dir());
+    assert!(!layout.projection_shard(&wt_removing).exists());
+    assert!(!layout.projection_shard("orphan-shard").exists());
 }
 
 /// The two sweeps are complementary and non-overlapping: the orphan sweep never

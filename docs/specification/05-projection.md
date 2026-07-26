@@ -383,6 +383,26 @@ shard is gone simply makes later sweeps no-ops (the sweep is idempotent). Evicti
 handle for a destroyed shard is `ShardManager::remove` (T09-02), which the daemon wires to this
 sweep in group 15 — the same wiring deferral the orphan sweep already carries, not a new one.
 
+As-built note (D-011, `[SPEC]`): the per-model-space split T11-05 introduced (§2) needs a **third**
+sweep, `local_rag_store::housekeeping::run_unreferenced_space_sweep`, beside the orphan (T06-03) and
+grace-destroy (D-007) ones. After a worktree migrates A → B (10 §4 steps 4–6), `projection/<wt>/<A>/`
+is dead weight neither sibling can see: the worktree is alive, so its root is not orphaned, and it is
+`active`, so the root never expires. On the *generation* axis the equivalent stale data is reclaimed
+inside the switch itself (§5 step 3's `delete(existing \ expected)` runs against the same directory);
+the model axis has no such step by construction, which is exactly what makes the outgoing buffer
+survivable during the switch — so the reclamation has to be a sweep. Gate G11 found the requirement
+had no owning card: D-004's deferral chain and the sweeps predate the split.
+
+Liveness is read as spec 04 §3's own phrase, per worktree: a space directory is live while the
+worktree's `worktree_projection_state` row names it in **any** column
+(`local_rag_store::referenced_model_space_ids`). Reading all three columns — not just `active` — is
+what makes the sweep race-free against a switch in flight with no lock at all: §5 commits the
+write-ahead (which sets `target_model_space_id`) *before* any backend mutation, so a target
+directory is referenced from before it exists. Conservative in the same two ways as its siblings: a
+root with **no** projection-state row is skipped wholesale (that root belongs to the orphan sweep),
+and only directories are candidates. It never removes the worktree's shard *root* — "keyed by
+`worktree_id`" above is untouched.
+
 As-built note (T09-02, `[SPEC]`): the L3 shard-manager map (spec 02 §5) is
 `local_rag_projection::manager::ShardManager` (`crates/projection/src/manager.rs`). Ref-counted
 handles are plain `Arc<dyn ShardHandle>` — every method but `destroy` takes `&self` and the trait

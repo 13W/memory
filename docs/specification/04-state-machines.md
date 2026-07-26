@@ -83,6 +83,26 @@ building ──▶ projection_ready ──▶ active ──▶ retiring
 Per-worktree activation `[FIXED]`: an offline/dormant worktree migrates to the default space
 at its next open (05 §8); there is **no global write barrier**.
 
+As-built note (D-012, `[SPEC]`): "the default space MUST be `active`" is enforced from **both**
+sides, because either alone leaves a hole. `set_default_model_space_id` (T11-05) refuses to point
+the pointer at a non-active space; `transition_model_space` now additionally refuses to move an
+`active` space *out of* `active` while it is the one the pointer names
+(`ModelSpaceTransitionError::IsDefaultModelSpace`). Gate G11 found the second half missing: retiring
+the default was a legal `active → retiring` edge, and the resulting store had a default no worktree
+could migrate to — `dormant_migration_target` (05 §8) returns `None` when the default is itself
+unusable, so dormant migration silently stopped instead of failing loudly. Refusing rather than
+auto-repointing keeps the choice of default explicit and matches the order 10 §4 already fixes:
+step 5 (`default := B`) precedes step 6 (`A → retiring`). The guard is scoped to a departure *from*
+`active`, so it can never trap a store whose pointer already names a non-active space: walking that
+space back up (`building → projection_ready → active`) stays legal, and self-transitions stay
+idempotent no-ops.
+
+The section's deletion rule ("a model space may be deleted only when no `worktree_projection_state`
+row references it in any column and no `embedding_cache` pins remain") is **vacuously satisfied
+today**: no code deletes `model_space` rows, and no v0 card calls for it. Whichever task introduces
+a deletion path owns that precondition. Its filesystem counterpart — reclaiming the shard directory
+of a space a worktree no longer references — is D-011 (05 §8).
+
 As-built note (T11-04, `[SPEC]`): the coverage the `projection_ready` precondition reads is
 computed by the backfill worker (`local_rag_embed::backfill::run_backfill`, 10 §3/§4 step 2) and
 applied by `transition_model_space`, which reads the **stored** `model_space.coverage` — so the

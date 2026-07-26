@@ -59,6 +59,15 @@
 - **Тесты:** scope isolation/union, ≤20k guard, terminal exclusion, tie order, 1500-token budget,
   control/injection/`</memory`/1KiB cases, exact byte len, empty emits zero bytes.
 
+### Добавлено D-013 (G11) — `memory`-представление дефолтного model space
+
+Группа 14 владеет **memory-половиной** spec 10 §3's «at minimum `code_raw` + `memory` in v0»:
+subject-функцией kind'а `memory` (сегодня её отсутствие — осознанный отказ
+`BackfillError::UnsupportedRequiredKind`, а не «expected = 0») и регистрацией самого
+представления как `required` для дефолтного model space. До этого момента kind `memory`
+**не** должен помечаться `required` ни в одной карточке: полный `Coverage` тогда недостижим и
+ни один space не сможет получить `projection_ready`. `code_raw`-половина — T15-07.
+
 ## G14 — Сверка memory correctness/quality
 
 Перечитать spec 04 §4–6, 08, 11 §5, 12 §3–4, 14. Run state/transaction crash suite,

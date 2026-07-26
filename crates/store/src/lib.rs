@@ -226,8 +226,9 @@ pub use eviction::{
 };
 pub use housekeeping::{
     HousekeepingError, SHARD_DESTROY_GRACE_MS, ShardSweepReport, expired_shard_ids,
-    run_expired_shard_sweep, run_orphan_shard_sweep, shard_destroy_due, sweep_expired_shard_dirs,
-    sweep_orphan_shard_dirs,
+    run_expired_shard_sweep, run_orphan_shard_sweep, run_unreferenced_space_sweep,
+    shard_destroy_due, sweep_expired_shard_dirs, sweep_orphan_shard_dirs,
+    sweep_unreferenced_space_dirs,
 };
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
@@ -258,7 +259,7 @@ pub use registry::{
     IllegalProjectionTransition, PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation,
     ProjectionStateChange, ProjectionStateError, ProjectionStateRow, ProjectionStatus,
     check_invariants, default_model_space_id, insert_projection_state, projection_state,
-    set_default_model_space_id, write_projection_state,
+    referenced_model_space_ids, set_default_model_space_id, write_projection_state,
 };
 pub use retention::{
     ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,

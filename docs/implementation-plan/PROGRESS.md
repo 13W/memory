@@ -115,7 +115,11 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [x] D-010 Сузить манифест-линт `crates/embed` до имён зависимостей (найдено в T11-04)
 - [x] T11-05 Реализовать per-worktree model switch
 - [x] T11-06 Реализовать model asset installer
-- [ ] G11 Сверка model migration
+- [x] D-011 Уборка per-model-space каталогов шарда после миграции (найдено в G11)
+- [x] D-012 Инвариант «дефолтный model space активен» со стороны состояния (найдено в G11)
+- [x] D-013 Владельцы `code_raw`/`memory` представлений дефолтного space (найдено в G11)
+- [x] D-014 Детерминизм opt-in проверки digest'ов каталога моделей (найдено в G11)
+- [x] G11 Сверка model migration
 
 ## 12 — Hybrid code search
 
@@ -196,7 +200,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 | G08 | PASS | строка G08 в «Task evidence» + трейс «G08 — трейс требование → artifact/test» ниже |
 | G09 | PASS after D-007 | строка G09 в «Task evidence» + трейс «G09 — трейс требование → artifact/test» ниже |
 | G10 | PASS | строка G10 в «Task evidence» + трейс «G10 — трейс требование → artifact/test» ниже |
-| G11 | — | — |
+| G11 | PASS after D-011, D-012, D-013, D-014 | строка G11 в «Task evidence» + трейс «G11 — трейс требование → artifact/test» ниже |
 | G12 | — | — |
 | G13 | — | — |
 | G14 | — | — |
@@ -210,6 +214,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 | ID | Commit/PR | Проверки | Результат/артефакт | Исполнитель/дата |
 | --- | --- | --- | --- | --- |
+| G11 | коммит `G11: Сверка model migration (spec 04 §3, 05 §8, 10, 12 §1, 15 §4 O3) [PASS after D-011…D-014]` (строка evidence в том же коммите) | `cargo xtask ci` — **all checks passed** (полный воркспейс + шесть `--features failpoints`-шагов). Пофайлово по крейтам группы: `cargo test -p local-rag-store` — **354 OK**, 0 failed (в т.ч. `--lib housekeeping::` 20 (было 15, +5 D-011), `--test housekeeping` 14 (было 10, +4 D-011), `--test representation` 9 (было 5, +4 D-012)); `-p local-rag-projection` — **69 OK**; `-p local-rag-embed` — **56 OK** (в т.ч. `--test backfill` 10 — те два теста, что поймали слишком широкий гвард D-012); `-p local-rag-models` — **38 OK**; `cargo test -p xtask --test adr_links` — 8 OK. **Перепрогон ONNX по решению владельца** (ассеты машинные, не коммитятся): `LOCAL_RAG_TEST_MIRROR=<mirror> LOCAL_RAG_TEST_MODEL_HOME=<store> cargo test -p local-rag-models --test install the_default_catalog_matches -- --nocapture` → `RAN: verified 3 files (314.5 MiB) against the pinned catalog digests` + `RAN: shared root … is installed; repeat install is a no-op that reprints nothing` (10.86 s); `ORT_DYLIB_PATH=<libonnxruntime.1.27.0.dylib> LOCAL_RAG_TEST_MODEL_HOME=<store> cargo test -p local-rag-models --release --test onnx real_inference -- --nocapture` → `RAN: real inference over 3 texts, 768 dimensions, load 397.5 ms, batch 378.1 ms (126.0 ms/text), cos(same topic)=0.860 > cos(different)=0.483`. Обратная проверка: без переменных окружения оба теста печатают явный `SKIP`. Guardrails: `git diff --stat Cargo.lock` — **пусто**; `cargo build --offline -p local-rag-models` — OK | **PASS after D-011, D-012, D-013, D-014.** Трейс — секция «G11 — трейс требование → artifact/test» ниже (10 §1–§6, 04 §3, 05 §2/§4/§5/§8, 12 §1, 15 §4 O3, guardrails). Четыре находки: **D-011** — после миграции модели каталог старого space оставался на диске навсегда (ни orphan-, ни expired-sweep его не видят; на generation-оси эквивалент чистит сам switch, на model-оси такого шага нет по построению) → третий sweep `run_unreferenced_space_sweep` + ридер `referenced_model_space_ids`; **D-012** — инвариант «дефолтный space активен» охранялся только со стороны указателя, `active → retiring` на дефолте проходил и **тихо** останавливал dormant-миграцию → guard в `transition_model_space`, сознательно суженный до ухода из `active`, чтобы не запереть путь восстановления; **D-013** — 10 §3's «at minimum `code_raw` + `memory`» не покрыто ни одной карточкой → владение передано T15-07 (`code_raw`, вместе с `init`) и группе 14 (`memory`), обе карточки правлены, G14/G15 обязаны подтвердить; **D-014** — opt-in проверка digest'ов каталога на предзаполненном сторе падала и, что важнее, не хешировала ни байта (короткое замыкание на `.ok`), т.е. «успех» был бы ложным → верификация всегда в свежий temp-root, наполнение общего стора вынесено во вторую половину с позитивной проверкой no-op-семантики. `[SPEC]`-амендменты: 05 §8 (D-011), 04 §3 (D-012 + вакуумность правила удаления model space), 10 §4 (шаги 5–6), 10 §3 (D-013). Продуктового кода вне двух находок гейт не писал; `[FIXED]`-текст не менялся | Claude Opus 5 / 2026-07-26 |
 | T11-06 | коммит `T11-06: model asset installer и ONNX-провайдер (spec 10 §5/§1, 12 §1, 15 §4 O3)` (строка evidence в том же коммите) | `cargo test -p local-rag-models` — **38 OK** (новый крейт: 17 `--lib` + `--test install` 16 + `--test onnx` 5), 0 failed; `cargo test -p local-rag-models --features failpoints` — +`--test install_faults` **3 OK** (kill в `models.install.between_files` → модель непригодна, rerun до-качивает только недостающее, третий запуск — no-op); `cargo test -p xtask --test adr_links` — 8 OK (было 7, +`model_delivery_adr_is_well_formed`); `cargo test -p local-rag-embed` — **56 OK** (22 `--lib` + backfill 10 + offline_smoke 5 + policy 9 + representation 6 + retry 4; структурный линт «нет сетевого клиента и ML-рантайма» остаётся зелёным); `cargo test --workspace` — 0 failed; `cargo fmt --all --check` чист; `cargo clippy --workspace --all-targets -- -D warnings` чист; `cargo xtask ci` — **all checks passed** (добавлены два шага: `clippy`/`test -p local-rag-models --features failpoints`). Offline: `cargo build --offline -p local-rag-models` — OK (ни одна сборка не ходит в сеть; `ort` грузит библиотеку в рантайме). **Ручные прогоны на этой машине** (данные не коммитятся, `CLAUDE.md`): (1) сверка пиннутых digest'ов с реальными весами — `LOCAL_RAG_TEST_MIRROR=<mirror> LOCAL_RAG_TEST_MODEL_HOME=<store> cargo test -p local-rag-models --test install the_default_catalog_matches -- --nocapture` → `RAN: verified 3 files (314.5 MiB) against the pinned catalog digests`; (2) реальный инференс — `ORT_DYLIB_PATH=<libonnxruntime.1.27.0.dylib> LOCAL_RAG_TEST_MODEL_HOME=<store> cargo test -p local-rag-models --release --test onnx real_inference -- --nocapture` → `RAN: real inference over 3 texts, 768 dimensions, load 363.6/400.4 ms, batch 253.6/342.3 ms (84.5/114.1 ms/text), cos(same topic)=0.860 > cos(different)=0.483` (два прогона). Без `ORT_DYLIB_PATH`/весов оба теста печатают явный `SKIP`, а не молча проходят | **D-008 закрыт.** `crates/models` — производящая половина контракта `.ok`: инсталлятор spec 10 §5 (`.part` → потоковый sha256 → `sync_all` → сверка size+digest с **вкомпилированным** каталогом → `rename` → fsync каталога; затем `manifest.json`, и `.ok` **последним**) и `OnnxEmbedder`, который берёт путь к весам **только** через `require_model_assets` и отдаёт типизированный `ModelAssetsMissing` без единого сетевого вызова. Resumable без журнала: каждый запуск заново выводит недостающее хешированием того, что лежит на диске; оставшийся `.part` перезаписывается, а не дописывается. Рантайм — `ort` + `load-dynamic` (**ADR-0005**, delivery-половина O3): `ort-sys` компилируется без линковки, `libonnxruntime` резолвится в рантайме, поэтому сборка и весь гейт остаются offline — ровно то возражение, из-за которого возник D-008. Тяжёлые зависимости (`ort`, `tokenizers`, `ureq`+rustls) изолированы в **новый крейт**, а не добавлены в `crates/embed`: его структурный линт (T11-03, D-010) не ослаблен — тот же приём изоляции, что у `spike/`. `[SPEC]`-амендменты: 10 §5 (as-built инсталлятора и manifest-схема), 15 §4 O3 (delivery RESOLVED), 12 §1 (скачивание весов **не** подчинено `data_policy` — входящий трафик по явной команде, ни байта пользовательского контента наружу; URL и digest'ы запиннены, поэтому «скачать модель» не превращается в «скачать что угодно»), 11 §6 (`init` как команда — T15-07). `CONTRIBUTING.md`: три новые строки одобренных зависимостей с полным транзитивным списком и license-аудитом (90 новых крейтов в `Cargo.lock`, 13 из них — windows/wasm-gated; все permissive: MIT/Apache-2.0/ISC/BSD/CDLA-Permissive-2.0/Zlib, ни одной copyleft). Инфраструктурная правка: `.gitignore`'s path-agnostic `models/` (правило для каталога весов внутри store) скрывал сам крейт `crates/models`; добавлена одна строка `!/crates/models/` — проверено, что вложенный `<любой путь>/local-rag/models/*.onnx` по-прежнему игнорируется. Границы соблюдены: CLI-команда `init` — T15-07, ORT-бандлинг по матрице — T17-03, исключение весов из npm — T17-01, локальный генератор (вторая половина O3) — T14-07 | Claude Opus 5 / 2026-07-26 |
 | T11-05 | коммит `T11-05: per-worktree model switch (spec 10 §4, 05 §2/§4/§5/§8, 04 §3)` (строка evidence в том же коммите) | `cargo test -p local-rag-projection` — все бинарники 0 failed, в т.ч. новый `--test model_switch` 10 OK; `cargo test -p local-rag-projection --features failpoints` — +`--test model_switch_faults` 2 OK (kill перед коммитом → all-old, retry → all-new; миграция одного worktree не блокирует switch другого); `cargo test -p local-rag-store` — 26 бинарников 0 failed; `cargo test -p local-rag-core` — layout-тест дополнен вложенным путём; `cargo test --workspace` — 0 failed; `cargo fmt --all --check` чист; `cargo clippy --workspace --all-targets -- -D warnings` чист (три замечания пойманы и исправлены: `useless_conversion`, два `explicit_auto_deref`, неиспользуемые импорты); `cargo xtask ci` — **all checks passed**. Guardrail: `git diff --stat Cargo.lock` — **пусто** (ни одной новой зависимости; вся задача — разводка существующих крейтов) | Четыре форвард-референса, указывавших на эту карточку, закрыты. (1) `expected_points` больше не хардкодит required kinds: `required_code_kinds` джойнит `model_space_representation` и пересекает с «kinds that apply to code» (05 §4); пустое пересечение — типизированный `NoCodeRepresentation`, а не пустой expected set (иначе switch «успешно» опустошил бы шард). (2) `local_rag_projection::vectors::CacheVectorSource` — производственный `VectorSource` над `embedding_cache` (`occurrence_id → blob_id → H(subject/content_blob)`), где строка, не прошедшая `verify_cached_embedding`, трактуется как отсутствующая, т.е. `MissingVector` = coverage guard 05 §7. (3) `model_switch::switch_model_space` — шаг 4 из 10 §4: проверяет preconditions шага 0 (`active` + полное сохранённое покрытие) **до** write-ahead и вызывает тот же `switch()` с текущей генерацией, так что двигается ровно одна ось. (4) `migrate_dormant_on_open` вызывается из `ShardManager`'s fill **до** `open_and_validate` — буквальное «before serving dense search» (05 §8). **Layout шардов разделён по model space** (решение владельца): `projection/<worktree_id>/<model_space_id>/` — корень по-прежнему keyed by `worktree_id` (05 §8 «never a second shard», sweeps не тронуты), но старый шард остаётся целым во время миграции, что делает 10 §4's «until step 4 commits … still runs A entirely» проверяемым фактом, а не только восстановимым состоянием; `ShardParams` выводятся из `representation.dimensions` целевого пространства, поэтому «different dimensions ⇒ never in place» механично. Новый `set_default_model_space_id` — единственный писатель указателя, отвергающий не-`active` пространство (04 §3). Шаг 6 (старые строки перестают пиннуться) кода не потребовал — это уже поведение `protected_model_space_ids` (T11-04), и задача его проверяет тестом. Существующие фикстуры switch/rebuild/manager/search дополнены регистрацией code-представлений (та же пара kinds, что была захардкожена), поэтому ни один прежний ассерт не изменился. `[SPEC]`-амендменты: 05 §2 (layout), 05 §4 (реестр вместо хардкода), 05 §5 (preconditions + `VectorSource`), 05 §8 (dormant-миграция), 10 §4 (первая as-built заметка секции, шаги 4–6), 02 §2 (дерево store), 03 §2.1 (единственный писатель указателя default) | Claude Opus 5 / 2026-07-26 |
 | T11-04 | коммит `T11-04: resumable coverage backfill (spec 10 §3/§4, 04 §3, 03 §4.2/§4.4)` (строка evidence в том же коммите) | `cargo test -p local-rag-embed` — **41 OK** (22 `--lib` (было 18, +4 юнита: резервирование `InFlight`, классификация фатальных ошибок пула, дефолтные размеры батчей), + `--test backfill` 10 (новый), `--test offline_smoke` 5 (было 4, +1 D-010 regression), `--test policy` 9, `--test representation` 6, `--test retry` 4 — минус те, что перечислены, итог 0 failed); `cargo test -p local-rag-embed --features failpoints` — **44 OK** (+3 `--test backfill_resume`: kill после первого коммита с последующим resume, kill на **каждой** границе батча до сходимости, регистрация имени точки в здоровом прогоне); `cargo test -p local-rag-store` — 26 тест-бинарников, 0 failed (в т.ч. новый `--test subjects` 6 OK и `--test embedding_cache` 9 OK после расширения `EvictionParams`); `cargo test -p xtask` — 9 OK; `cargo fmt --all --check` чист; `cargo clippy --workspace --all-targets -- -D warnings` чист (один lint пойман и исправлен — `useless_conversion` на `.zip(vectors.into_iter())`); `cargo xtask ci` — **all checks passed** (полный workspace + `--features failpoints` теперь для пяти крейтов, включая новый шаг `local-rag-embed`). Guardrail: `git diff --stat Cargo.lock` — **пусто**, ни одной новой внешней зависимости (воркер асинхронный, но tokio в `[dependencies]` не добавлен: `.await` — языковая фича, а дедупликация конкурентных прогонов сделана `std::sync::Mutex`, чей guard никогда не живёт через `.await`) | Новый модуль `local_rag_store::subjects` — **единственное** определение «ожидаемых subject-ключей model space», которое потребляют обе стороны: воркер эмбеддит недостающее, эвиктор отказывается вытеснять входящее (раньше их посчитали бы порознь и они гонялись бы друг за другом). `expected content` зафиксирован как pin roots (06 §5) по всем worktree; subjects, а не points — `code_raw` схлопывается по `blob_id` (03 §4.2 `[FIXED]`). `local_rag_embed::backfill::run_backfill` — bounded, resumable **без журнала**: каждый прогон пересчитывает `missing = expected \ valid_cached`, эмбеддит вне транзакций (02 §5 «L4 queues are leaves»), пишет ≤500 строк за cache-транзакцию, затем отдельной state-транзакцией сохраняет пересчитанный `Coverage` (03 §1.4 запрещает cross-DB tx). Битая строка удаляется и переэмбеддивается (03 §4.4); отказ провайдера идёт в `failed`, никогда в `ready`, поэтому неполный прогон не может промотировать space; `required` kind без subject-функции (`code_context` — `[OPEN]` 09 §3, `memory` — группа 14) даёт `UnsupportedRequiredKind`, а не «expected=0», которое `fully_covered` прочитал бы как «покрыто». **Расширены пины эвикции** (решение владельца): защищены также spaces в `building`/`projection_ready` и дефолтный space — иначе свежие строки backfill'а становились первыми жертвами LRU, поскольку строящийся space не упомянут ни в одном `worktree_projection_state` до момента переключения; `retiring` без ссылок по-прежнему не пиннится (10 §4 шаг 6). `[SPEC]`-амендменты: 10 §3 (определение expected content, модель резюмируемости), 03 §4.2 (revised pin rule), 04 §3 (кто считает coverage и в какой транзакции происходит переход). Deviation: **D-010** (см. отдельную строку) | Claude Opus 5 / 2026-07-26 |
@@ -1345,3 +1350,119 @@ Guardrail — отсутствие преждевременной backend coupli
   T10-05, ни этим гейтом.
 - Отклонений не найдено; `DEVIATIONS.md` без изменений, D-001…D-007 остаются `resolved`.
   Историческое evidence не переписывалось. Группа 11 (Embeddings и model spaces) разблокирована.
+
+### G11 — трейс требование → artifact/test
+
+Дата 2026-07-26, исполнитель Claude Opus 5. Гейт перечитал spec 04 §3, 05 §2/§4/§5/§8, 10 (§1–§6),
+12 §1, 15 §4 O3, а также ADR-0004 и ADR-0005 целиком. Найдено **четыре** расхождения (D-011…D-014);
+два потребовали продуктового кода в `crates/store`, одно — только передачи владения карточкам,
+одно — фикса opt-in теста. Новых фич гейт не писал.
+
+Spec 10 §1 — Execution `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Embeddings run **in-process** (`fastembed`/ONNX или `Candle`) | `crates/models/src/onnx.rs::OnnxEmbedder` (ORT через `ort` + `load-dynamic`, ADR-0005) | `crates/models/tests/onnx.rs::real_inference` — **перепрогнан этим гейтом**: 768 dims, load 397.5 ms, batch 378.1 ms (126.0 ms/text), cos(same)=0.860 > cos(diff)=0.483 | as-built |
+| `Embedder` trait — ровно две `[FIXED]` сигнатуры | `crates/embed/src/contract.rs` | `crates/embed/tests/representation.rs` (`key()` ↔ реестр), `crates/models/tests/onnx.rs` (`key().model_id == "embeddinggemma-300m"`) | as-built |
+| `Generator` trait | — (кода нет) | — | **осознанно открыт**: 15 §4 O3 «local generator crate still open (T14-07)», карточка T14-07 несёт «ADR closes generator part O3». Гейт подтвердил, что группа 11 его не предрешила |
+| «The local backend is the working default»; Ollama/remote строго опциональны | `crates/embed/src/local.rs::HashingEmbedder` (bootstrap `local-hashing-v1`) + `OnnxEmbedder` (прод-модель) | `crates/embed/tests/offline_smoke.rs` — 5 OK, в т.ч. структурный линт «в `crates/embed` нет ни сетевого клиента, ни ML-рантайма» (сужен D-010 до имён зависимостей) | as-built |
+| `data_policy` default `local_only`; guard **до** выбора провайдера; `local_only` никогда не падает в remote | `crates/embed/src/policy.rs::allows` + `pool.rs:244` (`PolicyBlockedRemote` до селекции) | `crates/embed/tests/policy.rs` — 9 OK | as-built |
+| Primary/fallback + retry по v1-контракту | `crates/embed/src/pool.rs` | `crates/embed/tests/retry.rs` — 4 OK (семь `fault.llm.*` кейсов v1-фикстур) | as-built |
+
+Spec 10 §2 — Representations registry `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Дубликаты по шести полям невозможны by constraint | `crates/store/src/registry/representation.rs::register_representation` (`INSERT … ON CONFLICT (шесть полей) DO UPDATE … RETURNING`) | `crates/store/tests/representation.rs::six_field_uniqueness_and_duplicate_convergence` | as-built |
+| `embedding_cache` ссылается на `representation_id`, никогда не инлайнит model-параметры | `crates/store/src/cache/open.rs:127-139` (колонки: `subject_kind/subject_hash/representation_id/dimensions/vector_f32/byte_size/checksum/...` — ни `model_id`, ни метрики, ни версий нормализации) | `crates/store/tests/embedding_cache.rs`, `--test schema_audit` | as-built |
+
+Spec 10 §3 / 04 §3 — Model spaces и required coverage:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Coverage = expected/ready **набор** по каждому required kind, а не счётчик отказов `[FIXED]` | `Coverage`/`CoverageEntry{expected,ready,failed}`, `recompute_coverage` | `crates/store/tests/representation.rs::coverage_round_trips_through_the_real_column` | as-built |
+| Всегда пересчитываем из `state.sqlite` × `embedding_cache` | `crates/store/src/subjects.rs` (единственное определение expected) + `crates/embed/src/backfill.rs` (`missing = expected \ valid_cached`, без журнала) | `crates/embed/tests/backfill.rs` 10 OK, `backfill_resume.rs` 3 OK (kill на **каждой** границе батча) | as-built |
+| `projection_ready` только при полном покрытии required kinds | `transition_model_space` (читает **сохранённое** покрытие) | `crates/store/tests/representation.rs::incomplete_coverage_blocks_projection_ready_and_target_eligibility`; `crates/embed/tests/backfill.rs::full_required_coverage_gates_projection_ready`, `a_failure_does_not_inflate_ready` | as-built |
+| Required kind без subject-функции не читается как «покрыто» | `BackfillError::UnsupportedRequiredKind` (`backfill.rs:418`) | `crates/embed/tests/backfill.rs` | as-built; `code_context` остаётся `[OPEN]` (09 §3), группа 11 его не закрыла |
+| «Default space MUST be `active`» | `set_default_model_space_id` (сторона указателя) **+ `transition_model_space`** (сторона состояния) | `crates/store/tests/representation.rs`: `default_model_space_is_active_and_eligible_as_target`, `the_default_model_space_cannot_be_retired_while_it_is_the_default`, `a_non_active_default_can_still_be_walked_back_to_active`, `a_self_transition_on_the_default_is_still_a_no_op` | **PASS after D-012** — вторая половина инварианта отсутствовала |
+| «Model space bundles … at minimum `code_raw` + `memory` in v0» `[SPEC]` | — (у засеянного дефолтного space нет ни одной строки `model_space_representation`) | отказы громкие: `NoCodeRepresentation`/`NoShardParams` | **PASS after D-013** — владение передано: `code_raw` → T15-07 (`init`), `memory` → группа 14; карточки правлены |
+| Правило удаления model space (нет ссылок ни в одной колонке + нет пинов) | — (кода удаления нет: `grep 'DELETE FROM model_space'` пуст) | — | **вакуумно выполнено**, зафиксировано в 04 §3 as-built; владелец — та задача, что введёт удаление |
+
+Spec 10 §4 — Double-buffer migration `[FIXED]` (ядро карточки гейта):
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Шаг 2: «Different dimensions ⇒ separate shard layout — **never in place**» | `model_switch::params_for_model_space` (`ShardParams` из `representation.dimensions`) + `StoreLayout::projection_shard_space` (`projection/<wt>/<space>/`) | `crates/projection/tests/model_switch.rs` — 10 OK | as-built |
+| Шаг 4: standard write-ahead switch на MODEL-оси, сериализован с generation-осью | `model_switch::switch_model_space` вызывает тот же `switch::switch` с **текущей** генерацией; двухосевой guard `BothAxesMovedAtOnce` | `crates/projection/tests/model_switch.rs`, `switch_concurrency.rs` | as-built |
+| «Until step 4 commits … that worktree still runs A entirely» `[FIXED]` (per-worktree rollback) | старый шард живёт в собственном каталоге всю миграцию | `crates/projection/tests/model_switch_faults.rs` — 2 OK (kill до коммита → all-old; retry → all-new; миграция одного worktree не блокирует другой) | as-built |
+| Шаг 5: `default_model_space := B`, без глобального барьера `[FIXED]` | `set_default_model_space_id` — единственный писатель; всё per-worktree, store-wide write lock отсутствует в 02 §5 | `crates/store/tests/representation.rs::retiring_the_old_space_works_once_the_default_has_moved` (полный порядок 5→6) | as-built |
+| Шаг 5: dormant worktree мигрирует при следующем open (05 §8) | `migrate_dormant_on_open`, вызывается из `ShardManager` fill **до** `open_and_validate` | `crates/projection/tests/model_switch.rs` | as-built |
+| Шаг 6: cache-строки A становятся evictable | `subjects::protected_model_space_ids` перестаёт пиннить `retiring` без ссылок | `crates/store/tests/embedding_cache.rs`, `--test subjects` | as-built |
+| Шаг 6: **шард** A после переезда | `housekeeping::run_unreferenced_space_sweep` + `referenced_model_space_ids` | `--lib housekeeping::` 20 OK, `--test housekeeping` 14 OK (`a_migrated_away_model_space_shard_is_reclaimed` сперва доказывает, что оба прежних sweep'а тут пусты; `a_switch_in_flight_is_never_swept`; `the_three_sweeps_partition_the_work`) | **PASS after D-011** — уборки не существовало |
+
+Spec 05 §8 — Shard lifecycle follows registry lifecycle `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| «Same shard directory (keyed by `worktree_id`), never a second shard» | корень по-прежнему `projection/<worktree_id>/`; сплит — уровнем ниже; sweep D-011 никогда не удаляет корень | `--test housekeeping::a_migrated_away_model_space_shard_is_reclaimed` (явный ассерт про выживание корня) | as-built |
+| Оба прежних sweep'а корректны при вложенном layout | `sweep_shard_dirs` обходит верхний уровень, удаляет `remove_dir_all` (рекурсивно) | `--test housekeeping` (14 OK) | as-built — расхождения нет |
+| Dormant migration «before serving dense search» | `migrate_dormant_on_open` перед `open_and_validate` | `crates/projection/tests/model_switch.rs`, `manager.rs` | as-built |
+| Grace-destroy 7 дней (D-007) | `run_expired_shard_sweep` | `--test housekeeping` | as-built (неизменно) |
+
+Spec 12 §1 — Data policy `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Централизованное принуждение до выбора провайдера; `POLICY_BLOCKED_REMOTE` без тихого downgrade | `crates/embed/src/policy.rs`, `pool.rs:244`, `ErrorCode::PolicyBlockedRemote` | `crates/embed/tests/policy.rs` — 9 OK | as-built |
+| Скачивание весов **не** подчинено `data_policy` (as-built T11-06) | `crates/models` не читает политику вовсе; URL и digest'ы вкомпилированы | `crates/models/tests/install.rs` — 16 OK | as-built; гейт перечитал обоснование и подтвердил, что оно не расширяет remote-поверхность |
+
+Spec 10 §5 — Model assets `[FIXED policy]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `.part → fsync → rename → .ok`, `.ok` последним | `crates/models/src/install.rs` | `--test install` 16 OK; `--features failpoints --test install_faults` 3 OK (kill в `models.install.between_files`) | as-built |
+| Checksum-verified manifest; digest'ы описывают реальные байты | `catalog.rs` (вкомпилированные `size`+`sha256`), `manifest.rs` | `the_default_catalog_matches_a_real_local_mirror_when_one_is_supplied` — **перепрогнан гейтом**: «verified 3 files (314.5 MiB) against the pinned catalog digests» | **PASS after D-014** — до фикса проверка на предзаполненном сторе ничего не хешировала |
+| Offline после установки; консьюмер ходит через `require_model_assets` | `OnnxEmbedder::open` → `require_model_assets`, типизированный `ModelAssetsMissing` | `crates/models/tests/onnx.rs` (5 OK) | as-built |
+| Весов нет в npm | — | T17-01 (packaging test) | владелец назван, не пробел |
+
+Spec 10 §6 / 15 §4 O3:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Memory relevance backend v0 (FTS + brute cosine) | — | группа 14 (T14-08) | не тронуто группой 11 — подтверждено чтением |
+| O3 embedding model решён с evidence по quality/license/platform | `docs/adr/0004-default-embedding-model.md` (§Candidates and measurements — измеренная таблица; §Explicit weights; лицензия Gemma Terms of Use — не OSI, обязана быть surfaced инсталлятором) | `crates/xtask/tests/adr_links.rs::default_embedding_model_adr_is_well_formed`, `..._artifact_is_present_and_parsable` | as-built |
+| O3 delivery решён с evidence | `docs/adr/0005-model-delivery.md` (§Runtime candidates, §Delivery shape, §Why a separate `crates/models`) | `adr_links.rs::model_delivery_adr_is_well_formed` — 8 OK всего | as-built |
+| Генераторная половина O3 остаётся видимо открытой до T14-07 | `docs/specification/15-roadmap.md:64` — «local generator crate still open (T14-07)» | карточка T14-07 | as-built — требование карточки гейта выполнено |
+
+Guardrails (T10-наследие и D-008/D-010):
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Никаких ML/сетевых зависимостей в `crates/embed` | тяжёлое изолировано в `crates/models` | `offline_smoke.rs::the_crate_declares_no_network_or_model_dependency` | as-built |
+| Сборка остаётся offline | `ort` + `load-dynamic` | `cargo build --offline -p local-rag-models` — OK | as-built |
+| Гейт не добавил зависимостей | — | `git diff --stat Cargo.lock` — **пусто** | as-built |
+
+Заметки G11 (не отклонения):
+
+- **Почему D-011 и D-012 реализованы прямо в гейте, а D-013 — нет.** Диспозиция владельца:
+  решать по фундаменту. Для D-011 и D-012 фундамент полный (таблицы, layout, обход каталогов и
+  указатель уже существуют; новой схемы 0). Для D-013 сеять представление миграцией нельзя
+  технически: `model_id` — решение ADR-0004, и вкомпилировать его в DDL значит и захардкодить
+  то, ради миграции чего существует 10 §4, и заставить каждый свежий стор заявлять модель, чьи
+  веса могли не скачиваться. Поэтому владение передано с правкой текста карточек (T15-07 и
+  группа 14), а не отложено в backlog.
+- **Гвард D-012 сужался по результатам тестов, а не наоборот.** Первая формулировка («дефолт не
+  может уйти в любое не-`active` состояние») немедленно уронила два теста T11-04, которые
+  прогоняют дефолтный space через `building → projection_ready`. Это не «тест мешает» — это
+  корректное указание на то, что широкое правило запирало путь восстановления. Правило сужено до
+  `from == Active && to != Active`, и на сужение добавлен отдельный regression.
+- **D-014 — единственная находка, обязанная своим появлением решению владельца** перепрогнать
+  ONNX-evidence, а не цитировать T11-06: дефект проявляется только на **втором** прогоне против
+  того же `LOCAL_RAG_TEST_MODEL_HOME`.
+- Оба opt-in ONNX-теста проверены и в обратную сторону: без переменных окружения они печатают
+  явный `SKIP` (проверено отдельными прогонами), а не проходят молча.
+- Два прежних sweep'а против вложенного layout проверены отдельно и расхождения **не дали**:
+  они обходят верхний уровень и удаляют рекурсивно, что as-built заметка T11-05 к 05 §2 и
+  утверждала.
+- Историческое evidence не переписывалось; D-001…D-010 остаются `resolved`. Группа 12
+  (Hybrid code search) разблокирована.
