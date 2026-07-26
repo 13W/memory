@@ -10,6 +10,18 @@ publish.workspace = true
 local-rag-core = { path = "../core" }
 local-rag-protocol = { path = "../protocol" }
 local-rag-store = { path = "../store" }
+# Optional, dev-only path crate (0 external sources): enabled ONLY by the
+# `failpoints` feature so the backfill worker can host its named crash point
+# between committed batches (spec 10 §4 step 2's "resumable"; T11-04's
+# crash-resume test). Off by default → zero-cost; the release/distribution build
+# never links the test-support crate. Mirrors `store`/`index`/`projection`.
+local-rag-test-support = { path = "../test-support", optional = true }
+
+[features]
+# Compiles `embed.backfill.between_batches`, the crash point fired after a
+# non-empty cache-write transaction commits — the same placement
+# `local_rag_store::retention`'s sweep uses for `retention.sweep.between_batches`.
+failpoints = ["dep:local-rag-test-support"]
 
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }

@@ -83,6 +83,16 @@ building ──▶ projection_ready ──▶ active ──▶ retiring
 Per-worktree activation `[FIXED]`: an offline/dormant worktree migrates to the default space
 at its next open (05 §8); there is **no global write barrier**.
 
+As-built note (T11-04, `[SPEC]`): the coverage the `projection_ready` precondition reads is
+computed by the backfill worker (`local_rag_embed::backfill::run_backfill`, 10 §3/§4 step 2) and
+applied by `transition_model_space`, which reads the **stored** `model_space.coverage` — so the
+promotion is always a separate `state.sqlite` transaction *after* the vectors are committed to
+`cache.sqlite` (03 §1.4 forbids spanning both). "The content they are expected to cover" is fixed
+as the retention pin roots (06 §5) unioned across every worktree; see 10 §3's own note. A run that
+could not embed some subjects reports them as `failed`, never `ready`, so `Coverage::fully_covered`
+stays false and this edge is refused with `IncompleteCoverage` rather than promoting a space whose
+vectors are missing.
+
 ## 4. Consolidation run
 
 ```

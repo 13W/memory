@@ -780,6 +780,22 @@ Only `code_raw` subjects are resolved to real pinned keys today (via the occurre
 `[OPEN]` (09 §3, decided by the benchmark) and `memory`'s backing tables do not exist before group
 14 — both are skipped as a safe no-op, since no such `embedding_cache` row can exist yet either.
 
+Pin rule, revised (T11-04, `[SPEC]`): the pinned set is now **pin-root generations × protected model
+spaces** (`local_rag_store::subjects::protected_subject_keys`), a widening of the tuple-only rule
+above in two places. *Generations* come from the retention pin roots (06 §5) rather than the
+`active_*`/`target_*` columns alone — those columns are a subset of the roots, so every guarantee
+recorded above still holds, and `retiring` generations inside the `K`/`T` window are covered too,
+matching what the backfill worker (10 §4 step 2) is required to embed. *Model spaces* additionally
+include every space in `building`/`projection_ready`, plus the default space
+(`store_settings.default_model_space_id`). Without the first addition a space being backfilled — which
+no worktree references yet, since a new space enters `worktree_projection_state` only at switch time
+(10 §4 step 4) — would have its freshly written rows evicted as the LRU's first victims, i.e. the
+worker and the evictor would fight indefinitely; the second covers a dormant worktree that has not
+opened yet but will migrate to the default space when it does (05 §8 `[FIXED]`). A `retiring` space
+no worktree references stays unprotected, which is exactly when "its cache rows become evictable"
+(10 §4 step 6). `EvictionParams` therefore carries the retention `K`/`T` as well as the byte budget,
+and `run_embedding_cache_eviction` takes `now_ms` — both come from the one `[storage]` section.
+
 ### 4.3 FTS materialized view
 
 ```sql

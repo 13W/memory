@@ -78,8 +78,9 @@ rewritten.
 - Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `embed`,
   `search`, `memory`, `protocol`. `embed` (T11-03) is the embedding provider
   pool — the `Embedder` contract, the central remote-policy guard, primary/
-  fallback + retry, and the in-process default provider. It depends only on
-  other workspace crates.
+  fallback + retry, and the in-process default provider — plus, as of T11-04,
+  the resumable coverage backfill worker. It depends only on other workspace
+  crates.
 - Product binaries: `local-rag` (daemon + CLI), `local-rag-proxy` (stdio MCP
   proxy), `local-rag-hook` (spool writer).
 - Dev-only crates (workspace members, excluded from `default-members`, never
@@ -95,8 +96,10 @@ rewritten.
   `building → failed` injection for spec 04 §1 / T05-05 retry-failure tests); and
   `projection`'s fake shard (`projection.fake.{upsert,delete,write_head}` op-ordering
   seams plus the `inspect`/`corrupt` controls for the spec 05 §10 fault matrix,
-  T07-01) and, as of T07-05, the write-ahead switch's own
-  `projection.switch.before_commit` seam (fires after the shard write lands but
+  T07-01); as of T11-04, `embed`'s backfill worker
+  (`embed.backfill.between_batches`, the crash point after a committed cache-write
+  batch — spec 10 §4 step 2's "resumable"); and, as of T07-05, the write-ahead
+  switch's own `projection.switch.before_commit` seam (fires after the shard write lands but
   before the final `state.sqlite` commit — spec 05 §10 F4, the one kill point
   none of the fake shard's own seams could reach). It is never enabled in a
   release or distribution build, so the shipped binary never links

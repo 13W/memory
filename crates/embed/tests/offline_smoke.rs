@@ -183,6 +183,18 @@ fn the_crate_declares_no_network_or_model_dependency() {
         .next()
         .expect("section body");
 
+    // Declared dependency *names*, not raw text: matching substrings against the
+    // whole section made `local-rag-test-supp[ort]` read as the `ort` crate
+    // (D-010, the same false-positive class D-002 fixed for the `ATTACH` lint).
+    let declared: Vec<&str> = deps
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split('=').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+
     for forbidden in [
         "reqwest",
         "hyper",
@@ -204,20 +216,54 @@ fn the_crate_declares_no_network_or_model_dependency() {
         "hf-hub",
     ] {
         assert!(
-            !deps.contains(forbidden),
+            !declared.contains(&forbidden),
             "crates/embed must not depend on `{forbidden}`: T11-03 ships no network client and no \
              model runtime (spec 10 §1's local default; the ONNX provider and its weights are \
-             T11-06, see D-008)"
+             T11-06, see D-008). Declared: {declared:?}"
         );
     }
 
     // Positively: the only dependencies are this workspace's own crates.
-    for line in deps.lines().filter(|l| l.contains('=')) {
+    for name in &declared {
         assert!(
-            line.trim_start().starts_with("local-rag-"),
-            "unexpected external dependency in crates/embed: {line}"
+            name.starts_with("local-rag-"),
+            "unexpected external dependency in crates/embed: {name}"
         );
     }
+    assert!(
+        declared.contains(&"local-rag-test-support"),
+        "the optional failpoints dependency must be visible to this lint, not \
+         filtered out of it: {declared:?}"
+    );
+}
+
+/// D-010 regression: the manifest lint matches dependency **names**, so a crate
+/// whose name merely contains a forbidden one (`local-rag-test-support` contains
+/// `ort`) is not a violation, while a real one still is.
+#[test]
+fn the_dependency_lint_matches_names_not_substrings() {
+    fn declared_names(section: &str) -> Vec<&str> {
+        section
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split('=').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    let benign = "\nlocal-rag-core = { path = \"../core\" }\n\
+                  local-rag-test-support = { path = \"../test-support\", optional = true }\n";
+    let names = declared_names(benign);
+    assert_eq!(names, vec!["local-rag-core", "local-rag-test-support"]);
+    assert!(!names.contains(&"ort"), "a substring is not a dependency");
+
+    let violating = "\nlocal-rag-core = { path = \"../core\" }\nort = \"2\"\n";
+    assert!(
+        declared_names(violating).contains(&"ort"),
+        "a real `ort` dependency must still be caught"
+    );
 }
 
 /// Model assets are a *typed precondition*, not an implicit download: with no

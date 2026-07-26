@@ -81,6 +81,31 @@ A model space bundles the representations that must be coherent together (at min
 expected/ready set per **required** representation kind — not just a failed counter `[FIXED]`;
 stored advisory JSON, always recomputable from `state.sqlite` × `embedding_cache`.
 
+As-built note (T11-04, `[SPEC]`): the backfill worker is `local_rag_embed::backfill`
+(`run_backfill`), and it fixes the two things §3/§4 leave to the implementation.
+
+**"the content they are expected to cover" (04 §3) is the retention pin roots** (06 §5), unioned
+across every worktree: generations in `active`/`building`/`projection_ready` unconditionally plus
+`retiring` ones inside the `K`/`T` window. Computed once in `local_rag_store::subjects` and consumed
+from both sides — the worker embeds what is missing from that set, eviction refuses to evict what is
+in it — so the two can never chase each other. Expected **subjects**, not points: spec 05 §4's point
+set is `occurrences × required kinds`, collapsed here by each kind's subject function, which for
+`code_raw` is a real N:1 collapse over `blob_id` (§4.2 `[FIXED]`: content-blob embeddings are shared
+across paths). A `required` kind with no subject function — `code_context` (`[OPEN]`, 09 §3) or
+`memory` (group 14) — makes the worker refuse with `UnsupportedRequiredKind` rather than report zero
+expected, which `Coverage::fully_covered` would read as "covered".
+
+**Resumability is recomputation, not a journal.** There is no progress table: each run recomputes
+`missing = expected \ valid_cached`, embeds in bounded batches outside any transaction (02 §5, "L4
+queues are leaves"), commits ≤ `write_batch_rows` rows per `cache.sqlite` transaction, and finally
+writes coverage in its own `state.sqlite` transaction (03 §1.4 forbids one transaction across both).
+A kill at any point is healed by running again — proven by `backfill_resume.rs`, which kills at every
+batch boundary through the named `embed.backfill.between_batches` failpoint and asserts the sequence
+converges without re-embedding anything. A row that fails `verify_cached_embedding` is deleted and
+re-embedded (§4.4 step 4); a provider failure counts into `failed`, never `ready`, so an incomplete
+run cannot promote the space. `promote_if_covered` applies the gate through
+`transition_model_space`, which reads the **stored** coverage.
+
 As-built note (T11-01, `[SPEC]`): both sections are `local_rag_store::registry::representation`
 (migration 6, `SCHEMA_V6`). §2's canonical `RepresentationKey` is a six-field struct (`kind`,
 `representation_version`, `normalization_version`, `model_id`, `dimensions`, `distance_metric`);

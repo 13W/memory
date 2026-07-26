@@ -187,6 +187,7 @@ pub mod migrate;
 pub mod registry;
 pub mod retention;
 mod state;
+pub mod subjects;
 
 pub use cache::{
     BatchingLastUsed, BatchingLastUsedEmbeddings, CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError,
@@ -247,9 +248,10 @@ pub use registry::{
 pub use registry::{
     Coverage, CoverageEntry, DistanceMetric, IllegalModelSpaceTransition, ModelSpaceState,
     ModelSpaceTransitionError, RepresentationKey, RepresentationKind, create_model_space,
-    eligible_as_target, model_space_required_kinds, model_space_required_representation_ids,
-    model_space_state, recompute_coverage, register_representation, representation_key,
-    set_model_space_representation, transition_model_space, write_model_space_coverage,
+    eligible_as_target, model_space_ids_in_states, model_space_required_kinds,
+    model_space_required_representation_ids, model_space_state, recompute_coverage,
+    register_representation, representation_key, set_model_space_representation,
+    transition_model_space, write_model_space_coverage,
 };
 pub use registry::{
     DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,
@@ -263,3 +265,7 @@ pub use retention::{
     pinned_generation_roots, plan_sweep, run_sweep, run_sweep_with_batch,
 };
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};
+pub use subjects::{
+    SubjectSet, expected_subject_keys, pinned_generations, protected_model_space_ids,
+    protected_subject_keys,
+};

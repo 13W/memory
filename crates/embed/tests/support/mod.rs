@@ -139,3 +139,5 @@ pub fn batch() -> Vec<String> {
         "class Repository { find(id) { return this.rows.get(id) } }".to_string(),
     ]
 }
+
+pub mod store;
