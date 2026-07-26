@@ -15,6 +15,13 @@ spool/
 models/
 quarantine/
 
+# ...but `crates/models` is source code (the T11-06 model-asset installer and
+# ONNX provider), not a store's downloaded-weights directory. The rule above is
+# deliberately path-agnostic so a store created anywhere is covered; this one
+# line re-includes the crate. Weights themselves stay ignored: they only ever
+# land in `<store>/models/<model_id>/`, never under `crates/`.
+!/crates/models/
+
 # Logs and local scratch
 *.log
 /logs/

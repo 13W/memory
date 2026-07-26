@@ -179,6 +179,40 @@ fn default_embedding_model_adr_is_well_formed() {
     );
 }
 
+#[test]
+fn model_delivery_adr_is_well_formed() {
+    let path = adr_dir().join("0005-model-delivery.md");
+    let adr = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for section in ["## Status", "## Context", "## Decision", "## Consequences"] {
+        assert!(
+            adr.contains(section),
+            "ADR-0005 must contain a `{section}` section"
+        );
+    }
+    assert!(
+        adr.contains("Accepted"),
+        "ADR-0005 must record an Accepted status"
+    );
+    assert!(
+        adr.contains("O3"),
+        "ADR-0005 must reference the open question it closes the delivery half of"
+    );
+    // The generator half of O3 must stay visible with its owning task, exactly
+    // as ADR-0004 keeps it (group 11's gate checks this).
+    assert!(
+        adr.contains("T14-07"),
+        "ADR-0005 must keep O3's generator half visible with its owning task"
+    );
+    assert!(
+        adr.contains("D-008"),
+        "ADR-0005 must name the deviation it resolves"
+    );
+    assert!(
+        adr.contains("T17-03"),
+        "ADR-0005 must name the task that owns ORT bundling across the platform matrix"
+    );
+}
+
 /// The ADR's measurement artifact must exist and stay machine-readable: the
 /// decision cites numbers, and a citation to a missing or unparsable file is not
 /// evidence.
