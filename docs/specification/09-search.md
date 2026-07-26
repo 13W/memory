@@ -148,6 +148,26 @@ the indexed one by construction. Three `[SPEC]` decisions the spec text above do
   requiring every token would return nothing for nearly every query, while BM25's own IDF
   already ranks documents matching more and rarer terms first. Tunable by T12-05 alongside
   the weights.
+
+As-built note (D-018, `[SPEC]`): **a query term the corpus is saturated with is dropped before
+the expression is built** (`local_rag_store::selective_terms`, fed by `document_frequencies` over
+the new `fts_vocab` view — FTS5's own `fts5vocab` over `fts_occurrences`, which stores nothing and
+walks the index that already exists; `CACHE_SCHEMA_VERSION` 4 → 5). The threshold is BM25's own:
+its IDF `log((N − df + 0.5)/(df + 0.5))` crosses zero at `df = N/2`, so past that point the term
+has stopped telling documents apart. This is not a stopword list — an English one would be wrong
+for code, and this one is read off the corpus in front of it.
+
+Ranking is not the reason. Because terms are `OR`-ed, a document holding *only* a saturated term
+is still a **candidate**, and a candidate is a vote in §4's fusion; BM25's own discounting cannot
+undo that. A query made entirely of saturated terms keeps its rarest one, so noise reduction never
+turns a query into silence. `name_pattern` terms are never filtered: a filter is what the caller
+asked to narrow by, not evidence being weighed.
+
+Measured effect on the 49-query benchmark: **none** — the lexical leg scores MRR 0.4344 with and
+without it. At 545 indexed occurrences a term must appear in 273 of them to be dropped, and no
+term in that corpus does, which is exactly what a threshold derived from IDF rather than fitted to
+a benchmark should look like. The behaviour is proven on a corpus that *is* saturated
+(`crates/store/tests/fts_query.rs`), not on the one that happens not to be.
 - **Every term is emitted as a quoted FTS5 string** (`"embed"`, embedded `"` doubled). FTS5
   reads bare `AND`/`OR`/`NOT`/`NEAR` as operators, so an unquoted English query containing
   "and" would be `SQLITE_ERROR` rather than a search; quoting makes the expression total
@@ -290,6 +310,7 @@ is empty but healthy — the same treatment §2's lexical leg gives a termless q
 
 Reciprocal Rank Fusion: `score(d) = Σ_legs 1 / (k + rank_leg(d))`, `k = 60`. Deterministic
 tie-break: `(score desc, occurrence_id asc)`. Per-leg candidate depth: `max(limit·4, 50)`.
+(Per-leg weights were added by D-018 — see its as-built note below.)
 
 As-built note (T12-01, `[SPEC]`): the candidate depth is
 `local_rag_store::candidate_depth(limit)` (`crates/store/src/cache/fts_query.rs`,
@@ -326,16 +347,49 @@ through a `HashMap`, whose iteration order is randomized per process, so the sor
 thing that makes repeated output byte-stable (§7). Equal scores are the *common* case — any
 document both legs return at the same ranks ties with every other such document.
 
-Open finding (D-017's re-measurement, `[SPEC]` unchanged — recorded here so the next reader does
-not re-derive it): **unweighted RRF costs more than it adds once the legs differ in strength.**
-On the 49-query benchmark after D-017 the dense leg scores MRR 0.7007 and the lexical leg 0.4344,
-while the `hybrid` default lands at 0.5721 — *below its own dense leg*. The formula above is why:
-a document both legs return at middling ranks (`1/61 + 1/80`) outranks one the strong leg put
-first and the weak leg missed (`1/61`), so every weak-leg vote is a vote against the strong leg's
-ordering. Per query, fusion demotes 15 of the 49 (13 of them from dense rank 1) and promotes 9.
-This is registered as **D-018**; `k`, the weights and the per-leg candidate depth are unchanged
-until it is resolved, because tuning them against this corpus — single-relevant, natural-language
-queries, i.e. BM25's worst case — would fit the benchmark rather than the problem.
+As-built note (D-018, `[SPEC]`): **the legs are weighted**, so the formula is
+`score(d) = Σ_legs w_leg / (k + rank_leg(d))` with `w_dense = 1` and
+`w_lexical = 0.0161`. Fusion is still `local_rag_search::rrf`, still ranks-only, still `k = 60`;
+what changed is that "both legs count the same" turned out to be an assumption, not a decision.
+
+**The problem.** After D-017 the dense leg scores MRR 0.7007 on the 49-query benchmark and the
+lexical leg 0.4344, while the unweighted `hybrid` default landed at 0.5721 — *below its own dense
+leg*. The formula above is why: a document both legs return at middling ranks (`1/61 + 1/80`)
+outranks one the strong leg put first and the weak leg missed (`1/61`), and a document **only**
+the weak leg returned ties the strong leg's first result exactly, leaving `occurrence_id` to
+decide. Per query, fusion demoted 15 of the 49 (13 of them from dense rank 1) and promoted 9.
+
+**The weight is derived, not tuned.** The rule, fixed before any number was looked at: *a document
+the dense leg ranks first is not displaced by one the lexical leg ranks first unless the dense leg
+also ranks the challenger within its top `d`.* Solving
+`w_l/(k+1) + w_d/(k+d) ≤ w_d/(k+1)` gives `w_l ≤ w_d · [1 − (k+1)/(k+d)]`, so every depth is a
+policy one can say out loud and every weight is that policy's price
+(`local_rag_search::FusionWeights::for_displacement_depth`). The **default** was likewise selected
+by a rule fixed in advance: the largest derived depth at which the hybrid does not score below its
+own dense leg. Measured:
+
+| depth `d` | `w_lexical` | Hit@1 | Hit@3 | Hit@5 | MRR |
+| --- | --- | --- | --- | --- | --- |
+| — (unweighted) | 1.0000 | 0.4286 | 0.6939 | 0.7959 | 0.5721 |
+| 50 | 0.4460 | 0.5102 | 0.7347 | 0.7959 | 0.6255 |
+| 20 | 0.2380 | 0.5306 | 0.7551 | 0.7755 | 0.6378 |
+| 10 | 0.1290 | 0.5510 | 0.7551 | 0.8367 | 0.6622 |
+| 5 | 0.0615 | 0.5510 | 0.8367 | 0.8367 | 0.6667 |
+| 3 | 0.0317 | 0.5714 | 0.8367 | 0.8367 | 0.6905 |
+| **2 (shipped)** | **0.0161** | 0.5918 | 0.8367 | 0.8367 | **0.7007** |
+| — (dense leg alone) | 0.0000 | 0.5918 | 0.8367 | 0.8367 | 0.7007 |
+
+The curve is monotone: on this corpus the lexical leg is a net loss at every weight, and depth 2 —
+"lexical may overrule the dense leader only when the dense leg itself ranks the challenger second"
+— is the only derived policy that costs nothing. **What that does and does not say.** The corpus
+is entirely natural-language, i.e. BM25's worst case, and contains no identifier queries; the
+result is that the lexical leg adds nothing *there*, not that it adds nothing. It remains the only
+leg that answers at all when the dense one is degraded (02 §6), and at depth 2 it is damped rather
+than muted — it still reorders deeper ranks, where consecutive reciprocals differ by less than its
+contribution, and still contributes documents the dense leg never returned.
+
+`k = 60` and the per-leg candidate depth are unchanged: with the weights derived rather than
+fitted there was no reason to move two more constants against the same 49 queries.
 
 ## 5. Modes (v0) `[SPEC mapping of v1 modes]`
 

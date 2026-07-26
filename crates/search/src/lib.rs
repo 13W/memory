@@ -25,7 +25,7 @@ mod overview;
 mod pipeline;
 mod snippet;
 
-pub use fusion::{FusedHit, RRF_K, rrf};
+pub use fusion::{DISPLACEMENT_DEPTH, FusedHit, FusionWeights, RRF_K, rrf};
 pub use overview::{TOP_IMPORTS_LIMIT, TREE_DEPTH, build_tree, is_entry_point};
 pub use snippet::{SNIPPET_CAP_BYTES, SnippetError, cut as cut_snippet};
 

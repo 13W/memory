@@ -39,6 +39,12 @@
 //! boolean shape, so this is a `[SPEC]` choice tunable by T12-05 alongside the
 //! weights.
 //!
+//! `OR` is why a **term that is not evidence** matters: any document holding
+//! any one query token enters the candidate list, and from there it gets a vote
+//! in fusion (spec 09 §4). D-018 therefore drops non-selective terms before the
+//! expression is built — see [`selective_terms`], whose threshold comes from
+//! BM25's own IDF rather than from a stopword list or a tuned constant.
+//!
 //! Every token is emitted as a **quoted FTS5 string** (`"embed"`), with any
 //! embedded `"` doubled. This is not cosmetic: FTS5 reads bare `AND`/`OR`/
 //! `NOT`/`NEAR` as operators, so an unquoted query containing the English word
@@ -165,6 +171,88 @@ fn terms(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Keep the query terms that are still evidence, given how many documents hold
+/// each one (D-018, spec 09 §2).
+///
+/// # The threshold is BM25's, not a stopword list
+///
+/// SQLite's `bm25()` weighs a term by the Robertson/Sparck-Jones IDF
+/// `log((N − df + 0.5)/(df + 0.5))`, which crosses zero at `df = N/2`: past that
+/// point a term stops telling documents apart. So `df > N/2` is where a term
+/// ceases to be evidence — a property of the corpus in front of us, not of a
+/// hand-maintained English word list that would be wrong for code anyway.
+///
+/// # Why dropping them matters at all, given BM25 already discounts them
+///
+/// Because ranking is not the only thing they affect. Terms are `OR`-ed, so a
+/// document holding *only* a non-selective term still enters the candidate list,
+/// and a candidate is a vote in fusion (spec 09 §4). Removing them changes which
+/// documents are candidates, which is the part BM25's own weighting cannot fix.
+///
+/// # Never silently empty
+///
+/// If every term is non-selective — a query made entirely of common words — the
+/// rarest one survives. A query that matched something before must not start
+/// matching nothing because of a filter that exists to reduce noise.
+pub fn selective_terms(terms_with_df: &[(String, u64)], documents: u64) -> Vec<String> {
+    if terms_with_df.is_empty() {
+        return Vec::new();
+    }
+    // A term absent from the index has df 0: selective by definition (it simply
+    // matches nothing), and harmless to keep — it cannot pull in a candidate.
+    let cutoff = documents / 2;
+    let kept: Vec<String> = terms_with_df
+        .iter()
+        .filter(|(_, df)| *df <= cutoff)
+        .map(|(term, _)| term.clone())
+        .collect();
+    if !kept.is_empty() {
+        return kept;
+    }
+    let rarest = terms_with_df
+        .iter()
+        .min_by_key(|(term, df)| (*df, term.clone()))
+        .expect("non-empty");
+    vec![rarest.0.clone()]
+}
+
+/// How many documents each of `terms` appears in, read from the `fts5vocab`
+/// view over the index (`fts_vocab`, D-018).
+///
+/// **Corpus-wide, deliberately.** The view counts across every row of
+/// `fts_occurrences`, i.e. across worktrees and generations, while a search is
+/// scoped to one `(worktree, generation)`. For an IDF-shaped judgement — "is
+/// this word evidence?" — the wider corpus is the better estimate and the
+/// cheaper one; nothing downstream treats these counts as a per-search
+/// statistic.
+pub fn document_frequencies(
+    conn: &Connection,
+    terms: &[String],
+) -> rusqlite::Result<Vec<(String, u64)>> {
+    let mut stmt = conn.prepare("SELECT doc FROM fts_vocab WHERE term = ?1")?;
+    let mut out = Vec::with_capacity(terms.len());
+    for term in terms {
+        let df: u64 = stmt
+            .query_row(params![term], |row| row.get::<_, i64>(0))
+            .map(|d| d.max(0) as u64)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(0),
+                other => Err(other),
+            })?;
+        out.push((term.clone(), df));
+    }
+    Ok(out)
+}
+
+/// How many documents the FTS index holds — the `N` of [`selective_terms`]'s
+/// threshold, counted over the same population `fts_vocab`'s `doc` counts do.
+pub fn indexed_document_count(conn: &Connection) -> rusqlite::Result<u64> {
+    conn.query_row("SELECT count(*) FROM fts_doc", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|n| n.max(0) as u64)
+}
+
 /// Build the FTS5 `MATCH` expression for `query` (spec 09 §1/§2).
 ///
 /// Returns `None` when neither the query nor the pattern yields a single term —
@@ -179,7 +267,20 @@ fn terms(text: &str) -> Vec<String> {
 /// both         ("embed" OR "batch") AND ({name qualified_name} : ("extract"*))
 /// ```
 pub fn fts_match_expression(query: &str, name_pattern: Option<&str>) -> Option<String> {
-    let query_terms = terms(query);
+    fts_match_expression_from_terms(&terms(query), name_pattern)
+}
+
+/// [`fts_match_expression`] over already-chosen query terms.
+///
+/// Split out for D-018: the query's terms are filtered against the index's own
+/// document frequencies ([`selective_terms`]) before the expression is built, and
+/// that filtering needs a connection while this shaping must stay pure. The
+/// `name_pattern` is *not* filtered — a filter is what the caller explicitly
+/// asked to narrow by, not evidence the ranker weighs.
+pub fn fts_match_expression_from_terms(
+    query_terms: &[String],
+    name_pattern: Option<&str>,
+) -> Option<String> {
     let pattern_terms = name_pattern.map(terms).unwrap_or_default();
 
     let query_expr = (!query_terms.is_empty()).then(|| {
@@ -278,7 +379,18 @@ pub fn lexical_leg(
     generation_id: &str,
     query: &LexicalQuery<'_>,
 ) -> rusqlite::Result<Vec<LexicalHit>> {
-    let Some(match_expr) = fts_match_expression(query.query, query.name_pattern) else {
+    // D-018: ask the index which of the query's terms still discriminate before
+    // asking it for documents. A term in more than half the corpus is not
+    // evidence, and under `OR` it would otherwise drag its documents into the
+    // candidate list — and thence into fusion.
+    let query_terms = terms(query.query);
+    let selected = if query_terms.is_empty() {
+        Vec::new()
+    } else {
+        let documents = indexed_document_count(conn)?;
+        selective_terms(&document_frequencies(conn, &query_terms)?, documents)
+    };
+    let Some(match_expr) = fts_match_expression_from_terms(&selected, query.name_pattern) else {
         return Ok(Vec::new());
     };
     query_fts(
@@ -294,6 +406,58 @@ pub fn lexical_leg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- selective terms (D-018) --------------------------------------------
+
+    fn df(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        pairs.iter().map(|(t, d)| ((*t).to_string(), *d)).collect()
+    }
+
+    /// The cutoff is BM25's own IDF sign change at `df = N/2`, so a term in
+    /// exactly half the corpus is still kept and one past it is not.
+    #[test]
+    fn a_term_in_more_than_half_the_corpus_stops_being_evidence() {
+        let terms = df(&[("embed", 12), ("the", 51), ("half", 50)]);
+        assert_eq!(selective_terms(&terms, 100), ["embed", "half"]);
+    }
+
+    /// Order is the query's, not the index's: rewriting the expression must not
+    /// reorder what the user asked for.
+    #[test]
+    fn selection_preserves_query_order() {
+        let terms = df(&[("zebra", 1), ("apple", 2), ("mango", 3)]);
+        assert_eq!(selective_terms(&terms, 100), ["zebra", "apple", "mango"]);
+    }
+
+    /// A query made entirely of common words still searches — for the rarest of
+    /// them. Reducing noise must never turn a query into silence.
+    #[test]
+    fn an_all_common_query_keeps_its_rarest_term() {
+        let terms = df(&[("the", 98), ("of", 90), ("with", 95)]);
+        assert_eq!(selective_terms(&terms, 100), ["of"]);
+    }
+
+    /// Ties among equally common terms resolve by term, so the fallback is
+    /// deterministic rather than dependent on query order or map iteration.
+    #[test]
+    fn the_rarest_term_fallback_breaks_ties_deterministically() {
+        let terms = df(&[("with", 90), ("of", 90), ("the", 90)]);
+        assert_eq!(selective_terms(&terms, 100), ["of"]);
+    }
+
+    /// An empty index has no cutoff to speak of (`N/2 = 0`), and every term is
+    /// absent from it, so nothing is dropped — the query runs and matches
+    /// nothing, which is the truthful outcome.
+    #[test]
+    fn an_empty_index_drops_nothing() {
+        let terms = df(&[("embed", 0), ("batch", 0)]);
+        assert_eq!(selective_terms(&terms, 0), ["embed", "batch"]);
+    }
+
+    #[test]
+    fn no_terms_select_nothing() {
+        assert!(selective_terms(&[], 100).is_empty());
+    }
 
     // ---- candidate depth (spec 09 §4) ---------------------------------------
 

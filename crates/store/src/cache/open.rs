@@ -46,7 +46,8 @@ const BUSY_TIMEOUT_MS: u64 = 5000;
 /// - `2`: adds `normalized_text_cache` (T03-04).
 /// - `3`: adds `fts_doc`, `fts_occurrences` (FTS5), `fts_projection_head` (T08-01).
 /// - `4`: adds `embedding_cache` (T11-02).
-pub const CACHE_SCHEMA_VERSION: u32 = 4;
+/// - `5`: adds `fts_vocab`, the `fts5vocab` view over `fts_occurrences` (D-018).
+pub const CACHE_SCHEMA_VERSION: u32 = 5;
 
 /// The `cache_meta` binding table (spec 03 §4.1). Created on every (re)build.
 const CACHE_META_DDL: &str = "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
@@ -94,6 +95,20 @@ CREATE VIRTUAL TABLE fts_occurrences USING fts5(
   name, qualified_name, path, signature, body,
   tokenize = 'unicode61 remove_diacritics 2'
 );";
+
+/// `fts_vocab` (D-018): FTS5's own vocabulary view over `fts_occurrences`, in
+/// `'row'` mode — one row per term with `doc` (how many documents contain it)
+/// and `cnt` (total occurrences).
+///
+/// It stores nothing: `fts5vocab` is a read-only virtual table that walks the
+/// index that already exists, which is exactly why the query side can afford to
+/// ask it per search. The lexical leg uses `doc` to drop terms that are not
+/// evidence — a term present in more than half the documents has a negative
+/// BM25 IDF (`log((N − df + 0.5)/(df + 0.5))`), i.e. it stops discriminating —
+/// so they no longer drag documents into the candidate list and, from there,
+/// into fusion (`super::fts_query::selective_terms`, spec 09 §2).
+const FTS_VOCAB_DDL: &str = "\
+CREATE VIRTUAL TABLE fts_vocab USING fts5vocab(fts_occurrences, 'row');";
 
 /// `fts_projection_head` (spec 03 §4.3): the per-worktree validity proof for
 /// the FTS view (06 §4's validation order). This task only creates the table;
@@ -360,6 +375,7 @@ fn seed_binding(
     tx.execute_batch(NORMALIZED_TEXT_CACHE_DDL)?;
     tx.execute_batch(FTS_DOC_DDL)?;
     tx.execute_batch(FTS_OCCURRENCES_DDL)?;
+    tx.execute_batch(FTS_VOCAB_DDL)?;
     tx.execute_batch(FTS_PROJECTION_HEAD_DDL)?;
     tx.execute_batch(EMBEDDING_CACHE_DDL)?;
     let rows: [(&str, String); 3] = [

@@ -34,7 +34,8 @@ pub use fts::{
 };
 pub use fts_query::{
     BM25_DEFAULT_WEIGHTS, LexicalHit, LexicalQuery, MIN_CANDIDATE_DEPTH, candidate_depth,
-    fts_match_expression, lexical_leg, query_fts,
+    document_frequencies, fts_match_expression, fts_match_expression_from_terms,
+    indexed_document_count, lexical_leg, query_fts, selective_terms,
 };
 pub use open::{CACHE_SCHEMA_VERSION, CacheOpenError, CacheOpenOutcome};
 pub use text::{
