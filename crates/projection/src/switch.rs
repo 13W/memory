@@ -136,6 +136,9 @@ pub enum SwitchError {
     Sqlite(local_rag_store::rusqlite::Error),
     /// Opening a `state.sqlite` read connection failed.
     Open(OpenError),
+    /// The expected point set could not be derived — e.g. the target model space
+    /// requires no code representation (T11-05, `crate::expected::ExpectedError`).
+    Expected(crate::expected::ExpectedError),
     /// The write-ahead was rejected at the domain level (spec 04 §2) — nothing
     /// was written; the shard was never touched.
     WriteAhead(ProjectionStateError),
@@ -167,6 +170,9 @@ impl fmt::Display for SwitchError {
         match self {
             SwitchError::Write(e) => write!(f, "projection switch: transaction failed: {e}"),
             SwitchError::Sqlite(e) => write!(f, "projection switch: state.sqlite read failed: {e}"),
+            SwitchError::Expected(e) => {
+                write!(f, "projection switch: expected point set: {e}")
+            }
             SwitchError::Open(e) => write!(
                 f,
                 "projection switch: could not open a read connection: {e}"
@@ -193,6 +199,7 @@ impl std::error::Error for SwitchError {
         match self {
             SwitchError::Write(e) => Some(e),
             SwitchError::Sqlite(e) => Some(e),
+            SwitchError::Expected(e) => Some(e),
             SwitchError::Open(e) => Some(e),
             SwitchError::WriteAhead(e) => Some(e),
             SwitchError::Backend(e) => Some(e),
@@ -384,7 +391,7 @@ pub async fn switch(
         &target_generation_id,
         &target_model_space_id,
     )
-    .map_err(SwitchError::Sqlite)?;
+    .map_err(SwitchError::Expected)?;
     drop(read);
 
     // Step 3: desired-set reconciliation against the shard.

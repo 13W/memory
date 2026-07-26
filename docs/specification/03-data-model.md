@@ -122,6 +122,11 @@ CREATE TABLE store_settings (        -- store_instance_uuid, default_model_space
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- As-built (T11-05, [SPEC]): `default_model_space_id` has exactly one writer,
+-- `registry::set_default_model_space_id`, which refuses a space that is not
+-- `active` — so 04 §3's "the default space MUST be active" is enforced where the
+-- value is established rather than assumed by its readers (05 §8's dormant
+-- migration, `subjects::protected_model_space_ids`). Migration 4 seeds it.
 
 CREATE TABLE migration_progress (    -- resumable-migration checkpoints (13 §3); rows exist
   version  INTEGER NOT NULL,         -- only for the in-flight migration, cleared on finalize

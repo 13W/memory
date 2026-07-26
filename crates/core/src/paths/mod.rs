@@ -278,9 +278,38 @@ impl StoreLayout {
         self.root.join("projection")
     }
 
-    /// The dense shard directory for `worktree_id`.
+    /// The dense shard **root** for `worktree_id` (spec 05 §2:
+    /// `projection/<worktree_id>/`).
+    ///
+    /// One root per worktree, for the worktree's whole lifetime — an attach or a
+    /// move keeps it (spec 05 §8 `[FIXED]`: "same shard directory (keyed by
+    /// `worktree_id`), never a second shard"). Shard lifecycle sweeps
+    /// (`local_rag_store::housekeeping`) operate on this root and remove it
+    /// recursively, so they cover everything below it.
     pub fn projection_shard(&self, worktree_id: &str) -> PathBuf {
         self.projection_dir().join(worktree_id)
+    }
+
+    /// The dense shard directory for one `(worktree_id, model_space_id)` pair —
+    /// `projection/<worktree_id>/<model_space_id>/` (T11-05).
+    ///
+    /// Spec 05 §2 leaves the *contents* of a worktree's shard root
+    /// backend-defined; this splits them per model space, which is what makes
+    /// two `[FIXED]` requirements of spec 10 §4 simultaneously true during a
+    /// model migration:
+    ///
+    /// * "Different dimensions ⇒ separate shard layout / named-vector — never in
+    ///   place": a model space with a different `representation.dimensions`
+    ///   opens its own directory with its own [`ShardParams`], instead of
+    ///   attempting an impossible in-place widening of an existing shard;
+    /// * "until step 4 commits for a worktree, that worktree still runs A
+    ///   entirely": the outgoing space's shard is never touched while the
+    ///   incoming one is filled, so a crash mid-switch leaves a fully serviceable
+    ///   old shard rather than a half-rewritten one.
+    ///
+    /// [`ShardParams`]: https://docs.rs/local-rag-projection
+    pub fn projection_shard_space(&self, worktree_id: &str, model_space_id: &str) -> PathBuf {
+        self.projection_shard(worktree_id).join(model_space_id)
     }
 
     /// `spool/` — durable observation segments, one subdirectory per session.
@@ -583,6 +612,17 @@ mod tests {
         assert_eq!(
             layout.projection_shard("wt-1"),
             Path::new("/s/local-rag/projection/wt-1")
+        );
+        // Per-model-space shard directory nests *under* the worktree root, so a
+        // sweep of the root still covers every space (T11-05).
+        assert_eq!(
+            layout.projection_shard_space("wt-1", "ms-1"),
+            Path::new("/s/local-rag/projection/wt-1/ms-1")
+        );
+        assert!(
+            layout
+                .projection_shard_space("wt-1", "ms-1")
+                .starts_with(layout.projection_shard("wt-1"))
         );
         assert_eq!(
             layout.spool_session("sess-1"),

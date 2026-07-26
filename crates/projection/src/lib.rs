@@ -83,9 +83,11 @@ pub mod expected;
 pub mod fake;
 pub mod identity;
 pub mod manager;
+pub mod model_switch;
 pub mod rebuild;
 pub mod switch;
 pub mod validate;
+pub mod vectors;
 
 pub use contract::{
     DenseQuery, Hash32, PROJECTION_SCHEMA_VERSION, PointId, ProjectionError, ProjectionHead,
@@ -93,17 +95,23 @@ pub use contract::{
     ShardParams,
 };
 pub use expected::{
-    ExpectedPoint, REQUIRED_REPRESENTATION_KINDS, expected_point_ids, expected_points,
+    CODE_REPRESENTATION_KINDS, ExpectedError, ExpectedPoint, expected_point_ids, expected_points,
+    required_code_kinds,
 };
 pub use fake::{FakeProjectionStore, FakeShard};
 pub use identity::{head, manifest_hash, projection_point_id};
 pub use manager::{AcquireError, ShardManager};
+pub use model_switch::{
+    ModelSwitchError, dormant_migration_target, migrate_dormant_on_open, params_for_model_space,
+    shard_dir, switch_model_space,
+};
 pub use rebuild::{
     OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome,
     open_and_validate,
 };
 pub use switch::{SwitchCommitError, SwitchError, SwitchOutcome, VectorSource, switch};
 pub use validate::{Divergence, validate};
+pub use vectors::CacheVectorSource;
 
 #[cfg(feature = "failpoints")]
 pub use fake::{Corruption, ShardInspection};

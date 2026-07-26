@@ -115,6 +115,17 @@ directly corrupting that structural file surfaces an uncaught panic inside the v
   `ProjectionHead` must be recoverable from it (backend-native payload or a sidecar file —
   backend adapter's choice, but it MUST be written strictly after all point mutations of an op).
 
+As-built note (T11-05, `[SPEC]`): the worktree's shard directory is a **root**, and its
+backend-defined contents are split one level deeper, per model space:
+`projection/<worktree_id>/<model_space_id>/` (`StoreLayout::projection_shard_space`). "One shard per
+worktree" is unchanged — the root is still keyed by `worktree_id` alone, so §8's "attach/move …
+same shard directory, never a second shard" holds and both housekeeping sweeps still operate on the
+root and remove it recursively. What the split buys is two `[FIXED]` requirements of 10 §4 at once:
+a model space whose `representation.dimensions` differ opens its own directory with its own
+`ShardParams` (never an impossible in-place widening), and the outgoing space's shard stays
+untouched for the whole migration, which is what makes "until step 4 commits for a worktree, that
+worktree still runs A entirely" literally true rather than merely recoverable.
+
 ## 3. Deterministic point IDs `[FIXED]`
 
 `projection_point_id = H(projection_point, worktree_id, occurrence_id, model_space_id,
@@ -149,6 +160,15 @@ for the target `(generation, model_space)` — every occurrence of the generatio
 `required` representation kind of the model space that applies to code
 (`code_raw`, `code_context`; `structural_description` only when descriptions are enabled
 post-v0). The manifest hash is computed over this set, sorted bytewise.
+
+As-built note (T11-05, `[SPEC]`): the "every `required` representation kind of the model space"
+half is now a real `model_space_representation` join
+(`local_rag_projection::expected::required_code_kinds`), replacing T07-03's hardcoded pair;
+`CODE_REPRESENTATION_KINDS` survives only as this section's own "applies to code" filter over the
+registry's answer. A model space that requires **no** code kind is a typed refusal
+(`ExpectedError::NoCodeRepresentation`), not an empty expected set: an empty expectation would make
+§5 step 3's `delete(existing \ expected)` silently wipe the shard, which is indistinguishable from
+a correct empty projection.
 
 ## 5. Switch algorithm (generation-switch ≡ model-space-switch) `[FIXED]`
 
@@ -232,6 +252,20 @@ did **not** wire `expected::REQUIRED_REPRESENTATION_KINDS` or `switch::VectorSou
 registry (see the bullet above) — that stays T11-05's, once a real multi-model-space switch exists to
 exercise it.
 
+As-built note (T11-05, `[SPEC]`): both wirings above are now done, and step 0's model-axis
+preconditions have an owner. `local_rag_projection::model_switch::switch_model_space` is the
+production entry point: it checks the target space is `active` (`eligible_as_target`) and that its
+**stored** coverage is complete for its own required kinds, then calls `switch()` with the
+worktree's *current* generation, so exactly one axis moves. Re-checking coverage here is not
+redundant with `transition_model_space`'s gate: a space reaches `active` once, while the content it
+must cover keeps growing with every new generation, and a switch started on stale coverage would
+fail after the write-ahead already committed. Step 1's vectors come from
+`local_rag_projection::vectors::CacheVectorSource`, which resolves `occurrence_id → blob_id →
+H(subject/content_blob) → embedding_cache` and treats a row failing `verify_cached_embedding` as
+absent — the caller's `MissingVector` is §7's coverage guard, and repairing the row is the backfill
+worker's job (T11-04), never this reader's. Taking `L2.write` around the call remains the caller's
+responsibility (group 15's wiring, 02 §5's own T09-01 note).
+
 ## 6. Validate-on-open `[FIXED]`
 
 Executed on **every** shard open (daemon start, LRU re-open, post-crash), before the shard may
@@ -312,6 +346,17 @@ deterministic point IDs and a pure `state.sqlite`-derived expected set.
 - **Dormant worktree model migration** `[FIXED]`: opening a worktree whose
   `active_model_space_id` is retiring/absent switches it to the default space via the standard
   switch protocol before serving dense search.
+
+As-built note (T11-05, `[SPEC]`): implemented as
+`local_rag_projection::model_switch::migrate_dormant_on_open`, called by `ShardManager`'s fill
+**before** `open_and_validate` — i.e. before anything decides whether the shard may serve, which is
+what "before serving dense search" asks for. "Retiring/absent" is read as: no active space at all, a
+space the registry no longer knows, or one in `retiring`/`failed` (a `failed` space is likewise
+never a legal target, so leaving a worktree on one would strand it). A worktree on a *healthy* space
+is left alone even when a newer default exists — moving it is an explicit migration (10 §4 step 4),
+not something an open performs silently. The shard's directory and `ShardParams` are then resolved
+from whatever space is active after that migration, so a worktree that just moved to a
+different-dimension space opens the right shard on the same call.
 
 As-built note (D-007, `[SPEC]`): the **grace-destroy** bullet above ("remove/detach: grace
 period `[SPEC: 7 days]`, then destroy") is
