@@ -555,7 +555,7 @@ async fn eviction_honors_pins_and_budget() {
     });
     // A near-zero budget (each vector is 3*4=12 bytes; total = 36) forces
     // eviction of everything unpinned, oldest first.
-    let dry = run_embedding_cache_eviction(&cache, &state_read, &params, true)
+    let dry = run_embedding_cache_eviction(&cache, &state_read, &params, NOW, true)
         .await
         .expect("dry run");
     assert!(dry.dry_run);
@@ -571,7 +571,7 @@ async fn eviction_honors_pins_and_budget() {
     // Dry run mutates nothing.
     assert!(get_row(&cache, &stale_key).is_some());
 
-    let real = run_embedding_cache_eviction(&cache, &state_read, &params, false)
+    let real = run_embedding_cache_eviction(&cache, &state_read, &params, NOW, false)
         .await
         .expect("real eviction");
     assert!(!real.dry_run);
@@ -592,7 +592,7 @@ async fn eviction_honors_pins_and_budget() {
     );
 
     // Re-running finds nothing left to evict.
-    let idempotent = run_embedding_cache_eviction(&cache, &state_read, &params, false)
+    let idempotent = run_embedding_cache_eviction(&cache, &state_read, &params, NOW, false)
         .await
         .expect("idempotent re-run");
     assert!(idempotent.evicted.is_empty());
@@ -617,7 +617,7 @@ async fn eviction_is_a_noop_under_budget() {
 
     let state_read = state.open_read().expect("read conn");
     let params = EvictionParams::from_storage_config(&StorageConfig::default()); // 2048 MiB
-    let report = run_embedding_cache_eviction(&cache, &state_read, &params, false)
+    let report = run_embedding_cache_eviction(&cache, &state_read, &params, NOW, false)
         .await
         .expect("eviction");
     assert!(report.evicted.is_empty());

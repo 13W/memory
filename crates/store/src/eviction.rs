@@ -9,59 +9,54 @@
 //! - [`rows_to_evict`] is the pure core: sort **unpinned** rows by
 //!   `last_used_at` ascending, evict oldest-first until the retained set's
 //!   total `byte_size` is at or under budget. Table-tested with no I/O.
-//! - [`store_wide_embedding_pins`] is the cross-worktree pin reader — no
-//!   existing reader answers "which subjects are protected" (confirmed:
-//!   [`crate::registry::projection_state`] is strictly per-worktree), so this
-//!   loops [`crate::registry::all_worktree_ids`] exactly like
-//!   [`crate::retention`]'s own `store_wide_pinned` does for generations.
+//! - [`store_wide_embedding_pins`] is the pin reader; since T11-04 it is a thin
+//!   delegation to [`crate::subjects`], which owns the one definition of
+//!   "expected subjects of a model space" that both this module and the backfill
+//!   worker consume.
 //! - [`run_embedding_cache_eviction`] is the batched, dry-run-capable entry
 //!   point composing both.
 //!
 //! # Pin rule (spec 03 §4.2 `[SPEC]`: "rows pinned while referenced by an
 //! active projection tuple or a running rebuild")
 //!
-//! A pinned `(generation_id, model_space_id)` tuple is read from **both** the
-//! `active_*` and `target_*` columns of every worktree's
-//! `worktree_projection_state` row (regardless of `status`):
+//! The pinned set is **pin-root generations × protected model spaces**
+//! ([`crate::subjects::protected_subject_keys`]). Two revisions to T11-02's
+//! original tuple-only rule, both widening it:
 //!
-//! - `active_*` covers "active projection tuple" literally, and "a running
-//!   rebuild" too — rebuild always retargets the **active** tuple, never
-//!   `target` (spec 05 §7: "rebuild never changes *which* generation is
-//!   active, only re-syncs the shard to match it").
-//! - `target_*` is a deliberate, cheap, strictly-safer **superset** beyond the
-//!   card's literal wording: an in-flight `switch()` reads `embedding_cache`
-//!   for the target tuple's missing points *before* committing (spec 05 §5
-//!   step 1), so evicting a target-only subject mid-switch would induce an
-//!   avoidable `SwitchError::MissingVector`. Recorded explicitly as a
-//!   conservative extension, the same way [`crate::retention`]'s module docs
-//!   explicitly record "`failed` is never pinned by retention itself."
+//! - **Generations** come from the retention pin roots (spec 06 §5) rather than
+//!   from the `active_*`/`target_*` columns alone. Those columns are a subset:
+//!   an active generation is `active`, an in-flight target is `building`/
+//!   `projection_ready`, and all three are unconditional pin roots — so the
+//!   original guarantees still hold, and `retiring` generations inside the `K`/`T`
+//!   window are now covered too, matching what T11-04's backfill is required to
+//!   embed. `target_*` remains covered for the reason T11-02 recorded: an
+//!   in-flight `switch()` reads `embedding_cache` for the target tuple's missing
+//!   points *before* committing (spec 05 §5 step 1), so evicting a target-only
+//!   subject mid-switch would induce an avoidable `SwitchError::MissingVector`.
+//! - **Model spaces** additionally include every space in `building` or
+//!   `projection_ready`. A space being backfilled is referenced by **no**
+//!   worktree yet (it enters `worktree_projection_state` only at switch time,
+//!   spec 10 §4 step 4), so under the old rule its freshly written rows were the
+//!   LRU's first victims — the worker and the evictor would fight over the same
+//!   rows indefinitely. This is the pin the spec's own "a running rebuild"
+//!   clause implies for a running *backfill*.
 //!
-//! # Resolving a pinned tuple to `embedding_cache` subject keys
-//!
-//! Only [`RepresentationKind::CodeRaw`] is resolved to a real
-//! [`EmbeddingKey`] today, via [`crate::code::content_blob_ids_for_generation`]
-//! and [`local_rag_core::identity::domain::subject_content_blob`].
-//! `CodeContext`'s subject-hash format is `[OPEN]` (spec 09 §3: "content vs
-//! context representation choice is decided by the benchmark") and `Memory`'s
-//! backing table does not exist before group 14 — neither can produce a real
-//! `embedding_cache` row yet, so skipping them here is a safe no-op, not a
-//! misclassification (T11-02's scope-boundary decision, see the task's
-//! evidence in `PROGRESS.md`).
+//! Resolution of a kind to real subject keys (today `code_raw` only —
+//! `code_context`'s format is `[OPEN]`, `memory`'s tables arrive in group 14)
+//! also lives in [`crate::subjects`]; unresolvable kinds are simply absent from
+//! the pin set here, which is safe because no such `embedding_cache` row can
+//! exist either.
 
 use std::collections::BTreeSet;
 
 use rusqlite::Connection;
 
 use local_rag_core::config::StorageConfig;
-use local_rag_core::identity::domain::subject_content_blob;
 
-use crate::cache::{
-    CacheDb, CacheOpenError, CacheWriteError, EmbeddingCacheMeta, EmbeddingKey, SubjectKind,
-};
-use crate::code::content_blob_ids_for_generation;
-use crate::registry::{
-    RepresentationKind, all_worktree_ids, model_space_required_representation_ids, projection_state,
-};
+#[cfg(test)]
+use crate::cache::SubjectKind;
+use crate::cache::{CacheDb, CacheOpenError, CacheWriteError, EmbeddingCacheMeta, EmbeddingKey};
+use crate::retention::{ExternalPins, RetentionParams};
 
 /// The bounded cache-transaction batch size for a real eviction sweep (spec 03
 /// §3 `[SPEC]`: "≤ 500 rows/tx"), mirroring [`crate::retention::SWEEP_BATCH_ROWS`].
@@ -78,15 +73,22 @@ pub const EVICTION_BATCH_ROWS: usize = 500;
 pub struct EvictionParams {
     /// The budget, in bytes.
     pub budget_bytes: i64,
+    /// The retention window the pin roots are computed against (T11-04): the pin
+    /// set is now defined over pin-root generations (spec 06 §5), so eviction
+    /// needs the same `K`/`T` the GC uses. Both come from one `[storage]`
+    /// section, so [`EvictionParams::from_storage_config`] fills both.
+    pub retention: RetentionParams,
 }
 
 impl EvictionParams {
-    /// Read `embedding_cache_budget_mb` from the `[storage]` config (spec 02
-    /// §3.1), MiB → bytes (saturating, so an absurd config can never overflow).
+    /// Read `embedding_cache_budget_mb` (and, for the pin roots, `K`/`T`) from
+    /// the `[storage]` config (spec 02 §3.1), MiB → bytes (saturating, so an
+    /// absurd config can never overflow).
     pub fn from_storage_config(cfg: &StorageConfig) -> Self {
         let bytes = cfg.embedding_cache_budget_mb.saturating_mul(1024 * 1024);
         EvictionParams {
             budget_bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+            retention: RetentionParams::from_storage_config(cfg),
         }
     }
 }
@@ -131,47 +133,27 @@ pub fn rows_to_evict(
     evict
 }
 
-/// Every `embedding_cache` subject key protected by an active or in-flight-target
-/// projection tuple, unioned across all worktrees (see the module docs for the
-/// pin rule and the `CodeRaw`-only resolution scope boundary).
-pub fn store_wide_embedding_pins(state: &Connection) -> rusqlite::Result<BTreeSet<EmbeddingKey>> {
-    let mut tuples: BTreeSet<(String, String)> = BTreeSet::new();
-    for worktree_id in all_worktree_ids(state)? {
-        let Some(row) = projection_state(state, &worktree_id)? else {
-            continue;
-        };
-        for (generation_id, model_space_id) in [
-            (row.active_generation_id, row.active_model_space_id),
-            (row.target_generation_id, row.target_model_space_id),
-        ] {
-            if let (Some(generation_id), Some(model_space_id)) = (generation_id, model_space_id) {
-                tuples.insert((generation_id, model_space_id));
-            }
-        }
-    }
-
-    let mut pinned = BTreeSet::new();
-    for (generation_id, model_space_id) in tuples {
-        let required = model_space_required_representation_ids(state, &model_space_id)?;
-        let Some((_, representation_id)) = required
-            .iter()
-            .find(|(kind, _)| *kind == RepresentationKind::CodeRaw)
-        else {
-            // No `code_raw` representation registered/required for this model
-            // space (today, before T11-03/T11-04 populate the registry) — a
-            // safe no-op, not a missed pin: no such embedding_cache row could
-            // exist yet either.
-            continue;
-        };
-        for (_occurrence_id, blob_id) in content_blob_ids_for_generation(state, &generation_id)? {
-            pinned.insert(EmbeddingKey {
-                subject_kind: SubjectKind::ContentBlob,
-                subject_hash: subject_content_blob(&blob_id),
-                representation_id: representation_id.clone(),
-            });
-        }
-    }
-    Ok(pinned)
+/// Every `embedding_cache` subject key protected from eviction, unioned across
+/// the whole store.
+///
+/// Delegates to [`crate::subjects::protected_subject_keys`] (T11-04), which owns
+/// the definition shared with the backfill worker: pin-root generations (spec 06
+/// §5) × model spaces that are either referenced by a worktree's projection state
+/// **or** still `building`/`projection_ready`. The second half is what T11-02's
+/// tuple-only rule could not express: a space being filled by a backfill is
+/// referenced by no worktree yet, so its freshly written rows would otherwise be
+/// the LRU's first victims — see the module docs above.
+pub fn store_wide_embedding_pins(
+    state: &Connection,
+    params: &EvictionParams,
+    now_ms: i64,
+) -> rusqlite::Result<BTreeSet<EmbeddingKey>> {
+    crate::subjects::protected_subject_keys(
+        state,
+        &params.retention,
+        &ExternalPins::default(),
+        now_ms,
+    )
 }
 
 /// The outcome of an eviction pass — either the keys a real pass **removed**
@@ -251,13 +233,14 @@ pub async fn run_embedding_cache_eviction(
     cache: &CacheDb,
     state: &Connection,
     params: &EvictionParams,
+    now_ms: i64,
     dry_run: bool,
 ) -> Result<EvictionReport, EvictionError> {
     let cache_read = cache.open_read()?;
     let rows = crate::cache::all_embedding_meta(&cache_read)?;
     drop(cache_read);
 
-    let pinned = store_wide_embedding_pins(state)?;
+    let pinned = store_wide_embedding_pins(state, params, now_ms)?;
     let evicted = rows_to_evict(&rows, &pinned, params.budget_bytes);
     let retained = rows.len() as u64 - evicted.len() as u64;
 

@@ -41,6 +41,8 @@
 //! production one, because `model_id` is one of the six fields of the canonical
 //! [`RepresentationKey`](local_rag_store::RepresentationKey) (spec 03 §2.2).
 
+pub mod backfill;
+
 mod contract;
 mod local;
 mod pool;
@@ -48,6 +50,10 @@ mod registry;
 
 pub mod policy;
 
+pub use backfill::{
+    BackfillError, BackfillParams, BackfillReport, DEFAULT_EMBED_BATCH, DEFAULT_WRITE_BATCH_ROWS,
+    InFlight, promote_if_covered, run_backfill,
+};
 pub use contract::{EmbedError, EmbedRequest, Embedder, ProviderFailure, Vector};
 pub use local::{
     HashingEmbedder, LOCAL_BOOTSTRAP_DIMENSIONS, LOCAL_BOOTSTRAP_MODEL_ID,

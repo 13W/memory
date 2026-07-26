@@ -399,6 +399,43 @@ pub fn model_space_state(
     .optional()
 }
 
+/// Every model space currently in one of `states`, ordered by id.
+///
+/// Added by T11-04 for the eviction pin rule (spec 03 §4.2): rows written under a
+/// `building`/`projection_ready` space are referenced by **no** worktree yet — a
+/// new space enters `worktree_projection_state` only at switch time (spec 10 §4
+/// step 4) — so they need a pin derived from the space's own state, not from a
+/// projection tuple.
+pub fn model_space_ids_in_states(
+    conn: &Connection,
+    states: &[ModelSpaceState],
+) -> rusqlite::Result<Vec<String>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        conn.prepare("SELECT model_space_id, state FROM model_space ORDER BY model_space_id")?;
+    let rows = stmt
+        .query_map([], |r| {
+            let id: String = r.get(0)?;
+            let raw: String = r.get(1)?;
+            let state = ModelSpaceState::from_db(&raw).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    1,
+                    Type::Text,
+                    format!("invalid model_space.state {raw:?}").into(),
+                )
+            })?;
+            Ok((id, state))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, state)| states.contains(state))
+        .map(|(id, _)| id)
+        .collect())
+}
+
 /// Whether a model space in `state` may be selected as a
 /// `target_model_space_id` (spec 04 §3: "`active`: eligible to be a
 /// `target_model_space_id`"). Pure.

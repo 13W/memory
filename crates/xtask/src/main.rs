@@ -95,6 +95,21 @@ fn run_ci() -> ExitCode {
             "warnings",
         ],
         &["test", "-p", "local-rag-search", "--features", "failpoints"],
+        // `local-rag-embed` (T11-04): the backfill worker's
+        // `embed.backfill.between_batches` crash point, exercised by
+        // `backfill_resume.rs`'s kill-and-resume tests (spec 10 §4 step 2).
+        &[
+            "clippy",
+            "-p",
+            "local-rag-embed",
+            "--all-targets",
+            "--features",
+            "failpoints",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &["test", "-p", "local-rag-embed", "--features", "failpoints"],
         // The dense-backend spike (T10-01) is a SEPARATE workspace with its own
         // Cargo.lock (`spike/`, `exclude`d from the root — CONTRIBUTING.md §
         // Workspace layout), so `test --workspace` above never reaches it. `fmt`
