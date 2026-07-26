@@ -17,6 +17,8 @@
 //! that mints and persists occurrences with it is T05-03. Write operations take a
 //! [`Transaction`]; reads take a [`Connection`].
 
+use std::collections::HashMap;
+
 use local_rag_core::identity::Domain;
 use local_rag_core::identity::domain::hash;
 use rusqlite::types::Type;
@@ -460,6 +462,112 @@ pub fn occurrences_for_fts(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// One occurrence's presentable metadata — the non-`snippet` half of spec 09
+/// §7's `results[]` element (T12-03).
+///
+/// Deliberately narrower than [`FtsSourceRow`]: a search response has no use
+/// for `blob_id`/`file_revision_id`, which exist there only to recompute
+/// evicted normalized text. T12-04, which slices `source_blob` for snippets,
+/// adds what it needs when it needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceMetadata {
+    /// The deterministic, generation-scoped occurrence id.
+    pub occurrence_id: String,
+    /// The member path this occurrence belongs to.
+    pub normalized_path: String,
+    /// Fully-qualified name, if derived (always `None` on real data today —
+    /// spec 06 §2's as-built note).
+    pub qualified_name: Option<String>,
+    /// The unit's kind (spec 03 §2.3).
+    pub unit_kind: UnitKind,
+    /// Optional local (unqualified) name — a file/text/config unit need not
+    /// have one.
+    pub local_name: Option<String>,
+    /// Byte offset of the unit's span start in the file's `source_blob`.
+    pub span_start: i64,
+    /// Byte offset of the unit's span end in the file's `source_blob`.
+    pub span_end: i64,
+    /// The content blob's language label.
+    pub language: String,
+}
+
+/// The metadata of specific occurrences of `generation_id` (spec 09 §7,
+/// T12-03), in the order the caller asked for them.
+///
+/// The same `generation_unit_occurrence ⋈ parsed_unit ⋈ content_blob` join as
+/// [`occurrences_for_fts`], restricted to `occurrence_ids` instead of a whole
+/// generation: a response carries at most `limit` hits, so scanning every
+/// occurrence of the generation to present a handful would be wasteful.
+///
+/// **Order follows `occurrence_ids`**, not the database — the caller's order is
+/// the fused ranking (spec 09 §4), which SQL knows nothing about. An id with no
+/// row is simply absent from the result (structurally impossible under a held
+/// `L2.read`, since a generation's occurrence set is immutable once
+/// `projection_ready` — but silently substituting empty fields would be worse
+/// than letting the caller notice).
+pub fn occurrences_by_id(
+    conn: &Connection,
+    generation_id: &str,
+    occurrence_ids: &[&str],
+) -> rusqlite::Result<Vec<OccurrenceMetadata>> {
+    if occurrence_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One placeholder per id, after the generation. Building the list rather
+    // than using a carray/JSON extension keeps this on the same plain-SQL
+    // footing as every other reader in this crate; the list is bounded by the
+    // request's candidate depth, not by the corpus.
+    let placeholders = std::iter::repeat_n("?", occurrence_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT o.occurrence_id, o.normalized_path, o.qualified_name, \
+                pu.unit_kind, pu.local_name, pu.span_start, pu.span_end, \
+                cb.language \
+         FROM generation_unit_occurrence o \
+         JOIN parsed_unit pu ON pu.unit_id = o.unit_id \
+         JOIN content_blob cb ON cb.blob_id = pu.blob_id \
+         WHERE o.generation_id = ?1 AND o.occurrence_id IN ({placeholders})"
+    ))?;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(occurrence_ids.len() + 1);
+    bound.push(&generation_id);
+    for id in occurrence_ids {
+        bound.push(id);
+    }
+    let rows = stmt
+        .query_map(bound.as_slice(), |r| {
+            let unit_kind_raw: String = r.get(3)?;
+            let unit_kind = UnitKind::from_db(&unit_kind_raw).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    3,
+                    Type::Text,
+                    format!("invalid parsed_unit.unit_kind {unit_kind_raw:?}").into(),
+                )
+            })?;
+            Ok(OccurrenceMetadata {
+                occurrence_id: r.get(0)?,
+                normalized_path: r.get(1)?,
+                qualified_name: r.get(2)?,
+                unit_kind,
+                local_name: r.get(4)?,
+                span_start: r.get(5)?,
+                span_end: r.get(6)?,
+                language: r.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Restore the caller's order (the fused ranking).
+    let mut by_id: HashMap<&str, OccurrenceMetadata> = rows
+        .iter()
+        .map(|r| (r.occurrence_id.as_str(), r.clone()))
+        .collect();
+    Ok(occurrence_ids
+        .iter()
+        .filter_map(|id| by_id.remove(*id))
+        .collect())
 }
 
 /// The number of occurrences recorded for `generation_id` (spec 03 §2.4,

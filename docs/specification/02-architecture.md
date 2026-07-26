@@ -305,6 +305,19 @@ surface as `INCOMPATIBLE_STORE`, disambiguated by a `details` field (e.g.
 progress surfaces as `MIGRATION_IN_PROGRESS`. The runner's own typed errors (13 §3) are
 finer-grained than the wire codes.
 
+As-built note (T12-03, `[SPEC]`): `ErrorCode::UnsupportedMode` (`UNSUPPORTED_MODE`) now exists —
+again added by the task that first detects the condition. It is produced when `search_code` is
+asked for `mode="semantic"`, the description leg spec 09 §5 defers past v0 `[FIXED]`; the request
+is refused before worktree resolution or any lock, and `retryable = false` (no retry can make a
+post-v0 leg available). This row is not in the table above because it is a *tool-contract*
+condition (spec 09 §5 / 11 §2) rather than a store/degradation one; it uses the same canonical
+envelope.
+
+The envelope's `details` is still a freeform `Option<String>`, but the search **response** now has
+a wired JSON serialization (`local_rag_protocol::SearchResponse`, spec 09 §7's shape) — the T09-03
+note below predates that and is superseded on this point only. Group 15 still owns transport,
+handshake and MCP framing.
+
 As-built note (T11-03, `[SPEC]`): `ErrorCode::PolicyBlockedRemote` (`POLICY_BLOCKED_REMOTE`) now
 exists — added by the task that first detects the condition, per the T09-03 note below. It is
 produced by the central remote-policy guard in the embedding provider pool

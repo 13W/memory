@@ -651,6 +651,8 @@ name = "local-rag-protocol"
 version = "0.0.0"
 dependencies = [
  "local-rag-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -670,6 +672,7 @@ dependencies = [
  "local-rag-protocol",
  "local-rag-store",
  "local-rag-test-support",
+ "serde_json",
  "tokio",
 ]
 

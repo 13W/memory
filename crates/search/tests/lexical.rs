@@ -29,8 +29,8 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_projection::{
     FakeProjectionStore, RepresentationKind, ShardManager, ShardParams, VectorSource, switch,
 };
-use local_rag_protocol::DegradedMode;
-use local_rag_search::{QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest};
+use local_rag_protocol::{DegradedMode, SearchMode};
+use local_rag_search::{NoopObserver, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest};
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, GenerationState,
     NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit, NewlineStyle, RepresentationKey,
@@ -436,9 +436,8 @@ fn request(path: &str, query: &str, name_pattern: Option<&str>, limit: usize) ->
         root: request_root(path),
         query: query.to_string(),
         limit,
+        mode: SearchMode::Hybrid,
         name_pattern: name_pattern.map(str::to_string),
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     }
 }
 
@@ -496,13 +495,17 @@ async fn a_healthy_search_returns_ranked_lexical_candidates() {
 
     let engine = engine_over(&state, &cache, layout);
     let snapshot = engine
-        .search_code(request(&path, "extractImports", None, 5), 3000)
+        .search_code_instrumented(
+            request(&path, "extractImports", None, 5),
+            3000,
+            &NoopObserver,
+        )
         .await
         .expect("no infrastructure error")
         .expect("healthy tuple must not be an error envelope");
 
-    assert_eq!(snapshot.degraded, None);
-    assert_eq!(snapshot.generation_id, generation.to_string());
+    assert_eq!(snapshot.response.degraded, None);
+    assert_eq!(snapshot.response.generation.id, generation.to_string());
     assert_eq!(
         snapshot
             .lexical
@@ -516,11 +519,15 @@ async fn a_healthy_search_returns_ranked_lexical_candidates() {
 
     // A query matching nothing is an empty leg, not an error and not degraded.
     let empty = engine
-        .search_code(request(&path, "nonexistentterm", None, 5), 3000)
+        .search_code_instrumented(
+            request(&path, "nonexistentterm", None, 5),
+            3000,
+            &NoopObserver,
+        )
         .await
         .expect("no infrastructure error")
         .expect("still healthy");
-    assert_eq!(empty.degraded, None);
+    assert_eq!(empty.response.degraded, None);
     assert!(empty.lexical.is_empty());
 }
 
@@ -566,7 +573,7 @@ async fn name_pattern_from_the_request_filters_the_leg() {
 
     // Unfiltered: both bodies carry `shared`.
     let all = engine
-        .search_code(request(&path, "shared", None, 5), 3000)
+        .search_code_instrumented(request(&path, "shared", None, 5), 3000, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy")
@@ -575,7 +582,11 @@ async fn name_pattern_from_the_request_filters_the_leg() {
 
     // Filtered by a name prefix: only the matching symbol survives.
     let filtered = engine
-        .search_code(request(&path, "shared", Some("extractImp"), 5), 3000)
+        .search_code_instrumented(
+            request(&path, "shared", Some("extractImp"), 5),
+            3000,
+            &NoopObserver,
+        )
         .await
         .expect("no infra error")
         .expect("healthy")
@@ -590,7 +601,11 @@ async fn name_pattern_from_the_request_filters_the_leg() {
 
     // A pattern nothing matches is an empty leg, not an error.
     let none = engine
-        .search_code(request(&path, "shared", Some("zzz"), 5), 3000)
+        .search_code_instrumented(
+            request(&path, "shared", Some("zzz"), 5),
+            3000,
+            &NoopObserver,
+        )
         .await
         .expect("no infra error")
         .expect("healthy")
@@ -624,7 +639,7 @@ async fn request_limit_drives_the_candidate_depth() {
     // Every bulk row's path is `wide<N>.rs`, so the `wide` path token matches
     // all 60 of them.
     let floored = engine
-        .search_code(request(&path, "wide", None, 1), 3000)
+        .search_code_instrumented(request(&path, "wide", None, 1), 3000, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy")
@@ -632,7 +647,7 @@ async fn request_limit_drives_the_candidate_depth() {
     assert_eq!(floored.len(), 50, "max(1·4, 50) = 50");
 
     let raised = engine
-        .search_code(request(&path, "wide", None, 14), 3000)
+        .search_code_instrumented(request(&path, "wide", None, 14), 3000, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy")
@@ -672,11 +687,11 @@ async fn a_stale_head_degrades_to_dense_only_without_running_the_leg() {
     // Sanity: while A is active, the landmark term is genuinely findable.
     let engine = engine_over(&state, &cache, layout.clone());
     let on_a = engine
-        .search_code(request(&path, "landmark", None, 5), 2500)
+        .search_code_instrumented(request(&path, "landmark", None, 5), 2500, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy on A");
-    assert_eq!(on_a.degraded, None);
+    assert_eq!(on_a.response.degraded, None);
     assert_eq!(
         on_a.lexical
             .iter()
@@ -703,15 +718,15 @@ async fn a_stale_head_degrades_to_dense_only_without_running_the_leg() {
 
     let engine = engine_over(&state, &cache, layout);
     let snapshot = engine
-        .search_code(request(&path, "landmark", None, 5), 3000)
+        .search_code_instrumented(request(&path, "landmark", None, 5), 3000, &NoopObserver)
         .await
         .expect("no infrastructure error")
         .expect("dense is healthy; must not be an error envelope");
 
-    assert_eq!(snapshot.generation_id, gen_b.to_string());
-    assert_eq!(snapshot.degraded, Some(DegradedMode::DenseOnly));
+    assert_eq!(snapshot.response.generation.id, gen_b.to_string());
+    assert_eq!(snapshot.response.degraded, Some(DegradedMode::DenseOnly));
     assert!(
-        !snapshot.diagnostics.is_empty(),
+        !snapshot.response.diagnostics.is_empty(),
         "a degraded response carries its validation reason (spec 02 §6)"
     );
     assert!(

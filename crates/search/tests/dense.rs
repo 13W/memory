@@ -37,9 +37,9 @@ use local_rag_projection::{
     BruteForceProjectionStore, RepresentationKind, ShardManager, ShardParams, VectorSource,
     params_for_model_space, shard_dir, switch,
 };
-use local_rag_protocol::DegradedMode;
+use local_rag_protocol::{DegradedMode, SearchMode};
 use local_rag_search::{
-    QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest, UnavailableEmbedder,
+    NoopObserver, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest, UnavailableEmbedder,
 };
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, DistanceMetric, GenerationState, NewContentBlob,
@@ -424,9 +424,8 @@ fn request(path: &str, limit: usize) -> SearchRequest {
         root: request_root(path),
         query: "searchable".to_string(),
         limit,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: Vec::new(),
-        k: 5,
     }
 }
 
@@ -506,12 +505,12 @@ async fn a_healthy_search_returns_dense_candidates_by_occurrence_id() {
         ShardParams::with_dimensions(DIMS),
     );
     let snapshot = engine
-        .search_code(request(&path, 5), NOW + 1)
+        .search_code_instrumented(request(&path, 5), NOW + 1, &NoopObserver)
         .await
         .expect("no infrastructure error")
         .expect("healthy tuple must not be an error envelope");
 
-    assert_eq!(snapshot.degraded, None);
+    assert_eq!(snapshot.response.degraded, None);
     assert!(snapshot.dense_served());
     assert_eq!(
         snapshot.dense.len(),
@@ -558,7 +557,7 @@ async fn the_query_is_embedded_with_the_active_representation() {
         ShardParams::with_dimensions(DIMS),
     );
     engine
-        .search_code(request(&path, 5), NOW + 1)
+        .search_code_instrumented(request(&path, 5), NOW + 1, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy");
@@ -593,7 +592,7 @@ async fn the_registered_distance_metric_orders_the_dense_leg() {
         Arc::new(UnitQueryEmbedder),
         ShardParams::with_dimensions(DIMS),
     )
-    .search_code(request(&path_a, 5), NOW + 1)
+    .search_code_instrumented(request(&path_a, 5), NOW + 1, &NoopObserver)
     .await
     .expect("no infra error")
     .expect("healthy")
@@ -611,7 +610,7 @@ async fn the_registered_distance_metric_orders_the_dense_leg() {
         Arc::new(UnitQueryEmbedder),
         ShardParams::with_dimensions(DIMS),
     )
-    .search_code(request(&path_b, 5), NOW + 1)
+    .search_code_instrumented(request(&path_b, 5), NOW + 1, &NoopObserver)
     .await
     .expect("no infra error")
     .expect("healthy")
@@ -654,7 +653,7 @@ async fn request_limit_drives_the_dense_candidate_depth() {
         ShardParams::with_dimensions(DIMS),
     );
     let floored = engine
-        .search_code(request(&path, 1), NOW + 1)
+        .search_code_instrumented(request(&path, 1), NOW + 1, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy")
@@ -662,7 +661,7 @@ async fn request_limit_drives_the_dense_candidate_depth() {
     assert_eq!(floored.len(), 50, "max(1·4, 50) = 50");
 
     let raised = engine
-        .search_code(request(&path, 14), NOW + 1)
+        .search_code_instrumented(request(&path, 14), NOW + 1, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy")
@@ -699,13 +698,13 @@ async fn the_dense_leg_serves_exactly_the_active_generations_occurrences() {
         ShardParams::with_dimensions(DIMS),
     );
     let snapshot = engine
-        .search_code(request(&path, 5), NOW + 2)
+        .search_code_instrumented(request(&path, 5), NOW + 2, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy");
 
-    assert_eq!(snapshot.generation_id, gen_b.to_string());
-    assert_eq!(snapshot.degraded, None);
+    assert_eq!(snapshot.response.generation.id, gen_b.to_string());
+    assert_eq!(snapshot.response.degraded, None);
     let served: HashSet<String> = snapshot
         .dense
         .iter()
@@ -739,21 +738,22 @@ async fn without_an_embedding_provider_the_search_degrades_to_lexical_only() {
         ShardParams::with_dimensions(DIMS),
     );
     let snapshot = engine
-        .search_code(request(&path, 5), NOW + 1)
+        .search_code_instrumented(request(&path, 5), NOW + 1, &NoopObserver)
         .await
         .expect("no infrastructure error")
         .expect("fts is healthy; must not be an error envelope");
 
-    assert_eq!(snapshot.degraded, Some(DegradedMode::LexicalOnly));
+    assert_eq!(snapshot.response.degraded, Some(DegradedMode::LexicalOnly));
     assert!(!snapshot.dense_served());
     assert!(snapshot.dense.is_empty());
     assert!(
         snapshot
+            .response
             .diagnostics
             .iter()
             .any(|d| d.contains("no embedding provider")),
         "the reason must be reported: {:?}",
-        snapshot.diagnostics
+        snapshot.response.diagnostics
     );
     assert!(
         !snapshot.lexical.is_empty(),
@@ -777,20 +777,21 @@ async fn a_wrong_dimensioned_embedding_degrades_to_lexical_only() {
         ShardParams::with_dimensions(DIMS),
     );
     let snapshot = engine
-        .search_code(request(&path, 5), NOW + 1)
+        .search_code_instrumented(request(&path, 5), NOW + 1, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy fts");
 
-    assert_eq!(snapshot.degraded, Some(DegradedMode::LexicalOnly));
+    assert_eq!(snapshot.response.degraded, Some(DegradedMode::LexicalOnly));
     assert!(snapshot.dense.is_empty());
     assert!(
         snapshot
+            .response
             .diagnostics
             .iter()
             .any(|d| d.contains("dimensions") && d.contains(&format!("{}", DIMS + 4))),
         "diagnostic must name the mismatch: {:?}",
-        snapshot.diagnostics
+        snapshot.response.diagnostics
     );
 }
 
@@ -835,15 +836,15 @@ async fn a_corrupt_shard_degrades_to_lexical_only() {
     );
 
     let snapshot = engine
-        .search_code(request(&path, 5), NOW + 1)
+        .search_code_instrumented(request(&path, 5), NOW + 1, &NoopObserver)
         .await
         .expect("no infrastructure error")
         .expect("fts is healthy; must not be an error envelope");
 
-    assert_eq!(snapshot.degraded, Some(DegradedMode::LexicalOnly));
+    assert_eq!(snapshot.response.degraded, Some(DegradedMode::LexicalOnly));
     assert!(snapshot.dense.is_empty());
     assert!(
-        !snapshot.diagnostics.is_empty(),
+        !snapshot.response.diagnostics.is_empty(),
         "a degraded response carries its reason (spec 02 §6)"
     );
 }
@@ -875,17 +876,17 @@ async fn a_textless_query_leaves_the_dense_leg_empty_but_healthy() {
     let mut req = request(&path, 5);
     req.query = "   ".to_string();
     let snapshot = engine
-        .search_code(req, NOW + 1)
+        .search_code_instrumented(req, NOW + 1, &NoopObserver)
         .await
         .expect("no infra error")
         .expect("healthy");
 
     assert_eq!(
-        snapshot.degraded, None,
+        snapshot.response.degraded, None,
         "an empty query is not a degradation"
     );
     assert!(snapshot.dense.is_empty());
-    assert!(snapshot.diagnostics.is_empty());
+    assert!(snapshot.response.diagnostics.is_empty());
 }
 
 /// The shard directory is per (worktree, model space) — `shard_dir` — and the

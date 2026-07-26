@@ -278,6 +278,22 @@ pub fn generation_state(
     .optional()
 }
 
+/// The generation's per-worktree monotone `generation_number`, if it exists
+/// (spec 03 §2.1) — T12-03.
+///
+/// Read by the search response's `generation: {id, number}` field (spec 09 §7).
+/// Until now the number was only ever *written* (`allocate_generation`) or
+/// scanned per worktree (retention, §5); a search knows its generation id and
+/// needs exactly this one column.
+pub fn generation_number(conn: &Connection, generation_id: &str) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT generation_number FROM generation WHERE generation_id = ?1",
+        params![generation_id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 /// The worktree's `active` generations, ascending by `generation_number` (spec 03
 /// §2.1, 04 §1).
 ///

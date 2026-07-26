@@ -14,15 +14,21 @@
 //! head means the leg does not run at all and the response is explicitly
 //! `dense_only`, never a silently empty lexical result `[FIXED]`).
 //!
-//! Deliberately out of scope here (owned by T09-04 or the rest of group 12, not
-//! duplicated): RRF fusion, `results[]`, per-leg scoring (T12-02/T12-03); real
-//! enrichment — parent unit, qualified name, graph (T12-04,
-//! [`Stage::Enrichment`] is a stub); the `mode` request field and per-mode leg
-//! selection (spec 09 §5, T12-03 — this pipeline always attempts both legs,
-//! mirroring the default `hybrid` mode); load/failpoint tests under concurrent
-//! generation/model-space switches (T09-04 — this module only proves the lock
-//! is held across one pipeline run, never that concurrent switches can't mix
-//! generations).
+//! T12-02 filled in the dense leg ([`Stage::DenseLeg`]): the active model
+//! space's `code_raw` representation, a query vector from the injected
+//! [`QueryEmbedder`], and the production brute-force backend.
+//!
+//! T12-03 closed the pipeline: legs are selected per
+//! [`SearchMode`](local_rag_protocol::SearchMode) (spec 09 §5), their candidates
+//! are fused by RRF ([`crate::fusion`], spec 09 §4), and the result is spec 09
+//! §7's canonical [`SearchResponse`] — `results[]` with presentable metadata,
+//! `generation {id, number}`, `degraded` and `diagnostics`.
+//!
+//! Deliberately out of scope here (owned by T12-04, not duplicated):
+//! `source_blob`-derived output — `snippet` (always `None` today),
+//! `get_file_context` and the cached per-generation overview — plus the
+//! graph/parent-unit half of enrichment; [`Stage::Enrichment`] remains a marker
+//! for where that lands.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -34,14 +40,18 @@ use local_rag_projection::{
     DenseQuery, RepresentationKind, ScoredPoint, ShardManager, code_raw_representation_key,
     expected_points, required_code_kinds,
 };
-use local_rag_protocol::{DegradedMode, ErrorEnvelope};
+use local_rag_protocol::{
+    DegradedMode, ErrorEnvelope, GenerationRef, SearchMode, SearchResponse, SearchResult,
+};
 use local_rag_store::lock::ReadTimedOut;
 use local_rag_store::{
     CacheDb, CacheOpenError, FtsAvailability, FtsOpenOutcome, FtsRebuildError, LexicalHit,
-    LexicalQuery, OpenError, RepresentationKey, RequestRoot, Resolution, StateDb, ValidationDepth,
-    WorktreeLockRegistry, candidate_depth, lexical_leg, open_and_validate_fts, projection_state,
-    requires_index_unavailable, resolve, rusqlite,
+    LexicalQuery, OccurrenceMetadata, OpenError, RepresentationKey, RequestRoot, Resolution,
+    StateDb, ValidationDepth, WorktreeLockRegistry, candidate_depth, generation_number,
+    lexical_leg, occurrences_by_id, open_and_validate_fts, projection_state, resolve, rusqlite,
 };
+
+use crate::fusion::{FusedHit, rrf};
 
 /// A provisional default for the bounded `L2.read` wait (spec 02 §6:
 /// "search waits on L2.read (bounded); timeout → BUSY_RETRY"). No
@@ -184,49 +194,51 @@ pub struct DenseHit {
 pub struct SearchRequest {
     /// The request's explicit worktree context.
     pub root: RequestRoot,
-    /// The raw query text for the lexical leg (spec 09 §1's `query`). Tokenized
-    /// by the leg itself, never handed to FTS5 verbatim.
+    /// The raw query text (spec 09 §1's `query`). Tokenized by the lexical leg
+    /// and embedded by the dense one; never handed to FTS5 verbatim.
     pub query: String,
-    /// The caller's requested result count (spec 09 §1's `limit`). The lexical
-    /// leg derives its candidate depth from it via
-    /// `local_rag_store::candidate_depth` (§4); the dense leg still takes its
-    /// own `k` until T12-02/T12-03 fuse the two.
+    /// Which legs to run (spec 09 §5). Defaults to
+    /// [`SearchMode::Hybrid`](local_rag_protocol::SearchMode::Hybrid).
+    pub mode: SearchMode,
+    /// The caller's requested result count (spec 09 §1's `limit`). Both legs
+    /// derive their candidate depth from it via
+    /// `local_rag_store::candidate_depth` (§4); the *response* carries at most
+    /// `limit` fused hits.
     pub limit: usize,
     /// Optional prefix filter on `local_name`/`qualified_name` (spec 09 §1's
     /// `name_pattern`).
     pub name_pattern: Option<String>,
-    /// The query vector for the dense leg.
-    pub query_vector: Vec<f32>,
-    /// The maximum number of dense candidates to request.
-    pub k: usize,
 }
 
-/// The read-path skeleton's success shape. **Not** spec 09 §7's full response
-/// (`results[]`/`legs`/`snippet`, group 12's job) — only the resolved tuple
-/// plus the degraded/diagnostics skeleton this task owns.
+/// One pipeline run, as an instrumented caller sees it: the canonical
+/// [`SearchResponse`] plus the internals a wire client has no business seeing.
+///
+/// [`SearchEngine::search_code`] returns only `response` — spec 09 §7's shape,
+/// and nothing more. This fuller view exists for
+/// [`search_code_instrumented`](SearchEngine::search_code_instrumented), whose
+/// whole purpose is letting tests assert on things the wire deliberately omits:
+/// the **model space** served (T09-04's "exactly one active generation/model
+/// tuple" load test) and each leg's **raw** candidates before fusion merged
+/// them (T12-01/T12-02's per-leg suites).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineSnapshot {
     /// The resolved worktree.
     pub worktree_id: String,
-    /// The active generation served.
-    pub generation_id: String,
-    /// The active model space served.
+    /// The active model space served. Not a §7 field — a shard is per
+    /// `(worktree, model_space)` (spec 05 §2), so this is what proves a
+    /// response did not mix model spaces.
     pub model_space_id: String,
-    /// The dense leg's ranked candidates (spec 09 §3), best first. Empty
-    /// whenever the leg did not run — `lexical_only`, or a query with no text.
-    /// Fusing these with the lexical leg into spec 09 §7's `results[]` is
-    /// T12-03.
-    pub dense: Vec<DenseHit>,
-    /// The lexical leg's ranked candidates (spec 09 §2), best first. Empty
-    /// whenever the leg did not run — an invalid FTS view (`dense_only`) or a
-    /// query that reduces to no terms. Fusing these with the dense leg into
-    /// spec 09 §7's `results[]` is T12-03.
+    /// The lexical leg's ranked candidates (spec 09 §2), best first, **before**
+    /// fusion. Empty whenever the leg did not run — an invalid FTS view
+    /// (`dense_only`), a mode that did not ask for it, or a query that reduces
+    /// to no terms.
     pub lexical: Vec<LexicalHit>,
-    /// `None` when both legs served; `Some` names which leg was skipped.
-    pub degraded: Option<DegradedMode>,
-    /// Freeform diagnostic reasons (spec 02 §6: "every degraded response
-    /// includes the validation reason").
-    pub diagnostics: Vec<String>,
+    /// The dense leg's ranked candidates (spec 09 §3), best first, **before**
+    /// fusion. Empty whenever the leg did not run — `lexical_only`, a mode that
+    /// did not ask for it, or a query with no text.
+    pub dense: Vec<DenseHit>,
+    /// The canonical response (spec 09 §7).
+    pub response: SearchResponse,
 }
 
 impl PipelineSnapshot {
@@ -234,7 +246,7 @@ impl PipelineSnapshot {
     /// `degraded == lexical_only`), for readers that care about the leg rather
     /// than the wire vocabulary.
     pub fn dense_served(&self) -> bool {
-        self.degraded != Some(DegradedMode::LexicalOnly)
+        self.response.degraded != Some(DegradedMode::LexicalOnly)
     }
 }
 
@@ -257,6 +269,10 @@ pub enum SearchInfraError {
     Fts(FtsRebuildError),
     /// A stored `worktree_id` did not parse as a UUID.
     CorruptWorktreeId(String),
+    /// The active generation has no `generation` row — a corrupt store, since
+    /// `worktree_projection_state.active_generation_id` is a foreign key into
+    /// exactly that table.
+    MissingGeneration(String),
 }
 
 impl fmt::Display for SearchInfraError {
@@ -270,6 +286,9 @@ impl fmt::Display for SearchInfraError {
             SearchInfraError::CorruptWorktreeId(id) => {
                 write!(f, "search: worktree_id {id:?} is not a valid UUID")
             }
+            SearchInfraError::MissingGeneration(id) => {
+                write!(f, "search: active generation {id:?} has no generation row")
+            }
         }
     }
 }
@@ -282,7 +301,7 @@ impl std::error::Error for SearchInfraError {
             SearchInfraError::CacheOpen(e) => Some(e),
             SearchInfraError::CacheRead(e) => Some(e),
             SearchInfraError::Fts(e) => Some(e),
-            SearchInfraError::CorruptWorktreeId(_) => None,
+            SearchInfraError::CorruptWorktreeId(_) | SearchInfraError::MissingGeneration(_) => None,
         }
     }
 }
@@ -347,9 +366,11 @@ impl SearchEngine {
         &self,
         request: SearchRequest,
         now_ms: i64,
-    ) -> Result<Result<PipelineSnapshot, ErrorEnvelope>, SearchInfraError> {
-        self.search_code_instrumented(request, now_ms, &NoopObserver)
-            .await
+    ) -> Result<Result<SearchResponse, ErrorEnvelope>, SearchInfraError> {
+        Ok(self
+            .search_code_instrumented(request, now_ms, &NoopObserver)
+            .await?
+            .map(|snapshot| snapshot.response))
     }
 
     /// [`search_code`](Self::search_code), plus a [`StageObserver`] callback
@@ -361,6 +382,13 @@ impl SearchEngine {
         now_ms: i64,
         observer: &dyn StageObserver,
     ) -> Result<Result<PipelineSnapshot, ErrorEnvelope>, SearchInfraError> {
+        // Step 0 (spec 09 §5): `semantic` is the description leg — post-v0,
+        // benchmark-gated `[FIXED]`. Refused before anything else happens: no
+        // resolution, no lock, no leg.
+        if request.mode == SearchMode::Semantic {
+            return Ok(Err(ErrorEnvelope::unsupported_mode(request.mode)));
+        }
+
         // Step 1 (spec 09 §1): resolve worktree from request context — before
         // any lock is taken.
         let worktree_id = {
@@ -421,43 +449,72 @@ impl SearchEngine {
             return Ok(Err(ErrorEnvelope::worktree_not_indexed()));
         };
 
-        observer.on_stage(Stage::FtsLeg);
-        let fts_outcome = open_and_validate_fts(
-            &self.state,
-            &self.cache,
-            worktree_id,
-            ValidationDepth::Cheap,
-            now_ms,
-        )
-        .await
-        .map_err(SearchInfraError::Fts)?;
-        let fts_availability = to_fts_availability(fts_outcome);
+        // Legs per mode (spec 09 §5). A leg the mode does not ask for is not
+        // *degraded*, it is simply not run — and it is not run at all: no FTS
+        // validation, no provider call, no shard open. `Semantic` never gets
+        // here (rejected before the lock).
+        let wants_lexical = request.mode.wants_lexical();
+        let wants_dense = request.mode.wants_dense();
 
-        observer.on_stage(Stage::DenseLeg);
-        let worktree_uuid: Uuid = worktree_id
-            .parse()
-            .map_err(|_| SearchInfraError::CorruptWorktreeId(worktree_id.to_string()))?;
-        let dense_outcome = self
-            .dense_leg(
-                worktree_uuid,
-                &generation_id,
-                &model_space_id,
-                request,
+        observer.on_stage(Stage::FtsLeg);
+        let fts_availability = if wants_lexical {
+            let outcome = open_and_validate_fts(
+                &self.state,
+                &self.cache,
+                worktree_id,
+                ValidationDepth::Cheap,
                 now_ms,
             )
-            .await?;
-        let dense_available = dense_outcome.available;
-        let dense_diagnostic = dense_outcome.diagnostic;
+            .await
+            .map_err(SearchInfraError::Fts)?;
+            Some(to_fts_availability(outcome))
+        } else {
+            None
+        };
 
-        if requires_index_unavailable(&fts_availability, dense_available) {
-            let mut details = Vec::new();
-            if let FtsAvailability::Unavailable(Some(divergence)) = &fts_availability {
-                details.push(divergence.to_string());
-            }
-            if let Some(diagnostic) = &dense_diagnostic {
-                details.push(diagnostic.clone());
-            }
-            return Ok(Err(ErrorEnvelope::index_unavailable(details.join("; "))));
+        observer.on_stage(Stage::DenseLeg);
+        let dense_outcome = if wants_dense {
+            let worktree_uuid: Uuid = worktree_id
+                .parse()
+                .map_err(|_| SearchInfraError::CorruptWorktreeId(worktree_id.to_string()))?;
+            Some(
+                self.dense_leg(
+                    worktree_uuid,
+                    &generation_id,
+                    &model_space_id,
+                    request,
+                    now_ms,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        // `Some(true)` served, `Some(false)` asked for but unavailable, `None`
+        // not asked for.
+        let lexical_served = fts_availability
+            .as_ref()
+            .map(|a| matches!(a, FtsAvailability::Valid));
+        let dense_served = dense_outcome.as_ref().map(|o| o.available);
+
+        let mut diagnostics = Vec::new();
+        if let Some(FtsAvailability::Unavailable(Some(divergence))) = &fts_availability {
+            diagnostics.push(divergence.to_string());
+        }
+        if let Some(diagnostic) = dense_outcome.as_ref().and_then(|o| o.diagnostic.as_ref()) {
+            diagnostics.push(diagnostic.clone());
+        }
+
+        // No requested leg could serve ⇒ `INDEX_UNAVAILABLE` (spec 02 §6). This
+        // generalizes `local_rag_store::requires_index_unavailable`'s
+        // both-legs-down predicate over spec 09 §5's single-leg modes, where
+        // "the other leg" the caller could have degraded onto was never
+        // requested.
+        if lexical_served != Some(true) && dense_served != Some(true) {
+            return Ok(Err(ErrorEnvelope::index_unavailable(
+                diagnostics.join("; "),
+            )));
         }
 
         // The lexical leg (T12-01), still under L2.read. It runs *only* on a
@@ -465,8 +522,7 @@ impl SearchEngine {
         // `dense_only` with a diagnostic, and an empty FTS is never silently
         // served as a correct lexical result (spec 06 §4 `[FIXED]`).
         observer.on_stage(Stage::LexicalLeg);
-        let fts_available = matches!(fts_availability, FtsAvailability::Valid);
-        let lexical = if fts_available {
+        let lexical = if lexical_served == Some(true) {
             let conn = self
                 .cache
                 .open_read()
@@ -485,37 +541,101 @@ impl SearchEngine {
         } else {
             Vec::new()
         };
+        let dense: Vec<DenseHit> = dense_outcome.map(|o| o.hits).unwrap_or_default();
 
-        // Stub: real enrichment is T12-04. Still runs under L2.read so
-        // instrumentation can prove it.
-        observer.on_stage(Stage::Enrichment);
-
-        let degraded = match (fts_available, dense_available) {
-            (true, true) => None,
-            (true, false) => Some(DegradedMode::LexicalOnly),
-            (false, true) => Some(DegradedMode::DenseOnly),
-            (false, false) => {
-                unreachable!("requires_index_unavailable already returned on both-down")
-            }
+        // `degraded` means "you got less than you asked for" (spec 09 §7), so a
+        // single-leg mode whose one leg served is **not** degraded — nothing was
+        // skipped. Only a mode that asked for both and got one reports which.
+        let degraded = match (lexical_served, dense_served) {
+            (Some(true), Some(false)) => Some(DegradedMode::LexicalOnly),
+            (Some(false), Some(true)) => Some(DegradedMode::DenseOnly),
+            _ => None,
         };
 
-        let mut diagnostics = Vec::new();
-        if let FtsAvailability::Unavailable(Some(divergence)) = &fts_availability {
-            diagnostics.push(divergence.to_string());
-        }
-        if let Some(diagnostic) = &dense_diagnostic {
-            diagnostics.push(diagnostic.clone());
-        }
+        // Enrichment is still a stub for the graph/parent-unit half (T12-04);
+        // the presentable metadata spec 09 §7 lists is assembled below.
+        observer.on_stage(Stage::Enrichment);
+
+        let fused = rrf(&lexical, &dense, request.limit);
+        let response = self.build_response(&generation_id, fused, degraded, &mut diagnostics)?;
 
         Ok(Ok(PipelineSnapshot {
             worktree_id: worktree_id.to_string(),
-            generation_id,
             model_space_id,
             lexical,
-            dense: dense_outcome.hits,
-            degraded,
-            diagnostics,
+            dense,
+            response,
         }))
+    }
+
+    /// Turn fused hits into spec 09 §7's canonical response: presentable
+    /// metadata per result, the generation reference, and the degraded /
+    /// diagnostics envelope.
+    fn build_response(
+        &self,
+        generation_id: &str,
+        fused: Vec<FusedHit>,
+        degraded: Option<DegradedMode>,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<SearchResponse, SearchInfraError> {
+        let conn = self
+            .state
+            .open_read()
+            .map_err(SearchInfraError::StateOpen)?;
+
+        let number = generation_number(&conn, generation_id)
+            .map_err(SearchInfraError::StateRead)?
+            .ok_or_else(|| SearchInfraError::MissingGeneration(generation_id.to_string()))?;
+
+        let ids: Vec<&str> = fused.iter().map(|f| f.occurrence_id.as_str()).collect();
+        let metadata =
+            occurrences_by_id(&conn, generation_id, &ids).map_err(SearchInfraError::StateRead)?;
+        let mut by_id: HashMap<&str, &OccurrenceMetadata> = metadata
+            .iter()
+            .map(|m| (m.occurrence_id.as_str(), m))
+            .collect();
+
+        let mut results = Vec::with_capacity(fused.len());
+        let mut dropped = 0usize;
+        for hit in &fused {
+            // Structurally impossible under a held `L2.read` (a generation's
+            // occurrence set is immutable once `projection_ready`, spec 03
+            // §1.2), so this is a corruption signal rather than a normal miss —
+            // reported, never papered over with empty fields.
+            let Some(meta) = by_id.remove(hit.occurrence_id.as_str()) else {
+                dropped += 1;
+                continue;
+            };
+            results.push(SearchResult {
+                occurrence_id: hit.occurrence_id.clone(),
+                path: meta.normalized_path.clone(),
+                name: meta.local_name.clone().unwrap_or_default(),
+                qualified_name: meta.qualified_name.clone(),
+                unit_kind: meta.unit_kind.as_str().to_string(),
+                span: [meta.span_start, meta.span_end],
+                language: meta.language.clone(),
+                score: hit.score,
+                legs: hit.legs,
+                // T12-04 owns everything read out of `source_blob`.
+                snippet: None,
+            });
+        }
+        if dropped > 0 {
+            diagnostics.push(format!(
+                "{dropped} fused hit(s) had no occurrence row in generation {generation_id} \
+                 and were dropped"
+            ));
+        }
+
+        Ok(SearchResponse {
+            results,
+            generation: GenerationRef {
+                id: generation_id.to_string(),
+                number,
+            },
+            degraded,
+            diagnostics: std::mem::take(diagnostics),
+        })
     }
 
     /// The dense leg (spec 09 §3) — T12-02.

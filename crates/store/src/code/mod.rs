@@ -45,10 +45,11 @@ mod source;
 
 pub use membership::{
     EdgeResolution, FtsSourceRow, NewOccurrence, NewResolvedEdge, NewUnresolvedReference,
-    SkipReason, content_blob_ids_for_generation, delete_unresolved_references_for_revision,
-    insert_generation_file, insert_occurrence, insert_resolved_edge, insert_skipped_file,
-    insert_unresolved_reference, member_file_revision, occurrence_count_for_generation,
-    occurrence_id, occurrence_ids_for_generation, occurrences_for_fts, skip_reason,
+    OccurrenceMetadata, SkipReason, content_blob_ids_for_generation,
+    delete_unresolved_references_for_revision, insert_generation_file, insert_occurrence,
+    insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
+    occurrence_count_for_generation, occurrence_id, occurrence_ids_for_generation,
+    occurrences_by_id, occurrences_for_fts, skip_reason,
 };
 pub use normalize::{
     ALGO_VERSION, DerivedContentBlob, NORMALIZATION_VERSION, content_blob_id, derive_content_blob,
