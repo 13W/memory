@@ -106,6 +106,64 @@ pub struct LegRanks {
     pub dense: Option<usize>,
 }
 
+/// What a size cap cut away (spec 12 §2 `[FIXED]`: "truncation always leaves
+/// `{hash, original_size}` metadata").
+///
+/// The hash is over the **full**, pre-truncation excerpt
+/// (`local_rag_core::identity::domain::truncated_excerpt`), so a caller can tell
+/// two truncated excerpts apart — and tell that a re-fetch would return the same
+/// thing — without the bytes being kept anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Truncation {
+    /// `H(truncated_excerpt, full excerpt bytes)`.
+    pub hash: String,
+    /// The full excerpt's byte length, before the cap.
+    pub original_size: i64,
+}
+
+/// A `source_blob`-derived excerpt (spec 09 §7's `snippet`).
+///
+/// # Serialization
+///
+/// Spec 09 §7 shows `snippet` as a plain string, and the overwhelmingly common
+/// case *is* a plain string — so an untruncated snippet serializes as exactly
+/// that. Only a truncated one widens to `{"text": …, "truncation": {…}}`, which
+/// is the only case that has anything more to say. Keeping the common case a
+/// bare string is what makes this type compatible with §7's documented shape
+/// rather than a silent change to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snippet {
+    /// The excerpt text (already capped).
+    pub text: String,
+    /// Present only when the cap actually cut something.
+    pub truncation: Option<Truncation>,
+}
+
+impl Snippet {
+    /// An untruncated snippet.
+    pub fn whole(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            truncation: None,
+        }
+    }
+}
+
+impl Serialize for Snippet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.truncation {
+            None => serializer.serialize_str(&self.text),
+            Some(truncation) => {
+                use serde::ser::SerializeStruct;
+                let mut s = serializer.serialize_struct("Snippet", 2)?;
+                s.serialize_field("text", &self.text)?;
+                s.serialize_field("truncation", truncation)?;
+                s.end()
+            }
+        }
+    }
+}
+
 /// The generation a response was served from (spec 09 §7's `"generation"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GenerationRef {
@@ -139,11 +197,11 @@ pub struct SearchResult {
     pub score: f64,
     /// Which legs matched, and at what rank.
     pub legs: LegRanks,
-    /// A `source_blob`-derived, span-bounded, size-capped excerpt. Always
-    /// `None` today — snippets are T12-04, which owns everything read out of
-    /// `source_blob`.
+    /// A `source_blob`-derived, span-bounded, size-capped excerpt (T12-04).
+    /// `None` only when the stored bytes could not produce one — a span outside
+    /// the revision, or non-UTF-8 content in a file that classified as text.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub snippet: Option<String>,
+    pub snippet: Option<Snippet>,
 }
 
 /// The canonical `search_code` response (spec 09 §7).
@@ -158,6 +216,77 @@ pub struct SearchResponse {
     /// Why the response is degraded, or anything else the caller should know
     /// (spec 02 §6: "every degraded response includes the validation reason").
     pub diagnostics: Vec<String>,
+}
+
+/// One occurrence of a file, as `get_file_context` reports it (spec 11 §2:
+/// "file's occurrence list (ids, kinds, names, spans) + snippet from
+/// `source_blob`").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileOccurrence {
+    /// The occurrence id (spec 03 §1.2).
+    pub occurrence_id: String,
+    /// The unit kind, as its stored token.
+    pub unit_kind: String,
+    /// The unit's local name, empty when it has none.
+    pub name: String,
+    /// The unit's qualified name, when the grammar exposes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    /// `[start, end)` byte offsets into the file's `source_blob`.
+    pub span: [i64; 2],
+    /// The unit's excerpt, cut from the stored bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<Snippet>,
+}
+
+/// The `get_file_context(path)` response (spec 11 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileContext {
+    /// The normalized path, as recorded in the active generation.
+    pub path: String,
+    /// The generation the answer was read from.
+    pub generation: GenerationRef,
+    /// The file's occurrences, ascending by span start.
+    pub occurrences: Vec<FileOccurrence>,
+}
+
+/// One node of `project_overview`'s directory tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverviewNode {
+    /// The directory path, relative to the worktree root (`""` is the root).
+    pub path: String,
+    /// Depth below the root: `0` for the root itself.
+    pub depth: usize,
+    /// Files at or below this directory (recursive).
+    pub file_count: usize,
+    /// Occurrences at or below this directory (recursive).
+    pub occurrence_count: usize,
+}
+
+/// One aggregated import specifier (`project_overview`'s "top imports").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImportCount {
+    /// The module specifier exactly as it appears in the source
+    /// (`unresolved_reference.reference_text`) — unresolved, because import
+    /// resolution is post-v0 (spec 09 §6).
+    pub specifier: String,
+    /// How many references across the generation name it.
+    pub count: usize,
+}
+
+/// The `project_overview()` response (spec 11 §2): "3-level tree + entry points
+/// + top imports, derived from active generation".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectOverview {
+    /// The generation the answer was derived from.
+    pub generation: GenerationRef,
+    /// Directories folded to three levels, ascending by path.
+    pub tree: Vec<OverviewNode>,
+    /// Conventional entry-point files present in this generation, ascending by
+    /// path (see the engine's `[SPEC]` heuristic).
+    pub entry_points: Vec<String>,
+    /// The most-referenced import specifiers, by descending count.
+    pub top_imports: Vec<ImportCount>,
 }
 
 #[cfg(test)]

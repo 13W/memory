@@ -45,6 +45,10 @@ this pipeline's first two steps and the lock/validate/degrade skeleton around th
   `name_pattern` are not yet request fields. The real BM25 query is T12-01, RRF/`results[]`/`legs`
   scoring is T12-02/T12-03, and real enrichment is T12-04 — each replaces its stub stage in place,
   still inside the same held `L2.read`.
+- `format results`: not yet — `SearchEngine::search_code` returns
+  `local_rag_search::PipelineSnapshot` (worktree/generation/model-space tuple, `degraded`,
+  `diagnostics`), the envelope skeleton `[SPEC]` this task owns, not §7's full response shape
+  below (T12-03 builds that on top).
 
 As-built note (T12-01, `[SPEC]`): `Stage::LexicalLeg` is no longer a stub — it runs
 `local_rag_store::lexical_leg` (`crates/store/src/cache/fts_query.rs`, the read-side sibling of
@@ -78,10 +82,11 @@ As-built note (T12-03, `[SPEC]`): the pipeline is now complete end to end — `l
 `SearchResponse` (§7's). The only remaining stub is `graph/context enrichment`
 (`Stage::Enrichment`): T12-04 owns the `source_blob`-derived half (`snippet`, `get_file_context`,
 the cached overview), and edges stay post-v0 (§6).
-- `format results`: not yet — `SearchEngine::search_code` returns
-  `local_rag_search::PipelineSnapshot` (worktree/generation/model-space tuple, `degraded`,
-  `diagnostics`), the envelope skeleton `[SPEC]` this task owns, not §7's full response shape
-  below (T12-03 builds that on top).
+
+As-built note (T12-04, `[SPEC]`): the `source_blob`-derived half landed (§7's own T12-04 note,
+11 §2's for the two tools). What remains behind `Stage::Enrichment` is only the *graph* half —
+parent-unit and edge enrichment — which §6 keeps post-v0/v0.x; the stage marker stays as the
+place that work will attach to.
 
 ## 2. Lexical leg — FTS5 `[FIXED]`
 
@@ -365,7 +370,30 @@ occurrence row is missing — structurally impossible under a held `L2.read`, si
 occurrence set is immutable once `projection_ready` — is dropped with a diagnostic rather than
 presented with empty fields.
 
-`snippet` is always `None` today: everything read out of `source_blob` is T12-04's.
+As-built note (T12-04, `[SPEC]`): `snippet` is now filled. `local_rag_search::snippet::cut`
+slices `[span_start, span_end)` out of the revision's stored bytes
+(`local_rag_store::source_bytes`) and caps the result at `SNIPPET_CAP_BYTES = 8 * 1024`
+(12 §2's `[SPEC]` cap); a truncated snippet carries 12 §2's `[FIXED]`
+`{hash, original_size}`, where the hash is over the **full** span (the new
+`Domain::TruncatedExcerpt`, 03 §1.2) — hashing what survived would answer the wrong
+question, since the metadata exists to describe what was cut.
+
+Two details the cap creates and the span does not. **UTF-8**: unit spans are
+character-aligned by construction (tree-sitter), but 8 KiB lands wherever it lands, so the cut
+moves back to the nearest boundary (at most three bytes) — otherwise the first emoji- or
+CJK-heavy file would fail `String::from_utf8` and lose its excerpt entirely. **Batching**: the
+bytes are read once per `file_revision_id`, not once per hit — ten results from one file share
+one revision, and `source_bytes` decompresses the whole revision on every call.
+
+A snippet that cannot be produced (span outside the revision, non-UTF-8 content in a file that
+classified as text — both corruption signals) leaves `snippet: None` **and** a diagnostic: the
+hit keeps its metadata and its rank, because the ranking is still correct even when the excerpt
+is not available.
+
+Serialization keeps this section's documented shape: an untruncated snippet serializes as the
+plain string shown above, and only a truncated one widens to
+`{"text": …, "truncation": {"hash": …, "original_size": …}}` — the case that has something more
+to say.
 
 `PipelineSnapshot` survives as the **instrumented** return of
 `SearchEngine::search_code_instrumented`, carrying the response plus what the wire deliberately

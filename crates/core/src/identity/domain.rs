@@ -72,6 +72,16 @@ pub enum Domain {
     RemoteFingerprint,
     /// Consolidation idempotency key.
     MemoryOp,
+    /// The `hash` half of the `{hash, original_size}` metadata a size-capped
+    /// excerpt leaves behind (spec 12 §2 `[FIXED]`) — the search snippet's
+    /// 8 KiB cap (09 §7, T12-04) today, memory evidence's 4 KiB cap later.
+    ///
+    /// Its own domain rather than a reuse of [`Domain::FileContent`]: an
+    /// excerpt is a *slice* of a file, and a snippet that happened to equal a
+    /// whole small file would otherwise hash identically to that file's
+    /// `content_hash` — exactly the confusion domain separation exists to
+    /// prevent.
+    TruncatedExcerpt,
 }
 
 impl Domain {
@@ -92,6 +102,7 @@ impl Domain {
             Domain::PathFingerprint => "path_fingerprint",
             Domain::RemoteFingerprint => "remote_fingerprint",
             Domain::MemoryOp => "memory_op",
+            Domain::TruncatedExcerpt => "truncated_excerpt",
         }
     }
 
@@ -130,6 +141,14 @@ pub fn encode(domain: Domain, fields: &[&[u8]]) -> Vec<u8> {
 /// Domain-separated BLAKE3 digest of `fields`, as 64 lowercase hex characters.
 pub fn hash(domain: Domain, fields: &[&[u8]]) -> String {
     blake3::hash(&encode(domain, fields)).to_hex().to_string()
+}
+
+/// `H(truncated_excerpt, bytes)` — the `hash` half of spec 12 §2's
+/// `{hash, original_size}` truncation metadata, taken over the **full**
+/// (pre-truncation) excerpt so a caller can tell what was cut without keeping
+/// it. Joins the single-field typed-constructor precedent below.
+pub fn truncated_excerpt(bytes: &[u8]) -> String {
+    hash(Domain::TruncatedExcerpt, &[bytes])
 }
 
 /// `H(path_fingerprint, canonical_path)` — the `worktree_path.path_fingerprint`
@@ -363,11 +382,15 @@ mod tests {
                 Domain::MemoryOp,
                 "90cafde9944e4e623bcf4bbf83acacf6f722724268b4cca95dc1b0408253e078",
             ),
+            (
+                Domain::TruncatedExcerpt,
+                "29786b15d9bea2651bdd44fb3f8de9d5fd0f09c767e67f1a943838dadd497318",
+            ),
         ];
         for (domain, expected) in table {
             assert_eq!(hash(domain, GOLDEN_FIELDS), expected, "domain {domain:?}");
         }
-        // Domain separation: all twelve digests are distinct.
+        // Domain separation: every digest is distinct.
         let mut seen: Vec<&str> = table.iter().map(|(_, h)| *h).collect();
         seen.sort_unstable();
         seen.dedup();

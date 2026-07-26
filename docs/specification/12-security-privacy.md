@@ -33,6 +33,24 @@ every file's `sha256`/`size` are pinned in the binary (ADR-0005), so "fetch a mo
 - Files classified `secret` by the scanner are `skipped_file(reason='secret')` — no
   `source_blob`, no occurrences (06 §2.2).
 
+As-built note (T12-04, `[SPEC]`): the snippet half of the caps rule is implemented —
+`local_rag_search::SNIPPET_CAP_BYTES = 8 * 1024`, with truncation leaving
+`{hash, original_size}` over the **full** pre-truncation excerpt via the new
+`local_rag_core::identity::Domain::TruncatedExcerpt` (03 §1.2). Its own domain rather than a
+reuse of `file_content`: an excerpt is a *slice* of a file, and a snippet that happened to equal
+a whole small file would otherwise hash identically to that file's `content_hash` — exactly the
+confusion domain separation exists to prevent. The same domain is what memory evidence's 4 KiB
+cap should use in group 14. The 256 KiB spool-payload cap remains group 13's.
+
+As-built note (T12-04, `[SPEC]`): the snippet half of the caps rule is implemented —
+`local_rag_search::SNIPPET_CAP_BYTES = 8 * 1024`, with truncation leaving
+`{hash, original_size}` over the **full** pre-truncation excerpt via the new
+`local_rag_core::identity::Domain::TruncatedExcerpt` (03 §1.2). Its own domain rather than a
+reuse of `file_content`: an excerpt is a *slice* of a file, and a snippet that happened to equal
+a whole small file would otherwise hash identically to that file's `content_hash` — exactly the
+confusion domain separation exists to prevent. The same domain is what memory evidence's 4 KiB
+cap should use in group 14. The 256 KiB spool-payload cap remains group 13's.
+
 **Scanner rule set v0 (as-built, T03-02) `[SPEC]`.** The scanner is a single shared component
 (`local-rag-core::redaction`, `redaction_version = 1`) reused by file classification, spool
 ingestion, and remote transmission so verdicts stay consistent and auditable against one version.

@@ -36,6 +36,10 @@ pub enum ErrorCode {
     /// (spec 09 §5: `semantic` is the description leg, post-v0 and
     /// benchmark-gated `[FIXED]`).
     UnsupportedMode,
+    /// The requested path is not part of the worktree's active generation —
+    /// either never seen, or deliberately skipped (spec 06 §2.2). `details`
+    /// says which.
+    PathNotIndexed,
 }
 
 impl ErrorCode {
@@ -47,6 +51,7 @@ impl ErrorCode {
             ErrorCode::BusyRetry => "BUSY_RETRY",
             ErrorCode::PolicyBlockedRemote => "POLICY_BLOCKED_REMOTE",
             ErrorCode::UnsupportedMode => "UNSUPPORTED_MODE",
+            ErrorCode::PathNotIndexed => "PATH_NOT_INDEXED",
         }
     }
 }
@@ -104,6 +109,19 @@ impl ErrorEnvelope {
             message: format!("search mode {mode} is not supported in v0"),
             retryable: false,
             details: None,
+        }
+    }
+
+    /// The path is absent from the active generation (spec 06 §2.2). Not
+    /// retryable: the same path in the same generation is absent identically.
+    /// `details` distinguishes "skipped, reason=…" from "no such path", because
+    /// those are different answers to the caller.
+    pub fn path_not_indexed(path: &str, details: impl Into<String>) -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::PathNotIndexed,
+            message: format!("path {path:?} is not part of the active generation"),
+            retryable: false,
+            details: Some(details.into()),
         }
     }
 
@@ -165,6 +183,7 @@ mod tests {
             "POLICY_BLOCKED_REMOTE"
         );
         assert_eq!(ErrorCode::UnsupportedMode.as_str(), "UNSUPPORTED_MODE");
+        assert_eq!(ErrorCode::PathNotIndexed.as_str(), "PATH_NOT_INDEXED");
     }
 
     #[test]

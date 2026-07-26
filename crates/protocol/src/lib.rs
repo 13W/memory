@@ -15,4 +15,7 @@ pub use local_rag_core::VERSION;
 mod error;
 mod search;
 pub use error::{DegradedMode, ErrorCode, ErrorEnvelope};
-pub use search::{GenerationRef, LegRanks, SearchMode, SearchResponse, SearchResult};
+pub use search::{
+    FileContext, FileOccurrence, GenerationRef, ImportCount, LegRanks, OverviewNode,
+    ProjectOverview, SearchMode, SearchResponse, SearchResult, Snippet, Truncation,
+};

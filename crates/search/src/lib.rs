@@ -19,10 +19,15 @@
 //! group 12's job (T12-02…T12-04). See the `pipeline` module's own docs for the
 //! exact division of scope.
 
+mod context;
 mod fusion;
+mod overview;
 mod pipeline;
+mod snippet;
 
 pub use fusion::{FusedHit, RRF_K, rrf};
+pub use overview::{TOP_IMPORTS_LIMIT, TREE_DEPTH, build_tree, is_entry_point};
+pub use snippet::{SNIPPET_CAP_BYTES, SnippetError, cut as cut_snippet};
 
 pub use pipeline::{
     DEFAULT_L2_READ_WAIT_BUDGET, DenseHit, NoopObserver, PipelineSnapshot, QueryEmbedError,

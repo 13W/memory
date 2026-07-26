@@ -468,9 +468,9 @@ pub fn occurrences_for_fts(
 /// §7's `results[]` element (T12-03).
 ///
 /// Deliberately narrower than [`FtsSourceRow`]: a search response has no use
-/// for `blob_id`/`file_revision_id`, which exist there only to recompute
-/// evicted normalized text. T12-04, which slices `source_blob` for snippets,
-/// adds what it needs when it needs it.
+/// for `blob_id`, which exists there only to recompute evicted normalized text.
+/// `file_revision_id` was added by T12-04 exactly as this note predicted — it
+/// is the handle `source_bytes` needs to cut a snippet (spec 09 §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OccurrenceMetadata {
     /// The deterministic, generation-scoped occurrence id.
@@ -485,6 +485,8 @@ pub struct OccurrenceMetadata {
     /// Optional local (unqualified) name — a file/text/config unit need not
     /// have one.
     pub local_name: Option<String>,
+    /// The revision whose `source_blob` the span indexes into (T12-04).
+    pub file_revision_id: String,
     /// Byte offset of the unit's span start in the file's `source_blob`.
     pub span_start: i64,
     /// Byte offset of the unit's span end in the file's `source_blob`.
@@ -507,6 +509,111 @@ pub struct OccurrenceMetadata {
 /// `L2.read`, since a generation's occurrence set is immutable once
 /// `projection_ready` — but silently substituting empty fields would be worse
 /// than letting the caller notice).
+pub fn occurrences_for_path(
+    conn: &Connection,
+    generation_id: &str,
+    normalized_path: &str,
+) -> rusqlite::Result<Vec<OccurrenceMetadata>> {
+    let mut stmt = conn.prepare(
+        "SELECT o.occurrence_id, o.normalized_path, o.qualified_name, \
+                pu.unit_kind, pu.local_name, pu.file_revision_id, \
+                pu.span_start, pu.span_end, cb.language \
+         FROM generation_unit_occurrence o \
+         JOIN parsed_unit pu ON pu.unit_id = o.unit_id \
+         JOIN content_blob cb ON cb.blob_id = pu.blob_id \
+         WHERE o.generation_id = ?1 AND o.normalized_path = ?2 \
+         ORDER BY pu.span_start, pu.span_end, o.occurrence_id",
+    )?;
+    stmt.query_map(params![generation_id, normalized_path], read_occurrence_row)?
+        .collect()
+}
+
+/// The most-referenced import specifiers of `generation_id`
+/// (`project_overview`'s "top imports", spec 11 §2) — T12-04.
+///
+/// Aggregates `unresolved_reference.reference_text` over the revisions the
+/// generation actually contains, ordered `(count desc, specifier asc)` so the
+/// output is deterministic even when counts tie, and cut at `limit`.
+///
+/// The specifiers stay **unresolved** — they are module strings exactly as the
+/// source wrote them (`./mod`, `serde`, `../util`), because import resolution is
+/// post-v0 (spec 09 §6). That is a property of the answer, not a shortcoming of
+/// this reader: "top imports" is a frequency question, which needs no resolution.
+///
+/// A revision shared by several paths in one generation is counted once per
+/// membership row it participates in — the same file reachable at two paths
+/// genuinely does import twice from the generation's point of view.
+pub fn top_imports_for_generation(
+    conn: &Connection,
+    generation_id: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, usize)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ur.reference_text, COUNT(*) AS n \
+         FROM generation_file gf \
+         JOIN unresolved_reference ur ON ur.file_revision_id = gf.file_revision_id \
+         WHERE gf.generation_id = ?1 \
+         GROUP BY ur.reference_text \
+         ORDER BY n DESC, ur.reference_text ASC \
+         LIMIT ?2",
+    )?;
+    stmt.query_map(
+        params![generation_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)),
+    )?
+    .collect()
+}
+
+/// Every `(normalized_path, occurrence_count)` of `generation_id`, ascending by
+/// path (`project_overview`'s tree input, spec 11 §2) — T12-04.
+///
+/// A `LEFT JOIN`, deliberately: a member file with no occurrence at all still
+/// belongs in the tree (it is part of the project), it simply contributes zero
+/// occurrences. An inner join would make such files invisible to the overview.
+pub fn generation_file_occurrence_counts(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<Vec<(String, usize)>> {
+    let mut stmt = conn.prepare(
+        "SELECT gf.normalized_path, COUNT(o.occurrence_id) AS n \
+         FROM generation_file gf \
+         LEFT JOIN generation_unit_occurrence o \
+           ON o.generation_id = gf.generation_id \
+          AND o.normalized_path = gf.normalized_path \
+         WHERE gf.generation_id = ?1 \
+         GROUP BY gf.normalized_path \
+         ORDER BY gf.normalized_path",
+    )?;
+    stmt.query_map(params![generation_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+    })?
+    .collect()
+}
+
+/// Decode one [`OccurrenceMetadata`] row from the shared nine-column projection
+/// used by [`occurrences_by_id`] and [`occurrences_for_path`].
+fn read_occurrence_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OccurrenceMetadata> {
+    let unit_kind_raw: String = r.get(3)?;
+    let unit_kind = UnitKind::from_db(&unit_kind_raw).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            format!("invalid parsed_unit.unit_kind {unit_kind_raw:?}").into(),
+        )
+    })?;
+    Ok(OccurrenceMetadata {
+        occurrence_id: r.get(0)?,
+        normalized_path: r.get(1)?,
+        qualified_name: r.get(2)?,
+        unit_kind,
+        local_name: r.get(4)?,
+        file_revision_id: r.get(5)?,
+        span_start: r.get(6)?,
+        span_end: r.get(7)?,
+        language: r.get(8)?,
+    })
+}
+
 pub fn occurrences_by_id(
     conn: &Connection,
     generation_id: &str,
@@ -524,8 +631,8 @@ pub fn occurrences_by_id(
         .join(",");
     let mut stmt = conn.prepare(&format!(
         "SELECT o.occurrence_id, o.normalized_path, o.qualified_name, \
-                pu.unit_kind, pu.local_name, pu.span_start, pu.span_end, \
-                cb.language \
+                pu.unit_kind, pu.local_name, pu.file_revision_id, \
+                pu.span_start, pu.span_end, cb.language \
          FROM generation_unit_occurrence o \
          JOIN parsed_unit pu ON pu.unit_id = o.unit_id \
          JOIN content_blob cb ON cb.blob_id = pu.blob_id \
@@ -537,26 +644,7 @@ pub fn occurrences_by_id(
         bound.push(id);
     }
     let rows = stmt
-        .query_map(bound.as_slice(), |r| {
-            let unit_kind_raw: String = r.get(3)?;
-            let unit_kind = UnitKind::from_db(&unit_kind_raw).ok_or_else(|| {
-                Error::FromSqlConversionFailure(
-                    3,
-                    Type::Text,
-                    format!("invalid parsed_unit.unit_kind {unit_kind_raw:?}").into(),
-                )
-            })?;
-            Ok(OccurrenceMetadata {
-                occurrence_id: r.get(0)?,
-                normalized_path: r.get(1)?,
-                qualified_name: r.get(2)?,
-                unit_kind,
-                local_name: r.get(4)?,
-                span_start: r.get(5)?,
-                span_end: r.get(6)?,
-                language: r.get(7)?,
-            })
-        })?
+        .query_map(bound.as_slice(), read_occurrence_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     // Restore the caller's order (the fused ranking).

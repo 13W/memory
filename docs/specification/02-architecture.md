@@ -305,6 +305,13 @@ surface as `INCOMPATIBLE_STORE`, disambiguated by a `details` field (e.g.
 progress surfaces as `MIGRATION_IN_PROGRESS`. The runner's own typed errors (13 §3) are
 finer-grained than the wire codes.
 
+As-built note (T12-04, `[SPEC]`): `ErrorCode::PathNotIndexed` (`PATH_NOT_INDEXED`) now exists,
+produced by `get_file_context` when the requested path is not part of the active generation. Like
+`UNSUPPORTED_MODE` it is a tool-contract condition rather than a store/degradation one, so it has
+no row in the table above; `retryable = false`, and `details` separates "no such path in the
+active generation" from "skipped, reason=…" (06 §2.2) — two genuinely different answers to
+"why can't I see my file?".
+
 As-built note (T12-03, `[SPEC]`): `ErrorCode::UnsupportedMode` (`UNSUPPORTED_MODE`) now exists —
 again added by the task that first detects the condition. It is produced when `search_code` is
 asked for `mode="semantic"`, the description leg spec 09 §5 defers past v0 `[FIXED]`; the request
