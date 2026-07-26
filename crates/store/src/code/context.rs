@@ -48,7 +48,7 @@ use std::collections::HashMap;
 
 use local_rag_core::identity::domain::subject_occurrence_context;
 
-use crate::code::{FtsSourceRow, UnitKind};
+use crate::code::{FtsSourceRow, UnitKind, derive_content_blob};
 
 /// The serialization-format version, hashed into the subject
 /// (`subject_occurrence_context(CONTEXT_VERSION, …)`). Bumping it re-keys every
@@ -218,7 +218,6 @@ pub struct ContextSubject {
 pub fn context_subjects_for_generation(
     conn: &rusqlite::Connection,
     generation_id: &str,
-    normalized_text_of: &mut dyn FnMut(&FtsSourceRow) -> Option<String>,
 ) -> rusqlite::Result<Vec<ContextSubject>> {
     let rows = super::occurrences_for_fts(conn, generation_id)?;
 
@@ -247,9 +246,18 @@ pub fn context_subjects_for_generation(
             let Some(Some(source)) = bytes_by_revision.get(row.file_revision_id.as_str()) else {
                 continue;
             };
-            let Some(text) = normalized_text_of(row) else {
+            // Normalized text is recomputed from the very bytes the doc block
+            // is read from, rather than read out of `normalized_text_cache`:
+            // it keeps this reader dependent on `state.sqlite` alone, and it
+            // removes any chance of the envelope's `Code:` disagreeing with the
+            // span its `Doc:` was derived from.
+            let Some(slice) = source.get(row.span_start as usize..row.span_end as usize) else {
                 continue;
             };
+            let Ok(unit_text) = std::str::from_utf8(slice) else {
+                continue;
+            };
+            let text = derive_content_blob(&row.language, unit_text).normalized_text;
             let serialization = serialize(&ContextInput {
                 normalized_path: &row.normalized_path,
                 unit_kind: row.unit_kind,

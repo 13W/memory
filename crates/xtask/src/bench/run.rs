@@ -26,14 +26,16 @@ use local_rag_core::identity::path::CaseSensitivity;
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::redaction::Scanner;
-use local_rag_embed::{BackfillParams, Embedder, InFlight, ProviderEntry, ProviderPool};
+use local_rag_embed::{
+    BackfillParams, EmbedError, Embedder, InFlight, ProviderEntry, ProviderPool, Vector,
+};
 use local_rag_index::classify::ClassifierConfig;
 use local_rag_index::reconcile::{WorktreeMeta, reconcile_once};
 use local_rag_index::scan::{ScanMode, StatCache};
 use local_rag_models::{CATALOG, HttpFetcher, ModelCatalogEntry, install_model};
 use local_rag_projection::{
-    BruteForceProjectionStore, CacheVectorSource, ShardManager, params_for_model_space, shard_dir,
-    switch,
+    BruteForceProjectionStore, CacheVectorSource, ShardManager, ShardParams,
+    representation_key_for, shard_dir, switch,
 };
 use local_rag_protocol::SearchMode;
 use local_rag_search::{QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest};
@@ -78,9 +80,41 @@ impl UuidSource for SeqUuids {
     }
 }
 
+/// Re-labels a provider's declared representation kind (D-016, dev-only).
+///
+/// `OnnxEmbedder` hard-codes `kind: code_raw` in its key and rejects a request
+/// for any other kind, because group 15 is where providers become configurable
+/// per kind. The benchmark needs the *same* model to embed `code_context` texts
+/// so that the comparison isolates the one variable under test — what text the
+/// model sees. Nothing but the kind label changes: model, dimensions, and metric
+/// pass through untouched, so the key stays the key of the same model.
+struct KindAdapter {
+    inner: Arc<dyn Embedder>,
+    kind: RepresentationKind,
+}
+
+impl Embedder for KindAdapter {
+    fn embed(&self, req: local_rag_embed::EmbedRequest) -> Result<Vec<Vector>, EmbedError> {
+        self.inner.embed(local_rag_embed::EmbedRequest {
+            kind: RepresentationKind::CodeRaw,
+            texts: req.texts,
+        })
+    }
+
+    fn key(&self) -> RepresentationKey {
+        RepresentationKey {
+            kind: self.kind,
+            ..self.inner.key()
+        }
+    }
+}
+
 /// Adapts an [`Embedder`] to the search engine's [`QueryEmbedder`] seam.
 struct PoolQueryEmbedder {
     embedder: Arc<dyn Embedder>,
+    /// The kind the query is embedded under — the same one the dense leg
+    /// searches, so query and points always come from one representation.
+    kind: RepresentationKind,
 }
 
 impl QueryEmbedder for PoolQueryEmbedder {
@@ -99,7 +133,7 @@ impl QueryEmbedder for PoolQueryEmbedder {
         let vectors = self
             .embedder
             .embed(local_rag_embed::EmbedRequest {
-                kind: RepresentationKind::CodeRaw,
+                kind: self.kind,
                 texts: vec![query.to_string()],
             })
             .map_err(|e| QueryEmbedError::new(e.to_string()))?;
@@ -128,6 +162,13 @@ pub struct Options {
     pub subdir: Option<String>,
     /// Which legs to run.
     pub mode: SearchMode,
+    /// The representation the dense leg searches over — `code_raw` (v0's
+    /// shipped choice) or `code_context` (D-016's candidate).
+    ///
+    /// Exactly one is registered, embedded, and searched per run, so the two
+    /// runs are independent measurements of the same corpus rather than one run
+    /// with two kinds competing for the same candidate depth.
+    pub dense_kind: RepresentationKind,
 }
 
 /// Run the benchmark end to end.
@@ -161,10 +202,18 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
         &mut std::io::stderr(),
     )
     .map_err(|e| format!("install {}: {e}", entry.model_id))?;
-    let embedder: Arc<dyn Embedder> = Arc::new(
+    let provider: Arc<dyn Embedder> = Arc::new(
         local_rag_models::OnnxEmbedder::open(&model_layout, entry)
             .map_err(|e| format!("open {}: {e}", entry.model_id))?,
     );
+    let embedder: Arc<dyn Embedder> = if options.dense_kind == RepresentationKind::CodeRaw {
+        provider
+    } else {
+        Arc::new(KindAdapter {
+            inner: provider,
+            kind: options.dense_kind,
+        })
+    };
 
     let state = Arc::new(StateDb::open(layout.state_db()).map_err(|e| format!("state: {e}"))?);
     let cache =
@@ -174,9 +223,9 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
     });
     let now_ms = 1_000;
 
-    // 2. Register the worktree and the model space's `code_raw` representation
-    //    under the provider's own key, so shard params and query embedding agree
-    //    by construction (spec 09 §3).
+    // 2. Register the worktree and the model space's representation under the
+    //    provider's own key, so shard params and query embedding agree by
+    //    construction (spec 09 §3).
     let worktree_id = uuids.next_uuid();
     let repo_id = uuids.next_uuid();
     // The worktree root *is* the indexed scope, so restricting the corpus is
@@ -194,7 +243,7 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
         None => checkout.clone(),
     };
     register_worktree(&state, &repo_id, &worktree_id, &root, now_ms).await?;
-    register_representation_for(&state, embedder.as_ref(), now_ms).await?;
+    register_representation_for(&state, embedder.as_ref(), options.dense_kind, now_ms).await?;
 
     // 3. Index.
     let indexed_at = Instant::now();
@@ -261,9 +310,19 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
     let model_space: Uuid = DEFAULT_MODEL_SPACE_ID
         .parse()
         .map_err(|_| "default model space id".to_string())?;
+    // `params_for_model_space` sizes a shard from the space's `code_raw`
+    // representation, which a `--dense-kind code_context` run does not register
+    // (registering both would embed both and make the two runs differ by more
+    // than the variable under test). The params are read from the *registered*
+    // kind instead; production keeps the `code_raw` rule untouched.
     let params = {
         let read = state.open_read().map_err(|e| format!("state read: {e}"))?;
-        params_for_model_space(&read, &model_space).map_err(|e| format!("shard params: {e}"))?
+        let key = representation_key_for(&read, &model_space, options.dense_kind)
+            .map_err(|e| format!("shard params: {e}"))?;
+        ShardParams {
+            dimensions: key.dimensions as usize,
+            distance_metric: key.distance_metric,
+        }
     };
     {
         let read_state = state.open_read().map_err(|e| format!("state read: {e}"))?;
@@ -311,9 +370,11 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
         )),
         Arc::new(PoolQueryEmbedder {
             embedder: embedder.clone(),
+            kind: options.dense_kind,
         }),
         std::time::Duration::from_secs(30),
-    );
+    )
+    .with_dense_kind(projection_kind(options.dense_kind));
     let request_root = request_root(&root);
 
     let mut per_query = Vec::with_capacity(corpus.queries.len());
@@ -385,6 +446,7 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
             // reader needs to reproduce the run.
             corpus_commit: git_short_head(&checkout).unwrap_or_else(|| "unknown".to_string()),
             corpus_subdir: options.subdir.clone(),
+            dense_kind: options.dense_kind.as_str().to_string(),
             corpus_version: corpus.version.clone(),
             model_id: entry.model_id.to_string(),
             mode: options.mode.as_str().to_string(),
@@ -451,24 +513,27 @@ async fn register_worktree(
 async fn register_representation_for(
     state: &StateDb,
     embedder: &dyn Embedder,
+    kind: RepresentationKind,
     now_ms: i64,
 ) -> Result<(), String> {
     let key = embedder.key();
+    let label = format!("bench-{}", kind.as_str());
     state
         .writer()
         .transaction(move |tx| {
-            let id = register_representation(tx, "bench-code-raw", &key, now_ms)?;
-            set_model_space_representation(
-                tx,
-                DEFAULT_MODEL_SPACE_ID,
-                RepresentationKind::CodeRaw,
-                &id,
-                true,
-                now_ms,
-            )
+            let id = register_representation(tx, &label, &key, now_ms)?;
+            set_model_space_representation(tx, DEFAULT_MODEL_SPACE_ID, kind, &id, true, now_ms)
         })
         .await
         .map_err(|e| format!("register representation: {e}"))
+}
+
+/// The projection crate's spelling of a store representation kind.
+fn projection_kind(kind: RepresentationKind) -> local_rag_projection::RepresentationKind {
+    match kind {
+        RepresentationKind::CodeContext => local_rag_projection::RepresentationKind::CodeContext,
+        _ => local_rag_projection::RepresentationKind::CodeRaw,
+    }
 }
 
 fn request_root(root: &Path) -> RequestRoot {

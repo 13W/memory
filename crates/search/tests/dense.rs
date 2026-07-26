@@ -540,9 +540,58 @@ async fn a_healthy_search_returns_dense_candidates_by_occurrence_id() {
     );
 }
 
+/// `with_dense_kind` moves the *whole* dense leg — the point filter and the
+/// query's representation together (D-016).
+///
+/// The default is asserted in the same test, because the risk being guarded is
+/// precisely that one of the two halves moves and the other does not: a leg that
+/// searched `code_context` points with a `code_raw` query key would still return
+/// results, just meaningless ones.
+#[tokio::test]
+async fn the_dense_kind_selects_both_the_points_and_the_query_representation() {
+    let (_home, layout, state, cache, _wt, _gen, path, occurrences) =
+        established(70, 4, DistanceMetric::Dot).await;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = engine_with(
+        &state,
+        &cache,
+        layout,
+        Arc::new(RecordingEmbedder { seen: seen.clone() }),
+        ShardParams::with_dimensions(DIMS),
+    )
+    .with_dense_kind(RepresentationKind::CodeContext);
+
+    let snapshot = engine
+        .search_code_instrumented(request(&path, 5), NOW + 1, &NoopObserver)
+        .await
+        .expect("no infrastructure error")
+        .expect("healthy tuple must not be an error envelope");
+
+    assert_eq!(
+        seen.lock().expect("mutex poisoned")[0].kind,
+        local_rag_store::RepresentationKind::CodeContext,
+        "the query follows the searched kind"
+    );
+    assert_eq!(
+        snapshot.dense.len(),
+        occurrences.len(),
+        "one hit per occurrence, now from the context points"
+    );
+    assert_eq!(
+        snapshot
+            .dense
+            .iter()
+            .map(|h| h.occurrence_id.clone())
+            .collect::<HashSet<_>>(),
+        occurrences.iter().cloned().collect::<HashSet<_>>()
+    );
+}
+
 /// The query is embedded with the **active** model space's `code_raw`
 /// representation — its `model_id`, `dimensions` and `distance_metric`, not a
-/// store-wide default.
+/// store-wide default. `code_raw` because that is the untouched default
+/// (spec 09 §3: "v0 ships `code_raw`") — no `with_dense_kind` here.
 #[tokio::test]
 async fn the_query_is_embedded_with_the_active_representation() {
     let (_home, layout, state, cache, _wt, _gen, path, _occ) =

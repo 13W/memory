@@ -239,13 +239,50 @@ async fn occurrences_collapse_to_distinct_content_subjects() {
 }
 
 /// A required kind whose subject function does not exist yet is reported, not
-/// silently dropped.
+/// silently dropped. `memory` is the last one (group 14).
 #[tokio::test(flavor = "multi_thread")]
 async fn kinds_without_a_subject_function_are_reported() {
     let (_home, db) = open_state();
     let (_worktree, generation) = seed_generation(&db, 10, &["fn a() {}"]).await;
     require_kind(&db, REPRESENTATION_ID, RepresentationKind::CodeRaw).await;
     require_kind(
+        &db,
+        "88888888-8888-7888-8888-888888888888",
+        RepresentationKind::Memory,
+    )
+    .await;
+
+    let read = db.open_read().expect("read");
+    let generations: BTreeSet<String> = [generation].into_iter().collect();
+    let set = expected_subject_keys(&read, DEFAULT_MODEL_SPACE_ID, &generations).expect("subjects");
+
+    assert_eq!(
+        set.unsupported.iter().copied().collect::<Vec<_>>(),
+        vec![RepresentationKind::Memory],
+        "memory's tables arrive in group 14"
+    );
+    assert!(
+        set.keys
+            .iter()
+            .all(|k| k.representation_id == REPRESENTATION_ID),
+        "no key is minted for an unsupported kind"
+    );
+}
+
+/// Context subjects do **not** share across occurrences (spec 03 §4.2, D-016).
+///
+/// The same three occurrences that collapse to two `code_raw` subjects stay three
+/// under `code_context`: the envelope names the path, so two occurrences of one
+/// content blob describe different things and must be embedded separately. Both
+/// halves are asserted against the same generation so the difference is the kind
+/// and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_subjects_do_not_share_across_occurrences() {
+    let (_home, db) = open_state();
+    let shared = "fn shared() -> u8 { 1 }";
+    let (_worktree, generation) = seed_generation(&db, 1, &[shared, shared, "fn other() {}"]).await;
+    let raw_id = require_kind(&db, REPRESENTATION_ID, RepresentationKind::CodeRaw).await;
+    let context_id = require_kind(
         &db,
         "88888888-8888-7888-8888-888888888888",
         RepresentationKind::CodeContext,
@@ -256,16 +293,27 @@ async fn kinds_without_a_subject_function_are_reported() {
     let generations: BTreeSet<String> = [generation].into_iter().collect();
     let set = expected_subject_keys(&read, DEFAULT_MODEL_SPACE_ID, &generations).expect("subjects");
 
+    assert!(set.unsupported.is_empty(), "code_context is supported now");
+    let per_kind = set.expected_per_kind(&[
+        (RepresentationKind::CodeRaw, raw_id),
+        (RepresentationKind::CodeContext, context_id.clone()),
+    ]);
     assert_eq!(
-        set.unsupported.iter().copied().collect::<Vec<_>>(),
-        vec![RepresentationKind::CodeContext],
-        "code_context's serialization is still [OPEN] (spec 09 §3)"
+        per_kind.get(&RepresentationKind::CodeRaw),
+        Some(&2),
+        "content shares"
+    );
+    assert_eq!(
+        per_kind.get(&RepresentationKind::CodeContext),
+        Some(&3),
+        "context does not"
     );
     assert!(
         set.keys
             .iter()
-            .all(|k| k.representation_id == REPRESENTATION_ID),
-        "no key is minted for an unsupported kind"
+            .filter(|k| k.representation_id == context_id)
+            .all(|k| k.subject_kind == SubjectKind::OccurrenceContext),
+        "context subjects are occurrence_context, not content_blob"
     );
 }
 

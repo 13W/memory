@@ -110,12 +110,23 @@ pub struct Provenance {
     pub model_id: String,
     /// Search mode the queries ran in.
     pub mode: String,
+    /// The representation the dense leg searched (D-016). Two runs that differ
+    /// only here measure different *representations* of the same corpus, so —
+    /// like `corpus_subdir` — it belongs in the provenance rather than in a
+    /// filename.
+    #[serde(default = "default_dense_kind")]
+    pub dense_kind: String,
     /// How many files were indexed.
     pub files_indexed: usize,
     /// How many occurrences the generation holds.
     pub occurrences: usize,
     /// Host triple.
     pub host: String,
+}
+
+/// Runs archived before D-016 have no `dense_kind`; they all searched `code_raw`.
+fn default_dense_kind() -> String {
+    "code_raw".to_string()
 }
 
 /// The metric-level comparison against v1.
@@ -224,6 +235,7 @@ impl BenchReport {
         ));
         out.push_str(&format!("| Model | `{}` |\n", p.model_id));
         out.push_str(&format!("| Mode | `{}` |\n", p.mode));
+        out.push_str(&format!("| Dense representation | `{}` |\n", p.dense_kind));
         out.push_str(&format!(
             "| Corpus size | {} files, {} occurrences |\n",
             p.files_indexed, p.occurrences
@@ -301,6 +313,7 @@ mod tests {
             corpus_subdir: Some("src".to_string()),
             model_id: "embeddinggemma-300m".to_string(),
             mode: "hybrid".to_string(),
+            dense_kind: "code_raw".to_string(),
             files_indexed: 96,
             occurrences: 544,
             host: "aarch64-apple-darwin".to_string(),

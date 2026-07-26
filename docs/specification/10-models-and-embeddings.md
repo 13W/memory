@@ -64,7 +64,8 @@ drift are impossible by constraint `[FIXED]`. `embedding_cache` rows reference
 `representation_id`, never inline model params.
 
 Representation kinds: `code_raw`, `code_context`, `structural_description` (post-v0),
-`memory`. Subject hashing per kind: 03 §1.2.
+`memory`. Subject hashing per kind: 03 §1.2. Which of the two code kinds the dense leg *searches*
+is 09 §3's decision — `code_raw`, decided by the benchmark under D-016.
 
 As-built note (T11-02, `[SPEC]`): `embedding_cache` itself now exists
 (`local_rag_store::cache::embedding`, migration 4, spec 03 §4.2's own as-built note has the full
@@ -124,9 +125,10 @@ from both sides — the worker embeds what is missing from that set, eviction re
 in it — so the two can never chase each other. Expected **subjects**, not points: spec 05 §4's point
 set is `occurrences × required kinds`, collapsed here by each kind's subject function, which for
 `code_raw` is a real N:1 collapse over `blob_id` (§4.2 `[FIXED]`: content-blob embeddings are shared
-across paths). A `required` kind with no subject function — `code_context` (`[OPEN]`, 09 §3) or
-`memory` (group 14) — makes the worker refuse with `UnsupportedRequiredKind` rather than report zero
-expected, which `Coverage::fully_covered` would read as "covered".
+across paths) and for `code_context` is deliberately **not** a collapse (the envelope carries the
+path; D-016). A `required` kind with no subject function — `memory` alone since D-016 (group 14) —
+makes the worker refuse with `UnsupportedRequiredKind` rather than report zero expected, which
+`Coverage::fully_covered` would read as "covered".
 
 **Resumability is recomputation, not a journal.** There is no progress table: each run recomputes
 `missing = expected \ valid_cached`, embeds in bounded batches outside any transaction (02 §5, "L4

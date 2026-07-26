@@ -45,8 +45,8 @@ use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
     CacheDb, CacheOpenError, CacheWriteError, Coverage, CoverageEntry, EmbeddingKey, ExternalPins,
     ModelSpaceState, RepresentationKind, RetentionParams, StateDb, SubjectSet, WriteError,
-    delete_embedding, derive_content_blob, expected_subject_keys, get_embedding,
-    get_normalized_text, insert_embedding, model_space_required_kinds,
+    context_subjects_for_generation, delete_embedding, derive_content_blob, expected_subject_keys,
+    get_embedding, get_normalized_text, insert_embedding, model_space_required_kinds,
     model_space_required_representation_ids, occurrences_for_fts, pinned_generations,
     recompute_coverage, rusqlite, source_bytes, transition_model_space, verify_cached_embedding,
     verify_cached_text, write_model_space_coverage,
@@ -479,23 +479,46 @@ async fn embed_and_write(
         return Ok(());
     }
 
-    // subject_hash → (blob_id, source row) for every expected subject.
+    // subject_hash → (blob_id, source row) for every expected `code_raw` subject.
     let sources = blob_index(state_read, expected)?;
+    // …and subject_hash → envelope for every `code_context` one. Built only when
+    // some pending subject actually needs it: the pass reads every source byte of
+    // the expected generations, which a `code_raw`-only run has no reason to pay.
+    let contexts = if pending
+        .iter()
+        .any(|p| p.key.subject_kind == local_rag_store::SubjectKind::OccurrenceContext)
+    {
+        context_index(state_read, expected)?
+    } else {
+        BTreeMap::new()
+    };
 
     let mut written: Vec<(EmbeddingKey, i64, Vec<f32>)> = Vec::new();
     for chunk in pending.chunks(params.embed_batch.max(1)) {
         let mut texts = Vec::with_capacity(chunk.len());
         let mut keys = Vec::with_capacity(chunk.len());
         for subject in chunk {
-            let Some(source) = sources.get(subject.key.subject_hash.as_str()) else {
-                // Every expected key came from a generation in `expected`, so its
-                // source must be in the index; an absence means the two views
-                // disagree, which is a defect, not a recoverable state.
-                return Err(BackfillError::MissingSource {
-                    blob_id: subject.key.subject_hash.clone(),
-                });
+            // Every expected key came from a generation in `expected`, so its
+            // source must be in the matching index; an absence means the two
+            // views disagree, which is a defect, not a recoverable state.
+            let text = match subject.key.subject_kind {
+                local_rag_store::SubjectKind::OccurrenceContext => contexts
+                    .get(subject.key.subject_hash.as_str())
+                    .cloned()
+                    .ok_or_else(|| BackfillError::MissingSource {
+                        blob_id: subject.key.subject_hash.clone(),
+                    })?,
+                _ => {
+                    let source =
+                        sources
+                            .get(subject.key.subject_hash.as_str())
+                            .ok_or_else(|| BackfillError::MissingSource {
+                                blob_id: subject.key.subject_hash.clone(),
+                            })?;
+                    normalized_text(state_read, cache, source)?
+                }
             };
-            texts.push(normalized_text(state_read, cache, source)?);
+            texts.push(text);
             keys.push(subject.key.clone());
         }
 
@@ -622,6 +645,28 @@ fn is_fatal(err: &EmbedError) -> bool {
 }
 
 /// Resolve every expected subject's source row, keyed by subject hash.
+/// `subject_hash → envelope` for every `code_context` subject of the expected
+/// generations (D-016).
+///
+/// Unlike `code_raw`, whose text is recomputed per subject on demand, a context
+/// envelope is produced by the same pass that computes its hash — the hash *is*
+/// the hash of that text, so carrying it here costs nothing and removes any way
+/// for the two to disagree.
+fn context_index(
+    state: &Connection,
+    expected: &SubjectSet,
+) -> Result<BTreeMap<String, String>, BackfillError> {
+    let mut index: BTreeMap<String, String> = BTreeMap::new();
+    for generation_id in &expected.generations {
+        for subject in context_subjects_for_generation(state, generation_id)? {
+            index
+                .entry(subject.subject_hash)
+                .or_insert(subject.serialization);
+        }
+    }
+    Ok(index)
+}
+
 fn blob_index(
     state: &Connection,
     expected: &SubjectSet,

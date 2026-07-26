@@ -183,10 +183,8 @@ pub fn shard_dir(layout: &StoreLayout, worktree_id: &Uuid, model_space_id: &Uuid
     layout.projection_shard_space(&worktree_id.to_string(), &model_space_id.to_string())
 }
 
-/// The canonical `RepresentationKey` of `model_space_id`'s **`code_raw`**
-/// representation (spec 03 §2.2) — the one representation v0's dense leg
-/// searches over (spec 09 §3: "v0 ships `code_raw`"; `code_context` is `[OPEN]`,
-/// decided by the benchmark).
+/// The canonical `RepresentationKey` of `model_space_id`'s representation of
+/// `kind` (spec 03 §2.2).
 ///
 /// Two callers, deliberately sharing one lookup (T12-02): [`params_for_model_space`]
 /// takes `dimensions`/`distance_metric` from it to open a shard, and the search
@@ -194,21 +192,40 @@ pub fn shard_dir(layout: &StoreLayout, worktree_id: &Uuid, model_space_id: &Uuid
 /// query with the *same* model the points were embedded with. Reading them from
 /// one place is what keeps "query embedding from the active model
 /// representation" (spec 09 §3) true by construction rather than by convention.
-pub fn code_raw_representation_key(
+///
+/// D-016 generalized this from `code_raw`-only so `code_context` can participate
+/// in the benchmark that spec 09 §3's `[OPEN]` names as the decider. The shard
+/// params stay on `code_raw` (see [`params_for_model_space`]): representations of
+/// one model space share a model, hence dimensions and metric.
+pub fn representation_key_for(
     conn: &rusqlite::Connection,
     model_space_id: &Uuid,
+    kind: local_rag_store::RepresentationKind,
 ) -> Result<RepresentationKey, ModelSwitchError> {
     let id = model_space_id.to_string();
     let representations = model_space_required_representation_ids(conn, &id)?;
     let representation_id = representations
         .into_iter()
-        .find(|(kind, _)| *kind == local_rag_store::RepresentationKind::CodeRaw)
+        .find(|(k, _)| *k == kind)
         .map(|(_, id)| id)
         .ok_or_else(|| ModelSwitchError::NoShardParams {
             model_space_id: id.clone(),
         })?;
     representation_key(conn, &representation_id)?
         .ok_or(ModelSwitchError::NoShardParams { model_space_id: id })
+}
+
+/// [`representation_key_for`] fixed to `code_raw` — the representation v0's dense
+/// leg searches over by default (spec 09 §3: "v0 ships `code_raw`").
+pub fn code_raw_representation_key(
+    conn: &rusqlite::Connection,
+    model_space_id: &Uuid,
+) -> Result<RepresentationKey, ModelSwitchError> {
+    representation_key_for(
+        conn,
+        model_space_id,
+        local_rag_store::RepresentationKind::CodeRaw,
+    )
 }
 
 /// The [`ShardParams`] a model space's shards are opened with: the `dimensions`

@@ -79,12 +79,13 @@ decision.
 (`/opt/soft/local-rag` @ `31dfba2`) дало четыре расхождения, три из них устранимы.
 Каждая ступень измерена отдельно, чтобы вклад был виден, а не смешался:
 
-| Ступень | Корпус | Окно | Файлы / occ | Hit@1 | Hit@3 | Hit@5 | MRR |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| исходный прогон | весь репозиторий | 256 | 101 / 581 | 0.4286 | 0.6939 | 0.7755 | 0.5646 |
-| **A** — корпус `src/` | `src/` | 256 | 93 / 545 | 0.4490 | 0.6939 | 0.7755 | **0.5680** |
-| **A + B** — окно 1024 | `src/` | 1024 | 93 / 545 | 0.4490 | 0.6735 | 0.7959 | **0.5782** |
-| v1 бейзлайн | `src/` | 3000 симв. | 96 / 544 | 0.5918 | 0.7959 | 0.8367 | **0.6963** |
+| Ступень | Корпус | Окно | Представление | Файлы / occ | Hit@1 | Hit@3 | Hit@5 | MRR |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| исходный прогон | весь репозиторий | 256 | `code_raw` | 101 / 581 | 0.4286 | 0.6939 | 0.7755 | 0.5646 |
+| **A** — корпус `src/` | `src/` | 256 | `code_raw` | 93 / 545 | 0.4490 | 0.6939 | 0.7755 | **0.5680** |
+| **A + B** — окно 1024 | `src/` | 1024 | `code_raw` | 93 / 545 | 0.4490 | 0.6735 | 0.7959 | **0.5782** |
+| **C** — конверт | `src/` | 1024 | `code_context` | 93 / 545 | 0.4082 | 0.7347 | 0.8163 | **0.5748** |
+| v1 бейзлайн | `src/` | 3000 симв. | конверт | 96 / 544 | 0.5918 | 0.7959 | 0.8367 | **0.6963** |
 
 **A — корпус.** v1 индексировал строго `<root>/src/` (`benchmark.ts::collectSrcFiles`),
 92 `.ts` + 4 `.json` = ровно записанные 96 файлов. Первый прогон v2 взял весь
@@ -101,18 +102,50 @@ decision.
 Вместе A и B отыграли **0.0136 из 0.1317** разрыва — около десятой части. Основное
 расхождение остаётся за **C**.
 
-**C — что именно эмбеддится.** v1 никогда не эмбеддил голый код: он строил
-размеченный контекстный конверт (`benchmark.ts::buildEmbedCtx`) из пути, типа,
-имени, докблока, сигнатуры **и** тела. v2's `code_raw` — это
+**C — что именно эмбеддится. Гипотеза не подтвердилась.** v1 никогда не эмбеддил
+голый код: он строил размеченный контекстный конверт (`benchmark.ts::buildEmbedCtx`)
+из пути, типа, имени, докблока, сигнатуры **и** тела. v2's `code_raw` — это
 `normalize(source_blob[span])`, без единого из этих полей. Отдельный
 `description_vector` под LLM-описания у v1 тоже был, но в бейзлайне он **выключен**,
 так что к разрыву отношения не имеет.
+
+Конверт воспроизведён как представление `code_context` (spec 03 §4.2, spec 09 §3 —
+это и есть тот `[OPEN]`, который спека поручала решить бенчмарку) и измерен на том же
+корпусе, тем же окном, тем же квантованием: **MRR 0.5748 против 0.5782 у `code_raw`**.
+Сдвиг −0.0034 — треть от того, что на корпусе в 49 запросов даёт один запрос,
+переехавший на одну позицию. Разрыв с v1 конверт **не закрывает**.
+
+Что конверт действительно меняет — это обмен точности на полноту: **+0.0612 Hit@3 и
++0.0204 Hit@5 против −0.0408 Hit@1**. Обмен настолько заметен, что пересекает порог
+гейта: `code_context` проходит `Recall@5 ≥ 0.80` (0.8163), а `code_raw` — нет (0.7959).
+По MRR обе ноги промахиваются примерно одинаково, так что меняется, **какое** условие
+падает, а не падает ли гейт.
+
+Контрольный прогон `code_raw` после всей проводки дал ровно A+B (0.5782) — то есть
+дефолт не сдвинулся ни на разряд, и разница между строками C — это разница
+представлений, а не побочный эффект рефакторинга. Артефакты:
+`run-v2-2026-07-26-stage-c-code-raw.json` и `…-code-context.json` (записаны раннером
+как есть; поле `provenance.dense_kind` появилось вместе с этим прогоном, так что в
+более ранних артефактах его нет — все они `code_raw`).
+
+**Решение по 09 §3:** v0 ищет по `code_raw`. Он лучше на первой позиции, дешевле как
+субъект (N:1-разделение по контенту: 538 субъектов против 544 на те же 545 occurrence,
+и никакой переэмбеддинг при переименовании файла), и ни одно из измерений не говорит
+платить больше. Реализация `code_context` остаётся зарегистрированным и searchable
+представлением (`--dense-kind`), так что решение можно перемерить, а не переписывать.
 
 **D — веса.** v1 через сборку Ollama, v2 — `model_quantized.onnx` (q8). Уравнять
 нечем; остаточное расхождение.
 
 Остаточные различия, которые не устраняются и записаны явно: 4 `.json`-файла, которые
 v1 индексировал, а v2 не берёт (v0-языки ts/js/rust, ADR-0001), и квантование весов.
+
+**Итог ступеней A–C: разрыв 0.1181 MRR остаётся необъяснённым.** A и B отыграли 0.0136,
+C — ничего. Из названных кандидатов не измерен ровно один: **квантование** (v1 шёл через
+сборку Ollama, v2 — `model_quantized.onnx`, q8). Дальнейшая подгонка на этих же 49
+запросах без отложенной выборки (веса BM25, глубина кандидатов, ещё окно) не проводится
+намеренно: корпус односоставный, один релевантный документ на запрос, и цикл
+«померили → подкрутили → перемерили» на нём переобучается быстрее, чем улучшает.
 
 ### What the per-leg split rules in and out
 
@@ -123,16 +156,19 @@ v1 индексировал, а v2 не берёт (v0-языки ts/js/rust, AD
   Same model family, same corpus, same queries, and neither v1 nor v2 applies
   EmbeddingGemma's task prefixes — so the difference is in *what text gets
   embedded*, not in how it is searched.
-- **Leading candidate: v1 embedded documentation, v2 does not.** v1's chunker
-  attached each symbol's preceding JSDoc/`//` block to the embedded text
+- **Leading candidate at the time: v1 embedded documentation, v2 does not.** v1's
+  chunker attached each symbol's preceding JSDoc/`//` block to the embedded text
   (`src/indexer/parser.ts::extractDoc`/`extractJsDoc`/`extractLineComments`);
   v2's tree-sitter adapters carry no comment handling at all, so a unit's
   embedded text is bare code. For a corpus whose queries are natural-language
   descriptions ("retry embedding request on failure with backoff"), the doc
-  comment is precisely the matching text.
-- **Secondary candidates, unmeasured**: the installed weights are
-  `model_quantized.onnx` (v1 went through Ollama's own build), and
-  `MAX_SEQUENCE_TOKENS = 256` truncates long units.
+  comment looked like precisely the matching text. **Measured in stage C and
+  disproved** — the full v1 envelope (doc block included) moves MRR by −0.0034;
+  see the stage table below.
+- **Secondary candidates**: `MAX_SEQUENCE_TOKENS = 256` truncated long units
+  (measured in stage B: +0.0102 MRR at 1024), and the installed weights are
+  `model_quantized.onnx` where v1 went through Ollama's own build (**still
+  unmeasured** — the one named candidate left).
 
 None of these is fixed here: changing what a unit's text contains alters
 `content_blob` derivation and invalidates every cache, which is well outside

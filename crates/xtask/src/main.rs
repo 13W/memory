@@ -26,11 +26,13 @@ fn main() -> ExitCode {
 }
 
 /// `cargo xtask bench --corpus <dir> [--out <path>] [--mode hybrid|lexical|code]`
+/// `[--dense-kind code_raw|code_context]`
 fn run_bench() -> ExitCode {
     let mut corpus_dir: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut mode = local_rag_protocol::SearchMode::Hybrid;
     let mut subdir: Option<String> = None;
+    let mut dense_kind = local_rag_store::RepresentationKind::CodeRaw;
 
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
@@ -38,6 +40,27 @@ fn run_bench() -> ExitCode {
             "--corpus" => corpus_dir = args.next().map(PathBuf::from),
             "--out" => out = args.next().map(PathBuf::from),
             "--subdir" => subdir = args.next(),
+            "--dense-kind" => {
+                let Some(raw) = args.next() else {
+                    eprintln!("--dense-kind needs a value");
+                    return ExitCode::from(2);
+                };
+                match local_rag_store::RepresentationKind::from_db(&raw) {
+                    Some(local_rag_store::RepresentationKind::CodeRaw) => {
+                        dense_kind = local_rag_store::RepresentationKind::CodeRaw;
+                    }
+                    Some(local_rag_store::RepresentationKind::CodeContext) => {
+                        dense_kind = local_rag_store::RepresentationKind::CodeContext;
+                    }
+                    // The other two kinds exist in the schema but have no code
+                    // subjects to embed, so a run over them would measure an
+                    // empty shard rather than fail loudly.
+                    _ => {
+                        eprintln!("--dense-kind must be code_raw or code_context, got {raw:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--mode" => {
                 let Some(raw) = args.next() else {
                     eprintln!("--mode needs a value");
@@ -60,7 +83,8 @@ fn run_bench() -> ExitCode {
 
     let Some(corpus_dir) = corpus_dir else {
         eprintln!(
-            "usage: cargo xtask bench --corpus <dir> [--subdir <rel>] [--out <path>] [--mode <mode>]"
+            "usage: cargo xtask bench --corpus <dir> [--subdir <rel>] [--out <path>] \
+             [--mode <mode>] [--dense-kind code_raw|code_context]"
         );
         return ExitCode::from(2);
     };
@@ -77,6 +101,7 @@ fn run_bench() -> ExitCode {
         corpus_dir,
         subdir,
         mode,
+        dense_kind,
     })) {
         Ok(report) => report,
         Err(e) => {

@@ -178,8 +178,9 @@ registered, since this is the previously accepted T08-02 scope boundary, not a n
 ## 3. Dense leg
 
 - Query embedding computed with the representation of the active model space; **content vs
-  context representation choice is decided by the benchmark** `[OPEN]` — v0 ships `code_raw`,
-  `code_context` participates in the spike/benchmark.
+  context representation choice is decided by the benchmark** — v0 ships `code_raw`,
+  `code_context` participates in the spike/benchmark. `[OPEN]` **closed by D-016**, see the
+  as-built note below.
 - Distance per `representation.distance_metric`.
 
 As-built note (T12-02, `[SPEC]`): the leg is `SearchEngine::dense_leg`
@@ -187,8 +188,9 @@ As-built note (T12-02, `[SPEC]`): the leg is `SearchEngine::dense_leg`
 the production brute-force backend (`local_rag_projection::BruteForceProjectionStore`, 05 §1's
 as-built note, ADR-0003).
 
-**Representation selection.** The active model space's `code_raw` `RepresentationKey` is read once
-per search via the new `local_rag_projection::code_raw_representation_key` — the same lookup
+**Representation selection.** The active model space's `RepresentationKey` for the searched kind
+is read once per search via `local_rag_projection::representation_key_for` (D-016 generalized
+T12-02's `code_raw_representation_key`, which survives as the `code_raw`-fixed wrapper) — the same lookup
 `params_for_model_space` uses to size and score the shard, factored out so the query cannot be
 embedded with a different `model_id`/`dimensions`/`distance_metric` than the points it is compared
 against. Reading it under the lock is deliberate: the representation is part of the active tuple,
@@ -210,8 +212,8 @@ store with no provider degrades visibly instead of silently serving a meaningles
 `dot` raw, `cosine` normalized (a zero-norm vector scores `0.0`, never `NaN`, which would poison
 the sort), `l2` **negated** so nearer still sorts first.
 
-**`code_raw` only, and how.** The shard holds a point per (occurrence × required representation
-kind), so today's default space also stores `code_context` points. The chosen backend has no
+**One kind only, and how.** The shard holds a point per (occurrence × required representation
+kind), so a space that requires both also stores `code_context` points. The chosen backend has no
 payload filter at all (ADR-0003: `filtered_hnsw_available = false`), so the leg requests
 `candidate_depth(limit) × |required kinds|` and filters by kind afterwards. That over-fetch is a
 heuristic, not a proof — so when the window comes back full and still yields fewer than
@@ -231,6 +233,36 @@ returns `DenseHit { occurrence_id, rank, score }`, deliberately the same shape a
 **No filters inside a shard.** `DenseQuery` carries a vector and `k` and nothing else; a shard is
 per `(worktree, model_space)` (05 §2) and holds only the active generation's points after a
 `switch`, so "no tenant/generation filter dependence" is structural, not enforced at query time.
+
+As-built note (D-016, `[SPEC]`, closes the `[OPEN]` above): **v0 searches `code_raw`.** The choice
+was made the way this section required — by the benchmark, on one corpus with one model and one
+window, changing nothing but the embedded text:
+
+| dense representation | Hit@1 | Hit@3 | Hit@5 / Recall@5 | MRR |
+| --- | --- | --- | --- | --- |
+| `code_raw` | **0.4490** | 0.6735 | 0.7959 | **0.5782** |
+| `code_context` | 0.4082 | **0.7347** | **0.8163** | 0.5748 |
+| v1 baseline | 0.5918 | 0.7959 | 0.8367 | 0.6963 |
+
+`code_context` renders the labelled envelope v1 embedded (03 §4.2's as-built note): path, unit
+kind, name, doc block, signature, then the code. The hypothesis it was built to test — that this
+envelope explains v2's regression against v1 — is **not confirmed**: MRR moves by −0.0034, a third
+of what a single query changing rank would move it on a 49-query corpus. What the envelope does
+buy is *recall over precision*: +0.0612 Hit@3 and +0.0204 Hit@5 against −0.0408 Hit@1. On this
+corpus that trade even crosses one gate threshold — `code_context` passes `Recall@5 ≥ 0.80` where
+`code_raw` does not — while both fail the MRR budget by roughly the same margin, so the trade
+changes which threshold fails, not whether the gate fails.
+
+v0 therefore ships `code_raw`: it is the better ranker at rank 1, it is the cheaper subject (N:1
+content sharing — 538 subjects against `code_context`'s 544 for the same 545 occurrences, and no
+re-embedding when a file moves), and nothing in the measurement argues for paying more. The
+`code_context` implementation stays: it is a registered, searchable representation
+(`SearchEngine::with_dense_kind`, `--dense-kind` in `cargo xtask bench`), so the decision is
+re-measurable rather than re-implementable when the model, the window, or the corpus changes.
+
+Artifacts: `fixtures/search/baseline/run-v2-2026-07-26-stage-c-{code-raw,code-context}.json`;
+reproduce with `ORT_DYLIB_PATH=<lib> cargo xtask bench --corpus <v1 checkout> --subdir src
+--dense-kind code_raw|code_context`.
 
 **Degradation, never an error.** Every dense failure — no `code_raw` representation, no provider,
 a provider error, an embedding whose length disagrees with the representation, an unopenable or
