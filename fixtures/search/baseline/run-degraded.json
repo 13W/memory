@@ -1,0 +1,41 @@
+{
+  "_comment": "A DELIBERATELY DEGRADED run, committed as a fixture (T12-05). Not a measurement of anything: every metric is roughly half the v1 baseline, so a gate configured against that baseline must reject it. `crates/xtask/src/bench/gate.rs` loads this file and asserts the rejection, which is what keeps the gate from silently becoming a no-op if a threshold is ever mis-edited.",
+  "schema_version": 1,
+  "provenance": {
+    "v2_commit": "degraded-fixture",
+    "corpus_path": "fixture",
+    "corpus_commit": "fixture",
+    "model_id": "fixture",
+    "mode": "hybrid",
+    "files_indexed": 0,
+    "occurrences": 0,
+    "host": "fixture",
+    "corpus_version": "1.0.0"
+  },
+  "metrics": {
+    "hit_at_1": 0.2857142857142857,
+    "hit_at_3": 0.3877551020408163,
+    "hit_at_5": 0.42857142857142855,
+    "mrr": 0.3418367346938775,
+    "recall_at_5": 0.42857142857142855
+  },
+  "baseline": {
+    "hit_at_1": 0.5918367346938775,
+    "hit_at_3": 0.7959183673469388,
+    "hit_at_5": 0.8367346938775511,
+    "mrr": 0.6962585034013605
+  },
+  "diff": {
+    "hit_at_1": -0.3061224489795918,
+    "hit_at_3": -0.4081632653061225,
+    "hit_at_5": -0.40816326530612257,
+    "mrr": -0.354421768707483
+  },
+  "per_query": [],
+  "latency": {
+    "index_ms": 0,
+    "embed_ms": 0,
+    "search_p50_ms": 0.0,
+    "search_p95_ms": 0.0
+  }
+}

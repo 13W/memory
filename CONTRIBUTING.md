@@ -19,6 +19,29 @@ This is exactly what CI runs. `xtask` is a thin Rust runner (crate
 
 After the initial `cargo fetch`, the full check runs **offline**.
 
+## Search benchmark (`cargo xtask bench`)
+
+The 49-query search benchmark (spec 14 §7, T12-05) is a **separate** command and
+deliberately *not* part of `cargo xtask ci`:
+
+```
+ORT_DYLIB_PATH=<libonnxruntime.dylib> cargo xtask bench --corpus <checkout>
+```
+
+It indexes a real corpus checkout, embeds it with the default model, projects it,
+runs all 49 queries, and writes a report next to the recorded baselines in
+`fixtures/search/baseline/`. Three reasons it stays out of the gate: it needs
+model weights (~315 MiB, fetched by the pinned catalog on first run and cached in
+`$LOCAL_RAG_BENCH_MODEL_HOME`, default `~/.local/share/local-rag-bench`), a
+`libonnxruntime` this repository does not ship (bundling is T17-03), and a corpus
+checkout that is not part of this repository. Everything *scored* — corpus
+integrity, matching semantics, metric math, the gate — is ordinary
+`cargo test -p xtask` and therefore does run in `ci`.
+
+`crates/xtask` consequently depends on the product crates. They are all already
+workspace members, so this adds **no** package to `Cargo.lock`; the cost is build
+time for a dev-only crate that `default-members` already excludes.
+
 ## Toolchain / MSRV
 
 - Pinned toolchain: **1.96.1** via `rust-toolchain.toml` (components `rustfmt`,

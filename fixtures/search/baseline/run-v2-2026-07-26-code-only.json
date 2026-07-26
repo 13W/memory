@@ -1,0 +1,409 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "v2_commit": "f958875",
+    "corpus_path": "/opt/soft/local-rag",
+    "corpus_commit": "31dfba2",
+    "model_id": "embeddinggemma-300m",
+    "mode": "code",
+    "files_indexed": 101,
+    "occurrences": 581,
+    "host": "aarch64-macos",
+    "corpus_version": "1.0.0"
+  },
+  "metrics": {
+    "hit_at_1": 0.32653061224489793,
+    "hit_at_3": 0.6938775510204082,
+    "hit_at_5": 0.7551020408163265,
+    "mrr": 0.493877551020408,
+    "recall_at_5": 0.7551020408163265
+  },
+  "baseline": {
+    "hit_at_1": 0.5918367346938775,
+    "hit_at_3": 0.7959183673469388,
+    "hit_at_5": 0.8367346938775511,
+    "mrr": 0.6962585034013605
+  },
+  "diff": {
+    "hit_at_1": -0.2653061224489796,
+    "hit_at_3": -0.10204081632653061,
+    "hit_at_5": -0.08163265306122458,
+    "mrr": -0.20238095238095255
+  },
+  "per_query": [
+    {
+      "id": "sc-01",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "embedBatch",
+      "returned": 5
+    },
+    {
+      "id": "sc-02",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "embedOne",
+      "returned": 5
+    },
+    {
+      "id": "sc-03",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "embedOllama",
+      "returned": 5
+    },
+    {
+      "id": "sc-04",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "embedOpenAI",
+      "returned": 5
+    },
+    {
+      "id": "sc-05",
+      "group": "embedder",
+      "rank": 2,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "embedVoyage",
+      "returned": 5
+    },
+    {
+      "id": "sc-06",
+      "group": "embedder",
+      "rank": 2,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "embedBatchAttempt",
+      "returned": 5
+    },
+    {
+      "id": "sc-07",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "generateDescription",
+      "returned": 5
+    },
+    {
+      "id": "sc-08",
+      "group": "embedder",
+      "rank": 3,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "llmFilter",
+      "returned": 5
+    },
+    {
+      "id": "sc-09",
+      "group": "embedder",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-10",
+      "group": "embedder",
+      "rank": 1,
+      "matched_path": "src/embedder.ts",
+      "matched_name": "resolveEmbedUrl",
+      "returned": 5
+    },
+    {
+      "id": "sc-11",
+      "group": "search_code",
+      "rank": 2,
+      "matched_path": "src/tools/search_code.ts",
+      "matched_name": "searchCodeTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-12",
+      "group": "search_code",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-13",
+      "group": "search_code",
+      "rank": 1,
+      "matched_path": "src/tools/search_code.ts",
+      "matched_name": "SearchCodeArgs",
+      "returned": 5
+    },
+    {
+      "id": "sc-14",
+      "group": "indexer",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-15",
+      "group": "indexer",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-16",
+      "group": "indexer",
+      "rank": 2,
+      "matched_path": "src/indexer/indexer.ts",
+      "matched_name": "buildEmbedContext",
+      "returned": 5
+    },
+    {
+      "id": "sc-17",
+      "group": "indexer",
+      "rank": 3,
+      "matched_path": "src/indexer/indexer.ts",
+      "matched_name": "collectFiles",
+      "returned": 5
+    },
+    {
+      "id": "sc-18",
+      "group": "indexer",
+      "rank": 4,
+      "matched_path": "src/indexer/indexer.ts",
+      "matched_name": "CodeIndexer",
+      "returned": 5
+    },
+    {
+      "id": "sc-19",
+      "group": "parser",
+      "rank": 4,
+      "matched_path": "src/indexer/parser.ts",
+      "matched_name": "parseFile",
+      "returned": 5
+    },
+    {
+      "id": "sc-20",
+      "group": "parser",
+      "rank": 1,
+      "matched_path": "src/indexer/parser.ts",
+      "matched_name": "walkTree",
+      "returned": 5
+    },
+    {
+      "id": "sc-21",
+      "group": "parser",
+      "rank": 3,
+      "matched_path": "src/indexer/parser.ts",
+      "matched_name": "extractDoc",
+      "returned": 5
+    },
+    {
+      "id": "sc-22",
+      "group": "parser",
+      "rank": 2,
+      "matched_path": "src/indexer/parser.ts",
+      "matched_name": "parseYaml",
+      "returned": 5
+    },
+    {
+      "id": "sc-23",
+      "group": "parser",
+      "rank": 1,
+      "matched_path": "src/indexer/parser.ts",
+      "matched_name": "parseJsonFile",
+      "returned": 5
+    },
+    {
+      "id": "sc-24",
+      "group": "parser",
+      "rank": 2,
+      "matched_path": "src/indexer/parser.ts",
+      "matched_name": "extractImports",
+      "returned": 5
+    },
+    {
+      "id": "sc-25",
+      "group": "types",
+      "rank": 1,
+      "matched_path": "src/types.ts",
+      "matched_name": "CodeChunk",
+      "returned": 5
+    },
+    {
+      "id": "sc-26",
+      "group": "types",
+      "rank": 1,
+      "matched_path": "src/types.ts",
+      "matched_name": "CodeChunkPayload",
+      "returned": 5
+    },
+    {
+      "id": "sc-27",
+      "group": "qdrant",
+      "rank": 2,
+      "matched_path": "src/qdrant.ts",
+      "matched_name": "ensureCodeChunks",
+      "returned": 5
+    },
+    {
+      "id": "sc-28",
+      "group": "qdrant",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-29",
+      "group": "qdrant",
+      "rank": 2,
+      "matched_path": "src/qdrant.ts",
+      "matched_name": "ensureCollections",
+      "returned": 5
+    },
+    {
+      "id": "sc-30",
+      "group": "config",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-31",
+      "group": "storage",
+      "rank": 3,
+      "matched_path": "src/storage.ts",
+      "matched_name": "getDeps",
+      "returned": 5
+    },
+    {
+      "id": "sc-32",
+      "group": "storage",
+      "rank": 3,
+      "matched_path": "src/storage.ts",
+      "matched_name": "getReverseDeps",
+      "returned": 5
+    },
+    {
+      "id": "sc-33",
+      "group": "storage",
+      "rank": 1,
+      "matched_path": "src/storage.ts",
+      "matched_name": "getMemoryMeta",
+      "returned": 5
+    },
+    {
+      "id": "sc-34",
+      "group": "storage",
+      "rank": 5,
+      "matched_path": "src/storage.ts",
+      "matched_name": "topFilesByRevDeps",
+      "returned": 5
+    },
+    {
+      "id": "sc-35",
+      "group": "server",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-36",
+      "group": "server",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-37",
+      "group": "tools",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-38",
+      "group": "tools",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-39",
+      "group": "tools",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-40",
+      "group": "tools",
+      "rank": 3,
+      "matched_path": "src/tools/get_dependencies.ts",
+      "matched_name": "getDependenciesTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-41",
+      "group": "tools",
+      "rank": 3,
+      "matched_path": "src/tools/project_overview.ts",
+      "matched_name": "projectOverviewTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-42",
+      "group": "tools",
+      "rank": null,
+      "returned": 5
+    },
+    {
+      "id": "sc-43",
+      "group": "tools",
+      "rank": 3,
+      "matched_path": "src/tools/forget.ts",
+      "matched_name": "forgetTool",
+      "returned": 5
+    },
+    {
+      "id": "sc-44",
+      "group": "util",
+      "rank": 3,
+      "matched_path": "src/util.ts",
+      "matched_name": "storeMemory",
+      "returned": 5
+    },
+    {
+      "id": "sc-45",
+      "group": "util",
+      "rank": 2,
+      "matched_path": "src/util.ts",
+      "matched_name": "colForType",
+      "returned": 5
+    },
+    {
+      "id": "sc-46",
+      "group": "scoring",
+      "rank": 1,
+      "matched_path": "src/scoring.ts",
+      "matched_name": "finalScore",
+      "returned": 5
+    },
+    {
+      "id": "sc-47",
+      "group": "scoring",
+      "rank": 1,
+      "matched_path": "src/scoring.ts",
+      "matched_name": "timeDecay",
+      "returned": 5
+    },
+    {
+      "id": "sc-48",
+      "group": "indexer_cli",
+      "rank": 1,
+      "matched_path": "src/indexer/cli.ts",
+      "matched_name": "expandRoots",
+      "returned": 5
+    },
+    {
+      "id": "sc-49",
+      "group": "bin",
+      "rank": 1,
+      "matched_path": "src/bin.ts",
+      "matched_name": "",
+      "returned": 5
+    }
+  ],
+  "latency": {
+    "index_ms": 1661,
+    "embed_ms": 60392,
+    "search_p50_ms": 118.071375,
+    "search_p95_ms": 121.323959
+  }
+}

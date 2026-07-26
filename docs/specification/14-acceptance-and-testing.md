@@ -32,6 +32,16 @@ schemas of a vector store. Fixture families:
 | idempotency | replayed spool event / retried reconcile ⇒ no duplicate memory op / duplicate rows (deterministic IDs) |
 | rebuild | deleted dense projection / cache fully restored from `state.sqlite` |
 
+As-built note (T12-05, `[SPEC]`): the `quality` row's `X`/`Y` are now set —
+`mrr_regression_budget = 0.03`, `min_recall_at_5 = 0.80` — and live in
+`fixtures/search/baseline/thresholds.json`, not in code, so a retune is a reviewable diff with a
+stated justification ("tuning changes are versioned"). They are derived from the **agreed v1
+baseline**, deliberately not from the first v2 run: that run regressed, and deriving a threshold
+from a regressed measurement would encode the regression as acceptable (O2). The gate consequently
+**fails on today's v2** — MRR 0.5646 vs the 0.6963 baseline, Recall@5 0.7755 — which is registered
+as `D-016` (`blocked`, product decision) rather than papered over. The `latency`/`resources`/
+`memory-quality` rows remain `[BASELINE]`-pending (T14-07, T17-05).
+
 ## 3. Fault-injection suite `[FIXED]`
 
 Proves exactly **two properties** of the projection protocol — (a) any divergence detected at
@@ -70,6 +80,33 @@ correctly escaped text; recall block never exceeds caps; delimiter collisions es
   startup with a large registry; LRU behavior; durability/validate-on-open semantics;
   platform support (win32); filtered-HNSW available. **Backend choice is fixed here, not
   earlier.**
+
+As-built note (T12-05, `[SPEC]`): the 49-query benchmark runner is `cargo xtask bench`
+(`crates/xtask/src/bench/`), split so everything *scored* is an ordinary offline test and only the
+end-to-end run needs weights, a corpus checkout and a `libonnxruntime`: `corpus` loads and refuses
+anything that is not the corpus the baseline was measured against, `score` holds the matching
+semantics and metric math, `report` shapes the output and the v1 diff, `gate` turns a report plus
+versioned thresholds into a verdict, and `run` is the only piece that indexes anything.
+
+**Matching semantics** are taken verbatim from the corpus's own description, because they define
+what the recorded numbers mean: `file` = substring of the result path, `symbol` = substring of the
+result name, `symbol: null` = file-level (any symbol of that file). **`Recall@5 == hit@5`** on this
+corpus by construction — it is single-relevant, so "how many relevant documents were retrieved"
+is one or zero; both names are reported rather than one silently standing in for the other.
+
+**Comparability** is enforced by mirroring the baseline's own corpus definition: `node_modules`,
+`dist` and `.git` are pruned, and the report records file/occurrence counts so a reader can check
+the corpora matched (v2 indexed 101 files / 581 occurrences against v1's 96 / 544 — the residual
+difference is v2's parser-derived units versus v1's own chunker).
+
+**Per-query diff vs v1 is metric-level, not rank-level (D-015)**: the imported v1 artifact holds
+aggregates only, and v1's runner folds ranks into counters inside its scoring loop without ever
+emitting a per-query rank. Recovering them would mean editing v1's source and re-running it, which
+T00-01 explicitly declined. The report therefore carries full per-query detail for v2 and reserves
+`v1_rank` for the day v1 is re-run with per-query output.
+
+The first recorded run and its per-leg diagnostics live in `fixtures/search/baseline/`; the
+regression they expose is `D-016`.
 
 As-built note (T10-02, `[SPEC]`): for the brute-force candidate, warm search p95 /
 open / close / registry-startup are measured generically by
