@@ -45,6 +45,6 @@ pub use install::{
     is_installed, write_license_notice,
 };
 pub use manifest::{ManifestFile, ModelManifest};
-pub use onnx::{MAX_SEQUENCE_TOKENS, OnnxEmbedder, OnnxError};
+pub use onnx::{MAX_SEQUENCE_TOKENS, OnnxEmbedder, OnnxError, POOLED_OUTPUT};
 
 pub use local_rag_core::VERSION;

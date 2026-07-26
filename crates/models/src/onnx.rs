@@ -54,6 +54,14 @@ use crate::catalog::ModelCatalogEntry;
 /// bumped in the same change for exactly that reason.
 pub const MAX_SEQUENCE_TOKENS: usize = 1024;
 
+/// The name a sentence-transformers ONNX export gives the output that *is* the
+/// model's embedding: mean pooling, the trained Dense projection modules, and
+/// normalization, all inside the graph.
+///
+/// Selecting it by name is the whole point of [`select_output`] — see there for
+/// what taking the first output instead cost (D-017).
+pub const POOLED_OUTPUT: &str = "sentence_embedding";
+
 /// Why the ONNX provider could not be created.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -101,6 +109,9 @@ pub struct OnnxEmbedder {
     /// a time, and the mutex makes that structurally true rather than assumed.
     session: Mutex<Session>,
     model_dir: PathBuf,
+    /// Which graph output carries the embedding, resolved once at open time by
+    /// [`select_output`] and then addressed **by name** on every run.
+    output_name: String,
 }
 
 impl OnnxEmbedder {
@@ -137,17 +148,32 @@ impl OnnxEmbedder {
             .and_then(|mut b| b.commit_from_file(dir.join(graph)))
             .map_err(|e| OnnxError::Runtime(e.to_string()))?;
 
+        let names: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
+        let output_name = select_output(&names)
+            .ok_or_else(|| OnnxError::Runtime(format!("{graph} declares no outputs")))?
+            .to_string();
+
         Ok(OnnxEmbedder {
             key: entry.representation_key(),
             tokenizer,
             session: Mutex::new(session),
             model_dir: dir.to_path_buf(),
+            output_name,
         })
     }
 
     /// The directory the assets were loaded from.
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
+    }
+
+    /// The graph output this provider reads its vectors from.
+    ///
+    /// Exposed so a run can *assert* which output it embedded with instead of
+    /// assuming it: D-017 was exactly the case where the assumption was wrong
+    /// and nothing said so.
+    pub fn output_name(&self) -> &str {
+        &self.output_name
     }
 
     /// Tokenize a batch into the `(input_ids, attention_mask, token_type_ids)`
@@ -214,12 +240,14 @@ impl Embedder for OnnxEmbedder {
             .run(inputs)
             .map_err(|e| EmbedError::retryable(format!("onnx inference failed: {e}")))?;
 
-        // Prefer a pooled output when the graph provides one; otherwise mean-pool
-        // the token states under the attention mask.
-        let (_, value) = outputs
-            .iter()
-            .next()
-            .ok_or_else(|| EmbedError::permanent("onnx session produced no output"))?;
+        // The output chosen at open time, addressed by name — a graph may declare
+        // several, and position says nothing about which one is the embedding.
+        let value = outputs.get(&self.output_name).ok_or_else(|| {
+            EmbedError::permanent(format!(
+                "onnx session produced no `{}` output",
+                self.output_name
+            ))
+        })?;
         let (shape, data) = value
             .try_extract_tensor::<f32>()
             .map_err(|e| EmbedError::permanent(format!("output tensor: {e}")))?;
@@ -231,6 +259,31 @@ impl Embedder for OnnxEmbedder {
     fn key(&self) -> RepresentationKey {
         self.key.clone()
     }
+}
+
+/// Pick the graph output that carries the embedding.
+///
+/// [`POOLED_OUTPUT`] wins whenever the graph declares it, **regardless of its
+/// position**; only a graph without it falls back to the first output, which
+/// [`pool`] then mean-pools by rank.
+///
+/// This function exists because the position-based version of it was a defect
+/// (D-017). EmbeddingGemma's export declares `last_hidden_state` first and
+/// `sentence_embedding` second, so taking "the first output" silently skipped
+/// the model's own trained Dense head (`st/dense_1` 768→3072, `st/dense_2`
+/// 3072→768) and embedded into a space the model was never trained to produce.
+/// Nothing downstream could notice: both outputs are 768-wide, both normalize
+/// cleanly, and query and documents went through the same wrong path — so the
+/// space stayed self-consistent and the only visible symptom was retrieval
+/// quality. On the 49-query benchmark the dense leg scored MRR 0.4939 against
+/// the v1 baseline's 0.6963, which ran the full pipeline through Ollama; reading
+/// this output instead puts it at 0.7007.
+fn select_output<'a>(names: &[&'a str]) -> Option<&'a str> {
+    names
+        .iter()
+        .copied()
+        .find(|name| *name == POOLED_OUTPUT)
+        .or_else(|| names.first().copied())
 }
 
 /// Reduce an encoder output to one unit-length vector per input.
@@ -323,6 +376,47 @@ mod tests {
             }
         }
         m
+    }
+
+    #[test]
+    fn the_pooled_output_wins_even_when_the_graph_declares_it_last() {
+        // EmbeddingGemma's own export order. Taking the first output here is
+        // what D-017 fixed: it skips the trained Dense head.
+        let chosen = select_output(&["last_hidden_state", "sentence_embedding"]);
+        assert_eq!(chosen, Some("sentence_embedding"));
+    }
+
+    #[test]
+    fn the_pooled_output_wins_from_any_position() {
+        // Export order is not a contract, so neither is the fix's dependence on it.
+        assert_eq!(
+            select_output(&["sentence_embedding", "last_hidden_state"]),
+            Some("sentence_embedding")
+        );
+        assert_eq!(
+            select_output(&[
+                "last_hidden_state",
+                "token_embeddings",
+                "sentence_embedding"
+            ]),
+            Some("sentence_embedding")
+        );
+    }
+
+    #[test]
+    fn a_graph_without_a_pooled_output_falls_back_to_token_states() {
+        // Then `pool` mean-pools rank-3 states under the mask, as before.
+        assert_eq!(
+            select_output(&["last_hidden_state"]),
+            Some("last_hidden_state")
+        );
+    }
+
+    #[test]
+    fn a_graph_with_no_outputs_selects_nothing() {
+        // `open_dir` turns this into a typed `Runtime` error rather than a panic
+        // on the first inference.
+        assert_eq!(select_output(&[]), None);
     }
 
     #[test]

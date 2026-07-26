@@ -224,6 +224,44 @@ unaffected — every candidate was measured under the same conditions — so the
 decision stands. Re-measuring absolute throughput at the shipped window belongs to
 T17-05's resource gate, which owns those numbers anyway.
 
+## Amendment: the model's own pooled output (2026-07-26, D-017)
+
+**Vectors come from the graph's `sentence_embedding` output, and
+`representation_version` is therefore `3`.** Model, dimensionality, distance metric
+and window are untouched; the decision above stands, but the numbers the benchmark
+attributed to this model were not this model's.
+
+### Why
+
+The ONNX export declares two outputs — `last_hidden_state` `[batch, seq, 768]` first,
+`sentence_embedding` `[batch, 768]` second — and only the second one runs
+EmbeddingGemma's trained Dense modules (`st/dense_1` 768→3072, `st/dense_2`
+3072→768) after mean pooling. The provider selected the *first* output and pooled it
+itself, so every measurement this project made of "EmbeddingGemma" was in fact a
+measurement of its raw token states. This ADR's published MTEB Code figure (68.76)
+describes the full pipeline; the shipped pipeline was not it.
+
+The correction moves the dense leg of the 49-query benchmark from **MRR 0.4939 to
+0.7007** against the v1 baseline's 0.6963 — same corpus, same 1024-token window, same
+q8 weights. It also settles the one candidate this ADR left open for D-016:
+**quantization is not a factor**. q8 reaches the BF16 baseline's dense-leg quality,
+and for a fixed triple of texts the corrected provider reproduces Ollama's BF16
+geometry to within 0.006 cosine (0.761/0.191 against 0.755/0.186).
+
+### Why the key had to move with it
+
+Which output is read is not one of the six `RepresentationKey` fields (spec 03 §2.2),
+exactly like the window before it, so `representation_version` moves `2 → 3` and the
+pre-fix vectors stop being addressable instead of being served as current.
+
+### What this invalidates in the text above
+
+Nothing in the comparison: every candidate was measured through the same harness, and
+the two rejected candidates were rejected for export shape and license, not for
+quality figures. The **latency** numbers are unaffected in kind — the Dense head is
+two small matmuls — but were re-measured incidentally at the shipped window: ≈520 ms
+for a 3-text batch, ≈2.7 s session load (`crates/models/tests/onnx.rs`, this host).
+
 
 ## Consequences
 

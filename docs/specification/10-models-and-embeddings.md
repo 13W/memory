@@ -92,6 +92,28 @@ would have produced different vectors under an unchanged `representation_id` and
 therefore moves `1 → 2` in the same change — that field exists precisely to make a
 vector-affecting change outside the other five addressable instead of silent.
 
+
+As-built note (D-017, `[SPEC]`): **the provider reads the graph's pooled output by
+name** (`local_rag_models::POOLED_OUTPUT = "sentence_embedding"`), falling back to
+masked mean pooling of token states only for a graph that declares no such output.
+Selecting by *position* was a defect. A sentence-transformers export declares two
+outputs — EmbeddingGemma's, in this order: `last_hidden_state` `[batch, seq, 768]` and
+`sentence_embedding` `[batch, 768]` — and only the second one runs the model's trained
+Dense modules (`st/dense_1` 768→3072, `st/dense_2` 3072→768) after pooling. Taking the
+first output therefore embedded into a space the model was never trained to emit.
+
+Nothing downstream could catch it: both outputs are 768 wide, both normalize to unit
+length, and query and documents travelled the same wrong path, so the space stayed
+self-consistent and only *retrieval quality* moved. The dense leg measured **MRR 0.4939**
+against the v1 baseline's 0.6963; reading `sentence_embedding` instead puts it at
+**0.7007** on the same corpus, window and quantization. Independent confirmation of the
+space, not just the score: for a fixed triple of texts the fixed provider reproduces
+Ollama's own geometry (cos 0.761/0.191 against Ollama's 0.755/0.186 for the same weights
+at BF16), where the positional version produced 0.860/0.483.
+
+Output selection, like the window, is not a `RepresentationKey` field, so
+`representation_version` moves `2 → 3` in the same change for the same reason.
+
 ## 3. Model spaces
 
 A model space bundles the representations that must be coherent together (at minimum

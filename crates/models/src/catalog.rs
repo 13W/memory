@@ -88,16 +88,20 @@ impl ModelCatalogEntry {
     /// The canonical representation key this model's `code_raw` vectors carry
     /// (ADR-0004's decision, byte-for-byte).
     ///
-    /// `representation_version = 2` since D-016: the sequence window moved from
-    /// 256 to 1024 tokens (`crate::onnx::MAX_SEQUENCE_TOKENS`), which changes the
-    /// vectors a long unit gets. The window is not itself a key field, so this
-    /// version is what keeps `embedding_cache` from serving 256-token vectors as
-    /// though they were 1024-token ones — the field exists precisely to make such
-    /// a change addressable instead of silent.
+    /// `representation_version = 3` since D-017: the provider now reads the
+    /// graph's own pooled output (`crate::onnx::POOLED_OUTPUT`) instead of
+    /// mean-pooling `last_hidden_state` itself, so every vector now comes out of
+    /// the model's trained Dense head rather than skipping it. Version `2` was
+    /// D-016's sequence window (256 → 1024 tokens).
+    ///
+    /// Neither the window nor the output selection is one of the six key fields,
+    /// so `representation_version` is the only thing that stops `embedding_cache`
+    /// from serving vectors from an earlier era as though they were current — the
+    /// field exists precisely to make such a change addressable instead of silent.
     pub fn representation_key(&self) -> RepresentationKey {
         RepresentationKey {
             kind: RepresentationKind::CodeRaw,
-            representation_version: 2,
+            representation_version: 3,
             normalization_version: 1,
             model_id: self.model_id.to_string(),
             dimensions: self.dimensions,
