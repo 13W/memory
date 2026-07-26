@@ -158,6 +158,7 @@ mod tests {
                 corpus_commit: "g".to_string(),
                 corpus_version: "1.0.0".to_string(),
                 corpus_subdir: None,
+                dense_kind: "code_raw".to_string(),
                 model_id: "m".to_string(),
                 mode: "hybrid".to_string(),
                 files_indexed: 1,

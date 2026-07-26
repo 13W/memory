@@ -76,7 +76,8 @@ to ad-hoc `hash()` call sites. `subject_content_blob` follows the existing singl
 `subject_occurrence_context`/`subject_memory_entry` are this codebase's first *typed* multi-field
 constructors (previously only the generic `hash` entry point handled multi-field domains). See spec
 03 §4.2's own as-built note for the field-shape and scope-boundary details (the real
-`occurrence_context` serialization stays `[OPEN]`, 09 §3).
+`occurrence_context` serialization was still `[OPEN]` then; D-016 fixed it — see §4.2's own
+as-built note).
 
 ### 1.3 Path canonicalization `[FIXED principle, details [SPEC]]`
 
@@ -781,10 +782,39 @@ columns of every worktree's `worktree_projection_state` row — `active_*` cover
 projection tuple" and "a running rebuild" (rebuild always retargets the active tuple, never
 `target`, spec 05 §7); `target_*` is a deliberate, conservative superset (an in-flight `switch()`
 reads `embedding_cache` for the target tuple's missing points before committing, spec 05 §5 step 1).
-Only `code_raw` subjects are resolved to real pinned keys today (via the occurrence →
-`parsed_unit.blob_id` join and `subject_content_blob`); `code_context`'s subject format stays
-`[OPEN]` (09 §3, decided by the benchmark) and `memory`'s backing tables do not exist before group
-14 — both are skipped as a safe no-op, since no such `embedding_cache` row can exist yet either.
+Only `code_raw` subjects were resolved to real pinned keys at T11-02 (via the occurrence →
+`parsed_unit.blob_id` join and `subject_content_blob`); `code_context`'s subject format was still
+`[OPEN]` (09 §3) and `memory`'s backing tables do not exist before group 14 — both were skipped as
+a safe no-op, since no such `embedding_cache` row could exist yet either. D-016 added the
+`code_context` resolution (see the as-built note below); `memory` remains the only skipped kind.
+
+As-built note (D-016, `[SPEC]`): the `occurrence_context` serialization is no longer `[OPEN]` at
+this level — `local_rag_store::code::context` (`serialize`, `CONTEXT_VERSION = 1`) renders the
+labelled envelope, and `context_subjects_for_generation` derives one subject per occurrence of a
+generation from `state.sqlite` alone. The envelope is line-oriented and fixed-order:
+
+```text
+File: {normalized_path}
+Type: {unit_kind}/{language kind}
+Name: {local_name}
+Doc: {doc block, blank lines dropped}
+Sig: {first line of the unit, capped at SIGNATURE_CAP_CHARS = 200 chars}
+Code:
+{normalized unit text}
+```
+
+Absent fields are **omitted entirely**, never emitted empty, so two units differing only in
+whether they carry a docblock never hash alike through a shared blank label. `Code:` is always
+last and always present. The doc block is recovered by walking backwards from the unit's span over
+blank lines and then over either a `/** … */` block or a run of `//` lines, stopping at the
+previous unit's end — the parsers do not attach comments to units, so this is a *reader-side*
+reconstruction and does not touch `parsed_unit` spans or `content_blob` identity. That separation
+is the point: the envelope is a search **representation**, so it lives in the representation
+layer, while the content-shared rows stay path- and context-free (01 §5.1). Per-occurrence, not
+per-blob: the path is inside the pre-image, so the "context is path-dependent by definition"
+`[FIXED]` above is now structural rather than aspirational, and two occurrences of one
+`content_blob` produce two distinct subjects (`crates/store/tests/subjects.rs::
+context_subjects_do_not_share_across_occurrences`).
 
 Pin rule, revised (T11-04, `[SPEC]`): the pinned set is now **pin-root generations × protected model
 spaces** (`local_rag_store::subjects::protected_subject_keys`), a widening of the tuple-only rule

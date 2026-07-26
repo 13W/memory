@@ -105,7 +105,8 @@ pub use identity::{head, manifest_hash, projection_point_id};
 pub use manager::{AcquireError, ShardManager};
 pub use model_switch::{
     ModelSwitchError, code_raw_representation_key, dormant_migration_target,
-    migrate_dormant_on_open, params_for_model_space, shard_dir, switch_model_space,
+    migrate_dormant_on_open, params_for_model_space, representation_key_for, shard_dir,
+    switch_model_space,
 };
 pub use rebuild::{
     OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome,
@@ -113,7 +114,7 @@ pub use rebuild::{
 };
 pub use switch::{SwitchCommitError, SwitchError, SwitchOutcome, VectorSource, switch};
 pub use validate::{Divergence, validate};
-pub use vectors::CacheVectorSource;
+pub use vectors::{CacheVectorSource, projection_kind_to_store};
 
 #[cfg(feature = "failpoints")]
 pub use fake::{Corruption, ShardInspection};

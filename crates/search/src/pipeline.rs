@@ -37,8 +37,8 @@ use std::time::Duration;
 
 use local_rag_core::identity::Uuid;
 use local_rag_projection::{
-    DenseQuery, RepresentationKind, ScoredPoint, ShardManager, code_raw_representation_key,
-    expected_points, required_code_kinds,
+    DenseQuery, RepresentationKind, ScoredPoint, ShardManager, expected_points,
+    projection_kind_to_store, representation_key_for, required_code_kinds,
 };
 use local_rag_protocol::{
     DegradedMode, ErrorEnvelope, FileContext, GenerationRef, ProjectOverview, SearchMode,
@@ -323,6 +323,9 @@ pub struct SearchEngine {
     /// T12-04).
     overviews: OverviewCache,
     read_wait_budget: Duration,
+    /// The representation the dense leg searches over. `code_raw` in v0 (spec 09
+    /// §3); see [`with_dense_kind`](Self::with_dense_kind).
+    dense_kind: RepresentationKind,
 }
 
 impl SearchEngine {
@@ -364,7 +367,23 @@ impl SearchEngine {
             embedder,
             overviews: OverviewCache::default(),
             read_wait_budget,
+            dense_kind: RepresentationKind::CodeRaw,
         }
+    }
+
+    /// Search the dense leg over `kind` instead of the `code_raw` default.
+    ///
+    /// Spec 09 §3 leaves the content-vs-context choice `[OPEN]`, "decided by the
+    /// benchmark", and ships `code_raw` in v0. This seam is what lets a
+    /// `code_context` shard *be* benchmarked without a second engine: the query
+    /// is embedded under that kind's representation key and the point filter
+    /// follows it, so both sides of the comparison move together. The default is
+    /// unchanged, so no production path is affected until the `[OPEN]` closes in
+    /// context's favour (D-016).
+    #[must_use]
+    pub fn with_dense_kind(mut self, kind: RepresentationKind) -> Self {
+        self.dense_kind = kind;
+        self
     }
 
     /// Run one search (spec 09 §1). The outer [`Result`] is an infrastructure
@@ -793,8 +812,8 @@ impl SearchEngine {
             )));
         };
 
-        // The query's representation IS the active model space's `code_raw`
-        // representation (spec 09 §3): the same `model_id`/`dimensions`/
+        // The query's representation IS the active model space's representation
+        // of the searched kind (spec 09 §3): the same `model_id`/`dimensions`/
         // `distance_metric` its points were embedded and its shard was opened
         // with. Resolved under the same `L2.read` as the tuple it belongs to.
         let (key, required_kinds) = {
@@ -802,7 +821,11 @@ impl SearchEngine {
                 .state
                 .open_read()
                 .map_err(SearchInfraError::StateOpen)?;
-            let key = match code_raw_representation_key(&conn, &model_space_uuid) {
+            let key = match representation_key_for(
+                &conn,
+                &model_space_uuid,
+                projection_kind_to_store(self.dense_kind),
+            ) {
                 Ok(key) => key,
                 Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
             };
@@ -834,8 +857,9 @@ impl SearchEngine {
         }
 
         // The shard holds a point per (occurrence × required representation
-        // kind), but v0's dense leg reads only `code_raw` (spec 09 §3;
-        // `code_context` is `[OPEN]`, decided by the benchmark). The backend
+        // kind), but the dense leg reads exactly one of them — `code_raw` unless
+        // overridden (spec 09 §3; the content-vs-context choice is `[OPEN]`,
+        // decided by the benchmark). The backend
         // cannot filter by kind — brute-force has no payload predicate at all
         // (ADR-0003 records `filtered_hnsw_available = false`) — so the leg
         // over-fetches by the number of required kinds and filters below.
@@ -863,7 +887,7 @@ impl SearchEngine {
             match expected_points(&conn, &worktree_id, &generation_uuid, &model_space_uuid) {
                 Ok(points) => points
                     .into_iter()
-                    .filter(|p| p.representation_kind == RepresentationKind::CodeRaw)
+                    .filter(|p| p.representation_kind == self.dense_kind)
                     .map(|p| (p.point_id.as_str().to_string(), p.occurrence_id))
                     .collect(),
                 Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),

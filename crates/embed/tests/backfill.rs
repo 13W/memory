@@ -90,6 +90,40 @@ impl Embedder for CountingEmbedder {
     }
 }
 
+/// A `HashingEmbedder` that keeps every text it was handed, for the tests that
+/// assert *what* got embedded rather than how much.
+struct RecordingEmbedder {
+    inner: HashingEmbedder,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingEmbedder {
+    fn new(kind: RepresentationKind) -> Arc<Self> {
+        Arc::new(RecordingEmbedder {
+            inner: HashingEmbedder::new(kind),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("recorder poisoned").clone()
+    }
+}
+
+impl Embedder for RecordingEmbedder {
+    fn embed(&self, req: EmbedRequest) -> Result<Vec<Vector>, EmbedError> {
+        self.seen
+            .lock()
+            .expect("recorder poisoned")
+            .extend(req.texts.iter().cloned());
+        self.inner.embed(req)
+    }
+
+    fn key(&self) -> RepresentationKey {
+        self.inner.key()
+    }
+}
+
 fn pool_of(embedder: Arc<dyn Embedder>) -> ProviderPool {
     ProviderPool::new(vec![ProviderEntry::local("local", embedder)])
 }
@@ -477,13 +511,16 @@ async fn a_corrupt_row_is_repaired() {
 
 /// A `required` kind with no subject function refuses the run rather than
 /// reporting zero expected subjects (which would read as "fully covered").
+///
+/// `memory` is the last such kind — its tables arrive in group 14. D-016 moved
+/// `code_context` out of this set, so the case below is the *positive* one.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unsupported_required_kind_refuses_the_run() {
     let f = store::seeded(&BODIES).await;
     store::register_kind(
         &f.state,
         "66666666-6666-7666-8666-666666666666",
-        store::foreign_key(RepresentationKind::CodeContext),
+        store::foreign_key(RepresentationKind::Memory),
     )
     .await;
 
@@ -499,17 +536,95 @@ async fn an_unsupported_required_kind_refuses_the_run() {
         NOW,
     )
     .await
-    .expect_err("code_context has no subject function yet");
+    .expect_err("memory has no subject function yet");
 
     assert!(
         matches!(
             err,
             BackfillError::UnsupportedRequiredKind {
-                kind: RepresentationKind::CodeContext
+                kind: RepresentationKind::Memory
             }
         ),
         "expected UnsupportedRequiredKind, got {err}"
     );
+}
+
+/// `code_context` embeds the **envelope**, one subject per occurrence (D-016).
+///
+/// Two things are asserted at once because they are the same claim seen from two
+/// sides: the count is `occurrences`, not `distinct_blobs` (the envelope carries
+/// the path, so the two identical bodies of `BODIES` no longer collapse), and the
+/// text handed to the provider is the labelled envelope, not the normalized unit
+/// text. Either one alone could pass with the wrong text source wired in.
+#[tokio::test(flavor = "multi_thread")]
+async fn code_context_embeds_the_envelope_once_per_occurrence() {
+    let f = store::seeded(&BODIES).await;
+    store::register_kind(
+        &f.state,
+        "66666666-6666-7666-8666-666666666666",
+        store::foreign_key(RepresentationKind::CodeContext),
+    )
+    .await;
+    // The seed's `code_raw` representation would otherwise be embedded too; this
+    // test is about the context leg alone.
+    unrequire_code_raw(&f).await;
+
+    let embedder = RecordingEmbedder::new(RepresentationKind::CodeContext);
+    let report = run_backfill(
+        &f.state,
+        &f.cache,
+        &pool_of(embedder.clone()),
+        DataPolicy::LocalOnly,
+        local_rag_store::registry::DEFAULT_MODEL_SPACE_ID,
+        &params(8, 500),
+        &retention(),
+        &InFlight::new(),
+        NOW,
+    )
+    .await
+    .expect("context backfill");
+
+    assert_eq!(
+        report.embedded as usize,
+        f.occurrences.len(),
+        "context does not share: one subject per occurrence, not per blob"
+    );
+    assert!(
+        report.embedded as usize > f.distinct_blobs(),
+        "the two identical bodies must NOT collapse into one context subject"
+    );
+
+    let texts = embedder.seen();
+    assert_eq!(texts.len(), f.occurrences.len());
+    for text in &texts {
+        assert!(
+            text.starts_with("File: src/file_"),
+            "expected an envelope, got {text:?}"
+        );
+        assert!(text.contains("\nCode:\n"), "envelope has no code section");
+    }
+    // Same body, different path ⇒ different envelope. This is the property that
+    // makes the per-occurrence count meaningful rather than incidental.
+    let mut distinct: Vec<&String> = texts.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), texts.len(), "envelopes must all differ");
+}
+
+/// Drop `code_raw` from the default model space's required set.
+async fn unrequire_code_raw(f: &Fixture) {
+    f.state
+        .writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "DELETE FROM model_space_representation \
+                 WHERE model_space_id = ?1 AND representation_kind = 'code_raw'",
+                rusqlite::params![local_rag_store::registry::DEFAULT_MODEL_SPACE_ID],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("unrequire code_raw");
 }
 
 /// Rows a backfill wrote under a `building` model space survive an eviction pass

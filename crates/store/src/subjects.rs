@@ -34,8 +34,7 @@
 //!
 //! # Kinds whose subject cannot be computed yet
 //!
-//! `code_context`'s serialization is `[OPEN]` (spec 09 §3 — decided by the
-//! benchmark) and `memory`'s tables do not exist before group 14. They are
+//! `memory`'s tables do not exist before group 14, so it is
 //! reported in [`SubjectSet::unsupported`] rather than silently skipped, and each
 //! caller decides: eviction ignores them (a missing pin for a row that cannot
 //! exist is harmless), while the backfill worker refuses to run, because
@@ -50,7 +49,7 @@ use rusqlite::Connection;
 use local_rag_core::identity::domain::subject_content_blob;
 
 use crate::cache::{EmbeddingKey, SubjectKind};
-use crate::code::content_blob_ids_for_generation;
+use crate::code::{content_blob_ids_for_generation, context_subjects_for_generation};
 use crate::registry::{
     ModelSpaceState, RepresentationKind, all_worktree_ids, default_model_space_id,
     model_space_ids_in_states, model_space_required_representation_ids, model_space_state,
@@ -65,7 +64,8 @@ pub struct SubjectSet {
     /// Every `embedding_cache` key the model space is expected to hold.
     pub keys: BTreeSet<EmbeddingKey>,
     /// `required` kinds that could not be resolved to subjects at all
-    /// (`code_context`: format `[OPEN]`; `memory`: no tables before group 14).
+    /// (`memory`: no tables before group 14). `code_context` left this set in
+    /// D-016, when the benchmark decided its serialization (spec 09 §3).
     pub unsupported: BTreeSet<RepresentationKind>,
     /// The generations the set was computed over (the pin roots).
     pub generations: BTreeSet<String>,
@@ -191,6 +191,22 @@ pub fn expected_subject_keys(
                         set.keys.insert(EmbeddingKey {
                             subject_kind: SubjectKind::ContentBlob,
                             subject_hash: subject_content_blob(&blob_id),
+                            representation_id: representation_id.clone(),
+                        });
+                    }
+                }
+            }
+            RepresentationKind::CodeContext => {
+                for generation_id in generations {
+                    // No N:1 collapse here, unlike `code_raw`: the envelope
+                    // carries the occurrence's path, so two occurrences of one
+                    // `content_blob` are two subjects — spec 03 §4.2's "context
+                    // does not share", made structural by the serialization
+                    // rather than enforced on top of it.
+                    for subject in context_subjects_for_generation(conn, generation_id)? {
+                        set.keys.insert(EmbeddingKey {
+                            subject_kind: SubjectKind::OccurrenceContext,
+                            subject_hash: subject.subject_hash,
                             representation_id: representation_id.clone(),
                         });
                     }

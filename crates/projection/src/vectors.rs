@@ -17,10 +17,11 @@
 //! representation_kind ──model_space_representation──▶ representation_id
 //! ```
 //!
-//! `code_context`'s subject serialization is `[OPEN]` (spec 09 §3, decided by the
-//! benchmark) and `memory`'s tables arrive in group 14 — the same boundary
-//! `local_rag_store::subjects` draws for the backfill worker and the eviction pin
-//! rule, so all three agree on which subjects can exist at all.
+//! `code_context` has one too (D-016) — its hash is over the rendered envelope,
+//! so the bridge is `occurrence_id ──serialize(envelope)──▶ subject_hash` and no
+//! two paths share a subject. `memory`'s tables arrive in group 14 — the same
+//! boundary `local_rag_store::subjects` draws for the backfill worker and the
+//! eviction pin rule, so all three agree on which subjects can exist at all.
 //!
 //! # Missing is `None`, never a guess
 //!
@@ -35,10 +36,13 @@
 //!
 //! The `occurrence_id → blob_id` map is loaded once per generation (one indexed
 //! scan through `local_rag_store::content_blob_ids_for_generation`) and cached,
-//! because a switch asks for every occurrence of the generation in a row. Cache
-//! reads stay per-call: they are point lookups on a `WITHOUT ROWID` primary key,
-//! and holding a long-lived cache connection inside a `VectorSource` would
-//! outlive the read snapshot the caller opened.
+//! because a switch asks for every occurrence of the generation in a row. The
+//! `code_context` map is cached the same way and for a stronger reason: building
+//! it decompresses every source revision of the generation, which must happen
+//! once per source, not once per point. Cache reads stay per-call: they are point
+//! lookups on a `WITHOUT ROWID` primary key, and holding a long-lived cache
+//! connection inside a `VectorSource` would outlive the read snapshot the caller
+//! opened.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -46,8 +50,9 @@ use std::sync::Mutex;
 use local_rag_core::identity::Uuid;
 use local_rag_core::identity::domain::subject_content_blob;
 use local_rag_store::{
-    CacheDb, EmbeddingKey, StateDb, SubjectKind, content_blob_ids_for_generation, decode_vector_le,
-    get_embedding, model_space_required_representation_ids, verify_cached_embedding,
+    CacheDb, EmbeddingKey, StateDb, SubjectKind, content_blob_ids_for_generation,
+    context_subjects_for_generation, decode_vector_le, get_embedding,
+    model_space_required_representation_ids, verify_cached_embedding,
 };
 
 use crate::contract::RepresentationKind;
@@ -64,6 +69,8 @@ pub struct CacheVectorSource<'a> {
     representations: HashMap<RepresentationKind, String>,
     /// `occurrence_id → blob_id`, loaded lazily on first use.
     blobs: Mutex<Option<HashMap<String, String>>>,
+    /// `occurrence_id → context subject_hash`, loaded lazily on first use.
+    contexts: Mutex<Option<HashMap<String, String>>>,
     state: &'a StateDb,
     generation_id: String,
 }
@@ -91,6 +98,7 @@ impl<'a> CacheVectorSource<'a> {
             cache,
             representations,
             blobs: Mutex::new(None),
+            contexts: Mutex::new(None),
             state,
             generation_id: generation_id.to_string(),
         })
@@ -109,21 +117,53 @@ impl<'a> CacheVectorSource<'a> {
             .and_then(|map| map.get(occurrence_id))
             .cloned()
     }
+
+    /// The `code_context` subject hash of an occurrence (D-016).
+    ///
+    /// Recomputed from `state.sqlite` rather than read back from a table: the
+    /// envelope is a *representation*, not stored content, so the hash exists
+    /// only as a function of the generation's rows. Recomputing it here is also
+    /// what makes a stale cache row detectable — it simply fails to match.
+    fn context_hash(&self, occurrence_id: &str) -> Option<String> {
+        let mut guard = self
+            .contexts
+            .lock()
+            .expect("vector-source context map poisoned");
+        if guard.is_none() {
+            let read = self.state.open_read().ok()?;
+            let rows = context_subjects_for_generation(&read, &self.generation_id).ok()?;
+            *guard = Some(
+                rows.into_iter()
+                    .map(|s| (s.occurrence_id, s.subject_hash))
+                    .collect(),
+            );
+        }
+        guard
+            .as_ref()
+            .and_then(|map| map.get(occurrence_id))
+            .cloned()
+    }
 }
 
 impl VectorSource for CacheVectorSource<'_> {
     fn vector(&self, occurrence_id: &str, kind: RepresentationKind) -> Option<Vec<f32>> {
         let representation_id = self.representations.get(&kind)?;
-        // Only `content_blob` subjects are computable today (see the module doc).
-        let subject_hash = match kind {
-            RepresentationKind::CodeRaw => subject_content_blob(&self.blob_id(occurrence_id)?),
-            RepresentationKind::CodeContext
-            | RepresentationKind::StructuralDescription
-            | RepresentationKind::Memory => return None,
+        // Memory and structural-description subjects are not computable yet (see
+        // the module doc).
+        let (subject_kind, subject_hash) = match kind {
+            RepresentationKind::CodeRaw => (
+                SubjectKind::ContentBlob,
+                subject_content_blob(&self.blob_id(occurrence_id)?),
+            ),
+            RepresentationKind::CodeContext => (
+                SubjectKind::OccurrenceContext,
+                self.context_hash(occurrence_id)?,
+            ),
+            RepresentationKind::StructuralDescription | RepresentationKind::Memory => return None,
         };
 
         let key = EmbeddingKey {
-            subject_kind: SubjectKind::ContentBlob,
+            subject_kind,
             subject_hash,
             representation_id: representation_id.clone(),
         };
@@ -154,6 +194,23 @@ pub(crate) fn store_kind_to_projection(
     }
 }
 
+/// The inverse of [`store_kind_to_projection`] — total, since every projection
+/// kind exists in the store's enum.
+///
+/// Needed by any caller that starts from the projection's vocabulary (a shard's
+/// point kinds) and has to ask the registry about it — the search pipeline's
+/// dense leg, which resolves the searched kind's `RepresentationKey` (D-016).
+pub fn projection_kind_to_store(kind: RepresentationKind) -> local_rag_store::RepresentationKind {
+    match kind {
+        RepresentationKind::CodeRaw => local_rag_store::RepresentationKind::CodeRaw,
+        RepresentationKind::CodeContext => local_rag_store::RepresentationKind::CodeContext,
+        RepresentationKind::StructuralDescription => {
+            local_rag_store::RepresentationKind::StructuralDescription
+        }
+        RepresentationKind::Memory => local_rag_store::RepresentationKind::Memory,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +236,7 @@ mod tests {
             ),
         ] {
             assert_eq!(store_kind_to_projection(store), Some(projection));
+            assert_eq!(projection_kind_to_store(projection), store);
             // The two enums must keep agreeing on the stored token, since both
             // sides key rows by it.
             assert_eq!(store.as_str(), projection.as_str());

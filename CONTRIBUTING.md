@@ -30,7 +30,13 @@ ORT_DYLIB_PATH=<libonnxruntime.dylib> cargo xtask bench --corpus <checkout>
 
 It indexes a real corpus checkout, embeds it with the default model, projects it,
 runs all 49 queries, and writes a report next to the recorded baselines in
-`fixtures/search/baseline/`. Three reasons it stays out of the gate: it needs
+`fixtures/search/baseline/`. Three flags matter for comparability, and each one
+changes *what is measured*, so a run is only comparable to another with the same
+values: `--subdir <rel>` indexes one subtree instead of the whole checkout (the v1
+baseline indexed `src/` alone), `--mode hybrid|lexical|code` picks the legs, and
+`--dense-kind code_raw|code_context` picks the representation the dense leg
+searches (default `code_raw`, spec 09 §3). All three land in the report's
+`provenance`. Three reasons it stays out of the gate: it needs
 model weights (~315 MiB, fetched by the pinned catalog on first run and cached in
 `$LOCAL_RAG_BENCH_MODEL_HOME`, default `~/.local/share/local-rag-bench`), a
 `libonnxruntime` this repository does not ship (bundling is T17-03), and a corpus

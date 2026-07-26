@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted — 2026-07-24.
+Accepted — 2026-07-24. **Amended 2026-07-26 (D-016)** — see
+"Amendment: sequence window" below: the canonical key's `representation_version`
+is now `2` and the sequence window is 1024 tokens. The model, dimensionality and
+distance metric this ADR decided are unchanged.
 
 Closes the **embedding half** of open question **O3 "Default embedding model +
 weights delivery; local generator crate"**
@@ -109,7 +112,7 @@ representation is therefore:
 
 ```
 kind                   = code_raw
-representation_version = 1
+representation_version = 2          # was 1; raised by D-016, see the amendment
 normalization_version  = 1          # local_rag_store::code::normalize
 model_id               = embeddinggemma-300m
 dimensions             = 768
@@ -181,6 +184,46 @@ and the machinery that makes it revisable is already built (T11-01/T11-02).
   not taken in v0 — 768 keeps baseline comparability. Taking it later is a
   model-space migration with a different `dimensions`, i.e. a new shard layout,
   exactly as spec 10 §4 requires.
+
+## Amendment: sequence window (2026-07-26, D-016)
+
+**The sequence window is 1024 tokens, and the canonical key's
+`representation_version` is therefore `2`.** Model, dimensionality and distance
+metric are untouched; this amendment changes neither the comparison above nor its
+verdict.
+
+### Why
+
+T12-05 measured v0 search on the 49-query benchmark at MRR 0.5646 against the v1
+baseline's 0.6963. Investigating the gap showed that v1 truncated embedding input
+at **3000 characters** (`scripts/benchmark.ts::MODEL_CONFIGS`) — roughly 750–1000
+tokens of code — while this project truncated at `MAX_SEQUENCE_TOKENS = 256`, about
+three times more aggressively. Comparing retrieval quality across that difference
+measures the truncation as much as the retrieval. 1024 covers v1's effective window
+with room to spare and still sits at half of EmbeddingGemma's 2048-token context.
+Measured effect on the benchmark: **+0.0102 MRR, +0.0204 Hit@5**.
+
+### Why the key had to move with it
+
+The window is **not** one of the six `RepresentationKey` fields (spec 03 §2.2), so
+raising it alone would have produced different vectors under an unchanged
+`representation_id` — `embedding_cache` would then serve 256-token rows as though
+they were 1024-token ones, with nothing to detect it. `representation_version`
+exists precisely to make a vector-affecting change outside the other five fields
+addressable, so it moves `1 → 2` in the same change. Every cached vector from the
+256-token era becomes unaddressable rather than silently reused.
+
+### What this invalidates in the text above
+
+The **latency and throughput figures** in this ADR's Context and Consequences were
+measured at `max_length = 256` (they say so at their point of use). They no longer
+describe the shipped configuration: cost per sequence scales with sequence length,
+so the ≈23 snippets/s figure is an upper bound for 256-token inputs, not a
+prediction for 1024. The *relative* comparison between candidate models is
+unaffected — every candidate was measured under the same conditions — so the
+decision stands. Re-measuring absolute throughput at the shipped window belongs to
+T17-05's resource gate, which owns those numbers anyway.
+
 
 ## Consequences
 
