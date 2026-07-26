@@ -79,7 +79,7 @@ pub use projection_state::{
     IllegalProjectionTransition, PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation,
     ProjectionStateChange, ProjectionStateError, ProjectionStateRow, ProjectionStatus,
     check_invariants, default_model_space_id, insert_projection_state, projection_state,
-    set_default_model_space_id, write_projection_state,
+    referenced_model_space_ids, set_default_model_space_id, write_projection_state,
 };
 
 pub(crate) use representation::SCHEMA_V6;

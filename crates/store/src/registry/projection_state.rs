@@ -33,6 +33,8 @@
 //! over this module's guarded primitives; validate-on-open, `mark_dirty`, and the
 //! rebuild transitions are **T07-04**.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use rusqlite::types::Type;
 use rusqlite::{Connection, Error, OptionalExtension, Transaction, params};
 
@@ -412,6 +414,46 @@ pub fn projection_state(
         format!("SELECT {SELECT_COLUMNS} FROM worktree_projection_state WHERE worktree_id = ?1");
     conn.query_row(&sql, params![worktree_id], row_from_query)
         .optional()
+}
+
+/// Every worktree's set of *referenced* model space ids — the ids named by its
+/// `active_model_space_id`, `projected_model_space_id`, or
+/// `target_model_space_id` (D-011).
+///
+/// This is spec 04 §3's phrase "no `worktree_projection_state` row references it
+/// in **any column**" read literally, per worktree instead of store-wide: it is
+/// the set a `(worktree, model_space)` shard directory must be a member of to be
+/// live (spec 05 §8, "shard lifecycle follows registry lifecycle"). A worktree
+/// with a row but all three columns NULL maps to an **empty** set, which is not
+/// the same as having no row at all — the latter is absent from the map entirely,
+/// and [`run_unreferenced_space_sweep`](crate::run_unreferenced_space_sweep)
+/// treats the two differently.
+///
+/// Reading all three columns (not just `active`) is what makes a sweep built on
+/// this race-free against a switch in flight: spec 05 §5's write-ahead commits
+/// the target tuple *before* any backend mutation, so a target space's directory
+/// is referenced from before it exists.
+pub fn referenced_model_space_ids(
+    conn: &Connection,
+) -> rusqlite::Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT worktree_id, active_model_space_id, projected_model_space_id, \
+                target_model_space_id \
+         FROM worktree_projection_state",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let worktree_id: String = r.get(0)?;
+        let columns: [Option<String>; 3] = [r.get(1)?, r.get(2)?, r.get(3)?];
+        Ok((worktree_id, columns))
+    })?;
+
+    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in rows {
+        let (worktree_id, columns) = row?;
+        let entry = map.entry(worktree_id).or_default();
+        entry.extend(columns.into_iter().flatten());
+    }
+    Ok(map)
 }
 
 /// Initialize a fresh `clean`, empty projection state row for `worktree_id` (all

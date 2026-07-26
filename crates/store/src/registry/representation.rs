@@ -339,6 +339,11 @@ pub enum ModelSpaceTransitionError {
     /// kind (spec 04 §3: "all required representation kinds have full
     /// coverage").
     IncompleteCoverage,
+    /// This space is `active`, is the store's current `default_model_space_id`,
+    /// and was asked to leave `active` — spec 04 §3 requires the default space to
+    /// be `active` (D-012). Repoint the default first: spec 10 §4 orders step 5
+    /// (`default := B`) before step 6 (`A → retiring`).
+    IsDefaultModelSpace,
 }
 
 impl std::fmt::Display for ModelSpaceTransitionError {
@@ -349,6 +354,10 @@ impl std::fmt::Display for ModelSpaceTransitionError {
             ModelSpaceTransitionError::IncompleteCoverage => {
                 write!(f, "a required representation kind lacks full coverage")
             }
+            ModelSpaceTransitionError::IsDefaultModelSpace => write!(
+                f,
+                "this space is the store default, which must stay active; repoint the default first"
+            ),
         }
     }
 }
@@ -499,6 +508,25 @@ pub fn transition_model_space(
 
     if let Err(illegal) = from.check_transition(to) {
         return Ok(Err(ModelSpaceTransitionError::Illegal(illegal)));
+    }
+
+    // Spec 04 §3: "the default space (`store_settings.default_model_space_id`)
+    // MUST be `active`". `set_default_model_space_id` enforces that when the
+    // *pointer* moves; this is the other half — the pointed-at space may not
+    // leave `active` underneath it (D-012). Refusing rather than silently
+    // repointing keeps the choice of default an explicit decision, and it is
+    // exactly the order spec 10 §4 fixes: step 5 (`default := B`) precedes step 6
+    // (`A → retiring`).
+    // Scoped exactly to what breaks the invariant: an `active` default *leaving*
+    // `active`. Deliberately not "any non-active target" — a store whose pointer
+    // somehow already names a non-active space must stay able to walk that space
+    // back up (`building → projection_ready → active`), and a self-transition
+    // must stay the idempotent no-op the machine promises.
+    if from == ModelSpaceState::Active
+        && to != ModelSpaceState::Active
+        && super::default_model_space_id(tx)?.as_deref() == Some(model_space_id)
+    {
+        return Ok(Err(ModelSpaceTransitionError::IsDefaultModelSpace));
     }
 
     if to == ModelSpaceState::ProjectionReady {

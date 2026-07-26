@@ -497,8 +497,15 @@ fn the_notice_writer_reports_a_failing_sink() {
 /// a flat directory holding `model_quantized.onnx`, `model_quantized.onnx_data`
 /// and `tokenizer.json`, and says so loudly when it skips.
 ///
-/// `LOCAL_RAG_TEST_MODEL_HOME`, when set, is used as the store root instead of a
-/// temporary one — that is how the ONNX inference test's weights get installed.
+/// The verification always runs into a **fresh temporary root**, never into
+/// `LOCAL_RAG_TEST_MODEL_HOME` (D-014, gate G11). Installing into an already
+/// populated root short-circuits on the `.ok` marker (`install_model` is a
+/// documented no-op there, 10 §5), which hashes nothing — so verifying "the
+/// pinned digests describe the real bytes" *in* that root would have proven
+/// exactly nothing while printing that it had. `LOCAL_RAG_TEST_MODEL_HOME`, when
+/// set, is additionally populated afterwards — that is how the ONNX inference
+/// test's weights get installed — and the no-op semantics are asserted there
+/// explicitly rather than tripped over.
 #[test]
 fn the_default_catalog_matches_a_real_local_mirror_when_one_is_supplied() {
     let Ok(mirror) = std::env::var("LOCAL_RAG_TEST_MIRROR") else {
@@ -508,25 +515,26 @@ fn the_default_catalog_matches_a_real_local_mirror_when_one_is_supplied() {
         );
         return;
     };
+    let entry = &local_rag_models::EMBEDDINGGEMMA_300M;
+    let fetcher = LocalFetcher::new(&mirror);
 
+    // The claim under test: every byte is hashed here, because this root is
+    // empty and no file can be reused.
     let home = TempHome::new().expect("temp home");
-    let root = match std::env::var("LOCAL_RAG_TEST_MODEL_HOME") {
-        Ok(path) => std::path::PathBuf::from(path),
-        Err(_) => home.join("local-rag"),
-    };
-    let layout = StoreLayout::new(root);
+    let layout = StoreLayout::new(home.join("local-rag"));
     layout.ensure().expect("ensure store tree");
 
-    let entry = &local_rag_models::EMBEDDINGGEMMA_300M;
     let mut notice = Vec::new();
-    let report = install_model(&layout, entry, &LocalFetcher::new(&mirror), &mut notice)
+    let report = install_model(&layout, entry, &fetcher, &mut notice)
         .expect("the mirror's bytes must match the pinned digests");
 
     assert!(is_installed(&layout, entry.model_id));
     assert_eq!(
-        report.downloaded.len() + report.reused.len(),
-        entry.files.len()
+        report.downloaded.len(),
+        entry.files.len(),
+        "a fresh root downloads (and therefore hashes) every file: {report:?}"
     );
+    assert!(report.reused.is_empty(), "nothing to reuse: {report:?}");
     let text = String::from_utf8(notice).expect("utf-8");
     assert!(text.contains("Gemma Terms of Use"), "{text}");
 
@@ -535,5 +543,36 @@ fn the_default_catalog_matches_a_real_local_mirror_when_one_is_supplied() {
         entry.files.len(),
         entry.total_bytes() as f64 / (1024.0 * 1024.0),
         layout.model_dir(entry.model_id).display()
+    );
+
+    // Optional second half: make the weights available to the ONNX test, and
+    // pin the documented no-op behavior of a repeat install (10 §5: "a no-op
+    // install does not reprint" the license).
+    let Ok(shared) = std::env::var("LOCAL_RAG_TEST_MODEL_HOME") else {
+        return;
+    };
+    let shared = StoreLayout::new(std::path::PathBuf::from(shared));
+    shared.ensure().expect("ensure shared store tree");
+    install_model(&shared, entry, &fetcher, &mut Vec::new()).expect("install into the shared root");
+    assert!(is_installed(&shared, entry.model_id));
+
+    let mut second_notice = Vec::new();
+    let repeat = install_model(&shared, entry, &fetcher, &mut second_notice)
+        .expect("a repeat install is a no-op");
+    assert_eq!(
+        repeat.reused.len(),
+        entry.files.len(),
+        "already installed ⇒ everything reused: {repeat:?}"
+    );
+    assert!(repeat.downloaded.is_empty(), "{repeat:?}");
+    assert_eq!(repeat.bytes_downloaded, 0);
+    assert!(
+        second_notice.is_empty(),
+        "a no-op install must not reprint the license"
+    );
+
+    eprintln!(
+        "RAN: shared root {} is installed; repeat install is a no-op that reprints nothing",
+        shared.model_dir(entry.model_id).display()
     );
 }

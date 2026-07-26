@@ -81,6 +81,22 @@ A model space bundles the representations that must be coherent together (at min
 expected/ready set per **required** representation kind — not just a failed counter `[FIXED]`;
 stored advisory JSON, always recomputable from `state.sqlite` × `embedding_cache`.
 
+As-built note (G11/D-013, `[SPEC]`): the "at minimum `code_raw` + `memory`" bundle is **not yet
+populated for the seeded default space**, and the gate records who owns each half rather than
+leaving it unowned. The seeded space (`SCHEMA_V4`) is `active` with no `model_space_representation`
+rows at all, so on a store nobody has configured, `required_code_kinds` refuses with
+`NoCodeRepresentation` and `params_for_model_space` with `NoShardParams` — loud, not silent. The
+registration API exists (`local_rag_embed::register_embedder_representation`, T11-03); what is
+missing is a caller.
+
+Deliberately not seeded by a migration: the key's `model_id` is the ADR-0004 choice, and baking it
+into `state.sqlite`'s DDL would both hard-code a decision §4 exists to keep migratable and make
+every fresh store claim a model whose weights may never have been downloaded (§5). It therefore
+belongs where the concrete provider is constructed — the `code_raw` half to **T15-07**'s `init`
+(the same command that installs the weights), the `memory` half to **group 14**, which owns the
+memory subject function `Coverage` would otherwise count against (§3's `UnsupportedRequiredKind`
+refusal exists precisely so an unowned required kind cannot read as "covered").
+
 As-built note (T11-04, `[SPEC]`): the backfill worker is `local_rag_embed::backfill`
 (`run_backfill`), and it fixes the two things §3/§4 leave to the implementation.
 
@@ -167,6 +183,17 @@ As-built note (T11-05, `[SPEC]`): steps 4–6 are `local_rag_projection::model_s
 * **Step 6** needs no new code: once the last worktree has moved off A and A is `retiring`,
   `local_rag_store::subjects::protected_model_space_ids` (T11-04) stops pinning it, which is exactly
   "its cache rows become evictable when no worktree references A".
+
+As-built note (G11/D-011+D-012, `[SPEC]`): the gate found two gaps around steps 5–6, both now
+closed in the store.
+
+* Step 6 covers A's **cache rows**; A's per-worktree **shard directory** (the one the T11-05 split
+  gave it) was reclaimed by nothing. `local_rag_store::housekeeping::run_unreferenced_space_sweep`
+  is that reclamation — see 05 §8's own D-011 note for the liveness rule and why it is race-free
+  against a switch in flight.
+* Steps 5 and 6 are ordered in the recipe, and that order is now **enforced** rather than assumed:
+  retiring A while it is still `default_model_space_id` is refused (04 §3's D-012 note). Doing step 6
+  first used to produce a store whose default was unusable.
 
 ## 5. Model assets `[FIXED policy]`
 

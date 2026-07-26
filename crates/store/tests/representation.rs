@@ -26,7 +26,9 @@ use local_rag_store::registry::{
     model_space_state, recompute_coverage, register_representation, representation_key,
     set_model_space_representation, transition_model_space, write_model_space_coverage,
 };
-use local_rag_store::{DEFAULT_MODEL_SPACE_ID, StateDb};
+use local_rag_store::{
+    DEFAULT_MODEL_SPACE_ID, StateDb, default_model_space_id, set_default_model_space_id,
+};
 use local_rag_test_support::TempHome;
 
 /// A temporary store with an ensured tree and an opened [`StateDb`] (runs the
@@ -377,4 +379,167 @@ async fn coverage_round_trips_through_the_real_column() {
         }),
     );
     assert!(!parsed.fully_covered(&[RepresentationKind::Memory]));
+}
+
+// ---- D-012: the default pointer may not be left on a non-active space ----
+
+/// Spec 04 §3 requires the *default* model space to be `active`.
+/// `set_default_model_space_id` enforces that when the pointer moves; this is
+/// the other half — the pointed-at space may not leave `active` underneath it.
+/// Without this guard, retiring the default (a legal `active → retiring` edge)
+/// silently produced a store whose default is unusable: every dormant worktree
+/// would then find no legal migration target on open.
+#[tokio::test]
+async fn the_default_model_space_cannot_be_retired_while_it_is_the_default() {
+    let (_home, db) = open_state();
+
+    let msid = DEFAULT_MODEL_SPACE_ID.to_string();
+    let result = db
+        .writer()
+        .transaction(move |tx| {
+            transition_model_space(tx, &msid, ModelSpaceState::Retiring, &[], 2000)
+        })
+        .await
+        .expect("transition tx (infrastructure)");
+
+    assert_eq!(result, Err(ModelSpaceTransitionError::IsDefaultModelSpace));
+
+    // No mutation on rejection: the seeded default is still active, and still a
+    // legal switch target.
+    let read = db.open_read().expect("read conn");
+    let state = model_space_state(&read, DEFAULT_MODEL_SPACE_ID)
+        .expect("read state")
+        .expect("row exists");
+    assert_eq!(state, ModelSpaceState::Active);
+    assert!(eligible_as_target(state));
+}
+
+/// The guard is scoped to the space the pointer names: any *other* `active`
+/// space retires normally (spec 10 §4 step 6). Together with the test above this
+/// pins the exact order the `[FIXED]` recipe fixes — step 5 (`default := B`)
+/// before step 6 (`A → retiring`) — and shows it is achievable, not a deadlock.
+#[tokio::test]
+async fn retiring_the_old_space_works_once_the_default_has_moved() {
+    let (_home, db) = open_state();
+
+    // Space B: created `building`, walked to `active` (empty required set, so
+    // coverage is vacuously complete).
+    let space_b = uuid(70);
+    let msid = space_b.clone();
+    db.writer()
+        .transaction(move |tx| {
+            create_model_space(tx, &msid, "space-b", 1000)?;
+            transition_model_space(tx, &msid, ModelSpaceState::ProjectionReady, &[], 1000)?
+                .expect("building -> projection_ready");
+            transition_model_space(tx, &msid, ModelSpaceState::Active, &[], 1000)?
+                .expect("projection_ready -> active");
+            Ok(())
+        })
+        .await
+        .expect("build space B");
+
+    // Step 5: `default_model_space := B`.
+    let msid = space_b.clone();
+    db.writer()
+        .transaction(move |tx| set_default_model_space_id(tx, &msid, 2000))
+        .await
+        .expect("set default tx")
+        .expect("B is active, so it may become the default");
+
+    // Step 6: the *old* default may now retire.
+    let old = DEFAULT_MODEL_SPACE_ID.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            transition_model_space(tx, &old, ModelSpaceState::Retiring, &[], 3000)
+        })
+        .await
+        .expect("transition tx (infrastructure)")
+        .expect("no longer the default, so retiring is allowed");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        model_space_state(&read, DEFAULT_MODEL_SPACE_ID)
+            .expect("read")
+            .expect("row"),
+        ModelSpaceState::Retiring,
+    );
+    // ...and B, the new default, is untouched and still a legal target.
+    assert_eq!(
+        model_space_state(&read, &space_b)
+            .expect("read")
+            .expect("row"),
+        ModelSpaceState::Active,
+    );
+    assert_eq!(
+        default_model_space_id(&read).expect("read pointer"),
+        Some(space_b),
+    );
+}
+
+/// The guard is scoped to a departure *from `active`*, so it can never trap a
+/// store: a default space that is not active (a build in progress under the
+/// pointer) must stay able to walk back up to `active`, which is the only
+/// transition sequence that restores spec 04 §3's invariant. A blanket
+/// "the default may not leave active-ness" rule would have blocked the repair.
+#[tokio::test]
+async fn a_non_active_default_can_still_be_walked_back_to_active() {
+    let (_home, db) = open_state();
+
+    // Put the pointed-at space into `building` directly — the state a store
+    // would be in mid-repair (no guarded writer produces it, by design).
+    db.writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE model_space SET state = 'building' WHERE model_space_id = ?1",
+                [DEFAULT_MODEL_SPACE_ID],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("force building");
+
+    let msid = DEFAULT_MODEL_SPACE_ID.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            transition_model_space(tx, &msid, ModelSpaceState::ProjectionReady, &[], 2000)?
+                .expect("building -> projection_ready is not blocked by the default guard");
+            transition_model_space(tx, &msid, ModelSpaceState::Active, &[], 2000)?
+                .expect("projection_ready -> active restores the invariant");
+            Ok(())
+        })
+        .await
+        .expect("repair tx");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        model_space_state(&read, DEFAULT_MODEL_SPACE_ID)
+            .expect("read")
+            .expect("row"),
+        ModelSpaceState::Active,
+    );
+}
+
+/// The guard only blocks an *effective* departure: re-requesting the state a
+/// space is already in stays the idempotent no-op the machine promises (the same
+/// contract D-007 relies on for worktree state clocks).
+#[tokio::test]
+async fn a_self_transition_on_the_default_is_still_a_no_op() {
+    let (_home, db) = open_state();
+
+    let msid = DEFAULT_MODEL_SPACE_ID.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            transition_model_space(tx, &msid, ModelSpaceState::Active, &[], 2000)
+        })
+        .await
+        .expect("transition tx (infrastructure)")
+        .expect("active -> active is a legal no-op even for the default");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        model_space_state(&read, DEFAULT_MODEL_SPACE_ID)
+            .expect("read")
+            .expect("row"),
+        ModelSpaceState::Active,
+    );
 }
