@@ -189,6 +189,15 @@ still stubs (T12-01/T12-04); this task proves only that the lock spans wherever 
 their eventual content. Load-tested generation-mixing under concurrent switches is explicitly
 T09-04, not proven here.
 
+As-built note (T12-01, `[SPEC]`): the lexical leg above is now real — `local_rag_store::
+lexical_leg` runs the BM25 query (09 §2's as-built note) from inside the same `run_locked` body,
+i.e. under the same held `L2.read`, so §3's diagram is satisfied by construction rather than by
+a stage marker. Its SQL filters `fts_doc.generation_id` to the active generation as well as the
+worktree, which makes "the read lock prevents *mixing*" hold structurally even if a stale head
+were ever served — while leaving §4's head validation as the mechanism that detects an
+*incomplete* projection, exactly as this section's own division of labor states. Enrichment
+remains a stub (T12-04).
+
 ## 4. FTS as an independently validated materialized view `[FIXED]`
 
 The FTS view lives in `cache.sqlite`, outside canonical transactions. Its validity proof is

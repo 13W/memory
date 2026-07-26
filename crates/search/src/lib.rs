@@ -10,12 +10,14 @@
 //! enrichment → release", no generation mixing between legs) and returns a
 //! canonical degraded/error outcome (spec 02 §6).
 //!
-//! Deliberately a **skeleton**, not spec 09 §7's full response: the lexical
-//! leg here is a stub (no tuned BM25 query — T12-01), the dense leg goes
-//! through the pre-T10 fake backend only (`local_rag_projection::fake`, per
-//! CLAUDE.md's "no real dense backend before the T10 spike" guardrail), and
-//! enrichment/RRF/`results[]` are group 12's job (T12-02…T12-04). See the
-//! `pipeline` module's own docs for the exact division of scope.
+//! Not yet spec 09 §7's full response: the lexical leg is real as of T12-01
+//! (the active-generation BM25 query with the spec's default weights, the
+//! `name_pattern` prefix filter and §4's candidate depth), but the dense leg
+//! still goes through the pre-T10 fake backend only
+//! (`local_rag_projection::fake`, per CLAUDE.md's "no real dense backend before
+//! the T10 spike" guardrail), and enrichment/RRF/`results[]` are the rest of
+//! group 12's job (T12-02…T12-04). See the `pipeline` module's own docs for the
+//! exact division of scope.
 
 mod pipeline;
 

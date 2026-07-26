@@ -254,6 +254,9 @@ async fn do_one_search(
 ) {
     let request = SearchRequest {
         root: request_root(path),
+        query: "search".to_string(),
+        limit: 5,
+        name_pattern: None,
         query_vector: vec![1.0, 0.0, 0.0],
         k: 5,
     };
