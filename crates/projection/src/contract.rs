@@ -20,6 +20,7 @@ use std::fmt;
 use std::path::Path;
 
 use local_rag_core::identity::Uuid;
+pub use local_rag_store::DistanceMetric;
 
 /// The projection-head schema version stamped into every [`ProjectionHead`]
 /// (spec 05 §1 `projection_schema_version`). Bumping it invalidates persisted
@@ -191,12 +192,92 @@ pub struct ScoredPoint {
 }
 
 /// Parameters fixed for a shard's lifetime (spec 05 §1). `[SPEC]` as-built:
-/// T07-01 fixes only the vector dimensionality, which the fake enforces on
-/// upsert; distance metric and backend tuning arrive with the real backend.
+/// T07-01 fixed only the vector dimensionality; T12-02 added the distance
+/// metric, exactly as that note anticipated ("distance metric and backend
+/// tuning arrive with the real backend"). Both are properties of the model
+/// space's `code_raw` representation and are resolved together by
+/// [`params_for_model_space`](crate::model_switch::params_for_model_space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardParams {
     /// The number of f32 components every point vector must have.
     pub dimensions: usize,
+    /// How [`ShardHandle::search`] scores a candidate against the query
+    /// (spec 09 §3: "distance per `representation.distance_metric`").
+    pub distance_metric: DistanceMetric,
+}
+
+impl ShardParams {
+    /// Params for `dimensions` under [`DistanceMetric::Dot`].
+    ///
+    /// Dot product is what every caller used before T12-02 (the fake backend
+    /// hard-coded it, and the spike's own as-built note pins it), so this
+    /// constructor keeps those call sites — bootstrap fallbacks and tests that
+    /// have no opinion on the metric — reading as they did. Production params
+    /// come from the registry via
+    /// [`params_for_model_space`](crate::model_switch::params_for_model_space),
+    /// never from here.
+    pub fn with_dimensions(dimensions: usize) -> Self {
+        Self {
+            dimensions,
+            distance_metric: DistanceMetric::Dot,
+        }
+    }
+}
+
+/// The similarity of `point` to `query` under `metric`, in the **"higher is
+/// closer"** convention [`ScoredPoint::score`] fixes for every backend.
+///
+/// Shared by every [`ProjectionStore`] implementation in this crate on purpose:
+/// two backends that scored the same vectors differently would make a shard's
+/// ranking depend on which one opened it, which is exactly the kind of
+/// backend-visible behavior spec 05 §1's backend-neutral trait exists to
+/// prevent.
+///
+/// - `dot` — the raw inner product.
+/// - `cosine` — the inner product over the product of norms; a zero-norm vector
+///   has no direction, so its similarity is `0.0` rather than `NaN`.
+/// - `l2` — the **negated** Euclidean distance, so that nearer still sorts
+///   first. Scores are therefore `<= 0` for this metric, which is expected: only
+///   the ordering is meaningful across metrics, never the absolute value.
+pub fn similarity(metric: DistanceMetric, query: &[f32], point: &[f32]) -> f32 {
+    match metric {
+        DistanceMetric::Dot => dot(query, point),
+        DistanceMetric::Cosine => {
+            let norms = norm(query) * norm(point);
+            if norms == 0.0 {
+                0.0
+            } else {
+                dot(query, point) / norms
+            }
+        }
+        DistanceMetric::L2 => -query
+            .iter()
+            .zip(point)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>()
+            .sqrt(),
+    }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Order two scored candidates deterministically: score descending, ties broken
+/// by point id ascending (spec 09 §4's tie-break convention, applied inside the
+/// leg so a truncation at `k` is reproducible rather than storage-order
+/// dependent).
+pub fn rank_scored(scored: &mut [ScoredPoint]) {
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.point_id.cmp(&b.point_id))
+    });
 }
 
 /// A projection backend failure.
@@ -317,6 +398,103 @@ mod tests {
             ids.iter().map(PointId::as_str).collect::<Vec<_>>(),
             ["00", "a0", "ff"],
         );
+    }
+
+    #[test]
+    fn dot_similarity_is_the_raw_inner_product() {
+        assert_eq!(
+            similarity(DistanceMetric::Dot, &[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]),
+            32.0
+        );
+    }
+
+    /// Mismatched lengths zip to the shorter side rather than panicking — the
+    /// backends reject a dimension mismatch before scoring
+    /// (`ProjectionError::DimensionMismatch`), so this is only a total-function
+    /// guarantee, never a path real data reaches.
+    #[test]
+    fn similarity_zips_to_the_shorter_slice() {
+        assert_eq!(
+            similarity(DistanceMetric::Dot, &[1.0, 2.0, 3.0], &[1.0, 1.0]),
+            3.0
+        );
+    }
+
+    /// The metric is not decoration: the same pair of candidates ranks
+    /// differently under `dot` and `cosine` when their magnitudes differ.
+    #[test]
+    fn cosine_ignores_magnitude_where_dot_does_not() {
+        let query = [1.0, 0.0];
+        let aligned_short = [0.5, 0.0];
+        let skewed_long = [3.0, 3.0];
+
+        assert!(
+            similarity(DistanceMetric::Dot, &query, &skewed_long)
+                > similarity(DistanceMetric::Dot, &query, &aligned_short),
+            "dot rewards the longer vector"
+        );
+        assert!(
+            similarity(DistanceMetric::Cosine, &query, &aligned_short)
+                > similarity(DistanceMetric::Cosine, &query, &skewed_long),
+            "cosine rewards the better-aligned one"
+        );
+        assert!(
+            (similarity(DistanceMetric::Cosine, &query, &aligned_short) - 1.0).abs() < 1e-6,
+            "a perfectly aligned vector has cosine 1.0 regardless of length"
+        );
+    }
+
+    /// A zero vector has no direction — `0.0`, never `NaN` (which would poison
+    /// the whole sort through `partial_cmp`).
+    #[test]
+    fn cosine_of_a_zero_vector_is_zero_not_nan() {
+        let s = similarity(DistanceMetric::Cosine, &[0.0, 0.0], &[1.0, 1.0]);
+        assert_eq!(s, 0.0);
+        assert!(!s.is_nan());
+    }
+
+    /// L2 is negated so that "higher is closer" still holds.
+    #[test]
+    fn l2_similarity_is_negated_distance() {
+        let exact = similarity(DistanceMetric::L2, &[1.0, 2.0], &[1.0, 2.0]);
+        let near = similarity(DistanceMetric::L2, &[1.0, 2.0], &[1.0, 3.0]);
+        let far = similarity(DistanceMetric::L2, &[1.0, 2.0], &[5.0, 9.0]);
+        assert_eq!(exact, 0.0);
+        assert_eq!(near, -1.0);
+        assert!(exact > near && near > far);
+    }
+
+    #[test]
+    fn ranking_is_score_desc_then_point_id_asc() {
+        let mut scored = vec![
+            ScoredPoint {
+                point_id: PointId::from_hex("bb"),
+                score: 1.0,
+            },
+            ScoredPoint {
+                point_id: PointId::from_hex("aa"),
+                score: 1.0,
+            },
+            ScoredPoint {
+                point_id: PointId::from_hex("cc"),
+                score: 2.0,
+            },
+        ];
+        rank_scored(&mut scored);
+        assert_eq!(
+            scored
+                .iter()
+                .map(|s| s.point_id.as_str())
+                .collect::<Vec<_>>(),
+            ["cc", "aa", "bb"]
+        );
+    }
+
+    #[test]
+    fn with_dimensions_defaults_to_dot() {
+        let params = ShardParams::with_dimensions(768);
+        assert_eq!(params.dimensions, 768);
+        assert_eq!(params.distance_metric, DistanceMetric::Dot);
     }
 
     #[test]

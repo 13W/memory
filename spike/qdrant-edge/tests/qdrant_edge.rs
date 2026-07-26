@@ -145,9 +145,7 @@ fn search_recall_clears_a_reasonable_lower_bound() {
     let scratch = Scratch::new();
     let dataset = corpus::generate(&corpus::SMALL, 42);
     let store = QdrantEdgeStore;
-    let params = ShardParams {
-        dimensions: dataset.dims,
-    };
+    let params = ShardParams::with_dimensions(dataset.dims);
 
     let shard = store.open(scratch.path(), params).expect("open");
     shard.upsert(&dataset.points).expect("upsert");
@@ -180,7 +178,7 @@ fn search_recall_clears_a_reasonable_lower_bound() {
 #[test]
 fn qdrant_edge_needs_no_tokio_runtime_or_listening_socket() {
     let scratch = Scratch::new();
-    let params = ShardParams { dimensions: 4 };
+    let params = ShardParams::with_dimensions(4);
     let store = QdrantEdgeStore;
 
     let shard = store

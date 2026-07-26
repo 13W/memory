@@ -107,9 +107,7 @@ fn search_matches_the_exact_neighbor_oracle() {
     let scratch = Scratch::new();
     let dataset = corpus::generate(&corpus::TINY, 99);
     let store = BruteForceStore::new();
-    let params = ShardParams {
-        dimensions: dataset.dims,
-    };
+    let params = ShardParams::with_dimensions(dataset.dims);
 
     let shard = store.open(scratch.path(), params).expect("open");
     shard.upsert(&dataset.points).expect("upsert");

@@ -40,7 +40,7 @@ fn point(id: &str, vector: [f32; DIMS]) -> ProjectionPoint {
 
 fn open(dir: &std::path::Path) -> Box<dyn local_rag_projection::ShardHandle> {
     FakeProjectionStore::new()
-        .open(dir, ShardParams { dimensions: DIMS })
+        .open(dir, ShardParams::with_dimensions(DIMS))
         .expect("open shard")
 }
 
@@ -234,6 +234,6 @@ fn open_on_corrupt_points_file_errors() {
     // A points line with a non-hex vector → Corrupt at open (F12-style). Use the
     // concrete `FakeShard` here because `Box<dyn ShardHandle>` is not `Debug`.
     std::fs::write(dir.join("points"), "0a\tnothex\n").expect("write");
-    let err = FakeShard::open(&dir, ShardParams { dimensions: DIMS }).expect_err("corrupt");
+    let err = FakeShard::open(&dir, ShardParams::with_dimensions(DIMS)).expect_err("corrupt");
     assert!(matches!(err, ProjectionError::Corrupt(_)), "got {err:?}");
 }

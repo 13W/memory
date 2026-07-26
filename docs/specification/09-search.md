@@ -62,6 +62,16 @@ previous generation physically present in the cache so the assertion cannot pass
 (T12-04). `name_pattern` is realized as an FTS5 column filter (§2's as-built note), so the
 "prefix-tokenized on `local_name`/`qualified_name`" step needs no state-side join and no
 cross-database `ATTACH`.
+
+As-built note (T12-02, `[SPEC]`): `Stage::DenseLeg` is likewise real — it resolves the active
+`code_raw` representation, embeds the query through the injected `QueryEmbedder`, and runs the
+production brute-force backend, returning `PipelineSnapshot.dense: Vec<DenseHit>` alongside
+`lexical` (§3's as-built note has the mechanics). `SearchEngine::new` keeps its signature and
+defaults to `UnavailableEmbedder`; `SearchEngine::with_embedder` is the constructor the daemon
+uses (group 15). Both legs now produce occurrence-identified, 1-based-ranked candidate lists cut at
+the same `candidate_depth(limit)` — everything RRF needs, so T12-03 adds fusion and §7's response
+shape without touching either leg. Still stubbed: enrichment (T12-04) and the `mode` field with
+its per-mode leg selection (§5, T12-03).
 - `format results`: not yet — `SearchEngine::search_code` returns
   `local_rag_search::PipelineSnapshot` (worktree/generation/model-space tuple, `degraded`,
   `diagnostics`), the envelope skeleton `[SPEC]` this task owns, not §7's full response shape
@@ -160,6 +170,62 @@ registered, since this is the previously accepted T08-02 scope boundary, not a n
   context representation choice is decided by the benchmark** `[OPEN]` — v0 ships `code_raw`,
   `code_context` participates in the spike/benchmark.
 - Distance per `representation.distance_metric`.
+
+As-built note (T12-02, `[SPEC]`): the leg is `SearchEngine::dense_leg`
+(`crates/search/src/pipeline.rs`), running inside the same held `L2.read` as everything else, over
+the production brute-force backend (`local_rag_projection::BruteForceProjectionStore`, 05 §1's
+as-built note, ADR-0003).
+
+**Representation selection.** The active model space's `code_raw` `RepresentationKey` is read once
+per search via the new `local_rag_projection::code_raw_representation_key` — the same lookup
+`params_for_model_space` uses to size and score the shard, factored out so the query cannot be
+embedded with a different `model_id`/`dimensions`/`distance_metric` than the points it is compared
+against. Reading it under the lock is deliberate: the representation is part of the active tuple,
+and resolving it before the lock would reintroduce exactly the mixing 06 §3 forbids. The cost of
+that choice is that query inference happens while `L2.read` is held — readers do not block each
+other, only writers (reconcile/switch) wait, which is the accepted v0 trade.
+
+**Query embedding** is an injected seam, `local_rag_search::QueryEmbedder` (same "inject a trait
+object, fake it in tests" idiom as `VectorSource`/`UuidSource`), not a dependency on
+`crates/embed`: provider selection and the `data_policy` guard that must run **before** any remote
+provider is considered (12 §1) belong to the daemon (group 15), and the seam keeps `crates/search`
+free of an inference runtime so its tests stay offline and deterministic. The default is
+`UnavailableEmbedder`, which fails with an explicit reason rather than returning a zero vector — a
+store with no provider degrades visibly instead of silently serving a meaningless dense leg.
+
+**Distance** comes from the representation and rides in `ShardParams::distance_metric` (03 §2.2 →
+05 §1). Every backend scores through one shared helper,
+`local_rag_projection::similarity(metric, query, point)`, in the "higher is closer" convention:
+`dot` raw, `cosine` normalized (a zero-norm vector scores `0.0`, never `NaN`, which would poison
+the sort), `l2` **negated** so nearer still sorts first.
+
+**`code_raw` only, and how.** The shard holds a point per (occurrence × required representation
+kind), so today's default space also stores `code_context` points. The chosen backend has no
+payload filter at all (ADR-0003: `filtered_hnsw_available = false`), so the leg requests
+`candidate_depth(limit) × |required kinds|` and filters by kind afterwards. That over-fetch is a
+heuristic, not a proof — so when the window comes back full and still yields fewer than
+`candidate_depth(limit)` `code_raw` hits, the leg re-queries once for the whole shard (for a
+linear-scan backend the same scan, only a larger sort), making the depth guaranteed at a bound of
+exactly two backend calls. Exercised deliberately by
+`crates/search/tests/dense.rs::request_limit_drives_the_dense_candidate_depth`, whose fixture ranks
+every `code_context` point above every `code_raw` one.
+
+**Identity.** `projection_point_id` is one-way (05 §3), so the occurrence behind a hit is recovered
+by re-deriving the tuple's expected set with the existing `expected_points` — the same function the
+switch uses to decide what belongs in the shard, which also carries each point's
+`representation_kind` and therefore serves as the kind filter and the reverse map at once. The leg
+returns `DenseHit { occurrence_id, rank, score }`, deliberately the same shape as T12-01's
+`LexicalHit`, so T12-03's RRF fuses two lists of occurrences rather than translating identities.
+
+**No filters inside a shard.** `DenseQuery` carries a vector and `k` and nothing else; a shard is
+per `(worktree, model_space)` (05 §2) and holds only the active generation's points after a
+`switch`, so "no tenant/generation filter dependence" is structural, not enforced at query time.
+
+**Degradation, never an error.** Every dense failure — no `code_raw` representation, no provider,
+a provider error, an embedding whose length disagrees with the representation, an unopenable or
+unrebuildable shard — produces `degraded: "lexical_only"` plus the reason in `diagnostics` (02 §6).
+A query with no text is **not** a failure: nothing is embedded, no provider is called, and the leg
+is empty but healthy — the same treatment §2's lexical leg gives a termless query.
 
 ## 4. Fusion `[SPEC]`
 

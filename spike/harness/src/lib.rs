@@ -195,9 +195,7 @@ fn measure_metrics(
     dataset: &SeededDataset,
     base: &Path,
 ) -> io::Result<MeasuredTimings> {
-    let params = ShardParams {
-        dimensions: dataset.dims,
-    };
+    let params = ShardParams::with_dimensions(dataset.dims);
     let dir = base.join("shard");
     std::fs::create_dir_all(&dir)?;
 

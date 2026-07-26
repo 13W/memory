@@ -48,7 +48,7 @@ use local_rag_test_support::TempHome;
 const DIMS: usize = 3;
 
 fn params() -> ShardParams {
-    ShardParams { dimensions: DIMS }
+    ShardParams::with_dimensions(DIMS)
 }
 
 fn default_model_space() -> Uuid {

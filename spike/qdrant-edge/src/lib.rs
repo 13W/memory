@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn persistence_round_trips_points_and_head() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = QdrantEdgeStore;
 
         let points = vec![point(1, 4), point(2, 4), point(3, 4)];
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn upsert_overwrites_existing_point_id_idempotently() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 2 };
+        let params = ShardParams::with_dimensions(2);
         let store = QdrantEdgeStore;
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn delete_is_idempotent_and_survives_reopen() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = QdrantEdgeStore;
         // Scoped: the WAL takes a real exclusive file lock (unlike brute-force/
         // usearch, which are plain files with no such lock) — a second `open`
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn upsert_rejects_wrong_dimension() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = QdrantEdgeStore;
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn search_rejects_wrong_dimension() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = QdrantEdgeStore;
         let shard = store.open(&scratch.path, params).expect("open");
         shard.upsert(&[point(1, 4)]).expect("upsert");
@@ -736,7 +736,7 @@ mod tests {
     fn point_ids_paginates_past_a_single_scroll_batch() {
         let scratch = Scratch::new();
         let dims = 4;
-        let params = ShardParams { dimensions: dims };
+        let params = ShardParams::with_dimensions(dims);
         let store = QdrantEdgeStore;
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn optimize_returns_ok() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = QdrantEdgeStore;
         let shard = store.open(&scratch.path, params).expect("open");
         shard.upsert(&[point(1, 4)]).expect("upsert");
@@ -784,7 +784,7 @@ mod tests {
     fn optimize_handles_a_segment_above_the_indexing_threshold() {
         let scratch = Scratch::new();
         let dims = 768;
-        let params = ShardParams { dimensions: dims };
+        let params = ShardParams::with_dimensions(dims);
         let store = QdrantEdgeStore;
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn corrupting_the_id_tracker_panics_instead_of_erroring_cleanly() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 8 };
+        let params = ShardParams::with_dimensions(8);
         {
             let shard = QdrantEdgeShard::open(&scratch.path, params).expect("open");
             shard.upsert(&[point(1, 8), point(2, 8)]).expect("upsert");

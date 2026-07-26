@@ -35,7 +35,7 @@ use local_rag_core::identity::Uuid;
 
 use crate::contract::{
     DenseQuery, Hash32, PointId, ProjectionError, ProjectionHead, ProjectionPoint, ProjectionStore,
-    Result, ScoredPoint, ShardHandle, ShardParams,
+    Result, ScoredPoint, ShardHandle, ShardParams, rank_scored, similarity,
 };
 
 const POINTS_FILE: &str = "points";
@@ -171,21 +171,17 @@ impl ShardHandle for FakeShard {
 
     fn search(&self, q: &DenseQuery) -> Result<Vec<ScoredPoint>> {
         let state = self.lock();
+        // Scored through the shared helper (T12-02) so this backend and the
+        // production one can never rank the same shard differently.
         let mut scored: Vec<ScoredPoint> = state
             .points
             .iter()
             .map(|(id, vector)| ScoredPoint {
                 point_id: id.clone(),
-                score: dot(&q.vector, vector),
+                score: similarity(self.params.distance_metric, &q.vector, vector),
             })
             .collect();
-        // Deterministic: score descending, ties broken by point id ascending.
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.point_id.cmp(&b.point_id))
-        });
+        rank_scored(&mut scored);
         scored.truncate(q.k);
         Ok(scored)
     }
@@ -203,10 +199,6 @@ impl ShardHandle for FakeShard {
             Err(e) => Err(ProjectionError::Io(e)),
         }
     }
-}
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 // ---- Persistence (pure std, atomic temp + rename) --------------------------
@@ -464,10 +456,5 @@ mod tests {
         assert!(hex_to_vector("abc").is_err(), "odd length");
         assert!(hex_to_vector("zz").is_err(), "non-hex");
         assert!(hex_to_vector("0102").is_err(), "not a multiple of 4 bytes");
-    }
-
-    #[test]
-    fn dot_zips_to_shorter() {
-        assert_eq!(dot(&[1.0, 2.0, 3.0], &[1.0, 1.0]), 3.0);
     }
 }

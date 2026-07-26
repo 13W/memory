@@ -56,7 +56,7 @@ fn point(id: &str, vector: [f32; DIMS]) -> ProjectionPoint {
 }
 
 fn params() -> ShardParams {
-    ShardParams { dimensions: DIMS }
+    ShardParams::with_dimensions(DIMS)
 }
 
 /// Points-then-head is the shape every op takes.

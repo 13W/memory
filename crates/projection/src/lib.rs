@@ -78,6 +78,7 @@
 //! `expected`/`switch`'s own module docs: wiring both is T11-05's). No real
 //! dense backend or dense/model SDK is coupled before T10.
 
+pub mod brute_force;
 pub mod contract;
 pub mod expected;
 pub mod fake;
@@ -89,10 +90,11 @@ pub mod switch;
 pub mod validate;
 pub mod vectors;
 
+pub use brute_force::{BruteForceProjectionStore, BruteForceShard, POINTS_FORMAT_VERSION};
 pub use contract::{
-    DenseQuery, Hash32, PROJECTION_SCHEMA_VERSION, PointId, ProjectionError, ProjectionHead,
-    ProjectionPoint, ProjectionStore, RepresentationKind, Result, ScoredPoint, ShardHandle,
-    ShardParams,
+    DenseQuery, DistanceMetric, Hash32, PROJECTION_SCHEMA_VERSION, PointId, ProjectionError,
+    ProjectionHead, ProjectionPoint, ProjectionStore, RepresentationKind, Result, ScoredPoint,
+    ShardHandle, ShardParams, rank_scored, similarity,
 };
 pub use expected::{
     CODE_REPRESENTATION_KINDS, ExpectedError, ExpectedPoint, expected_point_ids, expected_points,
@@ -102,8 +104,8 @@ pub use fake::{FakeProjectionStore, FakeShard};
 pub use identity::{head, manifest_hash, projection_point_id};
 pub use manager::{AcquireError, ShardManager};
 pub use model_switch::{
-    ModelSwitchError, dormant_migration_target, migrate_dormant_on_open, params_for_model_space,
-    shard_dir, switch_model_space,
+    ModelSwitchError, code_raw_representation_key, dormant_migration_target,
+    migrate_dormant_on_open, params_for_model_space, shard_dir, switch_model_space,
 };
 pub use rebuild::{
     OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome,

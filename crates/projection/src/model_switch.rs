@@ -58,9 +58,9 @@ use std::path::PathBuf;
 use local_rag_core::identity::{Uuid, UuidSource};
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    Coverage, ModelSpaceState, OpenError, StateDb, default_model_space_id, eligible_as_target,
-    model_space_required_kinds, model_space_required_representation_ids, model_space_state,
-    projection_state, representation_key, rusqlite,
+    Coverage, ModelSpaceState, OpenError, RepresentationKey, StateDb, default_model_space_id,
+    eligible_as_target, model_space_required_kinds, model_space_required_representation_ids,
+    model_space_state, projection_state, representation_key, rusqlite,
 };
 
 use crate::contract::{ProjectionStore, RepresentationKind, ShardParams};
@@ -183,17 +183,21 @@ pub fn shard_dir(layout: &StoreLayout, worktree_id: &Uuid, model_space_id: &Uuid
     layout.projection_shard_space(&worktree_id.to_string(), &model_space_id.to_string())
 }
 
-/// The [`ShardParams`] a model space's shards are opened with: the `dimensions`
-/// of its `code_raw` representation (spec 03 §2.2's canonical `RepresentationKey`).
+/// The canonical `RepresentationKey` of `model_space_id`'s **`code_raw`**
+/// representation (spec 03 §2.2) — the one representation v0's dense leg
+/// searches over (spec 09 §3: "v0 ships `code_raw`"; `code_context` is `[OPEN]`,
+/// decided by the benchmark).
 ///
-/// This is where "different dimensions ⇒ separate shard layout" (spec 10 §4
-/// `[FIXED]`) becomes mechanical rather than aspirational: params are a property
-/// of the space, and each space owns a directory, so a 768-dimension space can
-/// never be asked to write into a 256-dimension one's shard.
-pub fn params_for_model_space(
+/// Two callers, deliberately sharing one lookup (T12-02): [`params_for_model_space`]
+/// takes `dimensions`/`distance_metric` from it to open a shard, and the search
+/// pipeline's dense leg takes the whole key — `model_id` included — to embed the
+/// query with the *same* model the points were embedded with. Reading them from
+/// one place is what keeps "query embedding from the active model
+/// representation" (spec 09 §3) true by construction rather than by convention.
+pub fn code_raw_representation_key(
     conn: &rusqlite::Connection,
     model_space_id: &Uuid,
-) -> Result<ShardParams, ModelSwitchError> {
+) -> Result<RepresentationKey, ModelSwitchError> {
     let id = model_space_id.to_string();
     let representations = model_space_required_representation_ids(conn, &id)?;
     let representation_id = representations
@@ -203,13 +207,29 @@ pub fn params_for_model_space(
         .ok_or_else(|| ModelSwitchError::NoShardParams {
             model_space_id: id.clone(),
         })?;
-    let key = representation_key(conn, &representation_id)?.ok_or_else(|| {
-        ModelSwitchError::NoShardParams {
-            model_space_id: id.clone(),
-        }
-    })?;
+    representation_key(conn, &representation_id)?
+        .ok_or(ModelSwitchError::NoShardParams { model_space_id: id })
+}
+
+/// The [`ShardParams`] a model space's shards are opened with: the `dimensions`
+/// and `distance_metric` of its `code_raw` representation (spec 03 §2.2's
+/// canonical `RepresentationKey`, via [`code_raw_representation_key`]).
+///
+/// This is where "different dimensions ⇒ separate shard layout" (spec 10 §4
+/// `[FIXED]`) becomes mechanical rather than aspirational: params are a property
+/// of the space, and each space owns a directory, so a 768-dimension space can
+/// never be asked to write into a 256-dimension one's shard. The metric rides
+/// along for the same reason — spec 09 §3's "distance per
+/// `representation.distance_metric`" is a property of the space, not of the
+/// caller (T12-02).
+pub fn params_for_model_space(
+    conn: &rusqlite::Connection,
+    model_space_id: &Uuid,
+) -> Result<ShardParams, ModelSwitchError> {
+    let key = code_raw_representation_key(conn, model_space_id)?;
     Ok(ShardParams {
         dimensions: key.dimensions as usize,
+        distance_metric: key.distance_metric,
     })
 }
 

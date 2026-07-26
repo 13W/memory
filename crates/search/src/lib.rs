@@ -22,8 +22,9 @@
 mod pipeline;
 
 pub use pipeline::{
-    DEFAULT_L2_READ_WAIT_BUDGET, NoopObserver, PipelineSnapshot, SearchEngine, SearchInfraError,
-    SearchRequest, Stage, StageObserver,
+    DEFAULT_L2_READ_WAIT_BUDGET, DenseHit, NoopObserver, PipelineSnapshot, QueryEmbedError,
+    QueryEmbedder, SearchEngine, SearchInfraError, SearchRequest, Stage, StageObserver,
+    UnavailableEmbedder,
 };
 
 pub use local_rag_core::VERSION;

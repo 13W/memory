@@ -66,6 +66,35 @@ simply unquantified until T11 exists, and was not worth betting the v0 backend o
 is a documented no-op for this backend (§9's as-built note) — a flat array has no segment structure
 to compact. T12-02 integrates this candidate's design into the product workspace.
 
+As-built note (T12-02, `[SPEC]`): the production implementation is
+`local_rag_projection::BruteForceProjectionStore` (`crates/projection/src/brute_force.rs`) —
+still zero new dependencies (pure `std`), which the `Cargo.lock` diff proves rather than
+asserts. It carries the spike candidate's design over: a contiguous row-major `Vec<f32>` with a
+`point_id → row` index in memory, and on disk two files per shard directory — `points.bin` (a
+streamed, fixed-record binary format, records sorted ascending bytewise by point id so the file
+is a deterministic function of the point *set*, independent of upsert order) plus the
+`key=value` `head`, written strictly last. `open` trusts nothing: a wrong `POINTS_FORMAT_VERSION`,
+a dimension disagreement, a declared record count that contradicts the actual file length, a
+non-hex point id, or a truncation mid-record all surface as `ProjectionError::Corrupt` — the F12
+signal `crate::rebuild` turns into quarantine-then-rebuild — while a *missing* `points.bin` is a
+legitimately empty shard. The declared-length check is what catches a truncation that happens to
+land on a record boundary, which per-record reads alone would see as short-but-valid.
+
+`ShardParams` gained `distance_metric` (§9 §3's "distance per `representation.distance_metric`"),
+resolved together with `dimensions` from the model space's `code_raw` `RepresentationKey` by
+`params_for_model_space`, which now delegates to the extracted
+`code_raw_representation_key` — the same lookup the search pipeline's dense leg uses to embed the
+query, so shard and query can never disagree about model, width or metric. Both backends score
+through one shared helper (`similarity`) and rank through one shared comparator (`rank_scored`),
+so a shard cannot rank differently depending on which store opened it.
+
+`FakeProjectionStore` is **kept**, not replaced: it carries the named failpoints and the
+`inspect`/`corrupt` controls the group-07 fault matrix is built on (§10, 14 §3), and group 07's
+evidence stands unrewritten. The division is explicit — brute-force is the production backend,
+the fake is the fault-injection one — and `crates/projection/tests/backend_contract.rs` asserts
+the whole `ProjectionStore`/`ShardHandle` contract against **both**, so this section's
+"backend-neutral" claim is now a test rather than a convention.
+
 As-built note (T10-02, `[SPEC]`): the brute-force spike candidate
 (`spike/harness/src/brute_force.rs`, isolated from the product's pre-T10
 `FakeProjectionStore` dev scaffolding) scores by **dot product**, "higher is closer" —
@@ -450,6 +479,11 @@ As-built note (T10-05, `[SPEC]`, closes O1's `optimize`-threshold half): the cho
 since a wholesale-rewritten flat array has no segment/graph structure whose fragmentation could
 accrue. Recorded explicitly rather than left silently unresolved (O2: never invent a threshold
 that isn't needed).
+
+As-built note (T12-02, `[SPEC]`): the production `BruteForceProjectionStore::optimize` ships as
+exactly that no-op, and `backend_contract.rs::optimize_never_changes_what_the_shard_holds` pins
+the property every backend owes regardless of thresholds — calling it never alters the point set
+or the head.
 
 ## 10. Fault-detection matrix `[FIXED]`
 
