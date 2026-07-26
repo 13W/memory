@@ -30,12 +30,14 @@ fn run_bench() -> ExitCode {
     let mut corpus_dir: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut mode = local_rag_protocol::SearchMode::Hybrid;
+    let mut subdir: Option<String> = None;
 
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--corpus" => corpus_dir = args.next().map(PathBuf::from),
             "--out" => out = args.next().map(PathBuf::from),
+            "--subdir" => subdir = args.next(),
             "--mode" => {
                 let Some(raw) = args.next() else {
                     eprintln!("--mode needs a value");
@@ -57,7 +59,9 @@ fn run_bench() -> ExitCode {
     }
 
     let Some(corpus_dir) = corpus_dir else {
-        eprintln!("usage: cargo xtask bench --corpus <dir> [--out <path>] [--mode <mode>]");
+        eprintln!(
+            "usage: cargo xtask bench --corpus <dir> [--subdir <rel>] [--out <path>] [--mode <mode>]"
+        );
         return ExitCode::from(2);
     };
     let out = out.unwrap_or_else(|| bench::baseline_dir().join("run-v2.json"));
@@ -69,8 +73,11 @@ fn run_bench() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = match runtime.block_on(bench::run::run(&bench::run::Options { corpus_dir, mode }))
-    {
+    let report = match runtime.block_on(bench::run::run(&bench::run::Options {
+        corpus_dir,
+        subdir,
+        mode,
+    })) {
         Ok(report) => report,
         Err(e) => {
             eprintln!("bench: {e}");

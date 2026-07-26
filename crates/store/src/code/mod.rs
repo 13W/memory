@@ -38,11 +38,16 @@
 //! occurrences with it is T05-03. Callers still supply ids/`now_ms` as the
 //! registry primitives do, keeping the clock and entropy out of the write path.
 
+mod context;
 mod membership;
 mod normalize;
 mod revision;
 mod source;
 
+pub use context::{
+    CONTEXT_VERSION, ContextInput, ContextSubject, SIGNATURE_CAP_CHARS,
+    context_subjects_for_generation, serialize as serialize_context,
+};
 pub use membership::{
     EdgeResolution, FtsSourceRow, NewOccurrence, NewResolvedEdge, NewUnresolvedReference,
     OccurrenceMetadata, SkipReason, content_blob_ids_for_generation,

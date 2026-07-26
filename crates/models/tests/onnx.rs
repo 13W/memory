@@ -121,12 +121,19 @@ fn a_marked_directory_gets_past_the_gate_and_fails_on_the_asset_itself() {
 fn the_representation_key_is_exactly_the_one_adr_0004_fixed() {
     let key = EMBEDDINGGEMMA_300M.representation_key();
 
+    // ADR-0004's four decided fields — model, width, metric, kind — are frozen.
     assert_eq!(key.kind, RepresentationKind::CodeRaw);
     assert_eq!(key.model_id, "embeddinggemma-300m");
     assert_eq!(key.dimensions, 768);
     assert_eq!(key.distance_metric, DistanceMetric::Cosine);
-    assert_eq!(key.representation_version, 1);
     assert_eq!(key.normalization_version, 1);
+
+    // `representation_version` is the deliberate exception: it moves whenever
+    // something outside the other five fields changes the vectors. D-016 raised
+    // `MAX_SEQUENCE_TOKENS` 256 → 1024, so cached 256-token vectors must stop
+    // being addressable under this key.
+    assert_eq!(key.representation_version, 2);
+    assert_eq!(local_rag_models::MAX_SEQUENCE_TOKENS, 1024);
 }
 
 /// Real inference, when the host supplies both halves.

@@ -115,6 +115,17 @@ impl QueryEmbedder for PoolQueryEmbedder {
 pub struct Options {
     /// The corpus checkout to index.
     pub corpus_dir: PathBuf,
+    /// Optional subdirectory of the checkout to index *instead of* the whole
+    /// thing — the knob that makes a run comparable with a baseline that
+    /// indexed only part of a repository.
+    ///
+    /// The v1 baseline walked `<root>/src/` and nothing else
+    /// (`scripts/benchmark.ts::collectSrcFiles`), so a whole-repo run silently
+    /// measures a different corpus — including, in v1's own checkout,
+    /// `scripts/benchmark.ts`, the file that holds all 49 query strings as
+    /// literals and is therefore a near-perfect lexical match for the wrong
+    /// answer.
+    pub subdir: Option<String>,
     /// Which legs to run.
     pub mode: SearchMode,
 }
@@ -168,10 +179,20 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
     //    by construction (spec 09 §3).
     let worktree_id = uuids.next_uuid();
     let repo_id = uuids.next_uuid();
-    let root = options
+    // The worktree root *is* the indexed scope, so restricting the corpus is
+    // just rooting the worktree deeper. Result paths become relative to it,
+    // which the substring matcher does not care about.
+    let checkout = options
         .corpus_dir
         .canonicalize()
         .map_err(|e| format!("corpus dir: {e}"))?;
+    let root = match &options.subdir {
+        Some(sub) => checkout
+            .join(sub)
+            .canonicalize()
+            .map_err(|e| format!("corpus subdir {sub:?}: {e}"))?,
+        None => checkout.clone(),
+    };
     register_worktree(&state, &repo_id, &worktree_id, &root, now_ms).await?;
     register_representation_for(&state, embedder.as_ref(), now_ms).await?;
 
@@ -359,7 +380,11 @@ pub async fn run(options: &Options) -> Result<BenchReport, String> {
         Provenance {
             v2_commit: git_short_head(Path::new(".")).unwrap_or_else(|| "unknown".to_string()),
             corpus_path: root.display().to_string(),
-            corpus_commit: git_short_head(&root).unwrap_or_else(|| "unknown".to_string()),
+            // The *checkout*'s commit, not the subdirectory's — `git -C <subdir>`
+            // still resolves to the repository, but naming the checkout is what a
+            // reader needs to reproduce the run.
+            corpus_commit: git_short_head(&checkout).unwrap_or_else(|| "unknown".to_string()),
+            corpus_subdir: options.subdir.clone(),
             corpus_version: corpus.version.clone(),
             model_id: entry.model_id.to_string(),
             mode: options.mode.as_str().to_string(),
