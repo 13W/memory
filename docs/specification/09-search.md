@@ -260,6 +260,22 @@ re-embedding when a file moves), and nothing in the measurement argues for payin
 (`SearchEngine::with_dense_kind`, `--dense-kind` in `cargo xtask bench`), so the decision is
 re-measurable rather than re-implementable when the model, the window, or the corpus changes.
 
+Amended as-built note (D-017, `[SPEC]`): the table above was measured while the provider read the
+wrong graph output, i.e. **without** the model's trained Dense head (10 §2's D-017 note). The
+comparison was therefore re-run on corrected vectors, and — this being exactly what
+"re-measurable rather than re-implementable" was for — the decision **stands**:
+
+| dense representation | Hit@1 | Hit@3 | Hit@5 / Recall@5 | MRR |
+| --- | --- | --- | --- | --- |
+| `code_raw` (dense leg) | 0.5918 | **0.8367** | 0.8367 | **0.7007** |
+| `code_context` (dense leg) | 0.5918 | 0.8163 | 0.8367 | 0.6956 |
+| v1 baseline | 0.5918 | 0.7959 | 0.8367 | 0.6963 |
+
+Both representations now clear the gate on the dense leg; `code_raw` stays ahead by 0.0051 MRR —
+inside one query's worth of movement, but in the same direction as before and at the lower subject
+cost. These rows are the **dense leg alone** (`--mode code`), not the hybrid, because the hybrid is
+currently bounded by fusion rather than by the representation (§4's D-018 note).
+
 Artifacts: `fixtures/search/baseline/run-v2-2026-07-26-stage-c-{code-raw,code-context}.json`;
 reproduce with `ORT_DYLIB_PATH=<lib> cargo xtask bench --corpus <v1 checkout> --subdir src
 --dense-kind code_raw|code_context`.
@@ -309,6 +325,17 @@ The `(score desc, occurrence_id asc)` tie-break is load-bearing, not cosmetic: f
 through a `HashMap`, whose iteration order is randomized per process, so the sort is the only
 thing that makes repeated output byte-stable (§7). Equal scores are the *common* case — any
 document both legs return at the same ranks ties with every other such document.
+
+Open finding (D-017's re-measurement, `[SPEC]` unchanged — recorded here so the next reader does
+not re-derive it): **unweighted RRF costs more than it adds once the legs differ in strength.**
+On the 49-query benchmark after D-017 the dense leg scores MRR 0.7007 and the lexical leg 0.4344,
+while the `hybrid` default lands at 0.5721 — *below its own dense leg*. The formula above is why:
+a document both legs return at middling ranks (`1/61 + 1/80`) outranks one the strong leg put
+first and the weak leg missed (`1/61`), so every weak-leg vote is a vote against the strong leg's
+ordering. Per query, fusion demotes 15 of the 49 (13 of them from dense rank 1) and promotes 9.
+This is registered as **D-018**; `k`, the weights and the per-leg candidate depth are unchanged
+until it is resolved, because tuning them against this corpus — single-relevant, natural-language
+queries, i.e. BM25's worst case — would fit the benchmark rather than the problem.
 
 ## 5. Modes (v0) `[SPEC mapping of v1 modes]`
 

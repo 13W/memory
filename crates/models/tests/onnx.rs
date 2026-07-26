@@ -130,9 +130,11 @@ fn the_representation_key_is_exactly_the_one_adr_0004_fixed() {
 
     // `representation_version` is the deliberate exception: it moves whenever
     // something outside the other five fields changes the vectors. D-016 raised
-    // `MAX_SEQUENCE_TOKENS` 256 → 1024, so cached 256-token vectors must stop
-    // being addressable under this key.
-    assert_eq!(key.representation_version, 2);
+    // `MAX_SEQUENCE_TOKENS` 256 → 1024 (version 2); D-017 moved the provider onto
+    // the graph's pooled output, i.e. through the model's Dense head instead of
+    // around it (version 3). Vectors from either earlier era must stop being
+    // addressable under this key.
+    assert_eq!(key.representation_version, 3);
     assert_eq!(local_rag_models::MAX_SEQUENCE_TOKENS, 1024);
 }
 
@@ -174,6 +176,17 @@ async fn real_inference_when_the_runtime_and_weights_are_present() {
 
     let key = embedder.key();
     assert_eq!(key, EMBEDDINGGEMMA_300M.representation_key());
+
+    // D-017: the installed graph declares `last_hidden_state` first and
+    // `sentence_embedding` second, and only the second one runs the model's
+    // trained Dense head. Selecting by position embedded into a space the model
+    // never produces, and nothing downstream could tell — both outputs are
+    // 768-wide and normalize cleanly. This assertion is the detector.
+    assert_eq!(
+        embedder.output_name(),
+        local_rag_models::POOLED_OUTPUT,
+        "the provider must embed through the graph's pooled output, not the raw token states"
+    );
 
     // The card's contract: `key()` and the vector width must agree with the
     // *registered* representation, checked through the very code the pool uses
