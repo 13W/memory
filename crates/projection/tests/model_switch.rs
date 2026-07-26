@@ -284,7 +284,7 @@ async fn establish_on_a(
         db,
         store,
         &shard_dir(layout, &worktree_id, &space_a()),
-        ShardParams { dimensions: DIMS_A },
+        ShardParams::with_dimensions(DIMS_A),
         worktree_id,
         generation,
         space_a(),
@@ -404,7 +404,7 @@ async fn two_worktrees_migrate_independently() {
     let old = store
         .open(
             &shard_dir(&layout, &wt_b, &space_a()),
-            ShardParams { dimensions: DIMS_A },
+            ShardParams::with_dimensions(DIMS_A),
         )
         .expect("open the untouched shard");
     assert_eq!(old.point_count().expect("count"), 1);
@@ -443,15 +443,23 @@ async fn different_dimensions_never_reuse_the_old_shard() {
     let dir_b = shard_dir(&layout, &wt, &b);
     assert_ne!(dir_a, dir_b, "each model space owns a directory");
 
-    // Params are derived from the registry, not from a store-wide constant.
+    // Params are derived from the registry, not from a store-wide constant —
+    // both axes of them: `dimensions` and (T12-02) `distance_metric`, which is
+    // `cosine` for every representation this fixture registers.
     let read = db.open_read().expect("read");
     assert_eq!(
         params_for_model_space(&read, &space_a()).expect("params A"),
-        ShardParams { dimensions: DIMS_A }
+        ShardParams {
+            dimensions: DIMS_A,
+            distance_metric: DistanceMetric::Cosine,
+        }
     );
     assert_eq!(
         params_for_model_space(&read, &b).expect("params B"),
-        ShardParams { dimensions: DIMS_B }
+        ShardParams {
+            dimensions: DIMS_B,
+            distance_metric: DistanceMetric::Cosine,
+        }
     );
     drop(read);
 
@@ -477,14 +485,14 @@ async fn different_dimensions_never_reuse_the_old_shard() {
 
     // The old shard still answers at its own width, untouched.
     let old = store
-        .open(&dir_a, ShardParams { dimensions: DIMS_A })
+        .open(&dir_a, ShardParams::with_dimensions(DIMS_A))
         .expect("open old");
     assert_eq!(old.point_count().expect("count"), 1);
 
     // And the new shard refuses a vector of the old width — the widths are
     // physically separated, not merely conventionally.
     let new = store
-        .open(&dir_b, ShardParams { dimensions: DIMS_B })
+        .open(&dir_b, ShardParams::with_dimensions(DIMS_B))
         .expect("open new");
     let any_id = new
         .point_ids()

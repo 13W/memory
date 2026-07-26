@@ -285,7 +285,7 @@ async fn establish_on_a(
         db,
         store,
         &shard_dir(layout, &worktree_id, &space_a()),
-        ShardParams { dimensions: DIMS_A },
+        ShardParams::with_dimensions(DIMS_A),
         worktree_id,
         generation,
         space_a(),
@@ -351,7 +351,7 @@ async fn a_kill_before_commit_leaves_the_worktree_all_old_then_all_new() {
     let old = store
         .open(
             &shard_dir(&layout, &wt, &space_a()),
-            ShardParams { dimensions: DIMS_A },
+            ShardParams::with_dimensions(DIMS_A),
         )
         .expect("open A's shard");
     assert_eq!(old.point_count().expect("count"), 1);
@@ -446,7 +446,7 @@ async fn a_migration_does_not_block_another_worktree() {
                         &db,
                         &*store,
                         &shard_dir(&layout, &wt_b, &space_a()),
-                        ShardParams { dimensions: DIMS_A },
+                        ShardParams::with_dimensions(DIMS_A),
                         wt_b,
                         gen_b2,
                         space_a(),

@@ -25,7 +25,7 @@ const DIMS: usize = 3;
 const UPSERT_FP: &str = "projection.fake.upsert";
 
 fn params() -> ShardParams {
-    ShardParams { dimensions: DIMS }
+    ShardParams::with_dimensions(DIMS)
 }
 
 fn default_model_space() -> Uuid {

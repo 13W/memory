@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn persistence_round_trips_points_and_head() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = BruteForceStore::new();
 
         let points = vec![point(1, 4), point(2, 4), point(3, 4)];
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn truncated_points_file_is_reported_corrupt() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = BruteForceStore::new();
         {
             let shard = store.open(&scratch.path, params).expect("open");
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn upsert_rejects_wrong_dimension() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = BruteForceStore::new();
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn delete_is_idempotent_and_survives_reopen() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = BruteForceStore::new();
         let shard = store.open(&scratch.path, params).expect("open");
         shard.upsert(&[point(1, 4), point(2, 4)]).expect("upsert");
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn search_returns_highest_dot_product_first() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 2 };
+        let params = ShardParams::with_dimensions(2);
         let store = BruteForceStore::new();
         let shard = store.open(&scratch.path, params).expect("open");
         shard

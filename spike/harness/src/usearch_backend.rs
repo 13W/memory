@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn persistence_round_trips_points_and_head() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
 
         let points = vec![point(1, 4), point(2, 4), point(3, 4)];
@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn upsert_overwrites_existing_point_id_idempotently() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 2 };
+        let params = ShardParams::with_dimensions(2);
         let store = UsearchStore;
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn key_collision_between_distinct_point_ids_is_reported_as_backend_error() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 2 };
+        let params = ShardParams::with_dimensions(2);
         let store = UsearchStore;
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn delete_is_idempotent_and_survives_reopen() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
         let shard = store.open(&scratch.path, params).expect("open");
         shard.upsert(&[point(1, 4), point(2, 4)]).expect("upsert");
@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn upsert_rejects_wrong_dimension() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
         let shard = store.open(&scratch.path, params).expect("open");
 
@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn search_rejects_wrong_dimension() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
         let shard = store.open(&scratch.path, params).expect("open");
         shard.upsert(&[point(1, 4)]).expect("upsert");
@@ -850,7 +850,7 @@ mod tests {
     #[test]
     fn missing_companion_artifact_is_reported_corrupt() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
         {
             let shard = store.open(&scratch.path, params).expect("open");
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn ids_bin_and_index_count_mismatch_is_reported_corrupt() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
         {
             let shard = store.open(&scratch.path, params).expect("open");
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn truncated_index_file_is_reported_corrupt() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
         {
             let shard = store.open(&scratch.path, params).expect("open");
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn optimize_returns_ok() {
         let scratch = Scratch::new();
-        let params = ShardParams { dimensions: 4 };
+        let params = ShardParams::with_dimensions(4);
         let store = UsearchStore;
         let shard = store.open(&scratch.path, params).expect("open");
         shard.upsert(&[point(1, 4)]).expect("upsert");

@@ -24,18 +24,22 @@
 //! is held across one pipeline run, never that concurrent switches can't mix
 //! generations).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use local_rag_core::identity::Uuid;
-use local_rag_projection::{DenseQuery, ShardManager};
+use local_rag_projection::{
+    DenseQuery, RepresentationKind, ScoredPoint, ShardManager, code_raw_representation_key,
+    expected_points, required_code_kinds,
+};
 use local_rag_protocol::{DegradedMode, ErrorEnvelope};
 use local_rag_store::lock::ReadTimedOut;
 use local_rag_store::{
     CacheDb, CacheOpenError, FtsAvailability, FtsOpenOutcome, FtsRebuildError, LexicalHit,
-    LexicalQuery, OpenError, RequestRoot, Resolution, StateDb, ValidationDepth,
-    WorktreeLockRegistry, lexical_leg, open_and_validate_fts, projection_state,
+    LexicalQuery, OpenError, RepresentationKey, RequestRoot, Resolution, StateDb, ValidationDepth,
+    WorktreeLockRegistry, candidate_depth, lexical_leg, open_and_validate_fts, projection_state,
     requires_index_unavailable, resolve, rusqlite,
 };
 
@@ -81,6 +85,98 @@ impl StageObserver for NoopObserver {
     fn on_stage(&self, _stage: Stage) {}
 }
 
+/// Turns the request's query text into a vector **for a specific
+/// representation** (spec 09 §3: "query embedding computed with the
+/// representation of the active model space").
+///
+/// A seam rather than a direct dependency on `crates/embed`, following the same
+/// "inject a trait object, fake it in tests" idiom as
+/// `local_rag_projection::switch::VectorSource` and
+/// `local_rag_core::identity::UuidSource`. Two reasons it earns its keep here:
+/// the daemon (group 15) owns provider selection *and* the `data_policy` guard
+/// that must run before any remote provider is considered (spec 12 §1) — policy
+/// is not a search concern; and this crate stays free of an inference runtime,
+/// so its tests remain deterministic and offline.
+///
+/// Implementations MUST honor `key`: embedding with a different model than the
+/// one the shard's points were embedded with produces silently meaningless
+/// neighbours, which is exactly the failure the six-field
+/// [`RepresentationKey`] exists to make impossible.
+pub trait QueryEmbedder: Send + Sync {
+    /// Embed `query` under `key`, or explain why not.
+    fn embed_query(
+        &self,
+        query: &str,
+        key: &RepresentationKey,
+    ) -> Result<Vec<f32>, QueryEmbedError>;
+}
+
+/// Why a query could not be embedded — no provider registered for the
+/// representation, a provider failure, a policy refusal.
+///
+/// Never fatal to a search: the dense leg turns it into `degraded:
+/// lexical_only` plus this text as the diagnostic (spec 02 §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEmbedError {
+    /// Human-readable reason, surfaced verbatim in `diagnostics`.
+    pub reason: String,
+}
+
+impl QueryEmbedError {
+    /// Build an error from its reason.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for QueryEmbedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "query embedding failed: {}", self.reason)
+    }
+}
+
+impl std::error::Error for QueryEmbedError {}
+
+/// A [`QueryEmbedder`] that never produces a vector.
+///
+/// The honest default for a store with no embedding provider wired up yet
+/// (every caller before group 15): the dense leg degrades to `lexical_only`
+/// with this reason in `diagnostics`, rather than a silently empty dense leg
+/// pretending to be a healthy hybrid search.
+#[derive(Debug, Default)]
+pub struct UnavailableEmbedder;
+
+impl QueryEmbedder for UnavailableEmbedder {
+    fn embed_query(
+        &self,
+        _query: &str,
+        key: &RepresentationKey,
+    ) -> Result<Vec<f32>, QueryEmbedError> {
+        Err(QueryEmbedError::new(format!(
+            "no embedding provider is configured for model {}",
+            key.model_id
+        )))
+    }
+}
+
+/// One dense-leg candidate (spec 09 §3), in the same shape the lexical leg's
+/// [`LexicalHit`] uses so T12-03 can fuse them without translating identities.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenseHit {
+    /// The occurrence behind the matched projection point (spec 05 §3's
+    /// derivation, inverted via `expected_points`).
+    pub occurrence_id: String,
+    /// 1-based position in this leg's result order — RRF's `rank_leg(d)`
+    /// (spec 09 §4).
+    pub rank: usize,
+    /// The backend's similarity under the representation's own
+    /// `distance_metric`, always "higher is closer". Comparable *within* a leg
+    /// only; fusion uses `rank`.
+    pub score: f32,
+}
+
 /// One `search_code` request: the explicit context to resolve (spec 02 §3.3)
 /// plus the already-embedded dense query vector (query embedding is the
 /// caller's concern — this crate does not embed).
@@ -116,6 +212,11 @@ pub struct PipelineSnapshot {
     pub generation_id: String,
     /// The active model space served.
     pub model_space_id: String,
+    /// The dense leg's ranked candidates (spec 09 §3), best first. Empty
+    /// whenever the leg did not run — `lexical_only`, or a query with no text.
+    /// Fusing these with the lexical leg into spec 09 §7's `results[]` is
+    /// T12-03.
+    pub dense: Vec<DenseHit>,
     /// The lexical leg's ranked candidates (spec 09 §2), best first. Empty
     /// whenever the leg did not run — an invalid FTS view (`dense_only`) or a
     /// query that reduces to no terms. Fusing these with the dense leg into
@@ -126,6 +227,15 @@ pub struct PipelineSnapshot {
     /// Freeform diagnostic reasons (spec 02 §6: "every degraded response
     /// includes the validation reason").
     pub diagnostics: Vec<String>,
+}
+
+impl PipelineSnapshot {
+    /// Whether the dense leg served this response (the inverse of
+    /// `degraded == lexical_only`), for readers that care about the leg rather
+    /// than the wire vocabulary.
+    pub fn dense_served(&self) -> bool {
+        self.degraded != Some(DegradedMode::LexicalOnly)
+    }
 }
 
 /// An infrastructure-level failure: none of spec 02 §6's named error codes
@@ -185,11 +295,14 @@ pub struct SearchEngine {
     cache: Arc<CacheDb>,
     locks: Arc<WorktreeLockRegistry>,
     shards: Arc<ShardManager>,
+    embedder: Arc<dyn QueryEmbedder>,
     read_wait_budget: Duration,
 }
 
 impl SearchEngine {
-    /// Assemble a search engine over already-open store handles.
+    /// Assemble a search engine over already-open store handles, with no
+    /// embedding provider — every dense leg degrades to `lexical_only` with an
+    /// explicit reason ([`UnavailableEmbedder`]).
     pub fn new(
         state: Arc<StateDb>,
         cache: Arc<CacheDb>,
@@ -197,11 +310,32 @@ impl SearchEngine {
         shards: Arc<ShardManager>,
         read_wait_budget: Duration,
     ) -> Self {
+        Self::with_embedder(
+            state,
+            cache,
+            locks,
+            shards,
+            Arc::new(UnavailableEmbedder),
+            read_wait_budget,
+        )
+    }
+
+    /// [`new`](Self::new) with a real [`QueryEmbedder`] — the constructor the
+    /// daemon uses once providers exist (group 15).
+    pub fn with_embedder(
+        state: Arc<StateDb>,
+        cache: Arc<CacheDb>,
+        locks: Arc<WorktreeLockRegistry>,
+        shards: Arc<ShardManager>,
+        embedder: Arc<dyn QueryEmbedder>,
+        read_wait_budget: Duration,
+    ) -> Self {
         Self {
             state,
             cache,
             locks,
             shards,
+            embedder,
             read_wait_budget,
         }
     }
@@ -303,20 +437,17 @@ impl SearchEngine {
         let worktree_uuid: Uuid = worktree_id
             .parse()
             .map_err(|_| SearchInfraError::CorruptWorktreeId(worktree_id.to_string()))?;
-        let (dense_available, dense_diagnostic) =
-            match self.shards.acquire(worktree_uuid, now_ms).await {
-                Ok(handle) => {
-                    let query = DenseQuery {
-                        vector: request.query_vector.clone(),
-                        k: request.k,
-                    };
-                    match handle.search(&query) {
-                        Ok(_points) => (true, None),
-                        Err(e) => (false, Some(e.to_string())),
-                    }
-                }
-                Err(e) => (false, Some(e.to_string())),
-            };
+        let dense_outcome = self
+            .dense_leg(
+                worktree_uuid,
+                &generation_id,
+                &model_space_id,
+                request,
+                now_ms,
+            )
+            .await?;
+        let dense_available = dense_outcome.available;
+        let dense_diagnostic = dense_outcome.diagnostic;
 
         if requires_index_unavailable(&fts_availability, dense_available) {
             let mut details = Vec::new();
@@ -381,9 +512,203 @@ impl SearchEngine {
             generation_id,
             model_space_id,
             lexical,
+            dense: dense_outcome.hits,
             degraded,
             diagnostics,
         }))
+    }
+
+    /// The dense leg (spec 09 §3) — T12-02.
+    ///
+    /// Every failure here is a **degradation**, never an error: the caller turns
+    /// `available == false` into `degraded: lexical_only` plus the diagnostic
+    /// (spec 02 §6), exactly as an unopenable shard already did. The infra
+    /// `Result` is reserved for "the store itself would not answer".
+    async fn dense_leg(
+        &self,
+        worktree_id: Uuid,
+        generation_id: &str,
+        model_space_id: &str,
+        request: &SearchRequest,
+        now_ms: i64,
+    ) -> Result<DenseOutcome, SearchInfraError> {
+        let (Ok(generation_uuid), Ok(model_space_uuid)) = (
+            generation_id.parse::<Uuid>(),
+            model_space_id.parse::<Uuid>(),
+        ) else {
+            // Structurally unreachable (both are minted through `UuidSource`),
+            // but this crate cannot enforce that, so it degrades rather than
+            // panicking.
+            return Ok(DenseOutcome::unavailable(format!(
+                "active tuple has a non-UUID id: generation {generation_id:?}, \
+                 model space {model_space_id:?}"
+            )));
+        };
+
+        // The query's representation IS the active model space's `code_raw`
+        // representation (spec 09 §3): the same `model_id`/`dimensions`/
+        // `distance_metric` its points were embedded and its shard was opened
+        // with. Resolved under the same `L2.read` as the tuple it belongs to.
+        let (key, required_kinds) = {
+            let conn = self
+                .state
+                .open_read()
+                .map_err(SearchInfraError::StateOpen)?;
+            let key = match code_raw_representation_key(&conn, &model_space_uuid) {
+                Ok(key) => key,
+                Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+            };
+            let kinds = match required_code_kinds(&conn, &model_space_uuid) {
+                Ok(kinds) => kinds,
+                Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+            };
+            (key, kinds)
+        };
+
+        // A query with no text has nothing to embed. That is an empty leg, not
+        // an unavailable one — mirroring the lexical leg's own termless case, so
+        // an empty query never reports itself as a degraded search.
+        if request.query.trim().is_empty() {
+            return Ok(DenseOutcome::empty());
+        }
+
+        let vector = match self.embedder.embed_query(&request.query, &key) {
+            Ok(vector) => vector,
+            Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+        };
+        if vector.len() != key.dimensions as usize {
+            return Ok(DenseOutcome::unavailable(format!(
+                "query embedding has {} dimensions, representation {} expects {}",
+                vector.len(),
+                key.model_id,
+                key.dimensions
+            )));
+        }
+
+        // The shard holds a point per (occurrence × required representation
+        // kind), but v0's dense leg reads only `code_raw` (spec 09 §3;
+        // `code_context` is `[OPEN]`, decided by the benchmark). The backend
+        // cannot filter by kind — brute-force has no payload predicate at all
+        // (ADR-0003 records `filtered_hnsw_available = false`) — so the leg
+        // over-fetches by the number of required kinds and filters below.
+        // Without the factor, other kinds' points would eat the depth budget
+        // before the filter ever saw them.
+        let depth = candidate_depth(request.limit);
+        let over_fetch = depth.saturating_mul(required_kinds.len().max(1));
+
+        let handle = match self.shards.acquire(worktree_id, now_ms).await {
+            Ok(handle) => handle,
+            Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+        };
+
+        // `point_id` is a one-way digest (spec 05 §3), so the occurrence behind
+        // a hit is recovered by re-deriving the expected set for the active
+        // tuple — the very function the switch already uses to decide what
+        // belongs in this shard (`expected_points`), which also carries each
+        // point's `representation_kind` and is therefore the kind filter as well
+        // as the reverse map.
+        let by_point: HashMap<String, String> = {
+            let conn = self
+                .state
+                .open_read()
+                .map_err(SearchInfraError::StateOpen)?;
+            match expected_points(&conn, &worktree_id, &generation_uuid, &model_space_uuid) {
+                Ok(points) => points
+                    .into_iter()
+                    .filter(|p| p.representation_kind == RepresentationKind::CodeRaw)
+                    .map(|p| (p.point_id.as_str().to_string(), p.occurrence_id))
+                    .collect(),
+                Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+            }
+        };
+
+        let scored = match handle.search(&DenseQuery {
+            vector: vector.clone(),
+            k: over_fetch,
+        }) {
+            Ok(scored) => scored,
+            Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+        };
+        let window_was_full = scored.len() >= over_fetch;
+        let mut hits = to_dense_hits(scored, &by_point, depth);
+
+        // Over-fetching by the kind count is a heuristic, not a proof: if the
+        // window came back full *and* still yielded fewer than `depth` `code_raw`
+        // hits, the truncation may have hidden some behind other kinds' points.
+        // Ask once more for the whole shard — for a linear-scan backend that is
+        // the same scan, only a larger sort — so the leg's depth is guaranteed
+        // rather than probabilistic. Bounded at exactly two backend calls.
+        if window_was_full && hits.len() < depth {
+            let total = match handle.point_count() {
+                Ok(total) => total as usize,
+                Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+            };
+            if total > over_fetch {
+                match handle.search(&DenseQuery { vector, k: total }) {
+                    Ok(scored) => hits = to_dense_hits(scored, &by_point, depth),
+                    Err(e) => return Ok(DenseOutcome::unavailable(e.to_string())),
+                }
+            }
+        }
+
+        Ok(DenseOutcome {
+            hits,
+            available: true,
+            diagnostic: None,
+        })
+    }
+}
+
+/// Keep the `code_raw` hits (those present in `by_point`), map them to their
+/// occurrences, cut at `depth` and number them from 1 — the backend already
+/// returned them best-first (spec 05 §1's ranking contract).
+fn to_dense_hits(
+    scored: Vec<ScoredPoint>,
+    by_point: &HashMap<String, String>,
+    depth: usize,
+) -> Vec<DenseHit> {
+    scored
+        .into_iter()
+        .filter_map(|s| {
+            by_point
+                .get(s.point_id.as_str())
+                .map(|occurrence_id| (occurrence_id.clone(), s.score))
+        })
+        .take(depth)
+        .enumerate()
+        .map(|(i, (occurrence_id, score))| DenseHit {
+            occurrence_id,
+            rank: i + 1,
+            score,
+        })
+        .collect()
+}
+
+/// The dense leg's result plus whether the leg itself was serviceable.
+struct DenseOutcome {
+    hits: Vec<DenseHit>,
+    available: bool,
+    diagnostic: Option<String>,
+}
+
+impl DenseOutcome {
+    /// The leg ran and found nothing — still a healthy leg.
+    fn empty() -> Self {
+        Self {
+            hits: Vec::new(),
+            available: true,
+            diagnostic: None,
+        }
+    }
+
+    /// The leg could not run; the caller degrades to `lexical_only` and reports
+    /// `why`.
+    fn unavailable(why: impl Into<String>) -> Self {
+        Self {
+            hits: Vec::new(),
+            available: false,
+            diagnostic: Some(why.into()),
+        }
     }
 }
 

@@ -57,7 +57,7 @@ const BEFORE_COMMIT_FP: &str = "projection.switch.before_commit";
 static SERIAL: Mutex<()> = Mutex::const_new(());
 
 fn params() -> ShardParams {
-    ShardParams { dimensions: DIMS }
+    ShardParams::with_dimensions(DIMS)
 }
 
 fn default_model_space() -> Uuid {

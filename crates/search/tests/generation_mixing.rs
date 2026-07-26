@@ -32,15 +32,17 @@ use local_rag_projection::{
     RepresentationKind, ScoredPoint, ShardHandle, ShardManager, ShardParams, VectorSource, switch,
 };
 use local_rag_protocol::ErrorCode;
-use local_rag_search::{PipelineSnapshot, SearchEngine, SearchRequest};
+use local_rag_search::{
+    PipelineSnapshot, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest,
+};
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, GenerationState, LockLevel, NewContentBlob, NewFileRevision,
-    NewOccurrence, NewParsedUnit, NewlineStyle, RequestRoot, SourceCompression, StateDb, UnitKind,
-    WorktreeKind, WorktreeLockRegistry, WorktreeRootFacts, allocate_generation, create_repository,
-    create_worktree, derive_content_blob, held_level, insert_content_blob, insert_file_revision,
-    insert_generation_file, insert_occurrence, insert_parsed_unit, insert_projection_state,
-    materialize_fts, observe_repository_path, observe_worktree_path, occurrence_id,
-    transition_generation,
+    NewOccurrence, NewParsedUnit, NewlineStyle, RepresentationKey, RequestRoot, SourceCompression,
+    StateDb, UnitKind, WorktreeKind, WorktreeLockRegistry, WorktreeRootFacts, allocate_generation,
+    create_repository, create_worktree, derive_content_blob, held_level, insert_content_blob,
+    insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
+    insert_projection_state, materialize_fts, observe_repository_path, observe_worktree_path,
+    occurrence_id, transition_generation,
 };
 use local_rag_test_support::TempHome;
 
@@ -51,7 +53,7 @@ const MIN_POST_SWITCH_ITERS: usize = 3;
 const MAX_LOOP_ITERS: usize = 500;
 
 fn params() -> ShardParams {
-    ShardParams { dimensions: DIMS }
+    ShardParams::with_dimensions(DIMS)
 }
 
 fn default_model_space() -> Uuid {
@@ -84,6 +86,31 @@ struct AlwaysVectors;
 impl VectorSource for AlwaysVectors {
     fn vector(&self, _occurrence_id: &str, _kind: RepresentationKind) -> Option<Vec<f32>> {
         Some(vec![1.0, 0.0, 0.0])
+    }
+}
+
+/// A deterministic [`QueryEmbedder`] (T12-02): every query embeds to the same
+/// unit vector along the first axis, in whatever dimensionality the
+/// representation declares.
+///
+/// Real query embedding needs an inference runtime the daemon owns (group 15);
+/// this seam is precisely what lets these tests exercise the dense leg end to
+/// end while staying offline and deterministic. `AlwaysVectors` gives every
+/// *point* the same vector, so a healthy dense leg here returns every point of
+/// the active tuple — enough to prove plumbing, ordering and identity mapping.
+struct FixedQueryEmbedder;
+
+impl QueryEmbedder for FixedQueryEmbedder {
+    fn embed_query(
+        &self,
+        _query: &str,
+        key: &RepresentationKey,
+    ) -> Result<Vec<f32>, QueryEmbedError> {
+        let mut vector = vec![0.0; key.dimensions as usize];
+        if let Some(first) = vector.first_mut() {
+            *first = 1.0;
+        }
+        Ok(vector)
     }
 }
 
@@ -409,11 +436,12 @@ async fn run_load(
         Arc::new(SeqUuidV7::new()),
         8,
     ));
-    let engine = Arc::new(SearchEngine::new(
+    let engine = Arc::new(SearchEngine::with_embedder(
         state.clone(),
         cache,
         locks.clone(),
         shards,
+        Arc::new(FixedQueryEmbedder),
         Duration::from_secs(2),
     ));
 

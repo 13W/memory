@@ -126,9 +126,7 @@ fn search_recall_clears_the_calibrated_lower_bound() {
     let scratch = Scratch::new();
     let dataset = corpus::generate(&corpus::SMALL, 42);
     let store = UsearchStore;
-    let params = ShardParams {
-        dimensions: dataset.dims,
-    };
+    let params = ShardParams::with_dimensions(dataset.dims);
 
     let shard = store.open(scratch.path(), params).expect("open");
     shard.upsert(&dataset.points).expect("upsert");

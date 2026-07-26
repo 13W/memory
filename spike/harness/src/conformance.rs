@@ -51,9 +51,7 @@ pub fn run_conformance(
     dataset: &SeededDataset,
     base: &Path,
 ) -> io::Result<ConformanceReport> {
-    let params = ShardParams {
-        dimensions: dataset.dims,
-    };
+    let params = ShardParams::with_dimensions(dataset.dims);
     let mut cases = Vec::new();
 
     cases.push(case("reopen_preserves_points_and_head", || {
