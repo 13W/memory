@@ -70,7 +70,7 @@ pub mod worktree;
 
 pub use generation::{
     GenerationState, GenerationTransitionError, IllegalGenerationTransition, active_generations,
-    allocate_generation, generation_state, transition_generation,
+    allocate_generation, generation_number, generation_state, transition_generation,
 };
 
 pub(crate) use projection_state::SCHEMA_V4;

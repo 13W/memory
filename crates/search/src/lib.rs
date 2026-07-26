@@ -19,7 +19,10 @@
 //! group 12's job (T12-02…T12-04). See the `pipeline` module's own docs for the
 //! exact division of scope.
 
+mod fusion;
 mod pipeline;
+
+pub use fusion::{FusedHit, RRF_K, rrf};
 
 pub use pipeline::{
     DEFAULT_L2_READ_WAIT_BUDGET, DenseHit, NoopObserver, PipelineSnapshot, QueryEmbedError,

@@ -28,9 +28,9 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_projection::{
     FakeProjectionStore, RepresentationKind, ShardManager, ShardParams, VectorSource, switch,
 };
-use local_rag_protocol::{DegradedMode, ErrorCode};
+use local_rag_protocol::{DegradedMode, ErrorCode, SearchMode};
 use local_rag_search::{
-    QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest, Stage, StageObserver,
+    NoopObserver, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest, Stage, StageObserver,
 };
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, GenerationState,
@@ -529,9 +529,8 @@ async fn lock_is_held_in_every_leg_of_a_successful_hybrid_search() {
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     let outcome = engine
         .search_code_instrumented(request, 3000, &observer)
@@ -542,9 +541,9 @@ async fn lock_is_held_in_every_leg_of_a_successful_hybrid_search() {
 
     let snapshot = outcome.expect("must not be an error envelope");
     assert_eq!(snapshot.worktree_id, wt.to_string());
-    assert_eq!(snapshot.generation_id, gen_a.to_string());
-    assert_eq!(snapshot.degraded, None, "both legs are healthy");
-    assert!(snapshot.diagnostics.is_empty());
+    assert_eq!(snapshot.response.generation.id, gen_a.to_string());
+    assert_eq!(snapshot.response.degraded, None, "both legs are healthy");
+    assert!(snapshot.response.diagnostics.is_empty());
 
     let stages = observer.stages();
     assert_eq!(
@@ -594,12 +593,11 @@ async fn unknown_root_yields_worktree_not_indexed() {
         root: RequestRoot::default(),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     let outcome = engine
-        .search_code(request, 1000)
+        .search_code_instrumented(request, 1000, &NoopObserver)
         .await
         .expect("no infrastructure error");
     let err = outcome.expect_err("must be an error envelope");
@@ -643,18 +641,17 @@ async fn fts_diverged_above_threshold_degrades_dense_only() {
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     let outcome = engine
-        .search_code(request, 3000)
+        .search_code_instrumented(request, 3000, &NoopObserver)
         .await
         .expect("no infrastructure error");
     let snapshot = outcome.expect("dense is healthy; must not be an error envelope");
     assert_eq!(snapshot.worktree_id, wt.to_string());
-    assert_eq!(snapshot.degraded, Some(DegradedMode::DenseOnly));
-    assert!(!snapshot.diagnostics.is_empty());
+    assert_eq!(snapshot.response.degraded, Some(DegradedMode::DenseOnly));
+    assert!(!snapshot.response.diagnostics.is_empty());
 }
 
 /// **"lexical-only"**: a corrupted shard whose rebuild-on-acquire cannot
@@ -701,17 +698,16 @@ async fn dense_unavailable_degrades_lexical_only() {
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     let outcome = engine
-        .search_code(request, 5000)
+        .search_code_instrumented(request, 5000, &NoopObserver)
         .await
         .expect("no infrastructure error");
     let snapshot = outcome.expect("fts is healthy; must not be an error envelope");
-    assert_eq!(snapshot.degraded, Some(DegradedMode::LexicalOnly));
-    assert!(!snapshot.diagnostics.is_empty());
+    assert_eq!(snapshot.response.degraded, Some(DegradedMode::LexicalOnly));
+    assert!(!snapshot.response.diagnostics.is_empty());
 }
 
 /// **"neither"**: both legs unavailable at once (FTS deferred above
@@ -752,12 +748,11 @@ async fn both_legs_unavailable_yields_index_unavailable() {
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     let outcome = engine
-        .search_code(request, 6000)
+        .search_code_instrumented(request, 6000, &NoopObserver)
         .await
         .expect("no infrastructure error");
     let err = outcome.expect_err("both legs are unavailable; must be an error envelope");
@@ -859,9 +854,8 @@ async fn writer_holding_l2_write_delays_search_past_bound_yields_busy_retry() {
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     let search_task = tokio::spawn(async move { engine.search_code(request, 7000).await });
 

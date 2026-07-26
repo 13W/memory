@@ -72,6 +72,12 @@ uses (group 15). Both legs now produce occurrence-identified, 1-based-ranked can
 the same `candidate_depth(limit)` — everything RRF needs, so T12-03 adds fusion and §7's response
 shape without touching either leg. Still stubbed: enrichment (T12-04) and the `mode` field with
 its per-mode leg selection (§5, T12-03).
+
+As-built note (T12-03, `[SPEC]`): the pipeline is now complete end to end — `legs per mode`
+(§5's as-built note), RRF fusion (§4's), and `format results` as §7's canonical
+`SearchResponse` (§7's). The only remaining stub is `graph/context enrichment`
+(`Stage::Enrichment`): T12-04 owns the `source_blob`-derived half (`snippet`, `get_file_context`,
+the cached overview), and edges stay post-v0 (§6).
 - `format results`: not yet — `SearchEngine::search_code` returns
   `local_rag_search::PipelineSnapshot` (worktree/generation/model-space tuple, `degraded`,
   `diagnostics`), the envelope skeleton `[SPEC]` this task owns, not §7's full response shape
@@ -241,6 +247,32 @@ legs were cut at a comparable depth. The lexical leg already applies `(score, oc
 ordering internally (§2's as-built note); RRF itself, `k = 60`, and the cross-leg tie-break are
 T12-03.
 
+As-built note (T12-03, `[SPEC]`): fusion is `local_rag_search::rrf(lexical, dense, limit)`
+(`crates/search/src/fusion.rs`) — a pure function over two already-ranked lists, with no store,
+clock or lock, which is what makes its arithmetic hand-checkable in unit tests. `RRF_K = 60`.
+
+Four as-built decisions the section's formula leaves open:
+
+- **Merge key is `occurrence_id`.** A document both legs found is one result carrying both
+  ranks (`legs: {lexical, dense}`, §7), never two. Both legs were built to return
+  occurrence-identified, 1-based-ranked candidates precisely so fusion never has to translate
+  identities (T12-01/T12-02's as-built notes).
+- **Ranks only, never scores.** The legs score in incomparable units — BM25 (unbounded, more
+  negative is better) and a dense similarity under whichever `distance_metric` the model space
+  declares. RRF compares neither; the raw per-leg scores travel for diagnostics and are never
+  summed.
+- **`f64` accumulator.** `1/(60 + rank)` is not representable in binary floating point, and in
+  `f32` two documents whose true scores differ in the seventh digit can collapse into a tie —
+  or compare differently depending on which leg was added first. `f64` keeps the error far
+  below the smallest gap this fusion can produce (`1/61 - 1/62 ≈ 2.6e-4`).
+- **`limit`, not `candidate_depth`, bounds the output.** The deeper per-leg lists exist so
+  fusion has material to reorder, not so the caller receives them.
+
+The `(score desc, occurrence_id asc)` tie-break is load-bearing, not cosmetic: fusion merges
+through a `HashMap`, whose iteration order is randomized per process, so the sort is the only
+thing that makes repeated output byte-stable (§7). Equal scores are the *common* case — any
+document both legs return at the same ranks ties with every other such document.
+
 ## 5. Modes (v0) `[SPEC mapping of v1 modes]`
 
 | mode | legs |
@@ -252,6 +284,26 @@ T12-03.
 
 Cross-encoder reranker (`rerank`, `rerank_k`): **post-v0**, additive, only after baseline
 `[FIXED]`.
+
+As-built note (T12-03, `[SPEC]`): the mode is `local_rag_protocol::SearchMode`
+(`Hybrid`/`Lexical`/`Code`/`Semantic`, default `Hybrid`), and `SearchRequest.mode` selects legs
+through its `wants_lexical()`/`wants_dense()` predicates — the table above, in code.
+
+A leg the mode does not ask for is **not run at all**, not run-and-discarded: no FTS validation,
+no embedding-provider call, no shard open. `crates/search/tests/response.rs` proves this with an
+embedder that panics if reached under `mode=lexical`.
+
+`semantic` is refused with `UNSUPPORTED_MODE` (02 §6's as-built note) **before** worktree
+resolution and before any lock — a post-v0 leg cannot become available by doing more work first.
+It is deliberately a *recognized* mode (`SearchMode::from_wire("semantic")` succeeds), so a caller
+gets "not supported yet" rather than "unknown mode".
+
+**`degraded` in single-leg modes `[SPEC]`**: `degraded` means "you got less than you asked for",
+so a `lexical`/`code` request whose one leg served reports `degraded: null` — nothing was skipped.
+When that single leg *cannot* serve, the answer is `INDEX_UNAVAILABLE`, not a degraded response:
+there is no second leg to fall back to, because the caller did not ask for one. Only `hybrid`
+produces `lexical_only`/`dense_only`. This generalizes `local_rag_store::requires_index_unavailable`
+(T08-03's both-legs-down predicate), which cannot express "not requested".
 
 ## 6. Symbol graph `[FIXED semantics, final shape [OPEN]]`
 
@@ -282,6 +334,44 @@ an async drainer, post-v0, benchmark-gated.
 Snippets are cut from the exact `source_blob` by byte span — never from the live disk file
 (the file may have changed since the generation) — reproducibility is exactly what the
 source-blob invariant buys `[FIXED]`.
+
+As-built note (T12-03, `[SPEC]`): the response is `local_rag_protocol::SearchResponse`
+(`crates/protocol/src/search.rs`) with `SearchResult`, `LegRanks` and `GenerationRef` — in
+`protocol` rather than `search` for the same reason `ErrorEnvelope` is: it is the wire contract
+every caller of the MCP `search_code` tool sees (11 §2), not one subsystem's internal shape.
+`SearchEngine::search_code` returns it directly.
+
+**Serialization.** These types derive `serde::Serialize` in exactly this section's shape, and
+`DegradedMode` serializes as its `dense_only`/`lexical_only` string (`None` → `null`). This is the
+first serialization in `crates/protocol` — it implements a shape this section already fixes rather
+than inventing one, and it is what makes T12-03's "repeated output is byte-stable" an assertion
+about bytes: `serde_json` emits fields in declaration order, so §4's deterministic *value* yields
+deterministic *bytes* (`crates/search/tests/response.rs::
+repeated_identical_requests_serialize_to_identical_bytes`). `Deserialize` is deliberately not
+derived — nothing reads these back before group 15. Transport, handshake and MCP framing remain
+group 15's.
+
+**Absent is absent, not null**: `snippet`, `qualified_name` and each `legs` entry are omitted when
+they have no value, rather than serialized as `null` — a leg that did not match and a leg that
+matched at "rank 0" must not look alike to a reader.
+
+**Field sources.** `path`/`name`/`qualified_name`/`unit_kind`/`span`/`language` come from the new
+`local_rag_store::occurrences_by_id` — the same `generation_unit_occurrence ⋈ parsed_unit ⋈
+content_blob` join `occurrences_for_fts` uses, restricted to the fused hits instead of the whole
+generation, and re-ordered to the caller's (fused) order, which SQL knows nothing about. `name` is
+the empty string when the unit has no `local_name` (a file/text/config unit need not).
+`generation.number` comes from the new `local_rag_store::generation_number`. A fused hit whose
+occurrence row is missing — structurally impossible under a held `L2.read`, since a generation's
+occurrence set is immutable once `projection_ready` — is dropped with a diagnostic rather than
+presented with empty fields.
+
+`snippet` is always `None` today: everything read out of `source_blob` is T12-04's.
+
+`PipelineSnapshot` survives as the **instrumented** return of
+`SearchEngine::search_code_instrumented`, carrying the response plus what the wire deliberately
+omits — the model space served (T09-04's "exactly one generation/model tuple" load test) and each
+leg's raw pre-fusion candidates (T12-01/T12-02's per-leg suites). `search_code` itself returns
+`SearchResponse` and nothing more.
 
 ## 8. Latency gates (numbers after baseline `[OPEN]`)
 

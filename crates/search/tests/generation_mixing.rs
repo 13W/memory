@@ -31,9 +31,9 @@ use local_rag_projection::{
     DenseQuery, FakeProjectionStore, PointId, ProjectionHead, ProjectionPoint, ProjectionStore,
     RepresentationKind, ScoredPoint, ShardHandle, ShardManager, ShardParams, VectorSource, switch,
 };
-use local_rag_protocol::ErrorCode;
+use local_rag_protocol::{ErrorCode, SearchMode};
 use local_rag_search::{
-    PipelineSnapshot, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest,
+    NoopObserver, PipelineSnapshot, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest,
 };
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, GenerationState, LockLevel, NewContentBlob, NewFileRevision,
@@ -533,12 +533,14 @@ async fn do_one_search(
         root: request_root(path),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     for attempt in 0..20 {
-        match engine.search_code(request.clone(), now_ms).await {
+        match engine
+            .search_code_instrumented(request.clone(), now_ms, &NoopObserver)
+            .await
+        {
             Ok(Ok(snapshot)) => {
                 snapshots
                     .lock()
@@ -624,7 +626,7 @@ async fn generation_mixing_under_concurrent_switch_load() {
         let mut saw_a = false;
         let mut saw_b = false;
         for snap in &snapshots {
-            let tuple = (snap.generation_id.clone(), snap.model_space_id.clone());
+            let tuple = (snap.response.generation.id.clone(), snap.model_space_id.clone());
             assert!(
                 tuple == valid_a || tuple == valid_b,
                 "snapshot tuple {tuple:?} is neither the pre- nor post-switch tuple — mixed/torn read"

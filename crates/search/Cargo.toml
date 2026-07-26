@@ -23,6 +23,10 @@ failpoints = ["local-rag-projection/failpoints"]
 
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
+# T12-03's byte-stability criterion (spec 09 §7): the response type derives
+# `Serialize` in `local-rag-protocol`; rendering it is how "repeated output is
+# byte-stable" becomes an assertion about bytes rather than about values.
+serde_json = "1"
 # Integration tests drive the async `SearchEngine` pipeline end to end
 # (`state.sqlite` + `cache.sqlite` writers, `ShardManager` fills, the bounded
 # `L2.read` wait) and one test exercises a real `tokio::time::timeout` via

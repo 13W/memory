@@ -32,6 +32,10 @@ pub enum ErrorCode {
     /// need (spec 02 §6, 12 §1). Refused, never silently downgraded to a
     /// weaker policy or to a different provider class.
     PolicyBlockedRemote,
+    /// The requested search mode is recognized but not supported in v0
+    /// (spec 09 §5: `semantic` is the description leg, post-v0 and
+    /// benchmark-gated `[FIXED]`).
+    UnsupportedMode,
 }
 
 impl ErrorCode {
@@ -42,6 +46,7 @@ impl ErrorCode {
             ErrorCode::WorktreeNotIndexed => "WORKTREE_NOT_INDEXED",
             ErrorCode::BusyRetry => "BUSY_RETRY",
             ErrorCode::PolicyBlockedRemote => "POLICY_BLOCKED_REMOTE",
+            ErrorCode::UnsupportedMode => "UNSUPPORTED_MODE",
         }
     }
 }
@@ -90,6 +95,18 @@ impl ErrorEnvelope {
         }
     }
 
+    /// The requested search mode is not supported in v0 (spec 09 §5). Not
+    /// retryable: `semantic` becomes available only if the description leg
+    /// wins the benchmark, which no retry can bring about.
+    pub fn unsupported_mode(mode: impl fmt::Display) -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::UnsupportedMode,
+            message: format!("search mode {mode} is not supported in v0"),
+            retryable: false,
+            details: None,
+        }
+    }
+
     /// The bounded wait on `L2.read` elapsed while a writer held `L2.write`
     /// (spec 02 §6). Retryable: the in-flight switch is expected to finish.
     pub fn busy_retry() -> Self {
@@ -105,7 +122,8 @@ impl ErrorEnvelope {
 /// Spec 09 §7's `degraded` field vocabulary (`null | "dense_only" |
 /// "lexical_only"` — the `null` case is `Option<DegradedMode>::None` at the
 /// call site).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DegradedMode {
     /// The FTS view is invalid/stale; search served dense-only (spec 02 §6).
     DenseOnly,
@@ -146,6 +164,15 @@ mod tests {
             ErrorCode::PolicyBlockedRemote.as_str(),
             "POLICY_BLOCKED_REMOTE"
         );
+        assert_eq!(ErrorCode::UnsupportedMode.as_str(), "UNSUPPORTED_MODE");
+    }
+
+    #[test]
+    fn unsupported_mode_names_the_mode_and_is_not_retryable() {
+        let err = ErrorEnvelope::unsupported_mode(crate::SearchMode::Semantic);
+        assert_eq!(err.code, ErrorCode::UnsupportedMode);
+        assert!(!err.retryable);
+        assert!(err.message.contains("semantic"), "{}", err.message);
     }
 
     #[test]

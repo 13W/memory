@@ -33,9 +33,9 @@ use local_rag_projection::{
     FakeProjectionStore, RepresentationKind, ShardManager, ShardParams, SwitchError, VectorSource,
     switch,
 };
-use local_rag_protocol::ErrorCode;
+use local_rag_protocol::{ErrorCode, SearchMode};
 use local_rag_search::{
-    PipelineSnapshot, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest,
+    NoopObserver, PipelineSnapshot, QueryEmbedError, QueryEmbedder, SearchEngine, SearchRequest,
 };
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, GenerationState, NewContentBlob, NewFileRevision,
@@ -283,12 +283,14 @@ async fn do_one_search(
         root: request_root(path),
         query: "search".to_string(),
         limit: 5,
+        mode: SearchMode::Hybrid,
         name_pattern: None,
-        query_vector: vec![1.0, 0.0, 0.0],
-        k: 5,
     };
     for attempt in 0..20 {
-        match engine.search_code(request.clone(), now_ms).await {
+        match engine
+            .search_code_instrumented(request.clone(), now_ms, &NoopObserver)
+            .await
+        {
             Ok(Ok(snapshot)) => {
                 snapshots
                     .lock()
@@ -473,7 +475,10 @@ async fn switch_failure_before_commit_never_corrupts_concurrent_search() {
         assert!(!collected.is_empty(), "must have collected some snapshots");
         let valid_a = (gen_a.to_string(), ms.to_string());
         for snap in &collected {
-            let tuple = (snap.generation_id.clone(), snap.model_space_id.clone());
+            let tuple = (
+                snap.response.generation.id.clone(),
+                snap.model_space_id.clone(),
+            );
             assert_eq!(
                 tuple, valid_a,
                 "genB's commit never ran — every search must still see genA"

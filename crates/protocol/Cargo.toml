@@ -8,6 +8,17 @@ publish.workspace = true
 
 [dependencies]
 local-rag-core = { path = "../core" }
+# T12-03: spec 09 §7 fixes the `search_code` response JSON, so `Serialize`
+# derives here implement a spec'd shape rather than inventing a wire format —
+# and they make "repeated output is byte-stable" a real byte comparison instead
+# of a proxy for it. Already approved and already in `Cargo.lock` (used by
+# `core`/`store`/`index`/`models`), so this adds zero packages. Transport,
+# handshake and the MCP framing around these types stay group 15.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Byte-stability and shape assertions render the derived `Serialize` to JSON.
+serde_json = "1"
 
 [lints]
 workspace = true
