@@ -114,6 +114,9 @@ pub enum RebuildError {
     Sqlite(local_rag_store::rusqlite::Error),
     /// Opening a `state.sqlite` read connection failed.
     Open(OpenError),
+    /// The expected point set could not be derived — e.g. the target model space
+    /// requires no code representation (T11-05, `crate::expected::ExpectedError`).
+    Expected(crate::expected::ExpectedError),
     /// No `worktree_projection_state` row exists for this worktree.
     UnknownWorktree,
     /// [`mark_dirty`] was rejected at the domain level.
@@ -143,6 +146,7 @@ impl fmt::Display for RebuildError {
         match self {
             RebuildError::Write(e) => write!(f, "rebuild: transaction failed: {e}"),
             RebuildError::Sqlite(e) => write!(f, "rebuild: state.sqlite read failed: {e}"),
+            RebuildError::Expected(e) => write!(f, "rebuild: expected point set: {e}"),
             RebuildError::Open(e) => write!(f, "rebuild: could not open a read connection: {e}"),
             RebuildError::UnknownWorktree => {
                 write!(f, "rebuild: no projection state for this worktree")
@@ -169,6 +173,7 @@ impl std::error::Error for RebuildError {
         match self {
             RebuildError::Write(e) => Some(e),
             RebuildError::Sqlite(e) => Some(e),
+            RebuildError::Expected(e) => Some(e),
             RebuildError::Open(e) => Some(e),
             RebuildError::UnknownWorktree => None,
             RebuildError::MarkDirty(e) => Some(e),
@@ -370,7 +375,7 @@ async fn rebuild(
         &active_generation_id,
         &active_model_space_id,
     )
-    .map_err(RebuildError::Sqlite)?;
+    .map_err(RebuildError::Expected)?;
     drop(read);
 
     let mut points = Vec::with_capacity(expected.len());

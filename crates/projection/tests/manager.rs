@@ -137,6 +137,9 @@ async fn init_projection(db: &StateDb, worktree_id: &Uuid) {
         .transaction(move |tx| insert_projection_state(tx, &w, 1000))
         .await
         .expect("init projection state");
+    // The default model space must declare what it requires now that the
+    // expected point set joins the registry (T11-05).
+    register_code_representations(db, &default_model_space()).await;
 }
 
 async fn allocate_ready(db: &StateDb, worktree_id: &Uuid, gen_seed: u8) -> Uuid {
@@ -256,6 +259,46 @@ async fn established(
 /// **"LRU order/cap"**: eviction removes the least-recently-used entry once
 /// `max_open_shards` is exceeded, and a re-`acquire`d entry's bumped recency
 /// changes who gets evicted next — proving real recency order, not FIFO.
+/// Register the two code representations (`code_raw`, `code_context`) as
+/// `required` for `model_space_id`.
+///
+/// T11-05 replaced `expected::REQUIRED_REPRESENTATION_KINDS`'s hardcoded pair
+/// with a real `model_space_representation` join, so a fixture's model space now
+/// has to declare what it requires. Registering exactly that pair keeps every
+/// pre-existing expectation in this file (2 points per occurrence) unchanged.
+async fn register_code_representations(db: &StateDb, model_space_id: &Uuid) {
+    let space = model_space_id.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            for (i, kind) in [
+                local_rag_store::RepresentationKind::CodeRaw,
+                local_rag_store::RepresentationKind::CodeContext,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let representation_id = format!("{space}-repr-{i}");
+                let id = local_rag_store::register_representation(
+                    tx,
+                    &representation_id,
+                    &local_rag_store::RepresentationKey {
+                        kind,
+                        representation_version: 1,
+                        normalization_version: 1,
+                        model_id: format!("test-model-{space}"),
+                        dimensions: DIMS as u32,
+                        distance_metric: local_rag_store::DistanceMetric::Cosine,
+                    },
+                    1000,
+                )?;
+                local_rag_store::set_model_space_representation(tx, &space, kind, &id, true, 1000)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("register code representations");
+}
+
 #[tokio::test]
 async fn lru_evicts_least_recently_used_once_over_capacity() {
     let (_home, layout, db) = open_state();

@@ -24,16 +24,88 @@
 //! multi-model-space switch to actually exercise, which is **T11-05**'s card
 //! ("production model-axis uses standard projection switch") — not bundled
 //! into T11-01, whose own card scopes only the registry itself.
+use std::fmt;
+
 use local_rag_core::identity::Uuid;
 use local_rag_store::rusqlite::{self, Connection};
 
 use crate::contract::{PointId, RepresentationKind};
 use crate::identity::projection_point_id;
 
-/// The representation kinds every occurrence needs a projection point for in v0
-/// (spec 05 §4). See the module doc for why this is fixed rather than looked up.
-pub const REQUIRED_REPRESENTATION_KINDS: [RepresentationKind; 2] =
+/// The representation kinds spec 05 §4 says "apply to code" — the filter the
+/// model space's own `required` set is intersected with.
+///
+/// `structural_description` is excluded by the section's own parenthetical
+/// ("only when descriptions are enabled post-v0") and `memory` is not code at
+/// all, so neither ever produces a projection point in v0. Which of the two
+/// remaining kinds are actually expected is **not** fixed here — that comes from
+/// `model_space_representation` (T11-05, see [`required_code_kinds`]).
+pub const CODE_REPRESENTATION_KINDS: [RepresentationKind; 2] =
     [RepresentationKind::CodeRaw, RepresentationKind::CodeContext];
+
+/// Why an expected point set could not be derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExpectedError {
+    /// Reading `state.sqlite` failed.
+    Sqlite(String),
+    /// The model space requires no code representation at all, so the expected
+    /// set would be empty for every occurrence.
+    ///
+    /// Refused rather than returned as an empty set: an empty expectation makes
+    /// a switch "successfully" delete every point in the shard (spec 05 §5 step
+    /// 3 deletes `existing \ expected`), which is indistinguishable from a
+    /// correct wipe. A model space with no code representation is a registry
+    /// mistake, and this is where it surfaces.
+    NoCodeRepresentation {
+        /// The model space that has none.
+        model_space_id: String,
+    },
+}
+
+impl fmt::Display for ExpectedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExpectedError::Sqlite(e) => write!(f, "sqlite error deriving expected points: {e}"),
+            ExpectedError::NoCodeRepresentation { model_space_id } => write!(
+                f,
+                "model space {model_space_id} requires no code representation kind"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExpectedError {}
+
+impl From<rusqlite::Error> for ExpectedError {
+    fn from(e: rusqlite::Error) -> Self {
+        ExpectedError::Sqlite(e.to_string())
+    }
+}
+
+/// The code representation kinds `model_space_id` actually requires (spec 05 §4:
+/// "every `required` representation kind of the model space that applies to
+/// code") — T11-05.
+///
+/// The registry join T07-03 deferred: `model_space_representation` decides the
+/// set, [`CODE_REPRESENTATION_KINDS`] filters it down to the ones that project
+/// code. Ordered, so the expected set is deterministic.
+pub fn required_code_kinds(
+    conn: &Connection,
+    model_space_id: &Uuid,
+) -> Result<Vec<RepresentationKind>, ExpectedError> {
+    let model_space_id = model_space_id.to_string();
+    let kinds: Vec<RepresentationKind> =
+        local_rag_store::model_space_required_kinds(conn, &model_space_id)?
+            .into_iter()
+            .filter_map(crate::vectors::store_kind_to_projection)
+            .filter(|kind| CODE_REPRESENTATION_KINDS.contains(kind))
+            .collect();
+    if kinds.is_empty() {
+        return Err(ExpectedError::NoCodeRepresentation { model_space_id });
+    }
+    Ok(kinds)
+}
 
 /// One point the target tuple expects to exist, carrying the fields needed to
 /// both identify it ([`PointId`]) and source its vector (`occurrence_id` +
@@ -49,8 +121,8 @@ pub struct ExpectedPoint {
 }
 
 /// The expected point set for `(generation_id, model_space_id)` in `worktree_id`
-/// (spec 05 §4): every occurrence of the generation, crossed with
-/// [`REQUIRED_REPRESENTATION_KINDS`].
+/// (spec 05 §4): every occurrence of the generation, crossed with the model
+/// space's own required code representations ([`required_code_kinds`]).
 ///
 /// A deterministic, pure-of-vectors function of `state.sqlite` — no vector is
 /// read or computed here (spec 05 §5 step 1's PREPARE, and the vector lookup
@@ -60,12 +132,13 @@ pub fn expected_points(
     worktree_id: &Uuid,
     generation_id: &Uuid,
     model_space_id: &Uuid,
-) -> rusqlite::Result<Vec<ExpectedPoint>> {
+) -> Result<Vec<ExpectedPoint>, ExpectedError> {
+    let kinds = required_code_kinds(conn, model_space_id)?;
     let occurrence_ids =
         local_rag_store::occurrence_ids_for_generation(conn, &generation_id.to_string())?;
-    let mut points = Vec::with_capacity(occurrence_ids.len() * REQUIRED_REPRESENTATION_KINDS.len());
+    let mut points = Vec::with_capacity(occurrence_ids.len() * kinds.len());
     for occurrence_id in occurrence_ids {
-        for &kind in &REQUIRED_REPRESENTATION_KINDS {
+        for &kind in &kinds {
             let point_id = projection_point_id(worktree_id, &occurrence_id, model_space_id, kind);
             points.push(ExpectedPoint {
                 point_id,
@@ -85,7 +158,7 @@ pub fn expected_point_ids(
     worktree_id: &Uuid,
     generation_id: &Uuid,
     model_space_id: &Uuid,
-) -> rusqlite::Result<Vec<PointId>> {
+) -> Result<Vec<PointId>, ExpectedError> {
     Ok(
         expected_points(conn, worktree_id, generation_id, model_space_id)?
             .into_iter()
@@ -114,15 +187,31 @@ mod tests {
         "0000000c-0000-7000-8000-00000000000e".parse().unwrap()
     }
 
-    /// A minimal in-memory `generation_unit_occurrence` table — this module only
-    /// reads it, so no other schema is needed.
+    /// A minimal in-memory schema: the occurrences this module reads, plus the
+    /// `model_space_representation` rows the required-kind lookup now joins
+    /// against (T11-05). Both model spaces require the same code pair, so the
+    /// point-set assertions below are unchanged from T07-03's.
     fn seed(conn: &Connection, rows: &[(&str, &str)]) {
         conn.execute_batch(
             "CREATE TABLE generation_unit_occurrence \
                (occurrence_id TEXT, generation_id TEXT, normalized_path TEXT, unit_id TEXT);\n\
-             CREATE INDEX occurrence_by_gen ON generation_unit_occurrence(generation_id);",
+             CREATE INDEX occurrence_by_gen ON generation_unit_occurrence(generation_id);\n\
+             CREATE TABLE model_space_representation \
+               (model_space_id TEXT, representation_kind TEXT, representation_id TEXT, \
+                required INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL DEFAULT 0);",
         )
         .expect("seed schema");
+        for space in [ms_a(), ms_b()] {
+            for kind in ["code_raw", "code_context"] {
+                conn.execute(
+                    "INSERT INTO model_space_representation \
+                       (model_space_id, representation_kind, representation_id, required) \
+                     VALUES (?1, ?2, 'repr-' || ?2, 1)",
+                    rusqlite::params![space.to_string(), kind],
+                )
+                .expect("seed required kind");
+            }
+        }
         for (occ, generation_id) in rows {
             conn.execute(
                 "INSERT INTO generation_unit_occurrence \

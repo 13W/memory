@@ -31,6 +31,7 @@ Claude hooks ──atomic append──▶ spool/<session>/  ◀──tail/import
   cache.sqlite          # rebuildable, independently validated (+ -wal/-shm)
   projection/
     <worktree_id>/      # one dense shard per worktree; layout is backend-defined
+      <model_space_id>/ # per model space, so a migration never rewrites the old one in place (T11-05)
   spool/
     <session_id>/
       000001.seg …      # append-only segments (07)

@@ -146,6 +146,28 @@ Changing the embedding model (or dimensions/metric/normalization):
 No in-place re-embed, no migration without rollback: until step 4 commits for a worktree, that
 worktree still runs A entirely `[FIXED]`.
 
+As-built note (T11-05, `[SPEC]`): steps 4–6 are `local_rag_projection::model_switch`.
+
+* **Step 4** is `switch_model_space` — the *same* `switch()` the generation axis uses (05 §5), given
+  the worktree's current generation so only the model axis moves; the one-axis rule is enforced
+  independently by `check_invariants`'s `BothAxesMovedAtOnce`. It refuses before the write-ahead
+  when the target is not `active` or its stored coverage is short, so a refusal leaves both
+  `state.sqlite` and the shard untouched.
+* **Step 2's "different dimensions ⇒ separate shard layout"** is realized as a per-model-space shard
+  directory (05 §2's own T11-05 note): `ShardParams` are derived from the space's `code_raw`
+  `representation.dimensions`, and each space owns `projection/<worktree_id>/<model_space_id>/`.
+  This is also what makes the closing `[FIXED]` sentence above literally true — a kill anywhere
+  between the write-ahead and the commit leaves A's shard complete and serving, proven by
+  `model_switch_faults.rs`.
+* **Step 5** is `local_rag_store::set_default_model_space_id`, the only writer of that pointer; it
+  refuses a space that is not `active`, so 04 §3's "the default space MUST be `active`" is enforced
+  where the value is established. "No global write barrier" is structural rather than promised:
+  every operation here is per-worktree and spec 02 §5's hierarchy has no store-wide write lock at
+  all.
+* **Step 6** needs no new code: once the last worktree has moved off A and A is `retiring`,
+  `local_rag_store::subjects::protected_model_space_ids` (T11-04) stops pinning it, which is exactly
+  "its cache rows become evictable when no worktree references A".
+
 ## 5. Model assets `[FIXED policy]`
 
 Weights are **not** in npm. `local-rag init --download-models`: checksum-verified manifest,

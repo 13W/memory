@@ -254,10 +254,11 @@ pub use registry::{
     transition_model_space, write_model_space_coverage,
 };
 pub use registry::{
-    DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,
-    PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation, ProjectionStateChange,
-    ProjectionStateError, ProjectionStateRow, ProjectionStatus, check_invariants,
-    default_model_space_id, insert_projection_state, projection_state, write_projection_state,
+    DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, DefaultModelSpaceError,
+    IllegalProjectionTransition, PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation,
+    ProjectionStateChange, ProjectionStateError, ProjectionStateRow, ProjectionStatus,
+    check_invariants, default_model_space_id, insert_projection_state, projection_state,
+    set_default_model_space_id, write_projection_state,
 };
 pub use retention::{
     ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,

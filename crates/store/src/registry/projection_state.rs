@@ -524,6 +524,82 @@ pub fn default_model_space_id(conn: &Connection) -> rusqlite::Result<Option<Stri
     .optional()
 }
 
+/// Why moving the default-model-space pointer was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DefaultModelSpaceError {
+    /// No `model_space` row with that id exists.
+    Unknown {
+        /// The id that was offered.
+        model_space_id: String,
+    },
+    /// The space exists but is not `active`.
+    NotActive {
+        /// The id that was offered.
+        model_space_id: String,
+        /// The state it is actually in.
+        state: super::ModelSpaceState,
+    },
+}
+
+impl std::fmt::Display for DefaultModelSpaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DefaultModelSpaceError::Unknown { model_space_id } => {
+                write!(f, "unknown model space {model_space_id}")
+            }
+            DefaultModelSpaceError::NotActive {
+                model_space_id,
+                state,
+            } => write!(
+                f,
+                "model space {model_space_id} is {}, the default must be active",
+                state.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DefaultModelSpaceError {}
+
+/// Point `store_settings.default_model_space_id` at `model_space_id`
+/// (spec 10 §4 step 5: "`default_model_space := B`") — T11-05.
+///
+/// Guarded rather than a blind upsert: spec 04 §3 `[FIXED]` requires "the default
+/// space (`store_settings.default_model_space_id`) MUST be `active`", and this is
+/// the only writer, so the invariant is enforced where it is established. A
+/// refusal leaves the row untouched (the read happens before the write, and
+/// callers run this inside one transaction).
+///
+/// The pointer is what every *future* worktree open resolves to: spec 05 §8's
+/// dormant-worktree migration targets it, and `crate::subjects` pins its rows
+/// against eviction precisely because a worktree that has not opened yet will
+/// need them.
+pub fn set_default_model_space_id(
+    tx: &Transaction<'_>,
+    model_space_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Result<(), DefaultModelSpaceError>> {
+    let Some(state) = super::representation::model_space_state(tx, model_space_id)? else {
+        return Ok(Err(DefaultModelSpaceError::Unknown {
+            model_space_id: model_space_id.to_string(),
+        }));
+    };
+    if !super::representation::eligible_as_target(state) {
+        return Ok(Err(DefaultModelSpaceError::NotActive {
+            model_space_id: model_space_id.to_string(),
+            state,
+        }));
+    }
+    let _ = now_ms; // `store_settings` carries no timestamp column (spec 03 §2.1).
+    tx.execute(
+        "INSERT INTO store_settings (key, value) VALUES ('default_model_space_id', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![model_space_id],
+    )?;
+    Ok(Ok(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

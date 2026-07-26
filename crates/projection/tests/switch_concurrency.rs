@@ -126,6 +126,9 @@ async fn init_projection(db: &StateDb, worktree_id: &Uuid) {
         .transaction(move |tx| insert_projection_state(tx, &w, 1000))
         .await
         .expect("init projection state");
+    // The default model space must declare what it requires now that the
+    // expected point set joins the registry (T11-05).
+    register_code_representations(db, &default_model_space()).await;
 }
 
 async fn allocate_ready(db: &StateDb, worktree_id: &Uuid, gen_seed: u16) -> Uuid {
@@ -223,6 +226,7 @@ async fn insert_model_space(db: &StateDb, id: &Uuid) {
         })
         .await
         .expect("insert model space");
+    register_code_representations(db, id).await;
 }
 
 /// Run one generation-axis switch: always moves toward `my_gen` (a dedicated,
@@ -338,6 +342,46 @@ async fn model_axis_task(
 /// before choosing its one-axis move. Every switch must succeed (proving
 /// serialization prevented any stale-current race), and the final DB tuple
 /// must equal whichever switch actually landed last.
+/// Register the two code representations (`code_raw`, `code_context`) as
+/// `required` for `model_space_id`.
+///
+/// T11-05 replaced `expected::REQUIRED_REPRESENTATION_KINDS`'s hardcoded pair
+/// with a real `model_space_representation` join, so a fixture's model space now
+/// has to declare what it requires. Registering exactly that pair keeps every
+/// pre-existing expectation in this file (2 points per occurrence) unchanged.
+async fn register_code_representations(db: &StateDb, model_space_id: &Uuid) {
+    let space = model_space_id.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            for (i, kind) in [
+                local_rag_store::RepresentationKind::CodeRaw,
+                local_rag_store::RepresentationKind::CodeContext,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let representation_id = format!("{space}-repr-{i}");
+                let id = local_rag_store::register_representation(
+                    tx,
+                    &representation_id,
+                    &local_rag_store::RepresentationKey {
+                        kind,
+                        representation_version: 1,
+                        normalization_version: 1,
+                        model_id: format!("test-model-{space}"),
+                        dimensions: DIMS as u32,
+                        distance_metric: local_rag_store::DistanceMetric::Cosine,
+                    },
+                    1000,
+                )?;
+                local_rag_store::set_model_space_representation(tx, &space, kind, &id, true, 1000)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("register code representations");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_axis_switches_serialize_to_a_deterministic_final_tuple() {
     tokio::time::timeout(Duration::from_secs(10), async {

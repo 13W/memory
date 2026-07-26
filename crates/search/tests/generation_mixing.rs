@@ -228,6 +228,9 @@ async fn init_projection(state: &StateDb, worktree_id: &Uuid) {
         .transaction(move |tx| insert_projection_state(tx, &w, 1000))
         .await
         .expect("init projection state");
+    // T11-05: the expected point set now joins `model_space_representation`, so
+    // the default space has to declare its required code kinds.
+    register_code_representations(state, &default_model_space()).await;
 }
 
 async fn allocate_ready(state: &StateDb, worktree_id: &Uuid, gen_seed: u8) -> Uuid {
@@ -526,6 +529,47 @@ async fn do_one_search(
 /// under real concurrent load, every collected snapshot's tuple is exactly
 /// one of the two genuinely-committed tuples, never a third/hybrid value —
 /// and both are actually observed, proving real interleaving occurred.
+/// Register the two code representations (`code_raw`, `code_context`) as
+/// `required` for `model_space_id`.
+///
+/// T11-05 replaced `expected::REQUIRED_REPRESENTATION_KINDS`'s hardcoded pair
+/// with a real `model_space_representation` join, so a fixture's model space now
+/// has to declare what it requires. Registering exactly that pair keeps every
+/// pre-existing expectation in this file (2 points per occurrence) unchanged.
+async fn register_code_representations(state: &StateDb, model_space_id: &Uuid) {
+    let space = model_space_id.to_string();
+    state
+        .writer()
+        .transaction(move |tx| {
+            for (i, kind) in [
+                local_rag_store::RepresentationKind::CodeRaw,
+                local_rag_store::RepresentationKind::CodeContext,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let representation_id = format!("{space}-repr-{i}");
+                let id = local_rag_store::register_representation(
+                    tx,
+                    &representation_id,
+                    &local_rag_store::RepresentationKey {
+                        kind,
+                        representation_version: 1,
+                        normalization_version: 1,
+                        model_id: format!("test-model-{space}"),
+                        dimensions: DIMS as u32,
+                        distance_metric: local_rag_store::DistanceMetric::Cosine,
+                    },
+                    1000,
+                )?;
+                local_rag_store::set_model_space_representation(tx, &space, kind, &id, true, 1000)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("register code representations");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generation_mixing_under_concurrent_switch_load() {
     tokio::time::timeout(Duration::from_secs(10), async {

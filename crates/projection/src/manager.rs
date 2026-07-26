@@ -100,6 +100,7 @@ use local_rag_store::StateDb;
 use local_rag_store::lock::checked_scope_sync;
 
 use crate::contract::{ProjectionError, ProjectionStore, ShardHandle, ShardParams};
+use crate::model_switch::migrate_dormant_on_open;
 use crate::rebuild::{RebuildError, open_and_validate};
 use crate::switch::VectorSource;
 
@@ -117,6 +118,12 @@ pub enum AcquireError {
     Removed,
     /// The fill task panicked.
     Panicked(String),
+    /// The dormant-worktree model migration (spec 05 §8 `[FIXED]`) failed, so
+    /// the shard must not serve: it would answer from a model space the worktree
+    /// is no longer supposed to be on (T11-05).
+    ModelSwitch(crate::model_switch::ModelSwitchError),
+    /// Resolving the active model space's shard directory/params failed.
+    Sqlite(local_rag_store::rusqlite::Error),
 }
 
 impl std::fmt::Display for AcquireError {
@@ -128,6 +135,15 @@ impl std::fmt::Display for AcquireError {
                 write!(f, "shard acquire: cancelled by a concurrent remove()")
             }
             AcquireError::Panicked(why) => write!(f, "shard acquire: fill task panicked: {why}"),
+            AcquireError::ModelSwitch(e) => {
+                write!(f, "shard acquire: dormant model migration failed: {e}")
+            }
+            AcquireError::Sqlite(e) => {
+                write!(
+                    f,
+                    "shard acquire: could not resolve the active model space: {e}"
+                )
+            }
         }
     }
 }
@@ -137,6 +153,8 @@ impl std::error::Error for AcquireError {
         match self {
             AcquireError::Rebuild(e) => Some(e),
             AcquireError::Open(e) => Some(e),
+            AcquireError::ModelSwitch(e) => Some(e),
+            AcquireError::Sqlite(e) => Some(e),
             AcquireError::Removed | AcquireError::Panicked(_) => None,
         }
     }
@@ -337,13 +355,10 @@ impl ShardManager {
         worktree_id: Uuid,
         now_ms: i64,
     ) -> Result<Arc<dyn ShardHandle>, AcquireError> {
-        let shard_dir = self.layout.projection_shard(&worktree_id.to_string());
-        let quarantine_dir = self.layout.quarantine_dir();
         let join = tokio::spawn(fill(
             self.db.clone(),
             self.store.clone(),
-            shard_dir,
-            quarantine_dir,
+            self.layout.clone(),
             self.shard_params,
             worktree_id,
             self.vectors.clone(),
@@ -382,9 +397,8 @@ impl ShardManager {
 async fn fill(
     db: Arc<StateDb>,
     store: Arc<dyn ProjectionStore>,
-    shard_dir: std::path::PathBuf,
-    quarantine_dir: std::path::PathBuf,
-    shard_params: ShardParams,
+    layout: StoreLayout,
+    fallback_params: ShardParams,
     worktree_id: Uuid,
     vectors: Arc<dyn VectorSource + Send + Sync>,
     uuids: Arc<dyn UuidSource + Send + Sync>,
@@ -395,6 +409,29 @@ async fn fill(
         .acquire()
         .await
         .expect("rebuild semaphore is never closed");
+
+    // Spec 05 §8 `[FIXED]`: "opening a worktree whose `active_model_space_id` is
+    // retiring/absent switches it to the default space via the standard switch
+    // protocol **before serving dense search**" — so it runs here, before
+    // validate-on-open decides anything about the shard (T11-05).
+    migrate_dormant_on_open(
+        &db,
+        &*store,
+        &layout,
+        worktree_id,
+        &*vectors,
+        &*uuids,
+        now_ms,
+    )
+    .await
+    .map_err(AcquireError::ModelSwitch)?;
+
+    // Resolve the shard's directory and params from whatever space is active
+    // *after* that migration: each model space owns its own subdirectory and its
+    // own dimensions (spec 10 §4 `[FIXED]`).
+    let (shard_dir, shard_params) =
+        resolve_shard(&db, &layout, worktree_id, fallback_params).map_err(AcquireError::Sqlite)?;
+    let quarantine_dir = layout.quarantine_dir();
 
     open_and_validate(
         &db,
@@ -414,4 +451,51 @@ async fn fill(
         .open(&shard_dir, shard_params)
         .map_err(AcquireError::Open)?;
     Ok(Arc::from(handle))
+}
+
+/// The shard directory and params for a worktree's currently active model space.
+///
+/// Falls back to the manager's store-wide params (and the worktree's shard root)
+/// when the worktree has no active space yet, or when the registry holds no
+/// `code_raw` representation to size a shard from — the bootstrap path every
+/// pre-T11-05 store and test is on.
+fn resolve_shard(
+    db: &StateDb,
+    layout: &StoreLayout,
+    worktree_id: Uuid,
+    fallback_params: ShardParams,
+) -> Result<(std::path::PathBuf, ShardParams), local_rag_store::rusqlite::Error> {
+    let read = match db.open_read() {
+        Ok(read) => read,
+        // A read connection that will not open is reported by the very next
+        // step (`open_and_validate` opens its own), so fall back rather than
+        // inventing a second error path for it here.
+        Err(_) => {
+            return Ok((
+                layout.projection_shard(&worktree_id.to_string()),
+                fallback_params,
+            ));
+        }
+    };
+    let Some(row) = local_rag_store::projection_state(&read, &worktree_id.to_string())? else {
+        return Ok((
+            layout.projection_shard(&worktree_id.to_string()),
+            fallback_params,
+        ));
+    };
+    let Some(active) = row.active_model_space_id.as_deref() else {
+        return Ok((
+            layout.projection_shard(&worktree_id.to_string()),
+            fallback_params,
+        ));
+    };
+    let model_space_id: Uuid = active
+        .parse()
+        .expect("stored active_model_space_id is always a UUID");
+    let params = crate::model_switch::params_for_model_space(&read, &model_space_id)
+        .unwrap_or(fallback_params);
+    Ok((
+        crate::model_switch::shard_dir(layout, &worktree_id, &model_space_id),
+        params,
+    ))
 }

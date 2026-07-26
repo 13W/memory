@@ -75,10 +75,11 @@ pub use generation::{
 
 pub(crate) use projection_state::SCHEMA_V4;
 pub use projection_state::{
-    DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, IllegalProjectionTransition,
-    PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation, ProjectionStateChange,
-    ProjectionStateError, ProjectionStateRow, ProjectionStatus, check_invariants,
-    default_model_space_id, insert_projection_state, projection_state, write_projection_state,
+    DEFAULT_MODEL_SPACE_ID, DEFAULT_MODEL_SPACE_NAME, DefaultModelSpaceError,
+    IllegalProjectionTransition, PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation,
+    ProjectionStateChange, ProjectionStateError, ProjectionStateRow, ProjectionStatus,
+    check_invariants, default_model_space_id, insert_projection_state, projection_state,
+    set_default_model_space_id, write_projection_state,
 };
 
 pub(crate) use representation::SCHEMA_V6;
