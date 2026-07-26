@@ -190,20 +190,20 @@ mod state;
 pub mod subjects;
 
 pub use cache::{
-    BatchingLastUsed, BatchingLastUsedEmbeddings, CACHE_SCHEMA_VERSION, CacheDb, CacheOpenError,
-    CacheOpenOutcome, CacheWriteError, CacheWriter, EmbeddingCacheMeta, EmbeddingCacheRow,
-    EmbeddingDivergence, EmbeddingKey, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability,
-    FtsDivergence, FtsMaterializeError, FtsMaterializeOutcome, FtsOpenOutcome,
+    BM25_DEFAULT_WEIGHTS, BatchingLastUsed, BatchingLastUsedEmbeddings, CACHE_SCHEMA_VERSION,
+    CacheDb, CacheOpenError, CacheOpenOutcome, CacheWriteError, CacheWriter, EmbeddingCacheMeta,
+    EmbeddingCacheRow, EmbeddingDivergence, EmbeddingKey, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD,
+    FtsAvailability, FtsDivergence, FtsMaterializeError, FtsMaterializeOutcome, FtsOpenOutcome,
     FtsProjectionHeadRow, FtsRebuildError, LEXICAL_SCHEMA_VERSION, LastUsedSink,
-    LastUsedSinkEmbedding, NormalizedTextRow, SubjectKind, TOKENIZER_VERSION, ValidationDepth,
-    VectorLengthError, all_embedding_meta, decode_vector_le, delete_embedding,
-    delete_normalized_text, encode_vector_le, flush_last_used, flush_last_used_embeddings,
-    fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash, get_embedding,
-    get_normalized_text, insert_embedding, insert_normalized_text, materialize_fts,
-    open_and_validate_fts, read_fts_projection_head, requires_index_unavailable,
-    should_rebuild_synchronously, tokenize_identifier, tokenize_path, tokenize_qualified_name,
-    tokenize_signature, validate_fts_cheap, validate_fts_strong, verify_cached_embedding,
-    verify_cached_text,
+    LastUsedSinkEmbedding, LexicalHit, LexicalQuery, MIN_CANDIDATE_DEPTH, NormalizedTextRow,
+    SubjectKind, TOKENIZER_VERSION, ValidationDepth, VectorLengthError, all_embedding_meta,
+    candidate_depth, decode_vector_le, delete_embedding, delete_normalized_text, encode_vector_le,
+    flush_last_used, flush_last_used_embeddings, fts_doc_occurrence_count, fts_doc_occurrence_ids,
+    fts_manifest_hash, fts_match_expression, get_embedding, get_normalized_text, insert_embedding,
+    insert_normalized_text, lexical_leg, materialize_fts, open_and_validate_fts, query_fts,
+    read_fts_projection_head, requires_index_unavailable, should_rebuild_synchronously,
+    tokenize_identifier, tokenize_path, tokenize_qualified_name, tokenize_signature,
+    validate_fts_cheap, validate_fts_strong, verify_cached_embedding, verify_cached_text,
 };
 pub use code::{
     ALGO_VERSION, BlobOutcome, DerivedContentBlob, EdgeResolution, FtsSourceRow,

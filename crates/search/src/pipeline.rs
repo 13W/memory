@@ -6,16 +6,23 @@
 //! tuple, validate the FTS view (spec 06 §4) and the dense shard, then
 //! release and return a canonical outcome (spec 02 §6).
 //!
-//! Deliberately out of scope here (owned by T09-04 or group 12, not
-//! duplicated): a tuned BM25 lexical query with weights/filters (T12-01, the
-//! [`Stage::LexicalLeg`] step below is a stub); RRF fusion, `results[]`,
-//! per-leg scoring (T12-02/T12-03); real enrichment — parent unit, qualified
-//! name, graph (T12-04, [`Stage::Enrichment`] is a stub); `mode`/`limit`/
-//! `name_pattern` request fields and per-mode leg selection (spec 09 §5,
-//! group 12 — this pipeline always attempts both legs, mirroring the default
-//! `hybrid` mode); load/failpoint tests under concurrent generation/model-space
-//! switches (T09-04 — this module only proves the lock is held across one
-//! pipeline run, never that concurrent switches can't mix generations).
+//! T12-01 filled in the lexical leg: [`Stage::LexicalLeg`] now runs the real
+//! BM25 query (`local_rag_store::lexical_leg`) against the active generation,
+//! with the spec's default column weights, the `name_pattern` prefix filter and
+//! the `max(limit·4, 50)` candidate depth (spec 09 §2/§4) — still inside the
+//! same held `L2.read`, and **only** when the FTS view validated (an invalid
+//! head means the leg does not run at all and the response is explicitly
+//! `dense_only`, never a silently empty lexical result `[FIXED]`).
+//!
+//! Deliberately out of scope here (owned by T09-04 or the rest of group 12, not
+//! duplicated): RRF fusion, `results[]`, per-leg scoring (T12-02/T12-03); real
+//! enrichment — parent unit, qualified name, graph (T12-04,
+//! [`Stage::Enrichment`] is a stub); the `mode` request field and per-mode leg
+//! selection (spec 09 §5, T12-03 — this pipeline always attempts both legs,
+//! mirroring the default `hybrid` mode); load/failpoint tests under concurrent
+//! generation/model-space switches (T09-04 — this module only proves the lock
+//! is held across one pipeline run, never that concurrent switches can't mix
+//! generations).
 
 use std::fmt;
 use std::sync::Arc;
@@ -26,8 +33,9 @@ use local_rag_projection::{DenseQuery, ShardManager};
 use local_rag_protocol::{DegradedMode, ErrorEnvelope};
 use local_rag_store::lock::ReadTimedOut;
 use local_rag_store::{
-    CacheDb, FtsAvailability, FtsOpenOutcome, FtsRebuildError, OpenError, RequestRoot, Resolution,
-    StateDb, ValidationDepth, WorktreeLockRegistry, open_and_validate_fts, projection_state,
+    CacheDb, CacheOpenError, FtsAvailability, FtsOpenOutcome, FtsRebuildError, LexicalHit,
+    LexicalQuery, OpenError, RequestRoot, Resolution, StateDb, ValidationDepth,
+    WorktreeLockRegistry, lexical_leg, open_and_validate_fts, projection_state,
     requires_index_unavailable, resolve, rusqlite,
 };
 
@@ -50,7 +58,7 @@ pub enum Stage {
     FtsLeg,
     /// Acquiring the shard handle and running the dense query.
     DenseLeg,
-    /// The lexical leg (stub — T12-01 owns the real BM25 query).
+    /// The lexical leg: the active-generation BM25 query (T12-01).
     LexicalLeg,
     /// Enrichment (stub — T12-04 owns the real parent-unit/graph work).
     Enrichment,
@@ -80,6 +88,17 @@ impl StageObserver for NoopObserver {
 pub struct SearchRequest {
     /// The request's explicit worktree context.
     pub root: RequestRoot,
+    /// The raw query text for the lexical leg (spec 09 §1's `query`). Tokenized
+    /// by the leg itself, never handed to FTS5 verbatim.
+    pub query: String,
+    /// The caller's requested result count (spec 09 §1's `limit`). The lexical
+    /// leg derives its candidate depth from it via
+    /// `local_rag_store::candidate_depth` (§4); the dense leg still takes its
+    /// own `k` until T12-02/T12-03 fuse the two.
+    pub limit: usize,
+    /// Optional prefix filter on `local_name`/`qualified_name` (spec 09 §1's
+    /// `name_pattern`).
+    pub name_pattern: Option<String>,
     /// The query vector for the dense leg.
     pub query_vector: Vec<f32>,
     /// The maximum number of dense candidates to request.
@@ -97,6 +116,11 @@ pub struct PipelineSnapshot {
     pub generation_id: String,
     /// The active model space served.
     pub model_space_id: String,
+    /// The lexical leg's ranked candidates (spec 09 §2), best first. Empty
+    /// whenever the leg did not run — an invalid FTS view (`dense_only`) or a
+    /// query that reduces to no terms. Fusing these with the dense leg into
+    /// spec 09 §7's `results[]` is T12-03.
+    pub lexical: Vec<LexicalHit>,
     /// `None` when both legs served; `Some` names which leg was skipped.
     pub degraded: Option<DegradedMode>,
     /// Freeform diagnostic reasons (spec 02 §6: "every degraded response
@@ -115,6 +139,10 @@ pub enum SearchInfraError {
     StateOpen(OpenError),
     /// Reading `state.sqlite` failed.
     StateRead(rusqlite::Error),
+    /// Opening a `cache.sqlite` read connection failed.
+    CacheOpen(CacheOpenError),
+    /// Running the lexical query against `cache.sqlite` failed.
+    CacheRead(rusqlite::Error),
     /// The FTS validator failed at the infrastructure level.
     Fts(FtsRebuildError),
     /// A stored `worktree_id` did not parse as a UUID.
@@ -126,6 +154,8 @@ impl fmt::Display for SearchInfraError {
         match self {
             SearchInfraError::StateOpen(e) => write!(f, "search: state.sqlite open failed: {e}"),
             SearchInfraError::StateRead(e) => write!(f, "search: state.sqlite read failed: {e}"),
+            SearchInfraError::CacheOpen(e) => write!(f, "search: cache.sqlite open failed: {e}"),
+            SearchInfraError::CacheRead(e) => write!(f, "search: lexical query failed: {e}"),
             SearchInfraError::Fts(e) => write!(f, "search: FTS validation failed: {e}"),
             SearchInfraError::CorruptWorktreeId(id) => {
                 write!(f, "search: worktree_id {id:?} is not a valid UUID")
@@ -139,6 +169,8 @@ impl std::error::Error for SearchInfraError {
         match self {
             SearchInfraError::StateOpen(e) => Some(e),
             SearchInfraError::StateRead(e) => Some(e),
+            SearchInfraError::CacheOpen(e) => Some(e),
+            SearchInfraError::CacheRead(e) => Some(e),
             SearchInfraError::Fts(e) => Some(e),
             SearchInfraError::CorruptWorktreeId(_) => None,
         }
@@ -297,12 +329,36 @@ impl SearchEngine {
             return Ok(Err(ErrorEnvelope::index_unavailable(details.join("; "))));
         }
 
-        // Stubs: real lexical ranking is T12-01, real enrichment is T12-04.
-        // Both still run under L2.read so instrumentation can prove it.
+        // The lexical leg (T12-01), still under L2.read. It runs *only* on a
+        // validated view: an invalid `fts_projection_head` degrades to
+        // `dense_only` with a diagnostic, and an empty FTS is never silently
+        // served as a correct lexical result (spec 06 §4 `[FIXED]`).
         observer.on_stage(Stage::LexicalLeg);
+        let fts_available = matches!(fts_availability, FtsAvailability::Valid);
+        let lexical = if fts_available {
+            let conn = self
+                .cache
+                .open_read()
+                .map_err(SearchInfraError::CacheOpen)?;
+            lexical_leg(
+                &conn,
+                worktree_id,
+                &generation_id,
+                &LexicalQuery::new(
+                    &request.query,
+                    request.name_pattern.as_deref(),
+                    request.limit,
+                ),
+            )
+            .map_err(SearchInfraError::CacheRead)?
+        } else {
+            Vec::new()
+        };
+
+        // Stub: real enrichment is T12-04. Still runs under L2.read so
+        // instrumentation can prove it.
         observer.on_stage(Stage::Enrichment);
 
-        let fts_available = matches!(fts_availability, FtsAvailability::Valid);
         let degraded = match (fts_available, dense_available) {
             (true, true) => None,
             (true, false) => Some(DegradedMode::LexicalOnly),
@@ -324,6 +380,7 @@ impl SearchEngine {
             worktree_id: worktree_id.to_string(),
             generation_id,
             model_space_id,
+            lexical,
             degraded,
             diagnostics,
         }))

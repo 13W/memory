@@ -45,6 +45,23 @@ this pipeline's first two steps and the lock/validate/degrade skeleton around th
   `name_pattern` are not yet request fields. The real BM25 query is T12-01, RRF/`results[]`/`legs`
   scoring is T12-02/T12-03, and real enrichment is T12-04 — each replaces its stub stage in place,
   still inside the same held `L2.read`.
+
+As-built note (T12-01, `[SPEC]`): `Stage::LexicalLeg` is no longer a stub — it runs
+`local_rag_store::lexical_leg` (`crates/store/src/cache/fts_query.rs`, the read-side sibling of
+T08-02's write-side `materialize_fts`; both call the same `tokenize_identifier`, which is why query
+and index vocabularies cannot drift), inside the same held `L2.read`. `SearchRequest` gained
+`query`/`limit`/`name_pattern`; `mode` and per-mode leg selection (§5) stay with fusion in T12-03,
+so the pipeline still attempts both legs. The leg runs **only** when the FTS view validated
+(`FtsAvailability::Valid`): an invalid/stale head means the query is not issued at all and the
+response is `dense_only` with its diagnostic, never a silently empty lexical result (06 §4
+`[FIXED]`) — asserted end to end by `crates/search/tests/lexical.rs::
+a_stale_head_degrades_to_dense_only_without_running_the_leg`, which keeps a *valid* head for a
+previous generation physically present in the cache so the assertion cannot pass vacuously.
+`PipelineSnapshot` grew a `lexical: Vec<LexicalHit>` field (occurrence id + 1-based leg rank + raw
+`bm25`), the input T12-03 fuses into §7's `results[]`; the enrichment stage remains a stub
+(T12-04). `name_pattern` is realized as an FTS5 column filter (§2's as-built note), so the
+"prefix-tokenized on `local_name`/`qualified_name`" step needs no state-side join and no
+cross-database `ATTACH`.
 - `format results`: not yet — `SearchEngine::search_code` returns
   `local_rag_search::PipelineSnapshot` (worktree/generation/model-space tuple, `degraded`,
   `diagnostics`), the envelope skeleton `[SPEC]` this task owns, not §7's full response shape
@@ -89,6 +106,54 @@ the empty string; `tokenize_signature` takes already-extracted fragments and
 emits only their split parts, never a fused whole fragment.
 `LEXICAL_SCHEMA_VERSION`/`TOKENIZER_VERSION` are both `1`.
 
+As-built note (T12-01, `[SPEC]`): the query side lives in
+`local_rag_store::cache::fts_query` (`crates/store/src/cache/fts_query.rs`) —
+`fts_match_expression` builds the FTS5 `MATCH` string, `query_fts` runs the ranked SQL,
+`lexical_leg` composes the two. The **default weights** are the constant
+`BM25_DEFAULT_WEIGHTS = [4.0, 3.0, 1.5, 2.0, 1.0]`, bound as query parameters (not
+interpolated), and the ranking SQL joins `fts_occurrences ⋈ fts_doc` on the shared rowid,
+filtering `worktree_id` **and** `generation_id`. That generation predicate is defence in
+depth behind 06 §4's head validation: even a stale head that somehow passed cannot leak
+another generation's occurrences (06 §3's no-mixing guarantee, restated in SQL). Ordering
+is `bm25 ASC` — SQLite's `bm25()` is more negative for a better match — with
+`occurrence_id ASC` as tie-break, borrowing §4's fusion tie-break so a truncation at
+candidate depth is reproducible rather than storage-order dependent.
+
+Query preprocessing reuses `tokenize_identifier` verbatim, so the query's term vocabulary is
+the indexed one by construction. Three `[SPEC]` decisions the spec text above does not fix:
+
+- **Terms are combined with `OR`, not `AND`.** The 49-query corpus is natural language
+  ("call Ollama embed API and parse embeddings response", `fixtures/search/corpus.json`);
+  requiring every token would return nothing for nearly every query, while BM25's own IDF
+  already ranks documents matching more and rarer terms first. Tunable by T12-05 alongside
+  the weights.
+- **Every term is emitted as a quoted FTS5 string** (`"embed"`, embedded `"` doubled). FTS5
+  reads bare `AND`/`OR`/`NOT`/`NEAR` as operators, so an unquoted English query containing
+  "and" would be `SQLITE_ERROR` rather than a search; quoting makes the expression total
+  over arbitrary user input.
+- **`name_pattern` becomes an FTS5 column filter**,
+  `{name qualified_name} : ("extractimp"* AND "extract"* AND "imp"*)`, `AND`-ed onto the
+  query expression. `AND` because a filter must narrow; prefix per token is what makes a
+  partially typed pattern work. An empty/whitespace-only pattern tokenizes to nothing and is
+  treated as **no filter**, not as an impossible one. When neither query nor pattern yields a
+  term, the leg returns empty **without issuing SQL** (an empty `MATCH` expression is itself a
+  syntax error).
+
+One accepted asymmetry, documented rather than silently carried: `tokenize_path`/
+`tokenize_qualified_name` make the fused-whole-atom decision *per component* at index time,
+while a query string is tokenized as a single atom — so the query `src/foo/barBaz.rs` asks for
+`src foo bar baz rs` but not the fused `barbaz` the `path` column also holds. Recall is
+unaffected (`bar`/`baz` still match that row); splitting a free-text query on `/`/`.` to recover
+the fused term would misfire on ordinary prose ("v2.1", "and/or").
+
+The `signature` column's weight (`2.0`) is **inert on real data** for now: `materialize_fts`
+writes `tokenize_signature(&[])` for every row (T08-02's as-built note above — raw
+parameter/return-type text is still not plumbed out of the tree-sitter adapters). T12-01 owns
+the query, not the ingest, so the weight is proven honored on directly seeded rows
+(`crates/store/tests/fts_query.rs::signature_column_outranks_path_and_body`) and starts
+affecting production ranking unchanged once that column is populated — no deviation is
+registered, since this is the previously accepted T08-02 scope boundary, not a new mismatch.
+
 ## 3. Dense leg
 
 - Query embedding computed with the representation of the active model space; **content vs
@@ -100,6 +165,15 @@ emits only their split parts, never a fused whole fragment.
 
 Reciprocal Rank Fusion: `score(d) = Σ_legs 1 / (k + rank_leg(d))`, `k = 60`. Deterministic
 tie-break: `(score desc, occurrence_id asc)`. Per-leg candidate depth: `max(limit·4, 50)`.
+
+As-built note (T12-01, `[SPEC]`): the candidate depth is
+`local_rag_store::candidate_depth(limit)` (`crates/store/src/cache/fts_query.rs`,
+`limit.saturating_mul(4).max(MIN_CANDIDATE_DEPTH)`, `MIN_CANDIDATE_DEPTH = 50`), introduced
+with its first caller — the lexical leg. T12-02/T12-03 must take the dense leg's depth from
+this same function rather than restate the formula: RRF ranks only mean anything when both
+legs were cut at a comparable depth. The lexical leg already applies `(score, occurrence_id)`
+ordering internally (§2's as-built note); RRF itself, `k = 60`, and the cross-leg tie-break are
+T12-03.
 
 ## 5. Modes (v0) `[SPEC mapping of v1 modes]`
 

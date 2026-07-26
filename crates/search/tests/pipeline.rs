@@ -499,6 +499,9 @@ async fn lock_is_held_in_every_leg_of_a_successful_hybrid_search() {
     let observer = RecordingObserver::new();
     let request = SearchRequest {
         root: request_root(&path),
+        query: "search".to_string(),
+        limit: 5,
+        name_pattern: None,
         query_vector: vec![1.0, 0.0, 0.0],
         k: 5,
     };
@@ -554,6 +557,9 @@ async fn unknown_root_yields_worktree_not_indexed() {
 
     let request = SearchRequest {
         root: RequestRoot::default(),
+        query: "search".to_string(),
+        limit: 5,
+        name_pattern: None,
         query_vector: vec![1.0, 0.0, 0.0],
         k: 5,
     };
@@ -599,6 +605,9 @@ async fn fts_diverged_above_threshold_degrades_dense_only() {
 
     let request = SearchRequest {
         root: request_root(&path),
+        query: "search".to_string(),
+        limit: 5,
+        name_pattern: None,
         query_vector: vec![1.0, 0.0, 0.0],
         k: 5,
     };
@@ -653,6 +662,9 @@ async fn dense_unavailable_degrades_lexical_only() {
 
     let request = SearchRequest {
         root: request_root(&path),
+        query: "search".to_string(),
+        limit: 5,
+        name_pattern: None,
         query_vector: vec![1.0, 0.0, 0.0],
         k: 5,
     };
@@ -700,6 +712,9 @@ async fn both_legs_unavailable_yields_index_unavailable() {
 
     let request = SearchRequest {
         root: request_root(&path),
+        query: "search".to_string(),
+        limit: 5,
+        name_pattern: None,
         query_vector: vec![1.0, 0.0, 0.0],
         k: 5,
     };
@@ -803,6 +818,9 @@ async fn writer_holding_l2_write_delays_search_past_bound_yields_busy_retry() {
 
     let request = SearchRequest {
         root: request_root(&path),
+        query: "search".to_string(),
+        limit: 5,
+        name_pattern: None,
         query_vector: vec![1.0, 0.0, 0.0],
         k: 5,
     };

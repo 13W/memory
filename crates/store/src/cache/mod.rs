@@ -14,6 +14,7 @@
 
 mod embedding;
 mod fts;
+mod fts_query;
 mod open;
 mod text;
 mod validate;
@@ -30,6 +31,10 @@ pub use fts::{
     TOKENIZER_VERSION, fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash,
     materialize_fts, read_fts_projection_head, tokenize_identifier, tokenize_path,
     tokenize_qualified_name, tokenize_signature,
+};
+pub use fts_query::{
+    BM25_DEFAULT_WEIGHTS, LexicalHit, LexicalQuery, MIN_CANDIDATE_DEPTH, candidate_depth,
+    fts_match_expression, lexical_leg, query_fts,
 };
 pub use open::{CACHE_SCHEMA_VERSION, CacheOpenError, CacheOpenOutcome};
 pub use text::{
