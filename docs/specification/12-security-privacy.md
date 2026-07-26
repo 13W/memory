@@ -11,6 +11,15 @@ allow_remote_full`, default **`local_only`**. Effective policy = most restrictiv
 and repository settings (02 §3.2). Enforced centrally in the provider pool before provider
 selection; violations return `POLICY_BLOCKED_REMOTE`, never silently downgrade.
 
+As-built note (T11-06, `[SPEC]`). **Downloading model assets is not subject to `data_policy`.** The
+guard above governs repository content *leaving* the machine — that is what "before provider
+selection" is about. Fetching weights is the opposite direction: an explicit user command
+(`init --download-models`, 10 §5) pulls public bytes **in**, and no user content is sent. Gating it
+on the policy would make a `local_only` installation — the default — unable to obtain the local
+model at all, inverting the policy's intent. The download is still constrained: the source URL and
+every file's `sha256`/`size` are pinned in the binary (ADR-0005), so "fetch a model" cannot become
+"fetch arbitrary bytes". Embedding *through* a remote provider remains gated exactly as fixed above.
+
 ## 2. Redaction & caps `[FIXED]`
 
 - Secret redaction runs **before** anything is written to the spool `[FIXED]` and again before

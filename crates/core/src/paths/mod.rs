@@ -18,7 +18,7 @@
 //! `$LOCAL_RAG_HOME/config` — a sibling of the store root
 //! `$LOCAL_RAG_HOME/local-rag`, keeping a container fully self-contained.
 
-mod perms;
+pub mod perms;
 
 pub use perms::{ensure_dir, ensure_file_0600, verify_owner};
 

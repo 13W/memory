@@ -115,6 +115,19 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
     for block in msg.chunks_exact(64) {
+        compress(&mut h, block);
+    }
+
+    let mut out = [0u8; 32];
+    for (chunk, word) in out.chunks_exact_mut(4).zip(h) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Compress one 64-byte block into the running state.
+fn compress(h: &mut [u32; 8], block: &[u8]) {
+    {
         let mut w = [0u32; 64];
         for (i, word) in block.chunks_exact(4).enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
@@ -128,7 +141,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
                 .wrapping_add(s1);
         }
 
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
         for (&ki, &wi) in K.iter().zip(w.iter()) {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
@@ -155,12 +168,89 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
             *slot = slot.wrapping_add(v);
         }
     }
+}
 
-    let mut out = [0u8; 32];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(h) {
-        chunk.copy_from_slice(&word.to_be_bytes());
+/// An incremental SHA-256 over a byte stream.
+///
+/// [`sha256_hex`] buffers its whole input, which is fine for a SID or a
+/// migration script and impossible for a 300 MB model asset (spec 10 §5's
+/// checksum-verified download, T11-06). This hashes as bytes arrive, so the
+/// installer never holds an asset in memory.
+#[derive(Debug, Clone)]
+pub struct Sha256 {
+    state: [u32; 8],
+    /// Bytes not yet part of a complete 64-byte block.
+    buffer: Vec<u8>,
+    /// Total bytes consumed, for the length padding.
+    len: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
     }
-    out
+}
+
+impl Sha256 {
+    /// A fresh hasher.
+    pub fn new() -> Self {
+        Sha256 {
+            state: H0,
+            buffer: Vec::with_capacity(64),
+            len: 0,
+        }
+    }
+
+    /// Feed more bytes.
+    pub fn update(&mut self, mut bytes: &[u8]) {
+        self.len = self.len.wrapping_add(bytes.len() as u64);
+
+        if !self.buffer.is_empty() {
+            let need = 64 - self.buffer.len();
+            let take = need.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buffer.len() < 64 {
+                return;
+            }
+            let block: [u8; 64] = self.buffer[..].try_into().expect("buffer is one block");
+            compress(&mut self.state, &block);
+            self.buffer.clear();
+        }
+
+        let whole = bytes.len() - bytes.len() % 64;
+        for block in bytes[..whole].chunks_exact(64) {
+            compress(&mut self.state, block);
+        }
+        self.buffer.extend_from_slice(&bytes[whole..]);
+    }
+
+    /// Finish, returning the lowercase hex digest (64 characters).
+    pub fn finish_hex(mut self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let bit_len = self.len.wrapping_mul(8);
+
+        // Same padding as the one-shot path: 0x80, zeros, big-endian bit length.
+        let mut tail = Vec::with_capacity(128);
+        tail.extend_from_slice(&self.buffer);
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bit_len.to_be_bytes());
+        for block in tail.chunks_exact(64) {
+            compress(&mut self.state, block);
+        }
+
+        let mut hex = String::with_capacity(64);
+        for word in self.state {
+            for byte in word.to_be_bytes() {
+                hex.push(HEX[(byte >> 4) as usize] as char);
+                hex.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+        hex
+    }
 }
 
 #[cfg(test)]

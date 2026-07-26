@@ -1,0 +1,68 @@
+[package]
+name = "local-rag-models"
+description = "Model asset installer and the ONNX embedding provider for local-rag (spec 10 §5, ADR-0004/0005)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+local-rag-core = { path = "../core" }
+local-rag-embed = { path = "../embed" }
+local-rag-store = { path = "../store" }
+
+# The HTTPS client behind the `AssetFetcher` seam. `std` has no TLS and no HTTP;
+# `local-rag init --download-models` (spec 10 §5 `[FIXED policy]`) cannot be
+# implemented without one, and shelling out to `curl` would reintroduce an
+# external runtime dependency the whole design forbids (spec 01 §1). `ureq` is
+# blocking (matching the installer's own shape), and `rustls` keeps TLS in pure
+# Rust — no OpenSSL, no system TLS stack to bundle per platform.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# ONNX Runtime bindings for the model ADR-0004 selected. `load-dynamic` is the
+# load-bearing choice: it compiles `ort-sys` with linking disabled and resolves
+# `libonnxruntime` at *runtime* through `libloading`, so `cargo build` never
+# downloads a binary and `cargo xtask ci` stays offline (the exact objection
+# D-008 raised against the default `download-binaries` feature). Which library
+# ships per platform package is T17-03's "ORT bundling before the final CI
+# matrix".
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+    "load-dynamic",
+    "ndarray",
+    # `api-24` matches ONNX Runtime 1.24+, the API level `ort`'s own default
+    # selects; without an explicit level the crate does not compile.
+    "api-24",
+] }
+ndarray = "0.17"
+
+# The model's own tokenizer (`tokenizer.json` ships with the weights). Encoding
+# must match the training-time tokenizer byte for byte or the vectors are
+# meaningless; `std` obviously has no BPE/SentencePiece implementation, and this
+# is the reference one the model card assumes.
+tokenizers = { version = "0.23", default-features = false, features = [
+    "onig",
+] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Optional, dev-only path crate (0 external sources): enabled ONLY by the
+# `failpoints` feature so the installer can host its named crash point between
+# committed files (spec 14 §3's "deterministic kill points"). Off by default;
+# the shipped binary never links test-support.
+local-rag-test-support = { path = "../test-support", optional = true }
+
+[features]
+# Compiles `models.install.between_files`, the crash point fired after a file
+# has been renamed into place and before the next one starts.
+failpoints = ["dep:local-rag-test-support"]
+
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+] }
+
+[lints]
+workspace = true

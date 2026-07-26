@@ -179,9 +179,7 @@ As-built note (T11-03, `[SPEC]`): the **default model choice** half of that `[OP
 **`embeddinggemma-300m`, 768 dimensions, cosine** (ADR-0004, which records the measured candidate
 comparison, the explicit criteria weights, and the runner-up
 `jina-embeddings-v2-base-code` should the Gemma terms or the T12-05 gate force a switch; a switch
-costs one model-space migration per §4, not a redesign). Delivery details — which quantization is
-fetched, the runtime that loads it (`fastembed` vs `Candle`, §1), and the installer itself — remain
-`[OPEN]`/T11-06; quantization is a delivery choice and does not change `RepresentationKey`.
+costs one model-space migration per §4, not a redesign).
 The installer MUST surface and persist the model's license (Gemma Terms of Use, not an OSI license)
 in `models/embeddinggemma-300m/manifest.json`, which is what makes a non-redistributed,
 user-downloaded non-OSI default acceptable here.
@@ -189,6 +187,43 @@ user-downloaded non-OSI default acceptable here.
 The consumer half of the `.ok` contract already exists: `local_rag_embed::require_model_assets`
 treats a model directory as usable **only** with its `.ok` marker present (a `.part`/half-renamed
 download is "missing"), returning a typed `ModelAssetsMissing` and performing no network access.
+
+As-built note (T11-06, `[SPEC]`): the **delivery details** half of the `[OPEN]` above is now
+resolved too (ADR-0005), closing `D-008`. `local_rag_models` is the producing half of the same
+contract:
+
+* **Runtime**: ONNX Runtime through `ort` with `load-dynamic` — nothing is downloaded or linked at
+  build time, `libonnxruntime` is resolved at runtime (`ORT_DYLIB_PATH` or the loader path), and its
+  absence is a typed error. This is what keeps a clean build and the whole quality gate offline;
+  bundling the library per platform package stays the "ORT bundling verified before the final CI
+  matrix" `[FIXED]` item above, owned by T17-03.
+* **Quantization**: q8 (`model_quantized`) — three files totalling 314.5 MiB
+  (`model_quantized.onnx`, `model_quantized.onnx_data`, `tokenizer.json`). Still a delivery choice:
+  it does not appear in `RepresentationKey`.
+* **Verification**: every file's `size` and lowercase-hex `sha256` are pinned in the binary and the
+  source URL pins an immutable upstream revision. "Checksum-verified" means verified against the
+  compiled-in catalog; `manifest.json` is disclosure, never the authority a download is checked
+  against.
+* **Ordering**, per file: `<name>.part` → stream while hashing → `sync_all` → verify size **and**
+  digest → `rename` → fsync the directory. Then `manifest.json` by the same atomic path, and `.ok`
+  last. Everything before the marker is by construction indistinguishable from "not installed".
+* **`manifest.json` schema**: `model_id`, `source`, `revision`, `license`, `license_url`,
+  `dimensions`, and `files[] = {path, size, sha256}` — a superset of the four fields this section
+  requires.
+* **Resumability**: no journal. Each run re-derives what is missing by hashing what is on disk
+  against the pinned digests; a leftover `.part` is overwritten, never trusted or appended to. A
+  rerun after an interrupt refetches only the missing files, and a run after a completed install is
+  a no-op.
+* **The license notice** is written to a caller-supplied sink **before** the first fetch and without
+  prompting, so `init` stays scriptable; a no-op install does not reprint it.
+* **Data policy**: downloading model assets is **not** gated on `data_policy` (12 §1). See that
+  section's as-built note — the guard governs repository content leaving the machine, and this is an
+  explicit user command pulling public bytes in.
+* Permissions follow 02 §2.1: `models/<model_id>/` is 0700 and every installed file is 0600 on unix.
+
+`local-rag init --download-models` as a **command** is T15-07's CLI surface (`serve/status/stop/
+restart/init`); T11-06 delivers the typed API it calls. Excluding weights from the npm packages is
+T17-01's packaging test.
 
 ## 6. Memory relevance backend
 

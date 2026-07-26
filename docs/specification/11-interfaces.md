@@ -103,6 +103,11 @@ local-rag doctor            # store lock, versions, heads, orphan artifacts
 local-rag stats
 ```
 
+As-built note (T11-06, `[SPEC]`). `init --download-models` exists as a **typed library API**
+(`local_rag_models::install_model`, 10 §5): pinned-digest atomic install, license notice written to
+a caller-supplied sink, no prompting — so the command stays scriptable. Wiring it to the `local-rag`
+binary is T15-07's card, which owns `serve/status/stop/restart/init`.
+
 Plugin packaging (marketplace add / plugin install, hooks + MCP auto-registration, no
 project-level init, no files written into `.claude/rules/`) carries over from v1 behavior;
 the RECALL → SEARCH_CODE → THINK → ACT → REMEMBER protocol is delivered via MCP server

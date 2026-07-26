@@ -110,6 +110,22 @@ fn run_ci() -> ExitCode {
             "warnings",
         ],
         &["test", "-p", "local-rag-embed", "--features", "failpoints"],
+        // `local-rag-models` (T11-06): the installer's
+        // `models.install.between_files` crash point, exercised by
+        // `install_faults.rs`'s interrupt-and-resume tests (spec 10 §5's
+        // "atomic download … offline operation afterwards").
+        &[
+            "clippy",
+            "-p",
+            "local-rag-models",
+            "--all-targets",
+            "--features",
+            "failpoints",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &["test", "-p", "local-rag-models", "--features", "failpoints"],
         // The dense-backend spike (T10-01) is a SEPARATE workspace with its own
         // Cargo.lock (`spike/`, `exclude`d from the root — CONTRIBUTING.md §
         // Workspace layout), so `test --workspace` above never reaches it. `fmt`

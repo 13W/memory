@@ -37,6 +37,12 @@ After the initial `cargo fetch`, the full check runs **offline**.
   (T11-06, spec 10 §5), so `crates/embed` links **no** model or network SDK
   today and a test asserts that structurally
   (`crates/embed/tests/offline_smoke.rs`).
+  T11-06 links that runtime, in a **separate** crate: `crates/models` owns `ort`,
+  `tokenizers` and `ureq`, while `crates/embed`'s structural lint stays intact
+  rather than being widened to accommodate it — the same isolation principle
+  `spike/` applies to the dense-backend candidates. The offline rule above is
+  unaffected: `ort`'s `load-dynamic` feature resolves `libonnxruntime` at
+  *runtime*, so no build step reaches the network (ADR-0005, closing `D-008`).
 - New dependencies require justification (why the standard library is
   insufficient) and a license check; prefer `std` and small, well-vetted crates.
 - Lints are centralized in `[workspace.lints]`; each crate opts in via
@@ -66,6 +72,9 @@ the license check. Additions require a new row here.
 | `tree-sitter-rust` | `crates/index` | The third-release language grammar (ADR-0001 dogfooding, T04-05); ships generated C parser tables compiled by `cc`. Pinned at **0.23** (not 0.24) for ABI compatibility: the grammar's 0.24 line is ABI **15**, which `tree-sitter 0.24` (max supported language ABI 14) refuses to load — it would silently degrade to a file-only parse; 0.23.x is ABI 14, the same reason the TypeScript/JavaScript grammars are held at 0.23. Its only runtime dependency is `tree-sitter-language` (already in the tree, shared with `tree-sitter`), so it adds **no new transitive crate**; build-time `cc` reused. Not a dense-backend/model/network SDK. | MIT |
 | `streaming-iterator` | `crates/index` | tree-sitter 0.24 yields query matches as a `StreamingIterator`; driving `QueryCursor::matches` needs the trait in scope (also a transitive dep of `tree-sitter`, promoted to direct). Zero transitive dependencies. Not a dense-backend/model/network SDK. | MIT OR Apache-2.0 |
 | `serde_json` (dev-dependency) | `crates/index` and `crates/embed` (tests only) | T04-03 is the first task to consume typed JSON fixtures (the parser family, spec 14 §1.1); typed models with `#[serde(deny_unknown_fields)]` make deserialization the schema check, so no runtime `jsonschema` dep is needed. T11-03 reuses it for the same reason on the `fault.llm.*` family (`fixtures/fault/index.json`), which carries the v1 provider retry contract spec 10 §1 inherits — already in `Cargo.lock`, so **0 new external sources**. Dev-only — the shipped binary never links it. `serde` (`derive`) is already approved (crates/core). Native-linking transitive set: `itoa`, `zmij`, and `memchr`/`serde`/`serde_core` (reused). None are dense-backend/model/network SDKs. | MIT OR Apache-2.0 |
+| `ureq` (`default-features = false`, feature `rustls`) | `crates/models` | Spec 10 §5 `[FIXED policy]` requires `init --download-models` to fetch weights over the network; `std` has neither HTTP nor TLS, and shelling out to `curl` would reintroduce the external runtime dependency spec 01 §1 forbids. `ureq` is blocking (matching the installer's shape) and `rustls` keeps TLS in pure Rust — no OpenSSL, no per-platform system TLS stack to bundle. It sits behind the `AssetFetcher` trait seam, so every test in the suite runs against a loopback fixture server or a local directory, never the internet (T11-06, ADR-0005). Native-linking transitive set: `ureq-proto`, `rustls` (ISC), `rustls-pki-types`, `rustls-webpki` (ISC), `ring` (Apache-2.0 AND ISC), `webpki-roots` (CDLA-Permissive-2.0), `untrusted` (ISC), `subtle` (BSD-3-Clause), `zeroize`, `http`, `httparse`, `base64`, `percent-encoding`, `utf8-zero`, `cfg-if`/`log`/`libc` (reused). Not a dense-backend or model SDK. | MIT OR Apache-2.0 |
+| `ort` (`default-features = false`, features `load-dynamic`, `ndarray`, `api-24`) + `ndarray` | `crates/models` | Spec 10 §1 `[FIXED]` fixes that embeddings run **in-process** on ONNX Runtime or Candle; ADR-0005 picks ONNX Runtime, and `ort` is its Rust binding. **`load-dynamic` is the load-bearing feature**: `ort-sys` compiles with linking disabled and resolves `libonnxruntime` at runtime through `libloading`, so `cargo build` downloads no binary and the offline rule below still holds — the exact objection `D-008` raised against the default `download-binaries`. `api-24` pins the ONNX Runtime API level (without an explicit level the crate does not compile). `ndarray` is `ort`'s own tensor type (pinned to **0.17**, the version `ort` resolves) and is how token ids/attention masks are handed to a session; `std` has no n-dimensional array. Which shared library ships per platform package is T17-03's "ORT bundling verified before the final CI matrix". Native-linking transitive set: `ort-sys`, `libloading` (ISC), `ndarray`, `matrixmultiply`, `rawpointer`, `num-traits`/`num-complex`/`num-integer`, `portable-atomic`(-util), `tracing`/`tracing-core`, `rayon`(-core) (shared with `tokenizers`), `either`. | MIT OR Apache-2.0 |
+| `tokenizers` (`default-features = false`, feature `onig`) | `crates/models` | An embedding model's vectors are only meaningful if input is encoded with the *same* tokenizer it was trained on; `tokenizer.json` ships with the weights and `std` has no BPE/SentencePiece implementation. This is the reference implementation the model card assumes (T11-06). `default-features = false` drops `progressbar` (indicatif) and `esaxx_fast` (a C++ trainer this project never uses — inference only); `onig` stays because it is the only regex backend a non-wasm build can select (the alternative, `fancy-regex`, is reachable only through `unstable_wasm`, which forces `getrandom/wasm_js`). `onig_sys` vendors and compiles the Oniguruma C library (BSD-2-Clause) via the already-present `cc`. Native-linking transitive set: `onig`/`onig_sys` (MIT; vendored C BSD-2-Clause), `esaxx-rs` (pure-Rust without `cpp`), `spm_precompiled`, `compact_str`, `castaway`, `daachorse`, `derive_builder`(+`darling`, build-time), `monostate`, `macro_rules_attribute`, `unicode-normalization-alignments`, `unicode-segmentation`, `unicode_categories`, `itertools`, `ahash`, `rand`/`rand_chacha`/`rand_core`/`getrandom`/`ppv-lite86`/`zerocopy`, `rayon`(-core, -cond), `dary_heap`, `fnv`, `paste`, `static_assertions`, `nom`/`minimal-lexical`. Not a network or dense-backend SDK: it neither downloads (`http`/`hf-hub` features off) nor stores vectors. | Apache-2.0 |
 | `notify` (`default-features = false`, feature `macos_fsevent`) | `crates/index` | The reconcile scheduler needs filesystem-change notifications (spec 06 §1: "Watcher (`notify`) events"; the `[FIXED]` principle is watcher = hint, reconcile = truth). `std` has no FS-notification API. Live watching is confined to `reconcile::watcher`; the pure `WatchEvent → Trigger` mapping is what the tests cover, and the OS watcher itself is never in the CI suite (its event timing is not reproducible). `default-features = false` drops the `crossbeam-channel` default (the thin wrapper uses `std`/tokio channels), keeping the set minimal like `ignore`. Runtime crates compiled on the targets this project ships: `notify` (CC0-1.0) + `notify-types` (MIT OR Apache-2.0); on macOS `fsevent-sys` (MIT); on Linux `inotify` + `inotify-sys` (ISC) and `mio` (MIT). Reused (already in the tree): `bitflags`, `libc`, `log`, `walkdir`, `same-file`. `Cargo.lock` additionally records — but never compiles for v0's macOS/Linux targets — `kqueue`/`kqueue-sys` (MIT, BSD), the `windows-sys`/`windows-targets`/`windows_*` family (MIT OR Apache-2.0, `cfg(windows)`), and `wasi` (wasm), gated exactly like rusqlite's wasm subtree. Not a dense-backend/model/network SDK. | CC0-1.0 |
 
 The earlier "zero external sources" property (T00-02) is therefore superseded by
@@ -76,11 +85,16 @@ rewritten.
 ## Workspace layout
 
 - Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `embed`,
-  `search`, `memory`, `protocol`. `embed` (T11-03) is the embedding provider
-  pool — the `Embedder` contract, the central remote-policy guard, primary/
-  fallback + retry, and the in-process default provider — plus, as of T11-04,
-  the resumable coverage backfill worker. It depends only on other workspace
-  crates.
+  `models`, `search`, `memory`, `protocol`. `embed` (T11-03) is the embedding
+  provider pool — the `Embedder` contract, the central remote-policy guard,
+  primary/fallback + retry, and the in-process default provider — plus, as of
+  T11-04, the resumable coverage backfill worker. It depends only on other
+  workspace crates. `models` (T11-06) is the other side of the model-asset
+  contract: the checksum-verified atomic installer (spec 10 §5) and the ONNX
+  provider that loads what it installs. The split is deliberate — the heavy,
+  externally-facing dependencies (`ort`, `tokenizers`, `ureq`) live there so
+  `embed`'s "no network client, no model runtime" lint stays a true statement
+  about the pool rather than being relaxed.
 - Product binaries: `local-rag` (daemon + CLI), `local-rag-proxy` (stdio MCP
   proxy), `local-rag-hook` (spool writer).
 - Dev-only crates (workspace members, excluded from `default-members`, never
@@ -98,7 +112,9 @@ rewritten.
   seams plus the `inspect`/`corrupt` controls for the spec 05 §10 fault matrix,
   T07-01); as of T11-04, `embed`'s backfill worker
   (`embed.backfill.between_batches`, the crash point after a committed cache-write
-  batch — spec 10 §4 step 2's "resumable"); and, as of T07-05, the write-ahead
+  batch — spec 10 §4 step 2's "resumable"); as of T11-06, `models`'s installer
+  (`models.install.between_files`, fired after a file is verified and renamed into
+  place and before the next one starts — spec 10 §5's resumable download); and, as of T07-05, the write-ahead
   switch's own `projection.switch.before_commit` seam (fires after the shard write lands but
   before the final `state.sqlite` commit — spec 05 §10 F4, the one kill point
   none of the fake shard's own seams could reach). It is never enabled in a
