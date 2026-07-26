@@ -489,7 +489,13 @@ async fn a_healthy_hybrid_search_returns_the_canonical_response() {
     assert_eq!(first.language, "rust");
     assert!(first.span[1] > first.span[0], "span is a real byte range");
     assert_eq!(first.qualified_name, None, "no caller derives one yet");
-    assert_eq!(first.snippet, None, "snippets are T12-04");
+    let snippet = first.snippet.as_ref().expect("T12-04 fills snippets");
+    assert!(
+        snippet.text.starts_with("fn unit_") && snippet.text.contains("searchable"),
+        "the snippet is the unit's own bytes: {:?}",
+        snippet.text
+    );
+    assert_eq!(snippet.truncation, None, "a small unit is not truncated");
     assert!(first.score > 0.0);
 
     // Both legs found everything, so every result carries both ranks.

@@ -29,6 +29,48 @@ Status: **v0** ships in MVP; **v0.x** additive after MVP; **post-v0** benchmark/
 | `get_dependencies(path, direction, transitive?)` | v0.x | import graph traversal; same gating |
 | `search_code(mode="semantic")`, `rerank*` params | post-v0 | description leg / reranker only after baseline win `[FIXED]` |
 
+As-built note (T12-04, `[SPEC]`): `get_file_context` and `project_overview` are computed by
+`local_rag_search::SearchEngine` (`crates/search/src/context.rs`, `overview.rs`); this task ships
+the engine half, and the MCP tool wiring around them is T15-03's. Both resolve the request's
+worktree before any lock and then read the active generation under `L2.read` (06 §3) — the same
+discipline `search_code` follows, and for the same reason: an occurrence list and its snippets
+must not come from different generations.
+
+**`get_file_context(path)`** returns `{path, generation, occurrences[]}` with each occurrence's
+`{occurrence_id, unit_kind, name, qualified_name, span, snippet}`, ascending by span. A path that
+is not in the active generation is `PATH_NOT_INDEXED` (02 §6) with `details` separating the two
+genuinely different answers — `no such path in the active generation` versus
+`skipped, reason=<binary|lfs|huge|secret|ignored|encoding>` (06 §2.2). Collapsing them would make
+"why can't I see my file?" unanswerable, and reporting a skipped file as empty-but-present would
+be worse: a `secret` file has no `source_blob` at all (12 §5).
+
+**`project_overview()`** returns `{generation, tree[], entry_points[], top_imports[]}`, all derived
+from `state.sqlite` — never a disk walk, for the same reason snippets are not read from the live
+file (09 §7 `[FIXED]`). The section names the three fields and nothing else, so each shape is
+as-built:
+
+- **tree** — every directory holding at least one member file, folded to `TREE_DEPTH = 3` levels,
+  each node carrying *recursive* `file_count`/`occurrence_count`; deeper directories are
+  **summarized into** their depth-3 ancestor rather than dropped, and the root (`""`, depth 0)
+  totals the project. Sorted by path, so the answer is byte-stable like 09 §7's.
+- **entry_points** — a purely lexical, documented heuristic `[SPEC]`: a conventional final
+  component (`main.rs`, `lib.rs`, `mod.rs`, `index.{ts,tsx,js,jsx}`, `main.{go,py,js,ts}`,
+  `__main__.py`) or a file **directly** under a `bin/` directory. The graph-shaped definition
+  ("files nothing imports") is not computable in v0: imports are stored as *unresolved module
+  specifiers* and resolving them to paths is post-v0 (09 §6). A resolver invented here would be
+  both out of scope and a worse answer than an honest heuristic.
+- **top_imports** — `{specifier, count}` over `unresolved_reference.reference_text` for the
+  generation's revisions, ordered `(count desc, specifier asc)`, cut at `TOP_IMPORTS_LIMIT = 20`.
+  Frequency needs no resolution, so this field is exact rather than heuristic; specifiers are
+  reported exactly as the source wrote them.
+
+"Cached per generation" is realized **in memory**, keyed `(worktree_id, generation_id)` with a
+bounded (16-entry) insertion-ordered eviction. A generation switch therefore needs no
+invalidation step at all — the new generation is a different key, and the predecessor ages out.
+Keeping it out of `cache.sqlite` avoids a `CACHE_SCHEMA_VERSION` bump (which drops every existing
+store's FTS view, 03 §4.4) for a value that is a pure function of `state.sqlite` and cheap to
+recompute.
+
 v1 name mapping: `forget` → `retract_memory` (audit-preserving; hard delete only via CLI
 `purge`); `consolidate(src,tgt)` → `merge_memories`.
 

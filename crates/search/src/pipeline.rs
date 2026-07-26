@@ -41,7 +41,8 @@ use local_rag_projection::{
     expected_points, required_code_kinds,
 };
 use local_rag_protocol::{
-    DegradedMode, ErrorEnvelope, GenerationRef, SearchMode, SearchResponse, SearchResult,
+    DegradedMode, ErrorEnvelope, FileContext, GenerationRef, ProjectOverview, SearchMode,
+    SearchResponse, SearchResult,
 };
 use local_rag_store::lock::ReadTimedOut;
 use local_rag_store::{
@@ -51,7 +52,10 @@ use local_rag_store::{
     lexical_leg, occurrences_by_id, open_and_validate_fts, projection_state, resolve, rusqlite,
 };
 
+use crate::context::file_context;
 use crate::fusion::{FusedHit, rrf};
+use crate::overview::{OverviewCache, compute as compute_overview};
+use crate::snippet::cut_batch;
 
 /// A provisional default for the bounded `L2.read` wait (spec 02 §6:
 /// "search waits on L2.read (bounded); timeout → BUSY_RETRY"). No
@@ -315,6 +319,9 @@ pub struct SearchEngine {
     locks: Arc<WorktreeLockRegistry>,
     shards: Arc<ShardManager>,
     embedder: Arc<dyn QueryEmbedder>,
+    /// Per-`(worktree, generation)` `project_overview` cache (spec 11 §2,
+    /// T12-04).
+    overviews: OverviewCache,
     read_wait_budget: Duration,
 }
 
@@ -355,6 +362,7 @@ impl SearchEngine {
             locks,
             shards,
             embedder,
+            overviews: OverviewCache::default(),
             read_wait_budget,
         }
     }
@@ -422,6 +430,112 @@ impl SearchEngine {
         {
             Ok(inner) => inner,
             Err(ReadTimedOut) => Ok(Err(ErrorEnvelope::busy_retry())),
+        }
+    }
+
+    /// `get_file_context(path)` (spec 11 §2) — T12-04.
+    ///
+    /// Resolves the worktree before any lock, then reads the active
+    /// generation's occurrences for `normalized_path` and their `source_blob`
+    /// excerpts under `L2.read` (spec 06 §3), so list and snippets can never
+    /// come from different generations.
+    ///
+    /// No `now_ms`, unlike `search_code`: nothing here validates or rebuilds a
+    /// cache, so there is no clock-dependent decision to make.
+    pub async fn get_file_context(
+        &self,
+        root: &RequestRoot,
+        normalized_path: &str,
+    ) -> Result<Result<FileContext, ErrorEnvelope>, SearchInfraError> {
+        let Some(worktree_id) = self.resolve_worktree(root)? else {
+            return Ok(Err(ErrorEnvelope::worktree_not_indexed()));
+        };
+        match self
+            .locks
+            .read_bounded(
+                &worktree_id,
+                self.read_wait_budget,
+                self.file_context_locked(&worktree_id, normalized_path),
+            )
+            .await
+        {
+            Ok(inner) => inner,
+            Err(ReadTimedOut) => Ok(Err(ErrorEnvelope::busy_retry())),
+        }
+    }
+
+    async fn file_context_locked(
+        &self,
+        worktree_id: &str,
+        normalized_path: &str,
+    ) -> Result<Result<FileContext, ErrorEnvelope>, SearchInfraError> {
+        let conn = self
+            .state
+            .open_read()
+            .map_err(SearchInfraError::StateOpen)?;
+        let Some(generation_id) = active_generation(&conn, worktree_id)? else {
+            return Ok(Err(ErrorEnvelope::worktree_not_indexed()));
+        };
+        file_context(&conn, &generation_id, normalized_path)
+    }
+
+    /// `project_overview()` (spec 11 §2) — T12-04.
+    ///
+    /// Derived from the active generation under `L2.read` and cached per
+    /// `(worktree, generation)`; see [`crate::overview`] for what each field
+    /// means and why the cache lives in memory.
+    pub async fn project_overview(
+        &self,
+        root: &RequestRoot,
+    ) -> Result<Result<Arc<ProjectOverview>, ErrorEnvelope>, SearchInfraError> {
+        let Some(worktree_id) = self.resolve_worktree(root)? else {
+            return Ok(Err(ErrorEnvelope::worktree_not_indexed()));
+        };
+        match self
+            .locks
+            .read_bounded(
+                &worktree_id,
+                self.read_wait_budget,
+                self.project_overview_locked(&worktree_id),
+            )
+            .await
+        {
+            Ok(inner) => inner,
+            Err(ReadTimedOut) => Ok(Err(ErrorEnvelope::busy_retry())),
+        }
+    }
+
+    async fn project_overview_locked(
+        &self,
+        worktree_id: &str,
+    ) -> Result<Result<Arc<ProjectOverview>, ErrorEnvelope>, SearchInfraError> {
+        let conn = self
+            .state
+            .open_read()
+            .map_err(SearchInfraError::StateOpen)?;
+        let Some(generation_id) = active_generation(&conn, worktree_id)? else {
+            return Ok(Err(ErrorEnvelope::worktree_not_indexed()));
+        };
+        if let Some(cached) = self.overviews.get(worktree_id, &generation_id) {
+            return Ok(Ok(cached));
+        }
+        let computed = Arc::new(compute_overview(&conn, &generation_id)?);
+        self.overviews
+            .put(worktree_id, &generation_id, computed.clone());
+        Ok(Ok(computed))
+    }
+
+    /// Resolve the request's worktree (spec 02 §3.3) — before any lock, exactly
+    /// as [`search_code`](Self::search_code) does. `None` means the request does
+    /// not name an indexed worktree.
+    fn resolve_worktree(&self, root: &RequestRoot) -> Result<Option<String>, SearchInfraError> {
+        let conn = self
+            .state
+            .open_read()
+            .map_err(SearchInfraError::StateOpen)?;
+        match resolve(&conn, root).map_err(SearchInfraError::StateRead)? {
+            Resolution::Resolved { worktree_id, .. } => Ok(Some(worktree_id)),
+            Resolution::GlobalOnly | Resolution::Ambiguous { .. } => Ok(None),
         }
     }
 
@@ -595,7 +709,8 @@ impl SearchEngine {
             .map(|m| (m.occurrence_id.as_str(), m))
             .collect();
 
-        let mut results = Vec::with_capacity(fused.len());
+        let mut ordered: Vec<&OccurrenceMetadata> = Vec::with_capacity(fused.len());
+        let mut kept: Vec<&FusedHit> = Vec::with_capacity(fused.len());
         let mut dropped = 0usize;
         for hit in &fused {
             // Structurally impossible under a held `L2.read` (a generation's
@@ -606,7 +721,27 @@ impl SearchEngine {
                 dropped += 1;
                 continue;
             };
-            results.push(SearchResult {
+            ordered.push(meta);
+            kept.push(hit);
+        }
+        if dropped > 0 {
+            diagnostics.push(format!(
+                "{dropped} fused hit(s) had no occurrence row in generation {generation_id} \
+                 and were dropped"
+            ));
+        }
+
+        // Snippets come from the stored `source_blob`, never the live file
+        // (spec 09 §7 `[FIXED]`), batched one read per revision (T12-04).
+        let (snippets, snippet_diagnostics) =
+            cut_batch(&conn, &ordered).map_err(SearchInfraError::StateRead)?;
+        diagnostics.extend(snippet_diagnostics);
+
+        let results = kept
+            .into_iter()
+            .zip(ordered)
+            .zip(snippets)
+            .map(|((hit, meta), snippet)| SearchResult {
                 occurrence_id: hit.occurrence_id.clone(),
                 path: meta.normalized_path.clone(),
                 name: meta.local_name.clone().unwrap_or_default(),
@@ -616,16 +751,9 @@ impl SearchEngine {
                 language: meta.language.clone(),
                 score: hit.score,
                 legs: hit.legs,
-                // T12-04 owns everything read out of `source_blob`.
-                snippet: None,
-            });
-        }
-        if dropped > 0 {
-            diagnostics.push(format!(
-                "{dropped} fused hit(s) had no occurrence row in generation {generation_id} \
-                 and were dropped"
-            ));
-        }
+                snippet,
+            })
+            .collect();
 
         Ok(SearchResponse {
             results,
@@ -777,6 +905,17 @@ impl SearchEngine {
             diagnostic: None,
         })
     }
+}
+
+/// The worktree's active generation, or `None` when it has never been indexed
+/// (spec 04 §2's `worktree_projection_state`).
+fn active_generation(
+    conn: &local_rag_store::rusqlite::Connection,
+    worktree_id: &str,
+) -> Result<Option<String>, SearchInfraError> {
+    Ok(projection_state(conn, worktree_id)
+        .map_err(SearchInfraError::StateRead)?
+        .and_then(|row| row.active_generation_id))
 }
 
 /// Keep the `code_raw` hits (those present in `by_point`), map them to their

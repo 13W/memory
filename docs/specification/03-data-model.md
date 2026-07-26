@@ -41,13 +41,14 @@ All content/manifest/subject hashes are **domain-separated and version-tagged**.
 | `…/path_fingerprint` | canonical path | `worktree_path.path_fingerprint` (lookup only) |
 | `…/remote_fingerprint` | normalized remote URL (credentials stripped) | `repository.git_remote_fingerprint` |
 | `…/memory_op` | run_id, op_index | consolidation idempotency key |
+| `…/truncated_excerpt` | full excerpt bytes | `{hash, original_size}` truncation metadata (12 §2) |
 
 Deterministic IDs (`occurrence_id`, projection point IDs, memory-op keys) MUST be stable under
 retry/reconcile and independent of row insertion order `[FIXED]`.
 
 As-built note (T02-01, updated T04-03, `[SPEC]`): `local_rag_core::identity::domain` implements
 the encoding above (`encode`/`hash`, hex-encoded 64 chars) with a `Domain` enum covering all
-thirteen domains and the version-tagged string `local-rag/1/<slug>` (the two `subject/*` slugs
+fourteen domains (`truncated_excerpt` added by T12-04) and the version-tagged string `local-rag/1/<slug>` (the two `subject/*` slugs
 keep their `/`). Field payloads are raw bytes; the serialization conventions this codebase
 commits to are: text → UTF-8 bytes; an already-hex identity (a UUID or another domain hash) →
 its lowercase ASCII bytes exactly as stored in its `TEXT` column; a fixed-width integer field →
