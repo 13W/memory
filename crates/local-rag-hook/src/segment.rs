@@ -124,6 +124,12 @@ pub fn append_frame(
         }
         out.extend_from_slice(frame_bytes);
         file.write_all(&out)?;
+        // Injection seam (feature-gated, zero-cost otherwise; spec 07 §7 S1/S2):
+        // model a hard kill of the hook process after the write lands (already
+        // durable via the OS page cache for a mere process kill, as opposed to
+        // real power loss) but before `fdatasync` confirms it.
+        #[cfg(feature = "failpoints")]
+        local_rag_test_support::fail_point!("hook.segment.after_write_before_fdatasync");
         file.sync_data()?;
         let _ = file.unlock();
         return Ok(());

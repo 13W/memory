@@ -189,6 +189,16 @@ pub fn import_batch(
         new_committed_offset,
         now_ms,
     )?;
+
+    // Injection seam (feature-gated, zero-cost otherwise; spec 07 §7 S3):
+    // model a hard kill of the daemon after every row is staged but before
+    // this closure returns — `StateWriter::transaction`'s `txn.commit()` runs
+    // only *after* a successful return, so the process dies with the
+    // transaction still open, and it rolls back exactly as a crash would
+    // leave it.
+    #[cfg(feature = "failpoints")]
+    local_rag_test_support::fail_point!("observation.import_batch.before_commit");
+
     Ok(report)
 }
 
@@ -366,10 +376,32 @@ pub async fn import_session_tail(
                 .map_err(ImportError::Write)?
         };
 
+    // Injection seam (feature-gated, zero-cost otherwise; spec 07 §7 S4):
+    // model a hard kill right after the importing transaction durably
+    // commits but before any segment cleanup below has run.
+    #[cfg(feature = "failpoints")]
+    local_rag_test_support::fail_point!(
+        "observation.import_session_tail.after_commit_before_cleanup"
+    );
+
     // Best-effort cleanup, outside the transaction (see module doc): every
-    // segment strictly behind the new cursor's segment is fully consumed.
-    for seq in start_segment_seq..segment_seq {
-        let _ = fs::remove_file(segment_path(&session_dir, seq));
+    // segment strictly behind the cursor's *current* segment is fully
+    // consumed, whether or not this particular pass is the one that walked
+    // through it — a prior pass may have advanced the cursor and then been
+    // killed before finishing its own cleanup (spec 07 §7 S4/S5), so this
+    // always sweeps from scratch rather than only the delta this pass saw,
+    // or a leftover segment could linger forever undetected.
+    for seq in 1..segment_seq {
+        let seg = segment_path(&session_dir, seq);
+        if seg.exists() {
+            let _ = fs::remove_file(&seg);
+        }
+        // Injection seam (feature-gated, zero-cost otherwise; spec 07 §7 S5):
+        // model a hard kill partway through cleanup, after this segment was
+        // handled but before the next one is — the already-committed DB state
+        // does not depend on this loop finishing.
+        #[cfg(feature = "failpoints")]
+        local_rag_test_support::fail_point!("observation.import_session_tail.mid_cleanup");
     }
 
     Ok(ImportOutcome {

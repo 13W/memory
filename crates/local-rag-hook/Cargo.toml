@@ -15,9 +15,35 @@ local-rag-core = { path = "../core" }
 # sources. See CONTRIBUTING allowlist.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Optional, dev-only path crate (0 external sources): enabled ONLY by the
+# `failpoints` feature so the hook binary can host a named crash-injection
+# seam for the T13-06 S1/S2 real-subprocess kill tests. Never enabled in
+# release/dist. Mirrors `crates/store`'s identical convention.
+local-rag-test-support = { path = "../test-support", optional = true }
+
+[features]
+# Compile the hook's named failpoint seam (spec 07 §7 S1/S2 kill tests). Off
+# by default → zero-cost, and the release/distribution build never links the
+# test-support crate.
+failpoints = ["dep:local-rag-test-support"]
 
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
+# Test-only: T13-06's kill_matrix.rs verifies a real killed hook process's
+# segment through the real daemon-side decoder/importer, not just a decode
+# check — this is a cross-crate test dependency, never a production one (the
+# hook's own binary still never talks to store/daemon, spec 07 §2 `[FIXED]`).
+local-rag-store = { path = "../store" }
+# `import_session_tail` is `async fn`; `#[tokio::test]` is this workspace's
+# uniform way of driving one in a test (mirroring `crates/store`'s own
+# dev-dependency). Already resolved throughout the lockfile — 0 new external
+# sources, only a new edge.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+] }
 
 [lints]
 workspace = true
