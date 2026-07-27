@@ -17,12 +17,21 @@
 //! operations take a [`Connection`]. `observation_id` is minted by the caller
 //! (a UUIDv7 from [`local_rag_core::identity::uuidv7`]) and passed in, keeping
 //! entropy out of the write path, mirroring [`create_repository`](crate::create_repository).
+//!
+//! T13-05 adds the **payload TTL sweep** ([`payload_ttl::run_payload_ttl_sweep`],
+//! spec 12 §3) and the **startup catch-up enumeration seam**
+//! ([`import::known_spool_sessions`], spec 07 §6); the companion **spool
+//! session GC** sweep lives in [`crate::housekeeping`] alongside its filesystem
+//! sweep siblings.
 
 mod import;
+mod payload_ttl;
 
 pub use import::{
     ImportBatchReport, ImportError, ImportOutcome, import_batch, import_session_tail,
+    known_spool_sessions,
 };
+pub use payload_ttl::{PayloadSweepError, PayloadSweepReport, run_payload_ttl_sweep};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -334,6 +343,43 @@ pub(crate) fn upsert_cursor(
            committed_offset = excluded.committed_offset, \
            updated_at = excluded.updated_at",
         params![session_id, segment_seq, committed_offset as i64, now_ms],
+    )?;
+    Ok(())
+}
+
+/// One session's `spool_import_cursor` row (T13-05: the spool session GC sweep,
+/// `crate::housekeeping::run_spool_session_sweep`, reads every session's cursor
+/// to decide absence/full-commit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpoolCursorRow {
+    pub session_id: String,
+    pub segment_seq: u32,
+    pub committed_offset: u64,
+    pub updated_at: i64,
+}
+
+/// Every session's current cursor row, unordered.
+pub(crate) fn all_cursors(conn: &Connection) -> rusqlite::Result<Vec<SpoolCursorRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, segment_seq, committed_offset, updated_at FROM spool_import_cursor",
+    )?;
+    stmt.query_map([], |r| {
+        Ok(SpoolCursorRow {
+            session_id: r.get(0)?,
+            segment_seq: r.get::<_, i64>(1)? as u32,
+            committed_offset: r.get::<_, i64>(2)? as u64,
+            updated_at: r.get(3)?,
+        })
+    })?
+    .collect()
+}
+
+/// Delete `session_id`'s cursor row (T13-05: after its spool directory has been
+/// GC'd — spec 07 §6 — so no orphaned cursor row lingers).
+pub(crate) fn delete_cursor(tx: &Transaction<'_>, session_id: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM spool_import_cursor WHERE session_id = ?1",
+        params![session_id],
     )?;
     Ok(())
 }

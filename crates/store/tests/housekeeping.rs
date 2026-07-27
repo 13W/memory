@@ -15,15 +15,18 @@
 //! wall clock and no sleeps anywhere.
 
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use local_rag_core::identity::uuidv7_from;
+use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
+use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
 use local_rag_store::registry::{
-    WorktreeKind, WorktreeState, allocate_generation, create_repository, create_worktree,
-    insert_projection_state, transition_worktree_state,
+    RequestRoot, WorktreeKind, WorktreeState, allocate_generation, create_repository,
+    create_worktree, insert_projection_state, transition_worktree_state,
 };
 use local_rag_store::{
-    SHARD_DESTROY_GRACE_MS, StateDb, run_expired_shard_sweep, run_orphan_shard_sweep,
+    SHARD_DESTROY_GRACE_MS, SPOOL_SESSION_ABSENCE_MS, StateDb, import_session_tail,
+    run_expired_shard_sweep, run_orphan_shard_sweep, run_spool_session_sweep,
     run_unreferenced_space_sweep,
 };
 use local_rag_test_support::TempHome;
@@ -603,4 +606,241 @@ async fn the_two_sweeps_do_not_overlap() {
     // The orphan sweep then takes the orphan.
     let orphans = run_orphan_shard_sweep(&db, &layout, false).expect("orphan sweep");
     assert_eq!(orphans.removed, vec!["orphan-shard".to_string()]);
+}
+
+// ---- T13-05: spool session GC (spec 07 §6) ----
+
+struct SeqUuidV7 {
+    counter: AtomicU64,
+}
+
+impl SeqUuidV7 {
+    fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+        }
+    }
+}
+
+impl UuidSource for SeqUuidV7 {
+    fn next_uuid(&self) -> Uuid {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        uuidv7_from(1000 + n, [0xAB; 10])
+    }
+}
+
+fn spool_fixture(session_id: &str, source_event_id: &str, captured_at: i64) -> FramePayload {
+    FramePayload {
+        format_version: 1,
+        source_event_id: source_event_id.to_string(),
+        dedup_key: None,
+        event_type: "Stop".to_string(),
+        captured_at,
+        session_id: session_id.to_string(),
+        agent_id: None,
+        turn_id: None,
+        batch_id: None,
+        worktree_root: None,
+        commit: None,
+        evidence_kind: "model_claim".to_string(),
+        trust: "low".to_string(),
+        paths: vec![],
+        payload: None,
+        short_evidence_excerpt: None,
+    }
+}
+
+fn write_spool_segment(layout: &StoreLayout, session_id: &str, seq: u32, frames: &[FramePayload]) {
+    let session_dir = layout.spool_session(session_id);
+    fs::create_dir_all(&session_dir).expect("session dir");
+    let mut bytes = encode_segment_header().to_vec();
+    for f in frames {
+        bytes.extend_from_slice(&encode_frame(f).expect("under the frame cap"));
+    }
+    fs::write(session_dir.join(format!("{seq:06}.seg")), bytes).expect("write segment");
+}
+
+fn cursor_row_exists(db: &StateDb, session_id: &str) -> bool {
+    let read = db.open_read().expect("read conn");
+    let n: i64 = read
+        .query_row(
+            "SELECT count(*) FROM spool_import_cursor WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    n > 0
+}
+
+/// A session whose spool data is fully imported (cursor caught up, no further
+/// segment) and absent (no new import) for the full budget is GC'd: its
+/// directory and its `spool_import_cursor` row both disappear.
+#[tokio::test]
+async fn fully_committed_absent_session_is_removed() {
+    let (_home, layout, db) = open_state();
+    let uuids = SeqUuidV7::new();
+    let request_root = RequestRoot::default();
+    let session = "sess-old";
+
+    write_spool_segment(
+        &layout,
+        session,
+        1,
+        &[spool_fixture(session, "st:sess-old:1", 1_000)],
+    );
+    import_session_tail(&db, &layout, session, &request_root, &uuids, 1_000, 72)
+        .await
+        .expect("import");
+
+    let now = 1_000 + SPOOL_SESSION_ABSENCE_MS;
+    let report = run_spool_session_sweep(&db, &layout, now, SPOOL_SESSION_ABSENCE_MS, false)
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.removed, vec![session.to_string()]);
+    assert!(!layout.spool_session(session).exists());
+    assert!(
+        !cursor_row_exists(&db, session),
+        "the orphaned cursor row is cleaned up too"
+    );
+}
+
+/// One millisecond short of the absence budget, nothing is swept.
+#[tokio::test]
+async fn a_session_just_short_of_the_absence_budget_is_retained() {
+    let (_home, layout, db) = open_state();
+    let uuids = SeqUuidV7::new();
+    let request_root = RequestRoot::default();
+    let session = "sess-recent";
+
+    write_spool_segment(
+        &layout,
+        session,
+        1,
+        &[spool_fixture(session, "st:sess-recent:1", 1_000)],
+    );
+    import_session_tail(&db, &layout, session, &request_root, &uuids, 1_000, 72)
+        .await
+        .expect("import");
+
+    let just_before = 1_000 + SPOOL_SESSION_ABSENCE_MS - 1;
+    let report =
+        run_spool_session_sweep(&db, &layout, just_before, SPOOL_SESSION_ABSENCE_MS, false)
+            .await
+            .expect("sweep");
+
+    assert!(report.is_empty(), "not due yet: {report:?}");
+    assert!(layout.spool_session(session).is_dir());
+    assert!(cursor_row_exists(&db, session));
+}
+
+/// A session with un-imported bytes past the cursor's `committed_offset` (the
+/// hook wrote more after the last import pass) is never swept, however long
+/// it has been since that last import — spec 07 §6's "fully committed" half.
+#[tokio::test]
+async fn uncommitted_segment_is_retained_even_when_absent() {
+    let (_home, layout, db) = open_state();
+    let uuids = SeqUuidV7::new();
+    let request_root = RequestRoot::default();
+    let session = "sess-uncommitted";
+
+    write_spool_segment(
+        &layout,
+        session,
+        1,
+        &[spool_fixture(session, "st:sess-uncommitted:1", 1_000)],
+    );
+    import_session_tail(&db, &layout, session, &request_root, &uuids, 1_000, 72)
+        .await
+        .expect("first import catches up");
+
+    // The hook appends a second frame directly (no re-import happens), so the
+    // cursor now legitimately lags behind the file on disk.
+    let second_frame = encode_frame(&spool_fixture(session, "st:sess-uncommitted:2", 2_000))
+        .expect("under the frame cap");
+    let seg_path = layout.spool_session(session).join("000001.seg");
+    let mut bytes = fs::read(&seg_path).unwrap();
+    bytes.extend_from_slice(&second_frame);
+    fs::write(&seg_path, bytes).unwrap();
+
+    let now = 1_000 + SPOOL_SESSION_ABSENCE_MS;
+    let report = run_spool_session_sweep(&db, &layout, now, SPOOL_SESSION_ABSENCE_MS, false)
+        .await
+        .expect("sweep");
+
+    assert!(
+        report.is_empty(),
+        "uncommitted bytes must retain the session: {report:?}"
+    );
+    assert!(layout.spool_session(session).is_dir());
+    assert!(cursor_row_exists(&db, session));
+}
+
+/// A dry run reports what it would remove but deletes nothing; a repeated
+/// real run afterward is idempotent.
+#[tokio::test]
+async fn spool_session_sweep_dry_run_then_idempotent_real_run() {
+    let (_home, layout, db) = open_state();
+    let uuids = SeqUuidV7::new();
+    let request_root = RequestRoot::default();
+    let session = "sess-old";
+
+    write_spool_segment(
+        &layout,
+        session,
+        1,
+        &[spool_fixture(session, "st:sess-old:1", 1_000)],
+    );
+    import_session_tail(&db, &layout, session, &request_root, &uuids, 1_000, 72)
+        .await
+        .expect("import");
+    let now = 1_000 + SPOOL_SESSION_ABSENCE_MS;
+
+    let dry = run_spool_session_sweep(&db, &layout, now, SPOOL_SESSION_ABSENCE_MS, true)
+        .await
+        .expect("dry run");
+    assert!(dry.dry_run);
+    assert_eq!(dry.removed, vec![session.to_string()]);
+    assert!(
+        layout.spool_session(session).is_dir(),
+        "dry run must not delete"
+    );
+    assert!(cursor_row_exists(&db, session));
+
+    let first = run_spool_session_sweep(&db, &layout, now, SPOOL_SESSION_ABSENCE_MS, false)
+        .await
+        .expect("first real run");
+    assert_eq!(first.removed, vec![session.to_string()]);
+
+    let second = run_spool_session_sweep(&db, &layout, now, SPOOL_SESSION_ABSENCE_MS, false)
+        .await
+        .expect("second real run");
+    assert!(second.is_empty(), "second sweep is a no-op: {second:?}");
+}
+
+/// A session with no cursor row at all (never imported) is never a candidate,
+/// regardless of how old its directory looks on disk.
+#[tokio::test]
+async fn a_session_never_imported_is_never_a_candidate() {
+    let (_home, layout, db) = open_state();
+    let session = "sess-never-imported";
+    write_spool_segment(
+        &layout,
+        session,
+        1,
+        &[spool_fixture(session, "st:sess-never-imported:1", 1_000)],
+    );
+
+    let report = run_spool_session_sweep(
+        &db,
+        &layout,
+        1_000 + SPOOL_SESSION_ABSENCE_MS,
+        SPOOL_SESSION_ABSENCE_MS,
+        false,
+    )
+    .await
+    .expect("sweep");
+
+    assert!(report.is_empty());
+    assert!(layout.spool_session(session).is_dir());
 }

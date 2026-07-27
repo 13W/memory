@@ -379,3 +379,34 @@ pub async fn import_session_tail(
         stalled_on,
     })
 }
+
+/// Every session with a spool directory under `layout`'s `spool/` root (T13-05:
+/// the daemon-startup catch-up seam, spec 07 §6 "catch-up of unprocessed
+/// observations at daemon startup").
+///
+/// A thin enumeration only — each returned `session_id` is meant to be passed
+/// to [`import_session_tail`] by whichever future caller implements the actual
+/// startup/periodic scheduling (a background worker, group 15's daemon
+/// lifecycle); this module ships the seam, not the scheduler, the same
+/// deferral every sweep in `crate::housekeeping` already carries. An absent
+/// `spool/` directory yields an empty list rather than an error (a store that
+/// has never seen a hook write).
+pub fn known_spool_sessions(layout: &StoreLayout) -> std::io::Result<Vec<String>> {
+    let mut sessions = Vec::new();
+    let entries = match fs::read_dir(layout.spool_dir()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(sessions),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            sessions.push(name.to_string());
+        }
+    }
+    sessions.sort();
+    Ok(sessions)
+}

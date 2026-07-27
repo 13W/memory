@@ -308,6 +308,33 @@ sequence shared by every session's envelopes.
 - Import is idempotent under daemon kill at any point: cursor advances only in the same tx as
   the envelopes; re-reading a segment re-skips imported frames via dedup + offset.
 
+As-built note (T13-05, `[SPEC]`): the session directory GC sweep is
+`local_rag_store::housekeeping::run_spool_session_sweep`, the fourth sweep in
+`crates/store/src/housekeeping.rs` alongside the three shard sweeps (D-004/D-007/D-011) — the
+module's own doc had already named this exact future scope. "Absent" is read from
+`spool_import_cursor.updated_at`, not a filesystem mtime: T13-04's importer only writes that
+column when it imports genuinely *new* bytes, so a session with no further hook activity simply
+stops advancing its own cursor timestamp, giving this sweep a DB-only absence signal (pure
+predicate `session_gc_due`, mirroring D-007's `shard_destroy_due`: `>=`, not `>`, and a future
+timestamp — clock skew — is never due, the safe direction for a destructive sweep). "Fully
+committed" is a second, independent condition (`is_fully_committed`): the cursor's
+`committed_offset` must be at least the current on-disk length of the segment file it points at,
+and no further segment file may already exist — computed by a thin filesystem reader
+(`read_commit_state`) kept separate from the pure predicate, the same "pure core + thin DB/FS
+reader" split every sweep in this module follows. A session with no `spool_import_cursor` row at
+all (never imported) is never a candidate — it cannot be "fully committed" by definition. Deletion
+order on a real (non-dry-run) sweep is deliberate: the directory is removed first (best-effort,
+`fs::remove_dir_all`), the now-orphaned cursor row second, in its own transaction — a crash
+between the two leaves a harmless leftover row that the next pass's `read_commit_state` (segment
+file absent ⇒ `(0, false)`) trivially re-qualifies as fully committed and cleans up, whereas the
+reverse order would risk a resumed session re-importing from scratch were its `session_id` ever
+reused (astronomically unlikely given UUID session ids, but the safer ordering costs nothing).
+Like its three siblings, this sweep ships with no scheduler — triggering it at startup and
+periodically remains the daemon's job (group 15); `local_rag_store::observation::
+known_spool_sessions` (enumerating `spool/`'s session subdirectories) is the thin seam a future
+startup catch-up loop will drive `import_session_tail` over for "catch-up of unprocessed
+observations at daemon startup," the other half of this section's recovery story.
+
 As-built note (T13-04, `[SPEC]`): "truncate/delete a segment only after its bytes are ≤ committed
 cursor" is implemented by `import_session_tail` as a best-effort filesystem step **after** the
 importing transaction commits, deliberately not atomic with it (matching this section's own S4

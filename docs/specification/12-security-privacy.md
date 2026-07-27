@@ -97,7 +97,16 @@ As-built note (T13-04, `[SPEC]`): `payload_ttl_hours` (`StorageConfig::payload_t
 `local_rag_store::observation::import_batch` computes `observation_payload.expires_at =
 now_ms + payload_ttl_hours × 3_600_000` at import time, for every observation that has a payload
 row at all (an envelope-only/denied event never gets one — its absence *is* "no payload", not an
-expired one). The sweeper that actually deletes rows past `expires_at` is T13-05's, unbuilt here.
+expired one). The sweeper that actually deletes rows past `expires_at` is T13-05's,
+`local_rag_store::observation::run_payload_ttl_sweep`: a single `DELETE FROM observation_payload
+WHERE expires_at <= now_ms` per sweep (`<=`, not `<` — the same "a deadline exactly now means
+remove now" convention `housekeeping::shard_destroy_due` established), plus a metrics readout
+(`payload_removed`/`payload_retained`/`total_envelopes`) alongside it. `observation_envelope` and
+`observation_path` are never touched by this sweep — envelope survival past payload expiry is
+structural, not a decision this code makes: an envelope with no payload row looks identical
+whether it never had one or its payload already expired. Ships with no scheduler, the same
+deferral every sweep in this crate carries (triggering it periodically is the daemon's job, group
+15).
 - `inspect / export / purge` exist as first-class CLI operations (11 §6). `purge` is the only
   hard-delete path and tombstones audit references `[SPEC]`.
 - Optional encryption at rest (SQLite-level, e.g. SQLCipher-compatible) — optional feature,

@@ -192,6 +192,24 @@
 //! (best-effort, after the commit — spec 07 §7's S4 kill-matrix row) deletes
 //! segment files the cursor has fully passed.
 //!
+//! T13-05 adds the **payload TTL sweep** ([`observation::run_payload_ttl_sweep`],
+//! spec 12 §3): deletes `observation_payload` rows past their already-computed
+//! `expires_at`, never touching `observation_envelope`/`observation_path` (a
+//! payload row's absence *is* "no payload," whether it never had one or it
+//! expired). And the **spool session GC sweep** ([`run_spool_session_sweep`],
+//! spec 07 §6 `[SPEC: 14 days]`), a fourth sweep alongside
+//! [`housekeeping`]'s three shard sweeps: removes a session's
+//! `spool/<session_id>/` directory and its now-orphaned `spool_import_cursor`
+//! row once the session has gone without a *new* import for the absence
+//! budget ([`session_gc_due`], read from the cursor's own `updated_at` — no
+//! filesystem mtime needed) **and** its spool data is fully committed
+//! ([`is_fully_committed`] — no bytes left in the current segment beyond
+//! `committed_offset`, and no further segment file yet). Both sweeps ship
+//! without a scheduler, the same deferral every sweep in this crate carries
+//! (group 15 triggers them); [`observation::known_spool_sessions`] is the thin
+//! enumeration seam a future daemon-startup catch-up loop will drive
+//! [`observation::import_session_tail`] over.
+//!
 //! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
 //! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
 //! [`spool::decode_segment`] validates the 16-byte header
@@ -267,16 +285,18 @@ pub use eviction::{
     run_embedding_cache_eviction, store_wide_embedding_pins,
 };
 pub use housekeeping::{
-    HousekeepingError, SHARD_DESTROY_GRACE_MS, ShardSweepReport, expired_shard_ids,
-    run_expired_shard_sweep, run_orphan_shard_sweep, run_unreferenced_space_sweep,
+    HousekeepingError, SHARD_DESTROY_GRACE_MS, SPOOL_SESSION_ABSENCE_MS, ShardSweepReport,
+    SpoolSessionSweepReport, expired_shard_ids, is_fully_committed, run_expired_shard_sweep,
+    run_orphan_shard_sweep, run_spool_session_sweep, run_unreferenced_space_sweep, session_gc_due,
     shard_destroy_due, sweep_expired_shard_dirs, sweep_orphan_shard_dirs,
     sweep_unreferenced_space_dirs,
 };
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{
-    EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, TrustLevel, import_batch,
-    import_session_tail,
+    EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, PayloadSweepError,
+    PayloadSweepReport, TrustLevel, import_batch, import_session_tail, known_spool_sessions,
+    run_payload_ttl_sweep,
 };
 pub use registry::{
     AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
