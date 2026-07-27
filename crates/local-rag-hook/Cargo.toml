@@ -1,6 +1,6 @@
 [package]
 name = "local-rag-hook"
-description = "local-rag hook spool writer (scaffold)."
+description = "local-rag hook spool writer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,16 @@ publish.workspace = true
 
 [dependencies]
 local-rag-core = { path = "../core" }
+# Parse Claude Code's hook JSON (stdin) and build the LRSP frame payload (spec
+# 07 §2/§3). `derive` generates the per-event-type Deserialize impls. Already
+# in the workspace's dependency graph via local-rag-core/local-rag-store/etc.
+# (`serde` with `derive`), so only a new dependency edge — 0 new external
+# sources. See CONTRIBUTING allowlist.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
 
 [lints]
 workspace = true
