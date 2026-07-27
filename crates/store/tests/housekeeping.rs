@@ -645,6 +645,7 @@ fn spool_fixture(session_id: &str, source_event_id: &str, captured_at: i64) -> F
         evidence_kind: "model_claim".to_string(),
         trust: "low".to_string(),
         paths: vec![],
+        redaction_version: None,
         payload: None,
         short_evidence_excerpt: None,
     }

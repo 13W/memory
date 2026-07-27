@@ -362,6 +362,7 @@ mod tests {
             evidence_kind: "tool_result".to_string(),
             trust: "normal".to_string(),
             paths: vec![],
+            redaction_version: None,
             payload: None,
             short_evidence_excerpt: None,
         }

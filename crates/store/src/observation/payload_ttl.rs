@@ -169,6 +169,7 @@ mod tests {
                 batch_id: None,
                 commit_hash: None,
                 short_evidence_excerpt: None,
+                redaction_version: None,
             },
         )?;
         super::super::insert_path(tx, observation_id, "src/a.rs")?;

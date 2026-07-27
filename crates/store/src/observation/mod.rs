@@ -92,6 +92,26 @@ CREATE TABLE spool_import_cursor (
 );
 ";
 
+/// Version-8 migration DDL (D-019): adds `observation_envelope.redaction_version`
+/// (spec 12 §2 `[SPEC]` "versioned `redaction_version` recorded in envelopes"),
+/// closing a gap found at gate G13 — the value was computed at write time
+/// (`local_rag_hook::payload::prepare_payload`) but discarded before it ever
+/// reached the wire format or this table. No backfill: unlike D-007's
+/// `state_changed_at` (where a `0` default would have been actively wrong),
+/// `NULL` is the correct, legitimate value both for rows written before this
+/// migration and for an envelope-only (denied) event, whose payload was never
+/// scanned in the first place. Referenced by [`crate::migrate::ALL`] as
+/// migration version 8.
+///
+/// **Frozen once shipped.** Like the earlier `SCHEMA_V*` constants, the
+/// checksum is the SHA-256 of this text (see
+/// [`crate::migrate::Migration::checksum`]); any edit trips
+/// [`ChecksumDrift`](crate::migrate::MigrationError::ChecksumDrift) on an
+/// existing store. Future schema changes are new numbered migrations.
+pub(crate) const SCHEMA_V8: &str = "\
+ALTER TABLE observation_envelope ADD COLUMN redaction_version INTEGER;
+";
+
 /// `observation_envelope.evidence_kind` (spec 03 §2.5's CHECK domain; spec 07
 /// §2's as-built note on `local_rag_hook::identity::evidence_kind_and_trust`
 /// names the same five values as free-form strings at write time — this is
@@ -190,6 +210,11 @@ pub struct NewObservationEnvelope<'a> {
     pub batch_id: Option<&'a str>,
     pub commit_hash: Option<&'a str>,
     pub short_evidence_excerpt: Option<&'a str>,
+    /// The redaction scanner version that produced this event's payload
+    /// (spec 12 §2 `[SPEC]`, D-019); `None` for an envelope-only (denied)
+    /// event, whose payload was never scanned, and for a frame written before
+    /// migration 8 existed.
+    pub redaction_version: Option<i64>,
 }
 
 /// Insert one `observation_envelope` row, returning its assigned
@@ -206,8 +231,9 @@ pub(crate) fn insert_envelope(
         "INSERT INTO observation_envelope \
            (observation_id, source_event_id, dedup_key, payload_hash, event_type, \
             evidence_kind, trust, source_timestamp, repo_id, worktree_id, session_id, \
-            agent_id, turn_id, batch_id, commit_hash, short_evidence_excerpt) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+            agent_id, turn_id, batch_id, commit_hash, short_evidence_excerpt, \
+            redaction_version) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
          ON CONFLICT(dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING \
          RETURNING received_seq",
         params![
@@ -227,6 +253,7 @@ pub(crate) fn insert_envelope(
             row.batch_id,
             row.commit_hash,
             row.short_evidence_excerpt,
+            row.redaction_version,
         ],
         |r| r.get(0),
     )
@@ -424,6 +451,7 @@ mod tests {
             batch_id: None,
             commit_hash: None,
             short_evidence_excerpt: None,
+            redaction_version: None,
         }
     }
 
@@ -487,6 +515,49 @@ mod tests {
             .unwrap();
         assert_eq!(byte_size, 7);
         assert_eq!(expires_at, 5000);
+    }
+
+    /// D-019: `redaction_version` round-trips through `insert_envelope`, and a
+    /// row with none (the envelope-only/denied path, or a frame written before
+    /// migration 8) reads back as `NULL`, not some fabricated default.
+    #[tokio::test]
+    async fn insert_envelope_round_trips_redaction_version() {
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(move |tx| {
+                insert_envelope(
+                    tx,
+                    &NewObservationEnvelope {
+                        redaction_version: Some(1),
+                        ..row("obs-with", "sess-1", "st:sess-1:x:1", None, Some(1000))
+                    },
+                )?;
+                insert_envelope(
+                    tx,
+                    &row("obs-without", "sess-1", "st:sess-1:y:2", None, Some(2000)),
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("transaction commits");
+
+        let read = db.open_read().expect("read conn");
+        let with_version: Option<i64> = read
+            .query_row(
+                "SELECT redaction_version FROM observation_envelope WHERE observation_id = 'obs-with'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(with_version, Some(1));
+        let without_version: Option<i64> = read
+            .query_row(
+                "SELECT redaction_version FROM observation_envelope WHERE observation_id = 'obs-without'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(without_version, None);
     }
 
     #[tokio::test]

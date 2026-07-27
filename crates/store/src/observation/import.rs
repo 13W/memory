@@ -165,6 +165,7 @@ pub fn import_batch(
             batch_id: payload.batch_id.as_deref(),
             commit_hash: payload.commit.as_deref(),
             short_evidence_excerpt: payload.short_evidence_excerpt.as_deref(),
+            redaction_version: payload.redaction_version.map(i64::from),
         };
 
         let Some(_received_seq) = insert_envelope(tx, &row)? else {

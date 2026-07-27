@@ -82,6 +82,7 @@ fn fixture(
         evidence_kind: "model_claim".to_string(),
         trust: "low".to_string(),
         paths,
+        redaction_version: None,
         payload: payload.map(str::to_string),
         short_evidence_excerpt: None,
     }
@@ -565,4 +566,63 @@ async fn a_torn_tail_stops_cleanly_and_is_picked_up_after_the_writer_finishes() 
         .await
         .expect("retry succeeds once the frame is complete");
     assert_eq!(outcome2.report.imported, 1);
+}
+
+/// D-019: `import_session_tail` carries a frame's `redaction_version` through
+/// to `observation_envelope.redaction_version`, and an envelope-only frame
+/// (no scanner ever ran) stores `NULL`, not `0` or some other stand-in.
+#[tokio::test]
+async fn import_stores_redaction_version_and_null_for_envelope_only() {
+    let (_home, layout, db) = open_state();
+    let uuids = SeqUuidV7::new();
+    let request_root = RequestRoot::default();
+    let session = "sess-1";
+
+    let mut scanned = fixture(
+        "Stop",
+        "st:sess-1:scanned:1",
+        None,
+        session,
+        1_000,
+        vec![],
+        Some("{\"x\":1}"),
+    );
+    scanned.redaction_version = Some(1);
+    let envelope_only = fixture(
+        "Stop",
+        "st:sess-1:denied:2",
+        None,
+        session,
+        2_000,
+        vec![],
+        None,
+    );
+
+    write_segment(&layout, session, 1, &[scanned, envelope_only]);
+
+    let outcome = import_session_tail(&db, &layout, session, &request_root, &uuids, 5_000, 72)
+        .await
+        .expect("import commits");
+    assert_eq!(outcome.report.imported, 2);
+
+    let read = db.open_read().expect("read conn");
+    let scanned_version: Option<i64> = read
+        .query_row(
+            "SELECT redaction_version FROM observation_envelope WHERE source_event_id = 'st:sess-1:scanned:1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(scanned_version, Some(1));
+    let denied_version: Option<i64> = read
+        .query_row(
+            "SELECT redaction_version FROM observation_envelope WHERE source_event_id = 'st:sess-1:denied:2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        denied_version, None,
+        "an envelope-only event's payload was never scanned"
+    );
 }

@@ -178,6 +178,11 @@ pub struct FramePayload {
     pub evidence_kind: String,
     pub trust: String,
     pub paths: Vec<String>,
+    /// The redaction scanner version that produced `payload` (spec 12 §2
+    /// `[SPEC]` "versioned `redaction_version` recorded in envelopes").
+    /// `None` for an envelope-only (denied) event: a denied event's payload is
+    /// never scanned at all, so no scanner version applies (D-019).
+    pub redaction_version: Option<u32>,
     /// The redacted event body, JSON-encoded as a string (see module docs).
     /// `None` for an envelope-only (denied) event.
     pub payload: Option<String>,
@@ -334,6 +339,7 @@ mod tests {
             evidence_kind: "tool_result".to_string(),
             trust: "normal".to_string(),
             paths: vec!["src/a.ts".to_string()],
+            redaction_version: Some(1),
             payload: Some("{\"tool_output\":\"ok\"}".to_string()),
             short_evidence_excerpt: None,
         }
@@ -345,8 +351,21 @@ mod tests {
         let bytes = encode_frame(&fp).expect("under cap");
         // Payload begins after the 8-byte len/crc prefix.
         let json = std::str::from_utf8(&bytes[8..]).expect("utf-8");
-        let expected = "{\"format_version\":1,\"source_event_id\":\"pt:s:t:ok\",\"dedup_key\":\"pt:s:t:ok\",\"event_type\":\"PostToolUse\",\"captured_at\":1700000000000,\"session_id\":\"s\",\"agent_id\":null,\"turn_id\":null,\"batch_id\":null,\"worktree_root\":\"/repo\",\"commit\":null,\"evidence_kind\":\"tool_result\",\"trust\":\"normal\",\"paths\":[\"src/a.ts\"],\"payload\":\"{\\\"tool_output\\\":\\\"ok\\\"}\",\"short_evidence_excerpt\":null}";
+        let expected = "{\"format_version\":1,\"source_event_id\":\"pt:s:t:ok\",\"dedup_key\":\"pt:s:t:ok\",\"event_type\":\"PostToolUse\",\"captured_at\":1700000000000,\"session_id\":\"s\",\"agent_id\":null,\"turn_id\":null,\"batch_id\":null,\"worktree_root\":\"/repo\",\"commit\":null,\"evidence_kind\":\"tool_result\",\"trust\":\"normal\",\"paths\":[\"src/a.ts\"],\"redaction_version\":1,\"payload\":\"{\\\"tool_output\\\":\\\"ok\\\"}\",\"short_evidence_excerpt\":null}";
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn frame_payload_redaction_version_is_none_for_envelope_only() {
+        let mut fp = sample_payload();
+        fp.redaction_version = None;
+        fp.payload = None;
+        let bytes = encode_frame(&fp).expect("under cap");
+        let json = std::str::from_utf8(&bytes[8..]).expect("utf-8");
+        assert!(json.contains("\"redaction_version\":null"));
+        assert!(json.contains("\"payload\":null"));
+        let decoded: FramePayload = serde_json::from_slice(&bytes[8..]).expect("deserialize");
+        assert_eq!(decoded.redaction_version, None);
     }
 
     #[test]
