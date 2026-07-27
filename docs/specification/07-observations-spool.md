@@ -109,6 +109,13 @@ immediately on an unsupported (newer) format version, attempting zero frames; `d
 then decodes as many whole frames as possible from the remainder, stopping cleanly at a torn tail
 (§3's as-built note below has the corruption/torn-tail distinction).
 
+As-built note (T13-06, `[SPEC]`): a named failpoint,
+`hook.segment.after_write_before_fdatasync`, sits between `local_rag_hook::segment::append_frame`'s
+`file.write_all(&out)` and `file.sync_data()` calls, compiled only under a new, off-by-default
+`failpoints` cargo feature (mirroring `crates/store`'s identical convention) so the S1/S2 kill
+tests (§7) can genuinely `SIGABRT` the real hook binary at that boundary; it costs nothing in the
+default/release build.
+
 ## 3. Segment wire format `[SPEC]`
 
 ```
@@ -359,3 +366,49 @@ per-import segment cleanup described here.
 | S6 | duplicate stable event across segments (hook retry) | exactly one envelope (UNIQUE dedup_key) |
 | S7 | duplicate best-effort event within window | one envelope (windowed dedup); outside window: two envelopes, consolidation idempotence still holds |
 | S8 | crash at any point ⇒ | **no event with stable identity is ever lost after spool append** `[FIXED gate]` |
+
+As-built note (T13-06, `[SPEC]`): the suite is a genuine `SIGABRT` subprocess/failpoint matrix, not
+hand-truncated fixtures, mirroring `crates/store/tests/migrate_resumable.rs`'s established
+re-exec-self hard-kill technique (`local_rag_test_support::{Failpoints, Action, fail_point!}`).
+Per row:
+
+- **S1/S2** — `crates/local-rag-hook/tests/kill_matrix.rs` (`cargo test -p local-rag-hook
+  --features failpoints`), against the real compiled `local-rag-hook spool-write` binary killed
+  via a new named seam, `hook.segment.after_write_before_fdatasync` (armed from the child
+  process's own environment, `LOCAL_RAG_HOOK_FAILPOINT` — a separate OS process cannot be armed
+  by a parent test reaching into a different process's registry). **Genuine byte-level torn
+  writes are not independently reproduced**: POSIX gives no portable way to force a short
+  `write()` of a payload well under the 1 MiB frame cap without kernel-level fault injection, and
+  `local_rag_core::spool`/`local_rag_store::spool`'s own tests (T13-03/T13-04) already
+  exhaustively prove correct recovery for a torn frame of *any* truncation length via direct byte
+  manipulation. What the real kill uniquely proves instead: `s2_...` — the one realistic
+  single-syscall interruption point (killed right after the write lands in the page cache, before
+  `fdatasync`) still leaves a complete, durable, exactly-once-imported frame (a process kill is
+  not power loss: page-cache-visible bytes survive it regardless of `fdatasync`); `s1_...` —
+  "segment remains valid" demonstrated for real, via a second, unarmed, real hook invocation
+  appending validly to the same session afterward.
+- **S3/S4/S5** — `crates/store/tests/spool_kill_matrix.rs` (`cargo test -p local-rag-store
+  --features failpoints`), three new seams in `local_rag_store::observation::{import_batch,
+  import_session_tail}`: `observation.import_batch.before_commit` (fires inside the
+  `StateWriter::transaction` closure, so the process dies before `txn.commit()` ever runs),
+  `observation.import_session_tail.after_commit_before_cleanup` (after the transaction resolves,
+  before the segment-cleanup loop), `observation.import_session_tail.mid_cleanup` (inside that
+  loop, after the first deletion). Fixing S4/S5 surfaced a real gap in T13-04's own cleanup loop
+  (it only ever deleted the segments *this pass* walked through, so a segment left over from a
+  prior pass's interrupted cleanup could linger forever undetected) — corrected to sweep every
+  segment strictly behind the cursor's current position on every pass, regardless of which pass
+  originally advanced past it; never a correctness/data-loss issue (over-retention is always
+  safe), only a completeness one, now closed and covered by `s4_.../s5_...`'s own resume assertions.
+- **S6/S7** — same file, no process kill needed (both are pure dedup-logic claims already fully
+  exercised by T13-04's own tests; named here again for this suite's own row-by-row
+  traceability): `s6_...` retries the identical stable `dedup_key` across two segments/passes;
+  `s7_...` proves both halves of the bounded best-effort window end-to-end — within the window
+  (close in time, few total envelopes) dedups to one, and genuinely outside it (512 filler
+  envelopes push the original past the last-512 count bound *and* the repeat's own `captured_at`
+  is past the 10-minute bound, so neither side of the `OR` union fires) yields two.
+- **S8** is not a standalone test — it is the conjunction of S1–S7 holding, restated as the gate
+  claim; re-affirmed at G13, not fabricated as its own scenario.
+
+`cargo xtask ci` gained a new `local-rag-hook --features failpoints` clippy+test step pair
+alongside the existing `local-rag-store` one (both feature-gated seams are off, and the
+`local-rag-test-support` dependency is unlinked, in the default/release build).

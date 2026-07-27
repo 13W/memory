@@ -32,6 +32,9 @@ const BIN: &str = "local-rag-hook";
 const APPEND_BUDGET: Duration = Duration::from_millis(200);
 
 fn main() -> ExitCode {
+    #[cfg(feature = "failpoints")]
+    arm_failpoint_from_env();
+
     match std::env::args().nth(1).as_deref() {
         Some("version" | "--version" | "-V") => {
             println!("{}", local_rag_core::version_line(BIN));
@@ -42,6 +45,20 @@ fn main() -> ExitCode {
             eprintln!("usage: {BIN} version|spool-write");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Self-arm a named failpoint from `LOCAL_RAG_HOOK_FAILPOINT` (spec 07 §7 S1/S2
+/// kill tests). The hook is a separate OS process from its test harness, so a
+/// parent test cannot reach across process boundaries to arm this process's
+/// own failpoint registry directly — it sets this env var instead, and the
+/// hook arms itself before doing anything else.
+#[cfg(feature = "failpoints")]
+fn arm_failpoint_from_env() {
+    if let Ok(name) = std::env::var("LOCAL_RAG_HOOK_FAILPOINT") {
+        let fp = local_rag_test_support::failpoint::global();
+        fp.register(&name);
+        let _ = fp.arm(&name, local_rag_test_support::Action::Abort);
     }
 }
 

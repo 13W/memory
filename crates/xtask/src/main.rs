@@ -214,7 +214,9 @@ fn run_ci() -> ExitCode {
         // Feature-gated crash/error seams: the default steps above build with
         // `failpoints` OFF, so lint and run those code paths explicitly. Scoped to
         // each crate defining the feature — `local-rag-store` (migration crash seams,
-        // spec 13 §3), `local-rag-index` (generation-builder phase seams, spec 04
+        // spec 13 §3, plus T13-06's S3/S4/S5 spool importer kill seams, spec 07 §7),
+        // `local-rag-hook` (T13-06's S1/S2 real-subprocess hook kill seam, spec 07
+        // §7), `local-rag-index` (generation-builder phase seams, spec 04
         // §1 build → failed edge, T05-05), `local-rag-projection` (fake-shard
         // fault matrix seams + inspect/corrupt controls, spec 05 §10, T07-01), and
         // `local-rag-search` (forwards to `local-rag-projection/failpoints` so
@@ -232,6 +234,18 @@ fn run_ci() -> ExitCode {
             "warnings",
         ],
         &["test", "-p", "local-rag-store", "--features", "failpoints"],
+        &[
+            "clippy",
+            "-p",
+            "local-rag-hook",
+            "--all-targets",
+            "--features",
+            "failpoints",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &["test", "-p", "local-rag-hook", "--features", "failpoints"],
         &[
             "clippy",
             "-p",
