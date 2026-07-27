@@ -131,6 +131,17 @@ pending ──(lease acquired)──▶ running ──(ops applied, cursor advan
   ops + evidence + audit + `processing_cursor` advance is **one short tx** `[FIXED]`.
 - Router runs only on observations **at or below the cursor batch**; never past `to_received_seq`.
 
+As-built note (T14-01, `[SPEC]`): the diagram draws the crash/lease-expiry retry as `running`
+re-entering `running`, which the pure transition guard (`local_rag_store::memory::RunState::
+check_transition`) gets for free from the project-wide "self-transition is always legal"
+convention every state machine in this codebase honors — no separate edge needed. It also labels
+`failed` itself "(retryable)" without drawing the edge. Since `idempotency_key = H(memory_op,
+run_id, op_index)` requires a *stable* `run_id` across a retry (the bullet above) and nothing in
+this section describes minting a replacement run for an in-progress window, `failed → running` is
+realized as an explicit legal edge: the same row is retried under a fresh lease. `applied` stays
+terminal (no edge leaves it). This task ships only the pure state-legality guard; the lease
+`now_ms` comparison that decides *when* a `running` run is eligible for retry is T14-06's runner.
+
 ## 5. Memory entry — `kind` is origin (immutable), `state` is confirmedness `[FIXED]`
 
 Common rule: a *confirmed hypothesis* stays `kind=hypothesis, state=confirmed` (recall/router
@@ -147,6 +158,18 @@ Terminal states (`resolved`, `retracted`, `rejected`, `superseded`) are excluded
 default (08 §6) but remain queryable via review tools. Every transition writes an
 `audit_event` with the incremented `entry_version`; optimistic concurrency uses
 `expected_version` preconditions (08 §3).
+
+As-built note (T14-01, `[SPEC]`): `memory_entry.state` carries no SQL `CHECK` (03 §2.5) — legality
+is entirely a Rust-side guard, `local_rag_store::memory::MemoryState::check_transition(self, kind,
+to)`, taking `kind` as well as `to` because the table above defines **three disjoint** machines,
+not one shared state set (e.g. `confirmed` is legal only for `hypothesis` — a `fact` requesting it
+is `Illegal`, not merely "not yet reached"). A corrupt/unknown stored `state` or `kind` surfaces as
+a typed `rusqlite::Error::FromSqlConversionFailure`, mirroring the CHECK-backed machines elsewhere
+in this crate. `local_rag_store::memory::transition_memory_entry` performs only the guarded `state`
+write; it does **not** touch `entry_version`/`updated_at` — this section's own rule that every
+version increment carries a matching `audit_event` means the two must commit together, and
+composing that (plus evidence linking, the `expected_version` precondition, and idempotency-key
+retry recognition) is T14-02's transactional memory-op engine, not this task's primitive.
 
 ## 6. Pending memory candidate
 

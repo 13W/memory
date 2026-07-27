@@ -361,6 +361,18 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         ] {
             assert!(table_exists(&read, t), "observation table {t} created");
         }
+        // … and v9 (durable memory, T14-01, the remainder of §2.5).
+        for t in [
+            "memory_entry",
+            "memory_evidence",
+            "pending_memory_candidate",
+            "candidate_evidence",
+            "processing_cursor",
+            "consolidation_run",
+            "audit_event",
+        ] {
+            assert!(table_exists(&read, t), "memory table {t} created");
+        }
         // The v4 seed: the default model space is `active` and pointed at by
         // `store_settings.default_model_space_id` (spec 04 §3).
         let default_id: String = read
@@ -380,15 +392,15 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(name, "default", "default model space display_name");
         assert_eq!(state, "active", "default model space MUST be active");
 
-        // Recorded as exactly eight rows: (1,"registry"), (2,"worktree"),
+        // Recorded as exactly nine rows: (1,"registry"), (2,"worktree"),
         // (3,"code"), (4,"projection"), (5,"worktree_state_clock"),
         // (6,"representation"), (7,"observation"),
-        // (8,"observation_redaction_version").
+        // (8,"observation_redaction_version"), (9,"memory").
         let rows = migration_rows(&read);
         assert_eq!(
             rows.len(),
-            8,
-            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8] at D-019"
+            9,
+            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9] at T14-01"
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
@@ -406,6 +418,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[6].1, "observation");
         assert_eq!(rows[7].0, 8);
         assert_eq!(rows[7].1, "observation_redaction_version");
+        assert_eq!(rows[8].0, 9);
+        assert_eq!(rows[8].1, "memory");
     }
     drop(db);
 
@@ -415,7 +429,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 8, "reopen adds no new migration rows");
+    assert_eq!(applied, 9, "reopen adds no new migration rows");
 }
 
 /// D-007: migration 5 adds `worktree.state_changed_at` and backfills every

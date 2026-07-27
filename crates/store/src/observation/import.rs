@@ -4,15 +4,15 @@
 //! first consumer of T13-03's decoder
 //! (`local_rag_store::spool::{decode_segment, decode_frames}`).
 //!
-//! ## Scope boundary against T14-01
+//! ## Scope boundary against `memory`
 //!
 //! Spec 03 §2.5 "Memory side" describes, in one SQL block, both the
 //! observation ledger (owned here — [`super::SCHEMA_V7`]) and
 //! `memory_entry`/`memory_evidence`/`pending_memory_candidate`/
 //! `candidate_evidence`/`processing_cursor`/`consolidation_run`/`audit_event`
-//! — group 14's ("Durable memory", `groups/14-memory.md` T14-01 "Memory DDL
-//! and legal transitions"). [`super::SCHEMA_V7`] creates only the four
-//! observation tables; the memory tables are a later, separate migration.
+//! — [`crate::memory`]'s version-9 migration (T14-01, "Memory DDL and legal
+//! transitions"). [`super::SCHEMA_V7`] creates only the four observation
+//! tables; the memory tables are a separate, later migration.
 //!
 //! ## `RequestRoot` is injected, not computed
 //!
