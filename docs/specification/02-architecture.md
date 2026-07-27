@@ -87,6 +87,10 @@ data_policy = "local_only"        # local_only | metadata_only_remote |
 [index]
 languages = ["typescript", "javascript", "rust"]   # ADR-0001 (closes O4)
 max_file_size_kb = 1024
+
+[spool]
+deny_paths = []   # configurable deny-list (12 §2); matching events captured envelope-only
+deny_tools = []
 ```
 
 As-built note (T02-05, `[SPEC]`): the global config is parsed by
@@ -103,6 +107,17 @@ parsed as the provisional defaults shown here — T02-05 does not close those op
 `Config::load` takes only the resolved `<config_dir>`; there is no API that
 consults a worktree or repository tree, which is the structural form of §3.2's "never via files
 inside the repository".
+
+As-built note (T13-01, `[SPEC]`): the `[spool]` section is `local_rag_core::config::SpoolConfig`
+(`deny_paths`/`deny_tools`, both empty by default — opt-in exclusion, no built-in entries since
+12 §2 does not mandate any). `deny_paths` matches **component-wise** against an observation's
+normalized path(s): an entry is a directory-prefix match (`secrets` matches `secrets/api.key`,
+never `not-secrets/x.txt`), not a substring match. `deny_tools` matches by exact tool-name
+equality. **Global-only for v0**: unlike `data_policy` (§3.2), this section is not mirrored into
+`repo_settings` — 12 §2 asks for "a configurable deny-list", not per-repository granularity, so
+extending the generic repo-settings bridge here would be scope beyond what either section
+requires. The section's consumer, `local_rag_hook::payload::prepare_payload`, is documented at
+07 §2's as-built note.
 
 ### 3.2 Per-repository settings `[SPEC]`
 

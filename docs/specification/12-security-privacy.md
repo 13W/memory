@@ -51,6 +51,29 @@ a whole small file would otherwise hash identically to that file's `content_hash
 confusion domain separation exists to prevent. The same domain is what memory evidence's 4 KiB
 cap should use in group 14. The 256 KiB spool-payload cap remains group 13's.
 
+As-built note (T13-01, `[SPEC]`). **Masking transform**: `Scanner::redact` (`crates/core/src/
+redaction/mod.rs`) is the payload-rewriting half this module's own doc comment anticipated —
+every finding's span replaced with the fixed marker `REDACTION_MARKER = "[REDACTED]"`.
+Overlapping/touching findings (a long assigned quoted value that is *also* high-entropy matches
+both `AssignedSecret` and `HighEntropy` on the identical span — a real, reachable case, not a
+theoretical one) are merged into one replaced range first, so the marker is inserted exactly once
+per secret. **256 KiB spool-payload cap**: `local_rag_hook::payload::prepare_payload` caps the
+*redacted* bytes at `PAYLOAD_CAP_BYTES = 256 * 1024`, following the identical idiom T12-04
+established for the 8 KiB snippet cap — walk back to the nearest UTF-8 boundary (≤3 bytes), then
+`{hash, original_size}` via `Domain::TruncatedExcerpt` over the **full** (redacted, pre-cap)
+bytes. A payload capped mid-structure is not guaranteed to still be valid JSON, the same way a
+capped snippet is not guaranteed syntactically complete — documented, not a defect. **Deny-list**:
+`local_rag_core::config::SpoolConfig` (`deny_paths`/`deny_tools`, 02 §3.1's as-built note has the
+matching semantics); a denied event's payload is never scanned at all, only its envelope survives.
+**A known, accepted limitation**: the scanner runs over the payload as flat text (the same idiom
+file classification already uses), not a `serde_json::Value` walk, so the `AssignedSecret` rule
+(which expects a bare `"`/`'` immediately after `key =`) is weaker inside a JSON-escaped value
+(`\"…\"`); the token-boundary `CredentialToken`/`HighEntropy` rules — the two this section's own
+"credential/high-entropy patterns" phrasing names — are unaffected by escaping. Reshaping the
+scanner into a JSON-aware transform would expand T03-02's already-gated scope rather than reuse
+it, so this is accepted and documented rather than fixed. The **4 KiB evidence-excerpt cap**
+remains group 14's, unchanged by this task.
+
 **Scanner rule set v0 (as-built, T03-02) `[SPEC]`.** The scanner is a single shared component
 (`local-rag-core::redaction`, `redaction_version = 1`) reused by file classification, spool
 ingestion, and remote transmission so verdicts stay consistent and auditable against one version.
