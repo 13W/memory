@@ -6,4 +6,10 @@
 //! segment writer. Parsing Claude Code's hook JSON, computing `source_event_id`,
 //! and building/writing the frame itself are later group-13 tasks.
 
+pub mod clock;
+pub mod event;
+pub mod frame;
+pub mod identity;
 pub mod payload;
+pub mod segment;
+pub mod subagent_counter;

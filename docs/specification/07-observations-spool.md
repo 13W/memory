@@ -50,6 +50,46 @@ verbatim rather than reshaped, so the flow this section names ("spool ingestion�
 group 16's future remote-transmission flow share byte-identical redaction behavior. `compute
 source identity` and `build frame` remain T13-02's, unstarted here.
 
+As-built note (T13-02, `[SPEC]`): the remaining pipeline steps are real. `local_rag_hook::event`
+parses the real Claude Code hook JSON (an external contract this project does not control) into a
+typed `ParsedEvent`/`EventPayload` per capture-set member — only the fields spec 07 §4's identity
+table actually needs (`session_id`; `tool_use_id` for PostToolUse/Failure; `agent_id` for
+SubagentStop; `prompt` for UserPromptSubmit) are hard requirements, everything else is optional,
+and an unrecognized `hook_event_name` fails open rather than crashing (forward-compat with a
+future Claude Code hook type). `local_rag_hook::identity::compute_identity` implements this
+section's table (as-built detail at §4 below). `local_rag_hook::frame::{encode_segment_header,
+encode_frame}` build the wire bytes (§3's as-built note has the `payload`-field detail);
+`local_rag_hook::segment::append_frame` does the lock-then-rotate-then-append: the rotate-or-not
+decision is made from `file.metadata()` read only **after** `std::fs::File::lock()` succeeds
+(the same portable, dependency-free `flock`/`LockFileEx` idiom `crates/store/src/migrate/
+lock.rs`'s `MigrationLock` already established for the L1 lock), never from an earlier unlocked
+scan — closing both the "two writers both rotate" and "a write pushes a segment over threshold
+while another is mid-decision" races. `crates/local-rag-hook/src/main.rs`'s `spool-write`
+subcommand wires the whole path end to end: every fallible step is a typed `Result`
+(`HookError`), plus `std::panic::catch_unwind` as a safety net (the workspace sets no
+`panic = "abort"` profile override, so unwinding is real here), converging on `ExitCode::SUCCESS`
+unconditionally. The 200 ms budget (11 §3.1) is measured, not enforced as a hard deadline — killing
+mid-write would risk an inconsistent lock/file state — and reported via `eprintln!` only past the
+fact (no logging subsystem exists anywhere in this workspace yet). `worktree_root` is the hook
+JSON's raw `cwd` field, uncanonicalized, and `commit` stays `null`: git introspection is a
+daemon-side concern (02 §3.3/03 §2.1's as-built notes: `local-rag-store` carries no git
+dependency), and the hook must stay exec-fast (13 §1 "<50 ms cold") — canonicalizing here would
+add real syscalls for no benefit, since the daemon re-resolves identity from the raw root at
+import regardless. `paths` is extracted from `tool_input` by scanning well-known key names
+(`file_path`/`path`/`notebook_path`) rather than a per-tool switch — deliberately over-inclusive
+(a false positive is harmless to the deny-list gate; a false negative is the security-relevant
+failure mode), and deliberately not attempting to parse paths out of Bash's free-text `command`
+(`SpoolConfig::deny_tools`, T13-01, is the right lever for that). `evidence_kind`/`trust` per
+event type (not provided by Claude Code's own JSON) are this project's own classification:
+`PostToolUse`/`Failure` → `tool_result`/`normal`; `UserPromptSubmit` → `user_statement`/`high`
+(the user is the most authoritative, unmediated source available); `Stop`/`SubagentStop` →
+`model_claim`/`low` (directly justified by 12 §4 `[FIXED]` "model-claims are never auto-promoted
+to facts" — both carry the model's own generated `last_assistant_message`); `SessionStart`/
+`SessionEnd` → `code_state`/`normal` (by elimination — no tool ran, no party "stated" or
+"claimed" anything). `short_evidence_excerpt` is left `null` at write time — it is not this
+task's to populate (see 12 §2's as-built note on the 4 KiB evidence-excerpt cap remaining group
+14's).
+
 ## 3. Segment wire format `[SPEC]`
 
 ```
@@ -90,6 +130,18 @@ A torn tail frame (bad len/CRC at EOF) is by definition a *non-durable* event: i
 at it; the appending hook holds the flock until its frame is complete, so no valid frame can
 follow a torn one within a segment `[SPEC]`.
 
+As-built note (T13-02, `[SPEC]`, amends the illustration above): **`payload` is encoded as a
+JSON string, not a raw nested object.** `local_rag_hook::payload::PreparedPayload` (T13-01) only
+guarantees its redacted/capped bytes are valid UTF-8 — not valid JSON, since a truncation can land
+mid-structure. Embedding that content as a literal nested object would make the *whole frame*
+invalid JSON whenever a payload happened to be capped. Encoding `payload` as an ordinary JSON
+string (double-encoded — a string whose unescaped content is itself JSON text in the common,
+uncapped case) sidesteps this: the outer frame is structurally always valid JSON by construction
+of `serde_json`'s derived `Serialize` over a typed `FramePayload` struct, regardless of what
+happened to the inner content. `payload` is `null` for an envelope-only (denied) event. Field
+order in `FramePayload`'s declaration matches this section's illustration exactly, so
+`serde_json`'s field-declaration-order output is what "golden wire bytes" tests pin.
+
 ## 4. Source identity per event type `[FIXED]`
 
 | Event | `source_event_id` | `dedup_key` (stable → UNIQUE) |
@@ -105,6 +157,46 @@ Two legitimate identical prompts / Stop events are legal — best-effort fingerp
 **never** under a UNIQUE constraint `[FIXED]`; their dedup is a bounded retry window at import
 (§5). Guarantee `[FIXED]`: events with stable source IDs deduplicate exactly; the rest
 best-effort; consolidation and memory ops are idempotent regardless.
+
+As-built note (T13-02, `[SPEC]`): three numbers/decisions this table left open are now fixed by
+`local_rag_hook::identity`.
+
+- **`coarse_ts` = 1-second buckets** (`captured_at_ms / 1000`). Coarse enough to absorb a
+  duplicate hook invocation for the same real event landing within the same second, without
+  widening the false-collision window meaningfully beyond what the *separate*, later import-side
+  bounded dedup window (§5, 10 min / 512 envelopes) already tolerates by design. No principled
+  derivation fixes this number exactly; it is this task's concrete pick.
+- **`stop_occurrence`**: Claude Code's `SubagentStop` event carries no occurrence counter, and the
+  hook is a fresh, stateless process per invocation, so a durable, monotonic count has to live on
+  disk — `local_rag_hook::subagent_counter`, a small per-session, per-agent JSON counter file
+  (`spool/<session_id>/.subagent_stop_seq.json`) updated under its **own**, separate, never-renamed
+  lock file (`.subagent_stop_seq.lock`) via the same `File::lock()` idiom as the segment writer; the
+  counter value itself is replaced write-new + `fdatasync` + atomic `rename` (never truncate-in-
+  place, which is not crash-atomic). A corrupt counter file is a hard error — skip *this*
+  `SubagentStop` event (fail-open) — never a silent reset to `{}`, since a reset risks reissuing an
+  occurrence already used by a previously-imported envelope for the same agent (a false
+  `dedup_key` collision against permanently stored history is worse than losing one observation).
+  What this mechanism does and does not guarantee: Claude Code never learns a hook invocation
+  failed (`[FIXED]` fail-open, always exit 0), so it almost certainly never *deliberately* retries a
+  hook call — the "at-least-once delivery" language above describes the general spool-crash story,
+  not a literal retry loop for this specific event. The counter correctly guarantees distinct real
+  stops always receive distinct, monotonically increasing numbers, and that a crash mid-append
+  (S1) never corrupts or skips the count (the counter update and the segment append are two
+  independent durable operations). It structurally **cannot** distinguish "Claude Code double-fired
+  the hook for one logical stop" from "two genuinely distinct stops" — Claude Code provides no
+  correlating signal for that, so every invocation gets a fresh number by design. An
+  information-theoretic limit, not something better engineering closes.
+- **`H(prompt)`/`H(context)` = plain `local_rag_core::hash::sha256_hex`, not a new
+  `local_rag_core::identity::domain::Domain` variant.** The domain-separated BLAKE3 family is
+  reserved for values backing a durable, retry-stable, schema-level identity — an FK target or a
+  UNIQUE lookup key (every existing `Domain` variant does exactly that). These fingerprints are one
+  segment of a compound string that is **explicitly never** under a UNIQUE constraint (this
+  section, above) and never itself a stored identity column — the same shape as
+  `subject_memory_entry`'s own inner `H(text)` (03 §1.2's as-built note), which is documented as
+  deliberately using plain `sha256_hex` for the identical reason. `Stop`'s "context" resolves to
+  `last_assistant_message` (defaulting to an empty string if absent) — the only Stop-specific field
+  Claude Code exposes; this section never defined "context" more precisely, so this is this task's
+  interpretation, not a re-derivation of something already fixed.
 
 ## 5. Import (daemon side) `[FIXED protocol, mechanics [SPEC]]`
 

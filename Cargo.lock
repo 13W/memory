@@ -591,6 +591,9 @@ name = "local-rag-hook"
 version = "0.0.0"
 dependencies = [
  "local-rag-core",
+ "local-rag-test-support",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
