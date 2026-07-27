@@ -30,7 +30,30 @@
 //!   [`run_expired_shard_sweep`] below and migration 5
 //!   (`worktree.state_changed_at`);
 //! - **spool GC (sessions absent > 14 days with fully committed cursors, spec 07
-//!   §6)** → group 13 / T13-05 (needs the `spool_import_cursor` table).
+//!   §6)** → group 13 / T13-05 (needed the `spool_import_cursor` table, which
+//!   T13-04 added) — **implemented here** by [`run_spool_session_sweep`], the
+//!   fourth sweep in this file.
+//!
+//! ## Added later: spool session GC (T13-05)
+//!
+//! [`run_spool_session_sweep`] is the odd one out among the four: it is the
+//! only **async** sweep here, because deleting a session's leftover
+//! `spool_import_cursor` row needs the bounded writer
+//! ([`StateWriter::transaction`](crate::StateWriter::transaction)), not just a
+//! read-only connection. "Absent" is read from
+//! `spool_import_cursor.updated_at` rather than a filesystem mtime — T13-04's
+//! importer only touches that column when it actually imports *new* bytes, so
+//! a truly quiet session's cursor timestamp simply stops advancing, giving this
+//! sweep a DB-only absence signal for free. "Fully committed" additionally
+//! needs one filesystem fact per candidate ([`read_commit_state`]): does the
+//! cursor's current segment file, if it still exists, have any bytes beyond
+//! `committed_offset`, and does a next segment already exist? Deletion order
+//! is deliberate: the directory goes first (best-effort, "never lose data" is
+//! the higher priority), the cursor row second — a crash between the two
+//! leaves a harmless orphaned row that the next pass's `read_commit_state`
+//! (segment file absent ⇒ `(0, false)`) trivially re-qualifies as fully
+//! committed and cleans up, whereas the reverse order would risk a resumed
+//! session re-importing from scratch if its `session_id` were ever reused.
 //!
 //! ## Added later: unreferenced model-space directories (deviation D-011)
 //!
@@ -57,11 +80,12 @@ use std::path::Path;
 
 use local_rag_core::paths::StoreLayout;
 
+use crate::observation::{all_cursors, delete_cursor};
 use crate::registry::{
     WorktreeState, WorktreeStateClock, all_worktree_ids, referenced_model_space_ids,
     worktree_state_clocks,
 };
-use crate::state::{OpenError, StateDb};
+use crate::state::{OpenError, StateDb, WriteError};
 
 /// How long a `detached`/`removing` worktree's shard is retained before it is
 /// destroyed (spec 05 §8 `[SPEC: 7 days]`), in milliseconds.
@@ -101,10 +125,13 @@ impl ShardSweepReport {
 pub enum HousekeepingError {
     /// Opening the read-only state connection failed.
     Open(OpenError),
-    /// Reading the live worktree set failed.
+    /// Reading the live worktree set (or every session cursor) failed.
     Sqlite(rusqlite::Error),
     /// A filesystem operation (enumerate or remove) failed.
     Io(io::Error),
+    /// Deleting a swept session's cursor row failed (rolled back; the store is
+    /// unchanged for that session — [`run_spool_session_sweep`] only).
+    Write(WriteError),
 }
 
 impl std::fmt::Display for HousekeepingError {
@@ -114,9 +141,12 @@ impl std::fmt::Display for HousekeepingError {
                 write!(f, "housekeeping could not open the state store: {e}")
             }
             HousekeepingError::Sqlite(e) => {
-                write!(f, "housekeeping could not read the worktree set: {e}")
+                write!(f, "housekeeping could not read the live set: {e}")
             }
             HousekeepingError::Io(e) => write!(f, "housekeeping filesystem sweep failed: {e}"),
+            HousekeepingError::Write(e) => {
+                write!(f, "housekeeping could not delete a cursor row: {e}")
+            }
         }
     }
 }
@@ -127,6 +157,7 @@ impl std::error::Error for HousekeepingError {
             HousekeepingError::Open(e) => Some(e),
             HousekeepingError::Sqlite(e) => Some(e),
             HousekeepingError::Io(e) => Some(e),
+            HousekeepingError::Write(e) => Some(e),
         }
     }
 }
@@ -461,6 +492,149 @@ pub fn run_unreferenced_space_sweep(
     let referenced = referenced_model_space_ids(&conn).map_err(HousekeepingError::Sqlite)?;
     sweep_unreferenced_space_dirs(&layout.projection_dir(), &referenced, dry_run)
         .map_err(HousekeepingError::Io)
+}
+
+/// How long a session may go without a **new** import before it is eligible
+/// for spool GC (spec 07 §6 `[SPEC: 14 days]`), in milliseconds. See
+/// [`session_gc_due`].
+pub const SPOOL_SESSION_ABSENCE_MS: i64 = 14 * 24 * 60 * 60 * 1_000;
+
+/// The outcome of a spool session GC sweep (spec 07 §6, T13-05) — the session
+/// directories (and their `spool_import_cursor` rows) a real sweep **removed**,
+/// or those a dry run **would** remove.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpoolSessionSweepReport {
+    /// Session ids GC'd (or, for a dry run, that would be), sorted for
+    /// determinism.
+    pub removed: Vec<String>,
+    /// Sessions considered but not eligible (not yet absent long enough, or
+    /// not fully committed).
+    pub retained: u64,
+    /// Whether this was a dry run (nothing was actually deleted).
+    pub dry_run: bool,
+}
+
+impl SpoolSessionSweepReport {
+    /// Whether the sweep removed (or would remove) nothing.
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty()
+    }
+}
+
+/// Whether a session has gone without a new import for at least `absence_ms`
+/// (spec 07 §6 `[SPEC: 14 days]`), given its `spool_import_cursor.updated_at`.
+///
+/// Pure, mirroring [`shard_destroy_due`]'s shape: `>=`, not `>` (an absence
+/// exactly at the budget is due now, the same "zero grace means destroy now"
+/// convention D-007 established), and a future timestamp (clock skew) yields a
+/// negative age and is therefore never due — the safe direction for a
+/// destructive sweep.
+pub fn session_gc_due(now_ms: i64, absence_ms: i64, cursor_updated_at: i64) -> bool {
+    now_ms.saturating_sub(cursor_updated_at) >= absence_ms
+}
+
+/// Whether a session's spool data is fully committed — the importer has
+/// consumed every byte it can currently see — given the cursor's
+/// `committed_offset`, the current on-disk length of the segment the cursor
+/// points at, and whether a next segment file already exists.
+///
+/// Pure and table-testable, mirroring [`shard_destroy_due`]; the filesystem
+/// facts it needs are gathered separately by [`read_commit_state`].
+pub fn is_fully_committed(
+    current_segment_len: u64,
+    next_segment_exists: bool,
+    committed_offset: u64,
+) -> bool {
+    committed_offset >= current_segment_len && !next_segment_exists
+}
+
+/// The two filesystem facts [`is_fully_committed`] needs for `session_id`'s
+/// current cursor segment: its on-disk length, and whether the next segment
+/// file already exists.
+///
+/// A missing current-segment file (its session directory was already removed
+/// by a prior, interrupted sweep pass — see this module's doc) reads as
+/// `(0, false)`, which [`is_fully_committed`] trivially accepts: there is
+/// nothing left to commit.
+fn read_commit_state(
+    layout: &StoreLayout,
+    session_id: &str,
+    segment_seq: u32,
+) -> io::Result<(u64, bool)> {
+    let session_dir = layout.spool_session(session_id);
+    let current_len = match fs::metadata(session_dir.join(format!("{segment_seq:06}.seg"))) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
+    let next_exists = session_dir
+        .join(format!("{:06}.seg", segment_seq + 1))
+        .exists();
+    Ok((current_len, next_exists))
+}
+
+/// Garbage-collect every session whose spool data is both absent (spec 07 §6
+/// `[SPEC: 14 days]`, [`session_gc_due`]) and fully committed
+/// ([`is_fully_committed`]): delete its `spool/<session_id>/` directory, then
+/// its now-orphaned `spool_import_cursor` row.
+///
+/// The only async sweep in this module — see this module's doc for why
+/// (deleting the cursor row needs the bounded writer) and for the crash-safety
+/// reasoning behind removing the directory before the row. A session with no
+/// cursor row at all is never a candidate: it has never been imported, so it
+/// cannot be "fully committed" by definition. Idempotent and safe to run
+/// periodically alongside the three sibling sweeps; `dry_run` reports without
+/// deleting anything.
+pub async fn run_spool_session_sweep(
+    db: &StateDb,
+    layout: &StoreLayout,
+    now_ms: i64,
+    absence_ms: i64,
+    dry_run: bool,
+) -> Result<SpoolSessionSweepReport, HousekeepingError> {
+    let cursors = {
+        let conn = db.open_read().map_err(HousekeepingError::Open)?;
+        all_cursors(&conn).map_err(HousekeepingError::Sqlite)?
+    };
+
+    let mut removed = Vec::new();
+    let mut retained: u64 = 0;
+
+    for cursor in cursors {
+        if !session_gc_due(now_ms, absence_ms, cursor.updated_at) {
+            retained += 1;
+            continue;
+        }
+        let (current_len, next_exists) =
+            read_commit_state(layout, &cursor.session_id, cursor.segment_seq)
+                .map_err(HousekeepingError::Io)?;
+        if !is_fully_committed(current_len, next_exists, cursor.committed_offset) {
+            retained += 1;
+            continue;
+        }
+
+        removed.push(cursor.session_id.clone());
+        if !dry_run {
+            let dir = layout.spool_session(&cursor.session_id);
+            if dir.exists() {
+                fs::remove_dir_all(&dir).map_err(HousekeepingError::Io)?;
+            }
+            db.writer()
+                .transaction({
+                    let session_id = cursor.session_id.clone();
+                    move |tx| delete_cursor(tx, &session_id)
+                })
+                .await
+                .map_err(HousekeepingError::Write)?;
+        }
+    }
+
+    removed.sort();
+    Ok(SpoolSessionSweepReport {
+        removed,
+        retained,
+        dry_run,
+    })
 }
 
 #[cfg(test)]
