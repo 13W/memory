@@ -177,7 +177,7 @@
 //! `spool_import_cursor` — a deliberate subset of spec 03 §2.5's "Memory side"
 //! block (the remaining `memory_entry`/`memory_evidence`/
 //! `pending_memory_candidate`/`candidate_evidence`/`processing_cursor`/
-//! `consolidation_run`/`audit_event` tables are T14-01's).
+//! `consolidation_run`/`audit_event` tables are [`memory`]'s, below).
 //! [`observation::import_batch`] composes one per-session transaction: resolve
 //! `worktree_root` once (an already-built [`registry::RequestRoot`] is
 //! injected — the git probing that produces one is the daemon's job, not
@@ -210,6 +210,26 @@
 //! enumeration seam a future daemon-startup catch-up loop will drive
 //! [`observation::import_session_tail`] over.
 //!
+//! T14-01 adds the **durable memory schema** ([`memory`], spec 03 §2.5 "Memory
+//! side", the seven tables T13-04 left for this task): the version-9 migration
+//! creates `memory_entry`/`memory_evidence`/`pending_memory_candidate`/
+//! `candidate_evidence`/`processing_cursor`/`consolidation_run`/`audit_event`,
+//! plus a pure, typed `check_transition`/`transition_*` guard per state
+//! machine (spec 04 §4-6) — the same shape [`registry::GenerationState`]
+//! established for the generation lifecycle. `memory_entry`'s machine is
+//! *kind*-specific ([`memory::MemoryState::check_transition`] takes `kind` as
+//! well as `to`): `task`/`question`, `hypothesis`, and
+//! `fact`/`decision`/`convention`/`procedure` each have their own disjoint
+//! legal transition set, and `memory_entry.state` carries no SQL `CHECK` (kind
+//! conditions it), unlike `pending_memory_candidate.review_state`/
+//! `consolidation_run.state`, which do. None of the three `transition_*`
+//! primitives compose evidence linking, `audit_event` writing, the
+//! `expected_version` optimistic-concurrency precondition, or
+//! idempotency-key retry recognition — that atomic operation contract (spec 08
+//! §3) is T14-02's transactional memory-op engine; T14-01 ships exactly the
+//! schema and the transition legality it builds on, the same division T05-01
+//! drew relative to the generation builder/switch that followed it.
+//!
 //! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
 //! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
 //! [`spool::decode_segment`] validates the 16-byte header
@@ -236,6 +256,7 @@ pub mod code;
 pub mod eviction;
 pub mod housekeeping;
 pub mod lock;
+pub mod memory;
 pub mod migrate;
 pub mod observation;
 pub mod registry;
@@ -292,6 +313,17 @@ pub use housekeeping::{
     sweep_unreferenced_space_dirs,
 };
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
+pub use memory::{
+    Actor, AuditEventRow, CandidateState, CandidateTransitionError, CreateMemoryEntryError,
+    GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition, IllegalMemoryTransition,
+    IllegalRunTransition, MemoryKind, MemoryState, MemoryTransitionError, NewAuditEvent,
+    NewCandidate, NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunState,
+    RunTransitionError, ScopeKind, candidate_state, consolidation_run_state, create_candidate,
+    create_consolidation_run, create_memory_entry, insert_audit_event, insert_candidate_evidence,
+    insert_memory_evidence, memory_entry_state, memory_evidence_for, processing_cursor,
+    read_audit_events_for_entity, transition_candidate, transition_memory_entry, transition_run,
+    upsert_processing_cursor,
+};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{
     EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, PayloadSweepError,

@@ -712,6 +712,23 @@ audit/inspect consumer, 11 §6's `local-rag inspect observation <id>`, is the na
 Closes the gap spec 12 §2's "versioned `redaction_version` recorded in envelopes" described but
 T13-01…T13-04 never wired end to end.
 
+As-built note (T14-01, `[SPEC]`): migration **9**, `memory` (`local_rag_store::memory::SCHEMA_V9`),
+ships the seven tables this section's block left unbuilt above — `memory_entry`,
+`memory_evidence`, `pending_memory_candidate`, `candidate_evidence`, `processing_cursor`,
+`consolidation_run`, `audit_event` — byte-exact apart from stripping the block's own prose
+comments (the same convention `SCHEMA_V7` already established). Two details the DDL alone does
+not make explicit: `memory_entry.scope_owner_id`'s "global → fixed singleton UUID" rule is a
+comment, not a `CHECK`, so `local_rag_store::memory::create_memory_entry` enforces it in Rust
+(`memory::GLOBAL_SCOPE_OWNER_ID`, `00000000-0000-7000-8000-000000000001` — the same literal
+value `registry::DEFAULT_MODEL_SPACE_ID` happens to use for an unrelated table, coincidental, not
+shared); and `memory_entry.state` carries no `CHECK` at all (unlike
+`pending_memory_candidate.review_state`/`consolidation_run.state`, which do), because its legal
+domain is conditional on `kind` — see 04 §5's as-built note for the guard shape. This task ships
+schema plus the pure transition-legality guard per machine only; the atomic
+mutation+evidence+audit+idempotency operation contract (08 §3) — including the `entry_version`
+increment 04 §5 couples to a matching `audit_event` — is T14-02's transactional memory-op engine,
+not this migration's concern.
+
 ## 3. `state.sqlite` write policy `[FIXED, numbers [SPEC]]`
 
 Single **bounded global write queue** feeding one writer task (SQLite has one physical writer;

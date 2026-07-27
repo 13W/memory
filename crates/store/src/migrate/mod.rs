@@ -162,7 +162,11 @@ impl Migration {
 /// (D-019, found at gate G13) adds `observation_envelope.redaction_version`,
 /// closing a gap where the redaction scanner's version was computed at write
 /// time but discarded before it ever reached the wire format or this table
-/// (`observation::SCHEMA_V8`). Each checksum is frozen once shipped (see
+/// (`observation::SCHEMA_V8`); version 9 (T14-01) is the durable-memory side —
+/// `memory_entry`/`memory_evidence`/`pending_memory_candidate`/
+/// `candidate_evidence`/`processing_cursor`/`consolidation_run`/`audit_event`,
+/// the remainder of spec 03 §2.5's "Memory side" block version 7 left for this
+/// task (`memory::SCHEMA_V9`). Each checksum is frozen once shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
 pub const ALL: &[Migration] = &[
@@ -178,6 +182,7 @@ pub const ALL: &[Migration] = &[
         "observation_redaction_version",
         crate::observation::SCHEMA_V8,
     ),
+    Migration::sql(9, "memory", crate::memory::SCHEMA_V9),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

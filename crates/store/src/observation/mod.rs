@@ -1,6 +1,6 @@
 //! Spool-derived observation tables in `state.sqlite` (spec 03 §2.5 "Memory
 //! side" — the observation-ledger subset only; see [`import`]'s module doc for
-//! the scope boundary against T14-01's memory-entry tables).
+//! the scope boundary against [`crate::memory`]'s memory-entry tables).
 //!
 //! This module owns the seventh numbered migration ([`SCHEMA_V7`]): the four
 //! tables a decoded LRSP frame (`local_rag_store::spool::DecodedObservation`,
