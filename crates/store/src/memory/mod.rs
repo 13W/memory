@@ -39,9 +39,21 @@
 //! above into the atomic mutation+evidence+audit+idempotency contract every
 //! memory operation follows, and [`op::apply_noop`] is the router's
 //! zero-write "considered, no action" acknowledgment (see [`op`]'s own doc for
-//! why `noop` writes nothing). `resolve`/`supersede`/`retract`/`edit` (T14-03)
-//! and `merge_memories` (T14-04) are later, separate tasks built on the same
-//! primitives.
+//! why `noop` writes nothing).
+//!
+//! T14-03 adds the lifecycle/edit ops in the same module:
+//! [`op::apply_resolve`]/[`op::apply_retract`] (kind-specific state
+//! transitions, spec 04 §5), [`op::apply_supersede`] (the promotion op —
+//! create a new entry, retire the old one, one transaction; see D-020 below),
+//! and [`op::apply_edit`] (the one op allowed to change `text`).
+//! `merge_memories` (T14-04) is a later task built on the same primitives.
+//!
+//! **D-020** (found while planning T14-03, `[SPEC]`): spec 04 §5's own prose
+//! narrates promotion acting on an *already-confirmed* hypothesis, but
+//! T14-01's shipped [`entry::MemoryState::check_transition`] only allowed
+//! `active → superseded` for `Hypothesis`, leaving `confirmed` a dead end.
+//! Fixed by adding exactly `confirmed → superseded` (see `check_transition`'s
+//! own doc for the full rationale and what was deliberately *not* added).
 
 mod audit;
 mod candidate;
@@ -70,8 +82,9 @@ pub use entry::{
 };
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};
 pub use op::{
-    CreateMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome, MemoryOpResult,
-    ReinforceMemoryOp, apply_create, apply_noop, apply_reinforce,
+    CreateMemoryOp, EditMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome, MemoryOpResult,
+    ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp, SupersedeMemoryOp, apply_create,
+    apply_edit, apply_noop, apply_reinforce, apply_resolve, apply_retract, apply_supersede,
 };
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the
