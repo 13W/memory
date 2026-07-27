@@ -157,6 +157,19 @@ pub fn payload_field(prepared: &PreparedPayload) -> Option<String> {
     }
 }
 
+/// Fold a [`PreparedPayload`] into the frame's `redaction_version` field
+/// (spec 12 §2 `[SPEC]`, D-019): `None` for [`PreparedPayload::EnvelopeOnly`]
+/// (a denied event's payload is never scanned, so no scanner version
+/// applies), `Some(redaction_version)` for [`PreparedPayload::Included`].
+pub fn redaction_version_field(prepared: &PreparedPayload) -> Option<u32> {
+    match prepared {
+        PreparedPayload::EnvelopeOnly => None,
+        PreparedPayload::Included {
+            redaction_version, ..
+        } => Some(*redaction_version),
+    }
+}
+
 /// Whether this event's paths or tool name match the configured deny-list.
 fn is_denied(paths: &[String], tool_name: Option<&str>, deny: &SpoolConfig) -> bool {
     paths.iter().any(|p| path_denied(p, &deny.deny_paths))
@@ -238,5 +251,20 @@ mod tests {
             truncation: None,
         };
         assert_eq!(payload_field(&prepared), Some("{\"k\":\"v\"}".to_string()));
+    }
+
+    #[test]
+    fn redaction_version_field_is_none_for_envelope_only() {
+        assert_eq!(
+            redaction_version_field(&PreparedPayload::EnvelopeOnly),
+            None
+        );
+    }
+
+    #[test]
+    fn redaction_version_field_is_some_scanner_version_for_included() {
+        let scanner = Scanner::new();
+        let prepared = prepare_payload("clean text", &[], None, &no_deny(), &scanner);
+        assert_eq!(redaction_version_field(&prepared), Some(scanner.version()));
     }
 }

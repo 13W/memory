@@ -380,14 +380,15 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(name, "default", "default model space display_name");
         assert_eq!(state, "active", "default model space MUST be active");
 
-        // Recorded as exactly seven rows: (1,"registry"), (2,"worktree"),
+        // Recorded as exactly eight rows: (1,"registry"), (2,"worktree"),
         // (3,"code"), (4,"projection"), (5,"worktree_state_clock"),
-        // (6,"representation"), (7,"observation").
+        // (6,"representation"), (7,"observation"),
+        // (8,"observation_redaction_version").
         let rows = migration_rows(&read);
         assert_eq!(
             rows.len(),
-            7,
-            "the production set is [v1,v2,v3,v4,v5,v6,v7] at T13-04"
+            8,
+            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8] at D-019"
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
@@ -403,6 +404,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[5].1, "representation");
         assert_eq!(rows[6].0, 7);
         assert_eq!(rows[6].1, "observation");
+        assert_eq!(rows[7].0, 8);
+        assert_eq!(rows[7].1, "observation_redaction_version");
     }
     drop(db);
 
@@ -412,7 +415,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 7, "reopen adds no new migration rows");
+    assert_eq!(applied, 8, "reopen adds no new migration rows");
 }
 
 /// D-007: migration 5 adds `worktree.state_changed_at` and backfills every
@@ -459,6 +462,66 @@ async fn migration_5_adds_and_backfills_the_worktree_state_clock() {
     assert_eq!(
         clocks[0].state_changed_at, 7777,
         "the pre-existing row is backfilled from last_seen_at, not left at 0"
+    );
+}
+
+/// D-019: migration 8 adds `observation_envelope.redaction_version` with
+/// **no** backfill — unlike migration 5's `state_changed_at`, `NULL` is the
+/// correct value for a pre-existing row (it predates the column entirely, so
+/// no scanner version can honestly be attributed to it), not something that
+/// would make anything incorrectly eligible for anything else.
+///
+/// Applied against a store first migrated to version 7 only — the real
+/// upgrade path — with an envelope row inserted using the pre-migration
+/// column list, so the assertion actually exercises "an old row gets NULL",
+/// not merely "a fresh row can store a value".
+#[tokio::test]
+async fn migration_8_adds_the_envelope_redaction_version_column_with_no_backfill() {
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+
+    // 1) Bring the store up to version 7 only, and seed an envelope row using
+    // the pre-migration-8 column list (no `redaction_version` column exists
+    // yet at this point).
+    let up_to_v7: Vec<_> = local_rag_store::ALL
+        .iter()
+        .filter(|m| m.version <= 7)
+        .copied()
+        .collect();
+    {
+        let mut conn = rusqlite::Connection::open(layout.state_db()).expect("raw conn");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        let report =
+            run(&mut conn, &up_to_v7, &layout.migration_lock(), 1000).expect("migrate to v7");
+        assert_eq!(report.store_version, 7);
+
+        conn.execute(
+            "INSERT INTO observation_envelope \
+               (observation_id, source_event_id, dedup_key, payload_hash, event_type, \
+                evidence_kind, trust, session_id) \
+             VALUES ('obs-pre-v8', 'st:sess-1:x:1', NULL, 'deadbeef', 'Stop', \
+                     'model_claim', 'low', 'sess-1')",
+            [],
+        )
+        .expect("insert v7-shaped envelope row");
+    }
+
+    // 2) Opening with the full production set applies migration 8.
+    let db = StateDb::open(layout.state_db()).expect("open applies v8");
+    let read = db.open_read().expect("read conn");
+
+    let redaction_version: Option<i64> = read
+        .query_row(
+            "SELECT redaction_version FROM observation_envelope WHERE observation_id = 'obs-pre-v8'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read redaction_version");
+    assert_eq!(
+        redaction_version, None,
+        "a pre-existing row is left NULL, never backfilled to a fabricated version"
     );
 }
 

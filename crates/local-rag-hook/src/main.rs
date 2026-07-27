@@ -205,6 +205,7 @@ fn spool_write_pipeline(raw: &[u8]) -> Result<(), HookError> {
         evidence_kind: evidence_kind.to_string(),
         trust: trust.to_string(),
         paths,
+        redaction_version: payload::redaction_version_field(&prepared),
         payload: payload::payload_field(&prepared),
         short_evidence_excerpt: None,
     };

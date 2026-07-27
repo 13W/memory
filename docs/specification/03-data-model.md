@@ -566,7 +566,8 @@ CREATE TABLE observation_envelope (
   turn_id           TEXT,
   batch_id          TEXT,
   commit_hash       TEXT,
-  short_evidence_excerpt TEXT
+  short_evidence_excerpt TEXT,
+  redaction_version INTEGER                            -- migration 8 (D-019); NULL if never scanned
 );
 CREATE UNIQUE INDEX envelope_dedup
   ON observation_envelope(dedup_key) WHERE dedup_key IS NOT NULL;  -- [FIXED]
@@ -698,6 +699,18 @@ this task's. `payload_hash` is a plain `local_rag_core::hash::sha256_hex` over t
 (already redacted) payload text, or over an empty byte slice for an envelope-only event —
 deliberately not a domain-separated `identity::domain` hash, the same reasoning 07 §4's as-built
 note gives for the best-effort fingerprints (never an identity/UNIQUE/FK column).
+
+As-built note (D-019, `[SPEC]`, found at gate G13): migration **8**, `observation_redaction_version`
+(`local_rag_store::observation::SCHEMA_V8`), adds `observation_envelope.redaction_version` —
+`ALTER TABLE observation_envelope ADD COLUMN redaction_version INTEGER`, **no backfill**. Unlike
+D-007's `state_changed_at` (where a `0` default would have been actively wrong), `NULL` is the
+correct value both for a row written before this migration and for an envelope-only (denied)
+event, whose payload was never scanned in the first place — there is no fabricated version to
+backfill to. Written by `local_rag_store::observation::import::import_batch` from the decoded
+frame's `redaction_version` field (07 §3's own D-019 as-built note); read by nothing yet (a future
+audit/inspect consumer, 11 §6's `local-rag inspect observation <id>`, is the natural owner).
+Closes the gap spec 12 §2's "versioned `redaction_version` recorded in envelopes" described but
+T13-01…T13-04 never wired end to end.
 
 ## 3. `state.sqlite` write policy `[FIXED, numbers [SPEC]]`
 

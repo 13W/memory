@@ -78,6 +78,7 @@ fn fixture(
         evidence_kind: "model_claim".to_string(),
         trust: "low".to_string(),
         paths: vec![],
+        redaction_version: None,
         payload: None,
         short_evidence_excerpt: None,
     }

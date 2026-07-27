@@ -158,9 +158,13 @@ impl Migration {
 /// `RepresentationKey` (`registry::SCHEMA_V6`); version 7 (T13-04) is the
 /// spool-derived observation ledger — `observation_envelope`/
 /// `observation_path`/`observation_payload`/`spool_import_cursor`, a subset of
-/// spec 03 §2.5's "Memory side" block (`observation::SCHEMA_V7`). Each
-/// checksum is frozen once shipped (see [`Migration::checksum`]); later schema
-/// changes are new entries here, never edits to an applied one.
+/// spec 03 §2.5's "Memory side" block (`observation::SCHEMA_V7`); version 8
+/// (D-019, found at gate G13) adds `observation_envelope.redaction_version`,
+/// closing a gap where the redaction scanner's version was computed at write
+/// time but discarded before it ever reached the wire format or this table
+/// (`observation::SCHEMA_V8`). Each checksum is frozen once shipped (see
+/// [`Migration::checksum`]); later schema changes are new entries here, never
+/// edits to an applied one.
 pub const ALL: &[Migration] = &[
     Migration::sql(1, "registry", crate::registry::SCHEMA_V1),
     Migration::sql(2, "worktree", crate::registry::SCHEMA_V2),
@@ -169,6 +173,11 @@ pub const ALL: &[Migration] = &[
     Migration::sql(5, "worktree_state_clock", crate::registry::SCHEMA_V5),
     Migration::sql(6, "representation", crate::registry::SCHEMA_V6),
     Migration::sql(7, "observation", crate::observation::SCHEMA_V7),
+    Migration::sql(
+        8,
+        "observation_redaction_version",
+        crate::observation::SCHEMA_V8,
+    ),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

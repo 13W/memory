@@ -74,6 +74,15 @@ scanner into a JSON-aware transform would expand T03-02's already-gated scope ra
 it, so this is accepted and documented rather than fixed. The **4 KiB evidence-excerpt cap**
 remains group 14's, unchanged by this task.
 
+As-built note (D-019, `[SPEC]`, found at gate G13): **"versioned `redaction_version` recorded in
+envelopes"** was computed by `prepare_payload` (above) at T13-01 but never actually reached an
+envelope — `payload_field` (T13-02) extracted only the redacted bytes, and neither `FramePayload`
+(07 §3) nor `observation_envelope` (03 §2.5) carried a field/column for it. Closed end to end:
+`local_rag_hook::payload::redaction_version_field` folds it into the frame, `FramePayload.
+redaction_version` carries it over the wire (07 §3's own D-019 note), and migration 8
+(`observation_envelope.redaction_version`, 03 §2.5's own D-019 note) persists it — `None`/`NULL`
+for an envelope-only (denied) event, whose payload this scanner never touches.
+
 **Scanner rule set v0 (as-built, T03-02) `[SPEC]`.** The scanner is a single shared component
 (`local-rag-core::redaction`, `redaction_version = 1`) reused by file classification, spool
 ingestion, and remote transmission so verdicts stay consistent and auditable against one version.

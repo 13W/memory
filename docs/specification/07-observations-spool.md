@@ -146,6 +146,7 @@ Frame payload fields:
   "evidence_kind": "tool_result",
   "trust": "normal",
   "paths": ["src/a.ts"],
+  "redaction_version": 1 | null,   // 12 §2 — scanner rule-set version, null if never scanned
   "payload": { /* redacted event body */ },
   "short_evidence_excerpt": "…"
 }
@@ -178,6 +179,17 @@ simply stops and resumes later. A buffer that ends exactly on a frame boundary i
 clean outcome (no trailing bytes at all), never confused with a torn tail. `FramePayload` gained
 `Deserialize`/`PartialEq`/`Eq` (additive to its existing derives) so the decoder can deserialize a
 frame and tests can compare decoded payloads structurally.
+
+As-built note (D-019, `[SPEC]`, amends the illustration above): **`redaction_version`** carries
+12 §2's "versioned `redaction_version` recorded in envelopes" from the hook write path through to
+the wire frame — closing a gap found at gate G13, where the value was computed by
+`local_rag_hook::payload::prepare_payload` (T13-01) but discarded before it ever reached
+`FramePayload` or `state.sqlite`. `local_rag_hook::payload::redaction_version_field` folds
+`PreparedPayload` into this field exactly the way `payload_field` folds it into `payload`:
+`Some(scanner.version())` for `Included`, `None` for `EnvelopeOnly` (a denied event's payload is
+never scanned, so no scanner version applies). Placed immediately before `payload` in
+`FramePayload`'s field order, since it describes how `payload` was produced. See 03 §2.5's own
+D-019 as-built note for the `observation_envelope.redaction_version` column this value lands in.
 
 ## 4. Source identity per event type `[FIXED]`
 
