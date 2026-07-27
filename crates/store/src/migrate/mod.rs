@@ -155,9 +155,12 @@ impl Migration {
 /// the clock spec 05 §8's shard grace period is measured from
 /// (`registry::SCHEMA_V5`); version 6 (T11-01) is the representation registry —
 /// `representation` and `model_space_representation`, the canonical six-field
-/// `RepresentationKey` (`registry::SCHEMA_V6`). Each checksum is frozen once
-/// shipped (see [`Migration::checksum`]); later schema changes are new entries
-/// here, never edits to an applied one.
+/// `RepresentationKey` (`registry::SCHEMA_V6`); version 7 (T13-04) is the
+/// spool-derived observation ledger — `observation_envelope`/
+/// `observation_path`/`observation_payload`/`spool_import_cursor`, a subset of
+/// spec 03 §2.5's "Memory side" block (`observation::SCHEMA_V7`). Each
+/// checksum is frozen once shipped (see [`Migration::checksum`]); later schema
+/// changes are new entries here, never edits to an applied one.
 pub const ALL: &[Migration] = &[
     Migration::sql(1, "registry", crate::registry::SCHEMA_V1),
     Migration::sql(2, "worktree", crate::registry::SCHEMA_V2),
@@ -165,6 +168,7 @@ pub const ALL: &[Migration] = &[
     Migration::sql(4, "projection", crate::registry::SCHEMA_V4),
     Migration::sql(5, "worktree_state_clock", crate::registry::SCHEMA_V5),
     Migration::sql(6, "representation", crate::registry::SCHEMA_V6),
+    Migration::sql(7, "observation", crate::observation::SCHEMA_V7),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

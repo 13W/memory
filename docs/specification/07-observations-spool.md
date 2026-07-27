@@ -261,6 +261,45 @@ Ordering: `received_seq` is the cursor basis; **order ≠ causality** — causal
 Envelope resolution at import: `worktree_root` → `worktree_id`/`repo_id` via registry; an
 unknown root imports with NULL worktree (repo/global scoping still possible later).
 
+As-built note (T13-04, `[SPEC]`): the transactional batch importer is
+`local_rag_store::observation::import_batch`, which composes exactly this pseudocode's inner loop
+into one `StateWriter::transaction`: resolve `worktree_root` **once per batch** (not per frame —
+in practice every frame decoded together in one pass shares one session, and a session's `cwd`
+does not change mid-batch) via `registry::resolve`, insert envelopes/paths/payloads, and advance
+`spool_import_cursor`, all committing atomically. `registry::resolve` needs a canonicalized,
+git-probed `RequestRoot` (`crates/store/src/registry/resolve.rs`'s own doc: building one from a
+raw path is "the daemon's job (T15)" — `crates/store` carries no git dependency). Since group 15
+has not started, `import_batch`/`import_session_tail` accept an already-built `&RequestRoot` as a
+parameter rather than computing one from the frame's raw `worktree_root` string themselves;
+passing `RequestRoot { worktree_root: None, .. }` (today's only available caller state) resolves
+to `GlobalOnly`, which **is** this section's "an unknown root imports with NULL worktree" —
+literally, not a stand-in for it. A future group-15 driver supplies real git-probed facts through
+the same parameter without this module changing. `Resolution::Ambiguous` is treated the same as
+`GlobalOnly` (NULL ids): an ambiguous root has not picked one specific worktree, so recording no
+worktree is the conservative reading (never guessing).
+
+`local_rag_store::observation::import_session_tail` is the per-session driver: it reads the
+current `spool_import_cursor` (absent ⇒ start of segment 1), decodes via T13-03's
+`local_rag_store::spool::{decode_segment, decode_frames}` — walking across a segment rotation
+boundary within one pass when the next segment file already exists — and stops at a torn tail
+(normal; the writer has not finished yet) or, distinctly, at genuine corruption (bad magic/
+version/CRC/length/UTF-8/shape), which is reported rather than silently skipped past — the cursor
+never advances beyond a corrupt byte range. Every observation decoded across however many
+segments one pass covers is imported in a single `import_batch` call, with `observation_id`s
+(UUIDv7) minted by the caller *before* entering the transaction (spec 03 §1.1's identity-minting
+discipline — entropy stays out of the write path, the same convention `create_repository`'s own
+caller already follows).
+
+As-built note (T13-04, `[SPEC]`, the bounded best-effort window): the two bounds this section's
+diagram names — "10 min" and "512 envelopes" — combine as a **union (OR)**, the same
+"most-protective" reading `local_rag_store::retention::mark_pins`'s K/T retention window already
+established for retiring generations: a best-effort candidate is treated as a duplicate if an
+envelope with the same `source_event_id` exists in the same session within the last 512 envelopes
+*of that session* **or** within 10 minutes of the new frame's own `captured_at` (not the wall
+clock — nothing in the importer reads the system time). "Last 512 of the session" is a
+session-scoped rank, not a raw `received_seq` range, because `received_seq` is one global
+sequence shared by every session's envelopes.
+
 ## 6. Recovery & checkpoints `[FIXED]`
 
 - Consolidation checkpoint on `Stop` and on queue size threshold; best-effort on `SessionEnd`;
@@ -268,6 +307,18 @@ unknown root imports with NULL worktree (repo/global scoping still possible late
 - Spool of sessions absent for > `[SPEC 14 days]` with fully committed cursors → directory GC.
 - Import is idempotent under daemon kill at any point: cursor advances only in the same tx as
   the envelopes; re-reading a segment re-skips imported frames via dedup + offset.
+
+As-built note (T13-04, `[SPEC]`): "truncate/delete a segment only after its bytes are ≤ committed
+cursor" is implemented by `import_session_tail` as a best-effort filesystem step **after** the
+importing transaction commits, deliberately not atomic with it (matching this section's own S4
+row below: a daemon kill between commit and truncation just means the next pass's cursor read
+re-derives the same "which segments are now fully behind me" answer and deletes them then — never
+a correctness dependency). A segment file is deleted as a whole once the cursor's `segment_seq`
+has moved past it; the *current* segment is never truncated or deleted in place, even once every
+byte up to `committed_offset` has been consumed, since the writer may still be appending to it.
+This is distinct from T13-05's 14-day session-directory GC and payload-TTL sweep, which operate on
+a different, much longer timescale over abandoned sessions and expired rows, not on the ordinary
+per-import segment cleanup described here.
 
 ## 7. Spool kill matrix (acceptance, 14 §3)
 

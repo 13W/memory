@@ -65,6 +65,14 @@ const PATH_MEMBERSHIP_TABLES: &[&str] = &[
     "generation_unit_occurrence",
 ];
 
+/// The memory-side observation-membership table (spec 03 §2.5, T13-04):
+/// `observation_path` records which normalized paths an observation touched.
+/// Kept separate from [`PATH_MEMBERSHIP_TABLES`] — that list's doc is
+/// specifically the spec 01 §5.1 / 03 §2.4 code-side membership set;
+/// `observation_path` is a different table cluster for a different reason
+/// (spec 03 §2.5), not one more member of the code-side list.
+const OBSERVATION_PATH_TABLES: &[&str] = &["observation_path"];
+
 /// The content-shared, path-independent tables (spec 03 §2.3): a row here is
 /// shared by content across every path and generation, so it must carry **no**
 /// path-, context-, or generation-specific field (spec 01 §5.1).
@@ -80,7 +88,9 @@ const PATH_FK_TARGET_TABLES: &[&str] = &["generation_file"];
 /// Whether `table` is permitted to carry a filesystem-path column (a ledger or a
 /// generation-membership table).
 fn may_carry_path(table: &str) -> bool {
-    PATH_LEDGER_TABLES.contains(&table) || PATH_MEMBERSHIP_TABLES.contains(&table)
+    PATH_LEDGER_TABLES.contains(&table)
+        || PATH_MEMBERSHIP_TABLES.contains(&table)
+        || OBSERVATION_PATH_TABLES.contains(&table)
 }
 
 /// A context/generation-specific column forbidden on a content-shared table
@@ -209,7 +219,8 @@ async fn path_columns_live_only_on_path_bearing_tables() {
             assert!(
                 !is_path_column(&col),
                 "table `{table}` carries path column `{col}`, but a filesystem path may live \
-                 only on {PATH_LEDGER_TABLES:?} or {PATH_MEMBERSHIP_TABLES:?} (spec 01 §5.1)",
+                 only on {PATH_LEDGER_TABLES:?}, {PATH_MEMBERSHIP_TABLES:?}, or \
+                 {OBSERVATION_PATH_TABLES:?} (spec 01 §5.1, 03 §2.5)",
             );
         }
     }
