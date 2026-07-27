@@ -17,13 +17,13 @@ use std::time::{Duration, Instant};
 use local_rag_core::config::{Config, ConfigError};
 use local_rag_core::paths::{PathError, StoreLayout, SystemEnv, config_dir};
 use local_rag_core::redaction::Scanner;
+use local_rag_core::spool::{FrameError, FramePayload};
 
 use local_rag_hook::event::{self, EventPayload, ParseError};
-use local_rag_hook::frame::{FrameError, FramePayload};
 use local_rag_hook::identity::{self, IdentityError};
 use local_rag_hook::segment::{self, DEFAULT_ROTATE_THRESHOLD_BYTES, SpoolWriteError};
 use local_rag_hook::subagent_counter::{self, CounterError};
-use local_rag_hook::{clock, frame, payload};
+use local_rag_hook::{clock, payload};
 
 const BIN: &str = "local-rag-hook";
 /// Self-imposed budget for the append path (spec 11 §3.1 `[SPEC]`). Not
@@ -188,11 +188,11 @@ fn spool_write_pipeline(raw: &[u8]) -> Result<(), HookError> {
         evidence_kind: evidence_kind.to_string(),
         trust: trust.to_string(),
         paths,
-        payload: frame::payload_field(&prepared),
+        payload: payload::payload_field(&prepared),
         short_evidence_excerpt: None,
     };
 
-    let frame_bytes = frame::encode_frame(&frame_payload)?;
+    let frame_bytes = local_rag_core::spool::encode_frame(&frame_payload)?;
     segment::append_frame(
         &layout,
         &event.session_id,

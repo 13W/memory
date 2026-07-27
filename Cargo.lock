@@ -569,6 +569,7 @@ dependencies = [
  "libc",
  "local-rag-test-support",
  "serde",
+ "serde_json",
  "toml",
  "unicode-normalization",
 ]

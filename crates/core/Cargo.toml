@@ -22,12 +22,16 @@ publish.workspace = true
 # config (data_policy) is disproportionate and error-prone. serde `derive` types
 # the sections; parsing is lenient (unknown keys ignored), version/enum validation
 # is explicit in `config::Config`.
+# serde_json: the LRSP frame payload (spec 07 §3, `spool::FramePayload`, T13-03 —
+# relocated from `local-rag-hook`, already a consumer since T13-02). Already
+# resolved via `local-rag-store`/`local-rag-search`/etc. — 0 new external sources.
 [dependencies]
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 unicode-normalization = "0.1"
 casefold = "0.1"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # `geteuid` for POSIX owner verification (spec 02 §2.1). std exposes no getuid;
 # libc is a rust-lang-maintained, zero-transitive-dependency crate. See the

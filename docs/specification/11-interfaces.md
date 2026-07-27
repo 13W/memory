@@ -109,6 +109,15 @@ version, and **spool format compatibility** (daemon advertises max supported spo
 `format_version`; a newer hook binary writing a newer format than the running daemon supports
 is a reportable incompatibility, not silent loss) `[FIXED concern, mechanism [SPEC]]`.
 
+As-built note (T13-03, `[SPEC]`): `local_rag_core::spool::HeaderError::UnsupportedFormatVersion`
+(`max_supported = FORMAT_VERSION`) is the local building block implementing "reportable
+incompatibility, not silent loss" at the segment level — `local_rag_store::spool::decode_segment`
+returns `Err` immediately when a segment's header declares a format version newer than this build
+supports, without attempting to parse any frame (a newer container format may have restructured
+the frame layout itself, so nothing past the header can be trusted). The actual proxy↔daemon
+handshake wiring — advertising the daemon's max supported spool `format_version` over the wire —
+remains a later task; this fixes only the primitive it will rely on.
+
 ## 5. `additionalContext` format `[SPEC, deterministic per v1 contract]`
 
 Empty recall ⇒ **no output at all** `[FIXED]`. Otherwise:

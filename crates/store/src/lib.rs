@@ -171,6 +171,20 @@
 //! plan. The read side is adopted by T09-03 (`local_rag_search::SearchEngine`,
 //! `crates/search`) via [`lock::WorktreeLockRegistry::read_bounded`].
 //!
+//! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
+//! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
+//! [`spool::decode_segment`] validates the 16-byte header
+//! (`local_rag_core::spool::decode_segment_header`) and rejects a
+//! newer-than-supported format immediately, before attempting any frame;
+//! [`spool::decode_frames`] then decodes as many whole frames as possible,
+//! stopping cleanly at a torn tail (a legal `len` with insufficient trailing
+//! bytes — never an error) and distinctly reporting corruption (CRC/length-
+//! cap/UTF-8/shape/version mismatches). Each decoded frame is classified by
+//! [`spool::DedupClass`] against spec 07 §4's stable/best-effort table, cross-
+//! checked against the frame's actual `dedup_key` presence so an internally
+//! inconsistent frame is caught here rather than poisoning T13-04's
+//! transactional importer, which is this module's only consumer.
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -186,6 +200,7 @@ pub mod lock;
 pub mod migrate;
 pub mod registry;
 pub mod retention;
+pub mod spool;
 mod state;
 pub mod subjects;
 
@@ -270,6 +285,10 @@ pub use retention::{
     ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,
     SweepError, SweepPlan, SweepReport, generation_meta_for_worktree, mark_pins,
     pinned_generation_roots, plan_sweep, run_sweep, run_sweep_with_batch,
+};
+pub use spool::{
+    ClassificationError, DecodedObservation, DedupClass, FrameDecodeError, SegmentTailDecode,
+    StopReason, decode_frames, decode_segment,
 };
 pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};
 pub use subjects::{

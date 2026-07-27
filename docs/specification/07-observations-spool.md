@@ -90,6 +90,25 @@ to facts" — both carry the model's own generated `last_assistant_message`); `S
 task's to populate (see 12 §2's as-built note on the 4 KiB evidence-excerpt cap remaining group
 14's).
 
+As-built note (T13-03, `[SPEC]`, corrects and extends T13-02's note above): the frame reader is
+now real. The wire-format primitives named just above —
+`local_rag_hook::frame::{encode_segment_header, encode_frame}` — **relocated**: they now live in
+`local_rag_core::spool` (module `crates/core/src/spool.rs`), moved verbatim out of
+`local-rag-hook`'s now-deleted `frame` module, plus a new symmetric decoder-side primitive,
+`local_rag_core::spool::decode_segment_header`/`SegmentHeader`/`HeaderError`. `local-rag-hook` is
+a leaf binary crate (13 §1) with nothing else depending on it as a library, while the new
+daemon-side decoder is daemon-side; relocating to `crates/core` (already the shared foundational
+crate for identity/hash/config/paths/redaction) lets the writer and the reader depend on exactly
+one CRC/layout implementation rather than risking two that could drift — the same "single shared
+component" posture as this project's `Scanner`/`tokenize_identifier`. The decoder itself
+(`local_rag_store::spool`, `crates/store/src/spool.rs`) is a pure `&[u8] → DecodedObservation`
+transform with no database awareness — the `observation_envelope`/`spool_import_cursor` DDL (spec
+03 §2.5) and the actual transactional import remain T13-04's, which consumes this module's
+decoded, classified output. `decode_segment` validates the 16-byte header first and returns `Err`
+immediately on an unsupported (newer) format version, attempting zero frames; `decode_frames`
+then decodes as many whole frames as possible from the remainder, stopping cleanly at a torn tail
+(§3's as-built note below has the corruption/torn-tail distinction).
+
 ## 3. Segment wire format `[SPEC]`
 
 ```
@@ -141,6 +160,17 @@ of `serde_json`'s derived `Serialize` over a typed `FramePayload` struct, regard
 happened to the inner content. `payload` is `null` for an envelope-only (denied) event. Field
 order in `FramePayload`'s declaration matches this section's illustration exactly, so
 `serde_json`'s field-declaration-order output is what "golden wire bytes" tests pin.
+
+As-built note (T13-03, `[SPEC]`): the decode side is real and symmetric to the encoder. A
+frame's `len` is checked against `MAX_FRAME_PAYLOAD_BYTES` **before** checking whether enough
+trailing bytes exist: an impossible length can never come from a legitimate in-progress write, so
+it is corruption regardless of what follows, whereas a *legal* `len` with insufficient trailing
+bytes is a torn tail — not an error, since "the appending hook holds the flock until its frame is
+complete, so no valid frame can follow a torn one within a segment" (above) means the importer
+simply stops and resumes later. A buffer that ends exactly on a frame boundary is a distinct,
+clean outcome (no trailing bytes at all), never confused with a torn tail. `FramePayload` gained
+`Deserialize`/`PartialEq`/`Eq` (additive to its existing derives) so the decoder can deserialize a
+frame and tests can compare decoded payloads structurally.
 
 ## 4. Source identity per event type `[FIXED]`
 
@@ -197,6 +227,16 @@ As-built note (T13-02, `[SPEC]`): three numbers/decisions this table left open a
   `last_assistant_message` (defaulting to an empty string if absent) — the only Stop-specific field
   Claude Code exposes; this section never defined "context" more precisely, so this is this task's
   interpretation, not a re-derivation of something already fixed.
+
+As-built note (T13-03, `[SPEC]`): the read side of this table is implemented by
+`local_rag_store::spool`'s private `classify` function, which checks `event_type` against this
+table's stable/best-effort split and cross-checks it against the frame's actual
+`dedup_key.is_some()`. A mismatch (e.g. a `PostToolUse` frame with a `null` `dedup_key`, or a
+`Stop` frame with one present) is reported as `ClassificationError::DedupKeyEventTypeMismatch` and
+stops decoding at that frame as corruption — an explicit defense against an internally
+inconsistent frame (corrupted, or from a future bug) poisoning T13-04's `UNIQUE(dedup_key)`
+import logic. The result, `DedupClass::Stable{dedup_key}` / `DedupClass::BestEffort`, is a named,
+tested classification rather than an ad-hoc `.is_some()` check scattered at import call sites.
 
 ## 5. Import (daemon side) `[FIXED protocol, mechanics [SPEC]]`
 

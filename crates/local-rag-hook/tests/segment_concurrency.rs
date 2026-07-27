@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 
 use local_rag_core::paths::StoreLayout;
-use local_rag_hook::frame::{crc32c, encode_frame_bytes, encode_segment_header};
+use local_rag_core::spool::{crc32c, encode_frame_bytes, encode_segment_header};
 use local_rag_hook::segment::{DEFAULT_ROTATE_THRESHOLD_BYTES, append_frame};
 use local_rag_test_support::TempHome;
 
