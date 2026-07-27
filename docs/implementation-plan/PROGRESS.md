@@ -132,7 +132,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [x] D-016 Качество v0-поиска ниже v1-бейзлайна: расхождения сняты (A–E; разрыв закрыт полностью, дефолтный режим проходит гейт)
 - [x] D-017 Провайдер эмбеддил `last_hidden_state` вместо `sentence_embedding`: обученная Dense-голова модели не выполнялась (найдено при разборе остатка D-016)
 - [x] D-018 Невзвешенный RRF опускал гибрид ниже собственной dense-ноги (найдено перемером D-017)
-- [ ] G12 Сверка search v0
+- [x] G12 Сверка search v0
 
 ## 13 — Spool и observations
 
@@ -205,7 +205,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 | G09 | PASS after D-007 | строка G09 в «Task evidence» + трейс «G09 — трейс требование → artifact/test» ниже |
 | G10 | PASS | строка G10 в «Task evidence» + трейс «G10 — трейс требование → artifact/test» ниже |
 | G11 | PASS after D-011, D-012, D-013, D-014 | строка G11 в «Task evidence» + трейс «G11 — трейс требование → artifact/test» ниже |
-| G12 | — | — |
+| G12 | PASS | строка G12 в «Task evidence» + трейс «G12 — трейс требование → artifact/test» ниже |
 | G13 | — | — |
 | G14 | — | — |
 | G15 | — | — |
@@ -218,6 +218,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 | ID | Commit/PR | Проверки | Результат/артефакт | Исполнитель/дата |
 | --- | --- | --- | --- | --- |
+| G12 | коммит `G12: Сверка search v0 (spec 09, 11 §2, 14) [PASS]` (строка evidence в том же коммите) | `cargo test -p local-rag-search` — **86 OK** (45 lib + 8 context + 12 dense + 2 generation_mixing + 4 lexical + 6 pipeline + 9 response), `--features failpoints` — **87 OK** (+1 `switch_failpoint_load`); `cargo test -p local-rag-store --lib cache::fts_query` — **22 OK**, `--test fts_query` — **16 OK**; `cargo test -p local-rag-protocol` — **13 OK**; `cargo test -p xtask` — **46 OK** (36 lib + 8 adr_links + 2 ci_config); `cargo fmt --all --check` чист; `cargo clippy --workspace --all-targets -- -D warnings` чист; `cargo xtask ci` — **all checks passed** (полный workspace + `spike/`-воркспейс, 0 failed нигде, 0 warnings). **Живой прогон 49-query бенчмарка в дефолтной конфигурации на этой машине** (веса/корпус не коммитятся, `ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib cargo xtask bench --corpus /opt/soft/local-rag --subdir src`, без флагов режима/dense-kind/весов): индексация 93 файла/545 occurrence за 1428 мс, эмбеддинг 538 subjects за 244.5 с, **Hit@1 0.5918 / Hit@3 0.8367 / Hit@5 0.8367 / MRR 0.7007** против v1 0.5918/0.7959/0.8367/0.6963 — **`bench: gate: PASS`**, воспроизведено дословно относительно D-018's stage-e-default. Артефакт закоммичен: `fixtures/search/baseline/run-v2-2026-07-27-g12-verify.{json,report.md}` (v2 commit `17aaf9e` в provenance). `git diff --stat Cargo.lock` — пусто | **PASS.** Трейс — секция «G12 — трейс требование → artifact/test» ниже (09 §1–§8 целиком как основной владелец по `TRACEABILITY.md`; 05/06/10 как end-to-end повторная проверка их уже-`PASS`-гейтов; 11 §2 контракт code tools, MCP-wiring корректно вне scope — владеет G15; 14 §1/§2/§4/§5/§7). **Находок нет — новых D-NNN не заведено.** Точечно перепроверено и подтверждено: `DEVIATIONS.md` — все 18 записей (D-001…D-018) `resolved`, `HEAD` совпадает с коммитом D-018 (`17aaf9e`), новых `open`/`fixing` записей не появилось; `code_context` остаётся зарегистрированным searchable-представлением (`--dense-kind`) при дефолте `code_raw` (`pipeline.rs:373`); `signature`-колонка BM25 по-прежнему документированно инертна на реальных данных (`materialize_fts` пишет `tokenize_signature(&[])`, `fts.rs:665`) — граница T08-02 не нарушена; `semantic`-режим отказывает `UnsupportedMode` **до** резолва worktree и лока (`pipeline.rs:428-433`), `rerank`/`find_usages`/`get_dependencies` подтверждены отсутствующими во всём репозитории (`grep` по `**/*.rs` — 0 совпадений), деферал O7/`[FIXED]` не нарушен; латентность измеряется (`search_p95_ms` в отчёте бенчмарка), но **не гейтится** — `thresholds.json` несёт только `mrr_regression_budget`/`min_recall_at_5`, подтверждая, что 09 §8/14 §2's latency-строка осознанно оставлена `[BASELINE]`-pending за T14-07/T17-05, а не тихо закрыта здесь. MCP-обвязка (`search_code`/`get_file_context`/`project_overview` как реальные MCP tools) нигде в `crates/search` не появилась — граница T15-03 цела. `[SPEC]`-амендментов не потребовалось: T12-01…T12-05/D-015…D-018 уже документировали as-built целиком; гейт лишь подтвердил, что документация соответствует коду сегодня. **Группа 13 (Spool и observations) разблокирована** | Claude Opus 5 / 2026-07-27 |
 | D-018 (ступень E) | коммит `D-018: взвешенный RRF и отсев неселективных термов, гейт качества проходит` (строка evidence в том же коммите) | `cargo test -p local-rag-search --lib` — 45 OK (новые: `the_lexical_weight_follows_from_the_displacement_depth`, `a_dense_first_hit_survives_a_lexical_first_challenger_ranked_deeper`, `inside_the_displacement_depth_the_lexical_leg_still_wins`, `at_exactly_the_displacement_depth_the_scores_tie`, `the_shipped_default_still_reorders_deeper_ranks`, `a_lexical_only_document_no_longer_ties_with_the_dense_leader`, `weighting_a_leg_does_not_reorder_that_leg`, `a_zero_weight_leg_contributes_nothing`); `cargo test -p local-rag-store` — 0 failed (новые: 6 юнит-тестов `selective_terms` + 2 интеграционных на насыщенном корпусе `a_saturated_term_no_longer_pulls_documents_into_the_candidates`, `an_all_saturated_query_still_runs_on_its_rarest_term`); `cargo xtask ci` — **all checks passed**; `git diff Cargo.lock` — пусто. **Свип весов** (одна индексация и один проход эмбеддинга на все точки, кандидаты байт-в-байт одинаковые): `w=1.0` → MRR 0.5721; `d=50, w=0.446` → 0.6255; `d=20, w=0.238` → 0.6378; `d=10, w=0.129` → 0.6622; `d=5, w=0.0615` → 0.6667; `d=3, w=0.0317` → 0.6905; **`d=2, w=0.0161` → 0.7007 PASS**; `w=0` → 0.7007. **Контрольный прогон дефолтной конфигурации** (`cargo xtask bench --corpus /opt/soft/local-rag --subdir src`, без флагов): Hit@1 **0.5918** / Hit@3 **0.8367** / Hit@5 **0.8367** / MRR **0.7007** при v1 0.5918/0.7959/0.8367/0.6963 — **гейт PASS**. Лексическая нога с отсевом термов: 0.4344 — цифра в цифру как без него. Артефакты: `fixtures/search/baseline/run-v2-2026-07-27-stage-e-{lw*,shallow-lw*,lexical-only,default}.{json,report.md}` | **Фузия, а не поиск.** Невзвешенный RRF складывал сильную ногу со слабой и терял 0.1286 против собственной dense-ноги: документ, найденный обеими на средних рангах (`1/61 + 1/80`), обгонял поставленный сильной ногой первым (`1/61`), а найденный **только** слабой — ровно с ним ничьей, которую решал `occurrence_id`. Вес выведен, а не подобран: правило вытеснения («dense-первый не вытесняется lexical-первым, пока dense не держит претендента в топ-`d`») даёт `w_l ≤ w_d·[1 − (k+1)/(k+d)]`, то есть каждая глубина — произносимая политика, а `FusionWeights::for_displacement_depth` — эта формула в коде. Дефолт выбран **заранее сформулированным** правилом: наибольшая выведенная глубина, при которой гибрид не ниже собственной dense-ноги; кривая монотонна, и такой оказалась `d = 2`. Записано прямо: на этом корпусе (целиком естественно-языковом, без запросов-идентификаторов) лексика не помогает **здесь**, а не вообще — она остаётся единственной ногой при деградации dense (02 §6), и на `d = 2` она приглушена, а не выключена (переупорядочивает глубокие ранги и приносит документы, которых dense не вернул). **Вторая половина задачи** — отсев термов с `df > N/2` (порог из смены знака IDF в BM25, частоты из нового `fts5vocab`-представления `fts_vocab`, `CACHE_SCHEMA_VERSION` 4 → 5): на бенчмарке **не изменил ничего**, потому что при 545 occurrence терму нужно попасть в 273 документа; поведение доказано на насыщенном корпусе в тестах, а не на том, который случайно не насыщен. BM25-веса колонок и `OR`-семантика **не** трогались: критерий приёмки («улучшение больше цены одного запроса на собственной метрике ноги») не выполнился бы ничем, кроме подгонки. `k = 60` и `candidate_depth` тоже не двигались. `[SPEC]`-амендменты: 09 §4 (веса, правило вытеснения, таблица свипа), 09 §2 (отсев термов и его нулевой эффект здесь), 14 §2 (гейт качества теперь проходит), `baseline.md` (ступень E). **Гейт качества спека 14 §2 впервые зелёный на дефолтном режиме; D-016 закрыт целиком, G12 разблокирован** | Claude Opus 5 / 2026-07-27 |
 | D-017 (ступень D) | коммит `D-017: провайдер читает sentence_embedding, dense-нога вернулась к бейзлайну` (строка evidence в том же коммите) | `cargo test -p local-rag-models -p local-rag-embed -p local-rag-projection -p local-rag-search` — 0 failed (новые: `onnx.rs::the_pooled_output_wins_even_when_the_graph_declares_it_last`, `…_wins_from_any_position`, `a_graph_without_a_pooled_output_falls_back_to_token_states`, `a_graph_with_no_outputs_selects_nothing`; обновлён `tests/onnx.rs::the_representation_key_is_exactly_the_one_adr_0004_fixed` → `representation_version == 3`); `cargo fmt --all` + `cargo xtask ci` — **all checks passed**; `git diff Cargo.lock` — пусто. **Env-gated реальный прогон**: `ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib LOCAL_RAG_TEST_MODEL_HOME=~/.local/share/local-rag-bench/local-rag cargo test -p local-rag-models --test onnx -- --nocapture` → `RAN: real inference over 3 texts, 768 dimensions, load 2695.2 ms, batch 507.5 ms (169.2 ms/text), cos(same topic)=0.761 > cos(different)=0.191` при утверждении `output_name() == "sentence_embedding"`; до фикса тот же тест давал 0.860 / 0.483. **Перекрёстная проверка против v1-пайплайна**: `curl localhost:11434/api/embed` с `embeddinggemma:300m` (BF16, GGUF содержит `dense.0.weight`/`dense.1.weight`) на той же тройке текстов → 0.755 / 0.186 — исправленный провайдер воспроизводит геометрию Ollama с точностью 0.006, позиционная версия не воспроизводила. **Прогоны бенчмарка** (веса и корпус не коммитятся), `ORT_DYLIB_PATH=… cargo xtask bench --corpus /opt/soft/local-rag --subdir src [--dense-kind …] [--mode …]`: dense `code_raw` **0.5918/0.8367/0.8367/MRR 0.7007 — гейт PASS**; dense `code_context` 0.5918/0.8163/0.8367/0.6956 — PASS; гибрид `code_raw` 0.4286/0.6939/0.7959/0.5721 — FAIL; гибрид `code_context` 0.4286/0.7143/0.8163/0.5813 — FAIL; lexical 0.3061/0.5510/0.6327/0.4344. Артефакты: `fixtures/search/baseline/run-v2-2026-07-26-stage-d-*.{json,report.md}` (5 прогонов) | **Дефект, а не продуктовый вопрос.** ONNX-экспорт объявляет два выхода — `last_hidden_state` `[batch, seq, 768]` первым и `sentence_embedding` `[batch, 768]` вторым, — и только второй проходит обученные Dense-модули EmbeddingGemma (`st/dense_1` 768→3072, `st/dense_2` 3072→768). `onnx.rs` брал `outputs.iter().next()` (а `ort::SessionOutputs::iter()` сохраняет порядок выходов сессии), то есть **всегда первый**, и mean-пулил его сам: обученная голова не выполнялась никогда. Поймать было нечем — оба выхода 768-мерные, оба нормируются, запрос и документы шли одним путём, пространство оставалось самосогласованным. Правка: выбор выхода **по имени** (`POOLED_OUTPUT`), резолвится один раз в `open_dir` из `session.outputs()`, mean-пулинг остаётся fallback'ом; `representation_version` `2 → 3` по прецеденту окна (выбор выхода не входит в шесть полей ключа, иначе `embedding_cache` отдавал бы дофиксовые векторы как валидные). **Результат: dense-нога 0.4939 → 0.7007 при v1 0.6963** — Hit@1 совпадает до цифры, Hit@5 совпадает, Hit@3 выше на 0.0408; ступень D отыграла оставшиеся 0.2068 разрыва по ноге, а A+B до неё — 0.0136. **Квантование снято как кандидат**: q8 достигает качества BF16, fp16/fp32 не докачивались (это же закрывает последний пункт D-016). **Решение 09 §3 переизмерено и подтверждено**: `code_raw` 0.7007 против `code_context` 0.6956 — знак тот же, что и на дофиксовых числах, при меньшей цене субъекта. **Новое отклонение D-018**: дефолтный гибрид (0.5721) стал хуже собственной dense-ноги на 0.1286, потому что невзвешенный RRF (`k = 60`) складывает её с лексической ногой на 0.4344 — документ, найденный обеими ногами на средних рангах, обгоняет документ, который сильная нога поставила первым (`1/61 + 1/80` против `1/61`); пер-запросно демотировано 15 запросов (13 с dense-ранга 1), поднято 9. **Гейт по-прежнему падает на дефолтном режиме, и G12 не стартует, пока D-018 `open`.** `[SPEC]`-амендменты: 10 §2 (выбор выхода по имени, числа и перекрёстная проверка), 09 §3 (таблица переизмерена, решение подтверждено), 09 §4 (открытая находка по фузии), ADR-0004 (амендмент: `representation_version = 3`, квантование снято), `fixtures/search/baseline/baseline.md` (ступень D, пер-ножная таблица, ревизия двух выводов T12-05) | Claude Opus 5 / 2026-07-26 |
 | D-016 (ступень C) | коммит `D-016 (ступень C): code_context измерен, 09 §3 закрыт в пользу code_raw` (строка evidence в том же коммите) | `cargo test -p local-rag-store -p local-rag-embed -p local-rag-projection -p local-rag-search -p xtask` — 0 failed (новые: `subjects.rs::context_subjects_do_not_share_across_occurrences`, `backfill.rs::code_context_embeds_the_envelope_once_per_occurrence`, `dense.rs::the_dense_kind_selects_both_the_points_and_the_query_representation`, новый файл `crates/projection/tests/cache_vectors.rs` — 4 теста на бридж `occurrence → embedding_cache` для обоих видов, включая битую строку кэша); `cargo xtask ci` — **all checks passed**; `git diff Cargo.lock` — новых `[[package]]` нет. **Реальные прогоны** (веса и корпус не коммитятся): `ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib cargo xtask bench --corpus /opt/soft/local-rag --subdir src --dense-kind code_raw` → **0.4490 / 0.6735 / 0.7959 / MRR 0.5782**; тот же прогон с `--dense-kind code_context` → **0.4082 / 0.7347 / 0.8163 / MRR 0.5748**. Артефакты: `run-v2-2026-07-26-stage-c-code-raw.{json,report.md}`, `…-stage-c-code-context.{json,report.md}` | **Гипотеза C не подтвердилась.** Конверт v1 (`buildEmbedCtx`) воспроизведён как представление `code_context` и измерен на том же корпусе, окне и квантовании: MRR **0.5748** против **0.5782** у `code_raw`, сдвиг −0.0034 — треть от цены одного запроса, переехавшего на позицию, на корпусе в 49 запросов. Конверт меняет не уровень, а баланс: **+0.0612 Hit@3, +0.0204 Hit@5, −0.0408 Hit@1**; обмен пересекает порог гейта (`code_context` проходит `Recall@5 ≥ 0.80`, `code_raw` нет), но по MRR промахиваются обе — меняется, какое условие падает, а не падает ли гейт. `[OPEN]` spec 09 §3 закрыт **по числам в пользу `code_raw`**: лучше на первой позиции и дешевле как субъект (538 против 544 субъектов на те же 545 occurrence — N:1-разделение по контенту, никакого переэмбеддинга при переименовании файла). `code_context` остаётся зарегистрированным и searchable (`SearchEngine::with_dense_kind`, `--dense-kind`), чтобы решение перемерялось, а не переписывалось. Контрольный прогон `code_raw` после всей проводки воспроизвёл A+B **ровно** (0.5782) — дефолт не сдвинулся. Проводка: `subjects.rs` (ветка `CodeContext`), `backfill.rs` (`context_index`, выбор текста по виду субъекта), `vectors.rs` (ленивая карта `occurrence → subject_hash`), `model_switch.rs` (`representation_key_for(kind)`, `code_raw_representation_key` остаётся обёрткой), `pipeline.rs` (`dense_kind`, по умолчанию `CodeRaw`), раннер (`--dense-kind` + `KindAdapter`, dev-only переобъявление вида для того же провайдера). `params_for_model_space` **не** трогался — продакшн по-прежнему сайзит шард по `code_raw`; раннер берёт параметры из зарегистрированного вида сам. `[SPEC]`-амендменты: 09 §3 (`[OPEN]` закрыт, таблица решения), 03 §4.2 (формат конверта, `CONTEXT_VERSION`, «context does not share» стало структурным), 03 §1.2 и пин-правило (`memory` — единственный оставшийся неподдержанный вид), ADR-0004 (амендмент: `representation_version = 2`, окно 1024, прежние throughput-числа помечены как снятые при 256). **Остаток разрыва 0.1181 MRR не объяснён**; из названных кандидатов не измерен ровно один — квантование весов (v1 через сборку Ollama, v2 `model_quantized.onnx` q8). Дальнейшая подкрутка на тех же 49 запросах без отложенной выборки не проводится намеренно. D-016 остаётся **`blocked`**: выбор между «принять просадку для v0 и осознанно пересмотреть пороги», «идти за квантованием» и «расширить корпус отложенной выборкой» — продуктовое решение. **G12 не стартует, пока D-016 `blocked`** | Claude Opus 5 / 2026-07-26 |
@@ -1478,3 +1479,132 @@ Guardrails (T10-наследие и D-008/D-010):
   утверждала.
 - Историческое evidence не переписывалось; D-001…D-010 остаются `resolved`. Группа 12
   (Hybrid code search) разблокирована.
+
+### G12 — трейс требование → artifact/test
+
+Дата 2026-07-27, исполнитель Claude Opus 5 (background job). Гейт перечитал spec 09 (§1–§8)
+целиком, 11 §2 (code tools contract) и 14 (§1/§2/§4/§5/§7). По `TRACEABILITY.md` G12 —
+**основной** владеющий gate спецификации 09; для 05 (projection protocol), 06 (reconcile/FTS/
+GC) и 10 (models/embeddings) — **end-to-end повторная проверка** наблюдаемого через поиск
+поведения, не повторный аудит их собственных гейтов (G07/G09/G10/G11, уже `PASS`); 11 владеется
+`G15`, здесь сверяется только контракт §2. Расхождений не найдено — **`PASS`**, новых `D-NNN`
+не заведено.
+
+Spec 09 §1 — Pipeline `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| resolve worktree from request context, **before any lock** | `pipeline.rs::search_code_instrumented` шаг 1 (`resolve()`) | `pipeline.rs::unknown_root_yields_worktree_not_indexed` | as-built |
+| `L2.read` для **всего** пайплайна | тот же лок держится через legs+enrichment+format | `pipeline.rs::lock_is_held_in_every_leg_of_a_successful_hybrid_search`; `generation_mixing.rs::no_l3_held_during_backend_query_under_concurrent_load` | as-built |
+| validate `fts_projection_head` → `dense_only` | `open_and_validate_fts(Cheap)` (06 §4) | `pipeline.rs::fts_diverged_above_threshold_degrades_dense_only`; `lexical.rs::a_stale_head_degrades_to_dense_only_without_running_the_leg` | as-built; 06 §4 повторно наблюдаемо через поиск |
+| validate shard availability → `lexical_only` | `ShardManager::acquire` | `pipeline.rs::dense_unavailable_degrades_lexical_only`; `dense.rs::{a_corrupt_shard_degrades_to_lexical_only, a_wrong_dimensioned_embedding_degrades_to_lexical_only, without_an_embedding_provider_the_search_degrades_to_lexical_only}` | as-built; 05 §6 повторно наблюдаемо через поиск |
+| оба leg недоступны → `INDEX_UNAVAILABLE` | `requires_index_unavailable` | `pipeline.rs::both_legs_unavailable_yields_index_unavailable` | as-built |
+| legs per mode; неспрошенный leg **не выполняется** | `SearchMode::wants_lexical`/`wants_dense` | `response.rs::{lexical_mode_runs_only_the_fts_leg, code_mode_runs_only_the_dense_leg}` (эмбеддер-паникующий-если-вызван) | as-built |
+| `name_pattern` filter | FTS5 колоночный фильтр (§2) | `fts_query.rs::{name_pattern_prefix_filters_by_name_and_qualified_name, multi_token_pattern_requires_every_prefix, pattern_without_matches_is_an_empty_result_not_an_error, empty_pattern_does_not_filter_and_pattern_only_query_is_valid}` | as-built |
+| graph/context enrichment | `Stage::Enrichment` — только графовая половина осталась стабом, edges post-v0 (§6) | — | **намеренный деферал**, не пробел |
+| индексируется **все** виды units (symbol/file/config/text/fallback) | `materialize_fts` (T08-02, G08) | `fts_query.rs::every_unit_kind_is_searchable` — **перепрогнан этим гейтом сегодня** | as-built; 06/08 повторно наблюдаемо через поиск |
+
+Spec 09 §2 — Lexical leg `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `bm25(...)` веса `[4.0, 3.0, 1.5, 2.0, 1.0]` | `BM25_DEFAULT_WEIGHTS` (`fts_query.rs`) | `fts_query.rs::default_weights_rank_name_above_qualified_signature_path_and_body`, `signature_column_outranks_path_and_body` | as-built |
+| термы объединяются `OR`, каждый терм квотируется | `fts_match_expression(_from_terms)` | `fts_query.rs::fts5_operator_words_are_searchable_terms_not_syntax_errors` | as-built (`[SPEC]`-решение, не мандат спеки) |
+| `name_pattern` → колоночный `AND`-префикс-фильтр; пустой = без фильтра; без термов = без SQL | `fts_match_expression` | `fts_query.rs` (4 `name_pattern`-теста) + `a_termless_query_runs_no_sql` (plain `#[test]`) | as-built |
+| D-018: терм с `df > N/2` отбрасывается, не опустошая запрос | `selective_terms`/`document_frequencies` над `fts_vocab` | `fts_query.rs::{a_saturated_term_no_longer_pulls_documents_into_the_candidates, an_all_saturated_query_still_runs_on_its_rarest_term}` | as-built |
+| generation/worktree изоляция; tie-break `occurrence_id`; candidate depth | SQL `WHERE worktree_id AND generation_id`, `ORDER BY bm25 ASC, occurrence_id ASC LIMIT depth` | `fts_query.rs::{other_worktrees_and_generations_are_never_returned, identical_rows_break_ties_by_occurrence_id, candidate_depth_truncates_at_the_floor_deterministically}` | as-built |
+| `signature`-колонка инертна на реальных данных (граница T08-02) | `materialize_fts` пишет `tokenize_signature(&[])` (`fts.rs:665`) | — | **проверено сегодня, не новое расхождение** — `grep` подтвердил комментарий/код на месте |
+
+Spec 09 §3 — Dense leg:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| representation selection (активный model space, `code_raw` v0 default) | `representation_key_for`, `pipeline.rs:373` (`dense_kind: RepresentationKind::CodeRaw`) | `dense.rs::the_dense_kind_selects_both_the_points_and_the_query_representation` | as-built; **проверено сегодня** — дефолт остаётся `code_raw`, `code_context` остаётся searchable через `with_dense_kind`/`--dense-kind` |
+| distance per `representation.distance_metric` | `similarity(metric, ..)`, `ShardParams::distance_metric` | `dense.rs::the_registered_distance_metric_orders_the_dense_leg` | as-built |
+| over-fetch `depth × kinds`, один ретрай на весь шард при нехватке | `pipeline.rs` dense leg | `dense.rs::request_limit_drives_the_dense_candidate_depth` | as-built |
+| деградация никогда не ошибка: нет representation/provider/dimension mismatch/corrupt shard → `lexical_only` | `pipeline.rs` dense leg error mapping | `dense.rs::{without_an_embedding_provider_the_search_degrades_to_lexical_only, a_wrong_dimensioned_embedding_degrades_to_lexical_only, a_corrupt_shard_degrades_to_lexical_only}` | as-built |
+| текстless запрос — пустой, но здоровый leg | — | `dense.rs::a_textless_query_leaves_the_dense_leg_empty_but_healthy` | as-built |
+| нет tenant/generation filter внутри шарда (структурно) | shard = `(worktree, model_space)`, только активная generation после switch | `dense.rs::{a_shard_directory_has_no_generation_axis, the_dense_leg_serves_exactly_the_active_generations_occurrences}` | as-built; 05 §2/§5 повторно наблюдаемо через поиск |
+
+Spec 09 §4 — Fusion `[SPEC]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| RRF `k=60`, merge по `occurrence_id`, `f64`-аккумулятор, tie-break `(score desc, occurrence_id asc)` | `crates/search/src/fusion.rs::rrf`, `RRF_K=60` | `fusion.rs` (`--lib`, 11+ тестов: hand-calculated `1/61+1/63`, дубликаты, tie-break, лимит, пустые ноги, устойчивость к порядку `HashMap`) | as-built |
+| D-018: веса `w_dense=1`, `w_lexical=0.0161` (`d=2`), правило вытеснения | `FusionWeights::for_displacement_depth` | `fusion.rs::{the_lexical_weight_follows_from_the_displacement_depth, a_dense_first_hit_survives_a_lexical_first_challenger_ranked_deeper, at_exactly_the_displacement_depth_the_scores_tie, a_zero_weight_leg_contributes_nothing}` | as-built |
+| candidate depth `max(limit*4, 50)` — общая для обеих ног | `candidate_depth` (fts_query.rs), переиспользуется dense-ногой | `fts_query.rs::candidate_depth_truncates_at_the_floor_deterministically` | as-built |
+
+Spec 09 §5 — Modes `[SPEC mapping]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `Hybrid`/`Lexical`/`Code`/`Semantic`, дефолт `Hybrid` | `local_rag_protocol::SearchMode` | `response.rs` (9 тестов режимов/деградации) | as-built |
+| `semantic` → `UNSUPPORTED_MODE` **до** резолва worktree и лока | `pipeline.rs:428-433` — **перепрочитано сегодня**, подтверждено: шаг 0, до `resolve()` | `response.rs::semantic_mode_is_refused_before_any_work` | as-built |
+| `degraded` в одноногих режимах: успех → `null`, отказ → `INDEX_UNAVAILABLE` (не degraded) | `pipeline.rs` / `requires_index_unavailable` | `response.rs::a_single_leg_mode_whose_leg_fails_is_index_unavailable` | as-built |
+
+Spec 09 §6 — Symbol graph `[FIXED semantics, final shape OPEN]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `find_usages`/`get_dependencies`, edges — v0.x/post-v0, gated on `[OPEN]` | — | `grep -rn "find_usages\|get_dependencies" **/*.rs` — **0 совпадений во всём репозитории (проверено сегодня)** | **корректно отсутствует** — O7 не нарушен |
+
+Spec 09 §7 — Response format `[SPEC]`:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `SearchResponse`/`SearchResult`/`LegRanks`/`GenerationRef`, точная форма §7 | `crates/protocol/src/search.rs` | `crates/protocol` — 13 OK (форма, omit-vs-null, коды режимов) | as-built |
+| повторяемый вывод байт-стабилен | `serde_json` детерминированный порядок полей | `response.rs::repeated_identical_requests_serialize_to_identical_bytes` | as-built |
+| snippet: span-cut из `source_blob`, кэп 8 KiB, UTF-8-safe truncation + `{hash, original_size}` | `crates/search/src/snippet.rs::cut` | `context.rs` (8 тестов: кэп/границы/метаданные) + `snippet_serialization_matches_the_spec_shape` | as-built |
+| снипет переживает мутацию/удаление живого файла (source_blob invariant) | чтение только из `source_bytes` (state.sqlite), никогда с диска | `context.rs::snippets_survive_mutation_and_deletion_of_the_live_file` | as-built |
+
+Spec 09 §8 — Latency gates (numbers after baseline `[OPEN]`):
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| warm search p95 измеряется | `crates/xtask/src/bench/run.rs` (`search_p95_ms = percentile(.., 0.95)`) | зашито в `BenchReport`, печатается в `.report.md` | измеряется, **не гейтится** |
+| численные пороги latency | — | `thresholds.json` содержит только `mrr_regression_budget`/`min_recall_at_5` — **проверено сегодня**, latency-порога там нет | **осознанно `[BASELINE]`-pending**, владелец T14-07/T17-05 — не тихо закрыто здесь |
+
+Spec 11 §2 — Code tools contract (только контракт; MCP tool wiring владеется G15):
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `search_code`: `degraded`-флаги обязательны | `SearchResponse.degraded` | покрыто 09 §1/§5 тестами выше | as-built |
+| `get_file_context(path)`: occurrence-лист + snippet активной generation; unknown vs skipped различаются | `crates/search/src/context.rs` | `context.rs::{get_file_context returns ascending occurrences, unknown path vs skipped_file}` | as-built |
+| `project_overview()`: 3-level tree + entry_points + top_imports, кэш в памяти per `(worktree, generation)` | `crates/search/src/overview.rs` | `overview.rs` (`--lib`, 13 тестов: свёртка дерева, эвристика, кэш) | as-built |
+| `find_usages`/`get_dependencies` — v0.x, gated `[OPEN]` | — | `grep` — 0 совпадений (см. 09 §6) | корректно отсутствует |
+| MCP tool wiring вокруг обеих тулз | — (в `crates/search` нет MCP-кода — **подтверждено сегодня**) | — | **вне scope G12**, владеет T15-03/G15 |
+
+Spec 14 §1 — Fixture strategy: 49-query корпус `fixtures/search/corpus.json`,
+`EXPECTED_QUERY_COUNT = 49`-guard в `crates/xtask/src/bench/corpus.rs` — as-built.
+
+Spec 14 §2 — Acceptance gates:
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `quality`: MRR budget/Recall floor из **согласованного v1-бейзлайна** | `thresholds.json = {mrr_regression_budget: 0.03, min_recall_at_5: 0.8}` | `gate.rs::the_shipped_thresholds_reject_the_committed_degraded_run` (committed `run-degraded.json` действительно проваливает) | as-built |
+| гейт проходит на дефолтном режиме сегодня | — | **живой прогон этим гейтом**: `run-v2-2026-07-27-g12-verify.json` — Hit@1 0.5918/Hit@3 0.8367/Hit@5 0.8367/MRR 0.7007 vs v1 0.6963, `bench: gate: PASS` | **PASS, воспроизведено на этой машине сегодня** |
+| `latency`/`resources`/`memory-quality` | — | — | **`[BASELINE]`-pending**, владельцы T14-07/T17-05 — G12 не заполняет |
+| `reliability`/`consistency`/`sharing`/`idempotency`/`rebuild` | доказаны в группах 05–11 (G05…G11) | — | владеются своими гейтами; здесь **не** переоткрываются, только §4-подмножество (ниже) перепроверено через поиск |
+
+Spec 14 §4 — Consistency tests (буквальные три сценария карточки группы 12):
+
+| Требование (маркер) | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Generation-mixing: concurrent search vs switch, ни один result set не смешивает generation | `SearchEngine` под `L2.read` | `generation_mixing.rs::generation_mixing_under_concurrent_switch_load` — **перепрогнан сегодня** | as-built |
+| FTS staleness: устаревший head → degraded/rebuilt, никогда пустой leg как валидный | `open_and_validate_fts` | `lexical.rs::a_stale_head_degrades_to_dense_only_without_running_the_leg` | as-built |
+| cache/shard degradation (live-file mutation входит сюда же как источник несоответствия) | dense/lexical leg error mapping + `snippet::cut` над `source_blob` | `dense.rs` (3 degradation теста) + `context.rs::snippets_survive_mutation_and_deletion_of_the_live_file` | as-built |
+| Two-axis interleaving | владеется G09/G11 (`model_switch`/`switch` тесты) | `switch_failpoint_load.rs::switch_failure_before_commit_never_corrupts_concurrent_search` — search-наблюдаемая половина, перепрогнана сегодня с `--features failpoints` | end-to-end повторно наблюдаемо через поиск, не переоткрыто |
+
+Spec 14 §5 — Determinism: `response.rs::repeated_identical_requests_serialize_to_identical_bytes`
+— as-built (см. 09 §7 выше).
+
+Spec 14 §7 — Benchmarks: `cargo xtask bench` (`corpus.rs`/`score.rs`/`report.rs`/`gate.rs`/
+`run.rs`), matching semantics и corpus comparability документированы в `baseline.md`; per-query
+diff vs v1 — metric-level по D-015 (v1 не эмитит per-query ранги). Живой прогон — см. 14 §2.
+
+**Итог.** Ни одного расхождения не найдено при построении трейса и точечных проверках
+(перечислены в evidence-строке `G12` выше: `DEVIATIONS.md` без новых записей, `code_context`/
+`signature`/`semantic`/`rerank`/graph-tools границы целы, latency осознанно не гейтится, 11 §2
+MCP-wiring граница цела). Единственное намеренно незакрытое — 09 §6/§8 и 11 §2's
+`find_usages`/`get_dependencies`/MCP-wiring, все явно депендентны на более поздние
+задачи/гейты, не молча пропущены. **`PASS`.**
