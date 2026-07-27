@@ -1,8 +1,7 @@
 //! `audit_event`: the append-only trail every memory mutation writes to
-//! (spec 03 §2.5, 08 §3). Plain insert/read — the atomic
-//! mutation+evidence+audit+idempotency operation contract, and recognizing a
-//! retried `idempotency_key` as already-applied, are T14-02's transactional
-//! op engine.
+//! (spec 03 §2.5, 08 §3). Plain insert/read — [`find_by_idempotency_key`] is
+//! the read [`crate::memory::op`]'s transactional op engine checks first, on
+//! every operation, to recognize an already-applied retry.
 //!
 //! `entity_kind` and `op` are documented, open-ended value sets in the spec
 //! (`-- memory_entry | candidate | …`, `-- create|reinforce|…`) with **no** SQL
@@ -12,7 +11,7 @@
 //! `actor` gets one here, for the same reason.
 
 use rusqlite::types::Type;
-use rusqlite::{Connection, Error, Transaction, params};
+use rusqlite::{Connection, Error, OptionalExtension, Transaction, params};
 
 /// `audit_event.actor` (spec 03 §2.5 CHECK domain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +73,9 @@ pub struct AuditEventRow {
 /// on `UNIQUE (entity_kind, entity_id, entity_version)` or `UNIQUE
 /// (idempotency_key)` surfaces as the natural `rusqlite::Error` constraint
 /// violation — no special handling here; recognizing a retried
-/// `idempotency_key` as already-applied (spec 08 §3) is T14-02's concern.
+/// `idempotency_key` as already-applied (spec 08 §3) is
+/// [`crate::memory::op`]'s concern, via [`find_by_idempotency_key`] checked
+/// *before* this is ever called for a router-originated op.
 pub fn insert_audit_event(
     tx: &Transaction<'_>,
     row: &NewAuditEvent<'_>,
@@ -97,6 +98,46 @@ pub fn insert_audit_event(
         ],
         |r| r.get(0),
     )
+}
+
+/// The `audit_event` row already recorded under `idempotency_key`, if any
+/// (spec 08 §3: "same `idempotency_key` ⇒ recognized as already applied,
+/// returns the original result"). Callers check this *first*, inside the same
+/// transaction as the operation it would otherwise apply, so "was this retry
+/// already applied" and "apply it" are one atomic decision — see
+/// [`crate::memory::op`].
+pub fn find_by_idempotency_key(
+    conn: &Connection,
+    idempotency_key: &str,
+) -> rusqlite::Result<Option<AuditEventRow>> {
+    conn.query_row(
+        "SELECT audit_id, entity_kind, entity_id, entity_version, op, actor, idempotency_key, \
+                payload, created_at \
+         FROM audit_event WHERE idempotency_key = ?1",
+        params![idempotency_key],
+        |r| {
+            let raw_actor: String = r.get(5)?;
+            let actor = Actor::from_db(&raw_actor).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    5,
+                    Type::Text,
+                    format!("invalid audit_event.actor {raw_actor:?}").into(),
+                )
+            })?;
+            Ok(AuditEventRow {
+                audit_id: r.get(0)?,
+                entity_kind: r.get(1)?,
+                entity_id: r.get(2)?,
+                entity_version: r.get(3)?,
+                op: r.get(4)?,
+                actor,
+                idempotency_key: r.get(6)?,
+                payload: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        },
+    )
+    .optional()
 }
 
 /// Every `audit_event` row for `(entity_kind, entity_id)`, ascending by

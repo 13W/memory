@@ -20,9 +20,7 @@
 //!   `pending_memory_candidate.review_state`/`consolidation_run.state`, which
 //!   do have one). [`entry::transition_memory_entry`] deliberately does **not**
 //!   touch `entry_version`/`updated_at`: spec 04 §5 couples every version
-//!   increment to a matching `audit_event`, and composing mutation + evidence +
-//!   audit + the `expected_version` optimistic-concurrency precondition into one
-//!   contract is T14-02's "transactional memory-op engine", not this task's.
+//!   increment to a matching `audit_event`, and [`op`] composes that.
 //! - **`memory_evidence`** ([`evidence`]): plain insert/read over an
 //!   already-existing `memory_entry` and `observation_envelope` (T13-04) — no
 //!   state machine.
@@ -32,17 +30,29 @@
 //!   consolidation-run machine (spec 04 §4). T14-01 ships only the pure
 //!   transition legality; lease acquisition/renewal timing against a clock is
 //!   T14-06's runner.
-//! - **`audit_event`** ([`audit`]): plain insert/read; the atomic
-//!   evidence+audit+idempotency operation contract is T14-02's.
+//! - **`audit_event`** ([`audit`]): plain insert/read, plus
+//!   [`audit::find_by_idempotency_key`] — the read [`op`] checks first on
+//!   every operation to recognize an already-applied retry.
+//!
+//! T14-02 adds **[`op`]**, the shared transactional memory-op engine (spec 08
+//! §3): [`op::apply_create`]/[`op::apply_reinforce`] compose the primitives
+//! above into the atomic mutation+evidence+audit+idempotency contract every
+//! memory operation follows, and [`op::apply_noop`] is the router's
+//! zero-write "considered, no action" acknowledgment (see [`op`]'s own doc for
+//! why `noop` writes nothing). `resolve`/`supersede`/`retract`/`edit` (T14-03)
+//! and `merge_memories` (T14-04) are later, separate tasks built on the same
+//! primitives.
 
 mod audit;
 mod candidate;
 mod consolidation;
 mod entry;
 mod evidence;
+mod op;
 
 pub use audit::{
-    Actor, AuditEventRow, NewAuditEvent, insert_audit_event, read_audit_events_for_entity,
+    Actor, AuditEventRow, NewAuditEvent, find_by_idempotency_key, insert_audit_event,
+    read_audit_events_for_entity,
 };
 pub use candidate::{
     CandidateState, CandidateTransitionError, IllegalCandidateTransition, NewCandidate,
@@ -59,6 +69,10 @@ pub use entry::{
     transition_memory_entry,
 };
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};
+pub use op::{
+    CreateMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome, MemoryOpResult,
+    ReinforceMemoryOp, apply_create, apply_noop, apply_reinforce,
+};
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the
 /// `memory_entry`/`memory_evidence`/`pending_memory_candidate`/

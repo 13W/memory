@@ -44,6 +44,39 @@ Operations: `create | reinforce | resolve | supersede | retract | noop`
 - `merge_memories`: one tx — survivor absorbs evidence, losers → `superseded` with
   `supersedes_id` → survivor; audit records the merge set.
 
+As-built note (T14-02, `[SPEC]`): `local_rag_store::memory::op` ships exactly `create`/
+`reinforce`/`noop` — the shared transactional engine `resolve`/`supersede`/`retract`/`edit`
+(T14-03) and `merge_memories` (T14-04) compose on top of. Three implementation details this
+section states less precisely than the code fixes:
+
+- **Idempotency-key check runs first**, inside the same transaction, before any other
+  precondition (`op::apply_create`/`apply_reinforce` call `audit::find_by_idempotency_key`
+  before touching `memory_entry`). A hit reconstructs the response directly from the matching
+  `audit_event` row and touches nothing else — this is what makes "returns the original result"
+  true by construction rather than by re-deriving equal output on every retry.
+- **`create`'s scope-uniqueness precondition is a typed error**, per this section's own wording
+  ("Violation ⇒ tx aborts with a typed error") — `op::apply_create` pre-checks `canonical_key`
+  with a `SELECT` and returns `MemoryOpError::CanonicalKeyConflict` before ever attempting the
+  insert, rather than letting `create_memory_entry`'s raw `UNIQUE` constraint violation bubble up
+  unwrapped (that primitive's own doc comment explicitly defers this typed wrapping to this
+  task).
+- **`noop` writes nothing at all** — no `memory_entry` mutation, no `memory_evidence`, no
+  `audit_event`. The op envelope in §4 below lists `target/kind/text/scope/canonical_key/
+  confidence inputs` for the op list generally; `noop` needs none of them, unlike every other
+  listed op. Recording a `noop` as its own `audit_event` would need some
+  `(entity_kind, entity_id, entity_version)` to satisfy `audit_event`'s own `UNIQUE` constraint
+  (03 §2.5) — attaching it to the examined entry's current, unchanged version breaks the first
+  time two independent consolidation runs both examine that same still-unmodified entry and both
+  legitimately decide "no action": the second, equally valid decision would be rejected as a
+  duplicate of the first. A zero-write `noop` sidesteps this entirely and needs no
+  `idempotency_key` bookkeeping either — redoing nothing on retry is still nothing.
+- **`reinforce` always bumps `entry_version`** on a successful apply, even when `confidence` is
+  unchanged (evidence-only reinforcement) — every real mutation gets a new version with a
+  matching `audit_event`, consistent with "Response carries the new `entry_version`" being
+  stated for every operation, not only state transitions. It does not check the entry's current
+  `state`/terminality — that guard, if warranted, belongs to T14-03's kind/state-aware lifecycle
+  operations, which this task's card does not cover.
+
 ## 4. Consolidation `[FIXED]`
 
 Trigger: checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`, startup catch-up.
