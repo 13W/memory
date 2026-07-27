@@ -171,6 +171,27 @@
 //! plan. The read side is adopted by T09-03 (`local_rag_search::SearchEngine`,
 //! `crates/search`) via [`lock::WorktreeLockRegistry::read_bounded`].
 //!
+//! T13-04 adds the **transactional observation importer** ([`observation`],
+//! spec 03 §2.5, 07 §5/§6): the version-7 migration creates the spool-derived
+//! ledger — `observation_envelope`/`observation_path`/`observation_payload`/
+//! `spool_import_cursor` — a deliberate subset of spec 03 §2.5's "Memory side"
+//! block (the remaining `memory_entry`/`memory_evidence`/
+//! `pending_memory_candidate`/`candidate_evidence`/`processing_cursor`/
+//! `consolidation_run`/`audit_event` tables are T14-01's).
+//! [`observation::import_batch`] composes one per-session transaction: resolve
+//! `worktree_root` once (an already-built [`registry::RequestRoot`] is
+//! injected — the git probing that produces one is the daemon's job, not
+//! started yet), exact dedup via a partial-unique-index `ON CONFLICT DO
+//! NOTHING RETURNING`, best-effort dedup via a bounded per-session window
+//! (10 min **or** last 512 envelopes, the same "most protective" union
+//! `retention::mark_pins`'s K/T window already established), insert
+//! envelope/path/payload rows, and advance `spool_import_cursor` — all in one
+//! commit. [`observation::import_session_tail`] is the per-session driver:
+//! reads real segment files, decodes via [`spool::decode_segment`]/
+//! [`spool::decode_frames`] (T13-03, this module's first consumer), and
+//! (best-effort, after the commit — spec 07 §7's S4 kill-matrix row) deletes
+//! segment files the cursor has fully passed.
+//!
 //! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
 //! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
 //! [`spool::decode_segment`] validates the 16-byte header
@@ -198,6 +219,7 @@ pub mod eviction;
 pub mod housekeeping;
 pub mod lock;
 pub mod migrate;
+pub mod observation;
 pub mod registry;
 pub mod retention;
 pub mod spool;
@@ -252,6 +274,10 @@ pub use housekeeping::{
 };
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
+pub use observation::{
+    EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, TrustLevel, import_batch,
+    import_session_tail,
+};
 pub use registry::{
     AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
     IllegalGenerationTransition, IllegalWorktreeTransition, PathObservation, RequestRoot,

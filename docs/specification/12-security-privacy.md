@@ -91,6 +91,13 @@ in spool/remote flows) are exposed for later groups.
 
 - `observation_payload` under real TTL (`payload_ttl_hours`), enforced by a sweeper; envelopes
   are durable; `memory_evidence` FKs target envelopes and therefore survive payload expiry.
+
+As-built note (T13-04, `[SPEC]`): `payload_ttl_hours` (`StorageConfig::payload_ttl_hours`, default
+72h, already introduced by an earlier storage-foundation task) is now a real consumer:
+`local_rag_store::observation::import_batch` computes `observation_payload.expires_at =
+now_ms + payload_ttl_hours × 3_600_000` at import time, for every observation that has a payload
+row at all (an envelope-only/denied event never gets one — its absence *is* "no payload", not an
+expired one). The sweeper that actually deletes rows past `expires_at` is T13-05's, unbuilt here.
 - `inspect / export / purge` exist as first-class CLI operations (11 §6). `purge` is the only
   hard-delete path and tombstones audit references `[SPEC]`.
 - Optional encryption at rest (SQLite-level, e.g. SQLCipher-compatible) — optional feature,

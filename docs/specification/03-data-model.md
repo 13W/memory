@@ -676,6 +676,29 @@ CREATE TABLE spool_import_cursor (                    -- durable import progress
 );
 ```
 
+As-built note (T13-04, `[SPEC]`): this section's block covers two independently-owned table
+clusters, shipped by two different tasks/groups. **T13-04** (group 13) ships exactly the
+observation ledger illustrated above — `observation_envelope`, `observation_path`,
+`observation_payload`, `spool_import_cursor` — as migration version 7
+(`local_rag_store::observation::SCHEMA_V7`). **`memory_entry`, `memory_evidence`,
+`pending_memory_candidate`, `candidate_evidence`, `processing_cursor`, `consolidation_run`, and
+`audit_event`** remain unbuilt here; they are group 14's T14-01 ("Memory DDL and legal
+transitions", `groups/14-memory.md`), a later, separate migration. This mirrors the precedent
+D-013 already established for splitting a single spec block's ownership across groups when part
+of it depends on infrastructure a later group provides. `local_rag_store::observation::
+import_batch` is this ledger's only writer: it resolves `worktree_root` once per batch (see 07 §5's
+as-built note on why resolution is an injected `RequestRoot`, not computed here), applies exact
+dedup via `observation_envelope`'s partial `envelope_dedup` index (`INSERT ... ON CONFLICT(dedup_key)
+WHERE dedup_key IS NOT NULL DO NOTHING RETURNING received_seq`), applies the bounded best-effort
+window (07 §5 as-built note), inserts `observation_path`/`observation_payload` rows, and advances
+`spool_import_cursor` — all in one transaction. `observation_payload.expires_at` is computed here
+from the already-existing `StorageConfig::payload_ttl_hours` (default 72h, from the storage
+section's `[OPEN]` provisional-defaults note above); removing expired rows is T13-05's sweeper, not
+this task's. `payload_hash` is a plain `local_rag_core::hash::sha256_hex` over the frame's
+(already redacted) payload text, or over an empty byte slice for an envelope-only event —
+deliberately not a domain-separated `identity::domain` hash, the same reasoning 07 §4's as-built
+note gives for the best-effort fingerprints (never an identity/UNIQUE/FK column).
+
 ## 3. `state.sqlite` write policy `[FIXED, numbers [SPEC]]`
 
 Single **bounded global write queue** feeding one writer task (SQLite has one physical writer;
