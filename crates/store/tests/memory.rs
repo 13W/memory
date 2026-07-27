@@ -321,6 +321,33 @@ async fn hypothesis_confirm_vs_fact_supersede() {
     assert!(fact_state.is_terminal(), "superseded fact is terminal");
 }
 
+/// D-020 regression: spec 04 §5's own prose narrates promotion acting on an
+/// *already-confirmed* hypothesis ("a confirmed hypothesis stays... promotion
+/// to fact happens only via explicit supersede... which transitions to
+/// superseded") — `confirmed → superseded` must be legal, not just
+/// `active → superseded`.
+#[tokio::test]
+async fn hypothesis_confirmed_can_be_superseded() {
+    let (_home, db) = open_state();
+
+    let hyp = memory(&db, 52, MemoryKind::Hypothesis).await;
+    assert_eq!(
+        transition_entry(&db, &hyp, MemoryState::Confirmed).await,
+        Ok(())
+    );
+    assert_eq!(
+        transition_entry(&db, &hyp, MemoryState::Superseded).await,
+        Ok(()),
+        "a confirmed hypothesis must be promotable via supersede (D-020)"
+    );
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &hyp).expect("state"),
+        Some((MemoryKind::Hypothesis, MemoryState::Superseded)),
+    );
+}
+
 #[tokio::test]
 async fn terminal_states_excluded_from_recall_by_default() {
     let (_home, db) = open_state();

@@ -77,6 +77,23 @@ section states less precisely than the code fixes:
   `state`/terminality — that guard, if warranted, belongs to T14-03's kind/state-aware lifecycle
   operations, which this task's card does not cover.
 
+As-built note (T14-03, `[SPEC]`): `resolve`/`retract` compose 04 §5's
+`MemoryState::check_transition` directly, so an illegal kind/state request (e.g. resolving a
+`fact`, retracting a `hypothesis`) surfaces as a typed `MemoryOpError::IllegalTransition` wrapping
+that guard's own error, with **no mutation** — the same "typed error, tx aborts" contract this
+section already states for scope uniqueness. `supersede` creates the **new** entry first, then
+retires the **old** one to `superseded` second (matching 04 §5's own prose order for promotion),
+both pre-validated before either write; its response describes the **new** entry only — read as
+the "new `entry_version` and `audit_id`" this section promises, since the new entry is the
+headline result a promotion produces — while the old entry's transition is a verified side effect,
+not a second value in the return type. Only the new entry's `audit_event` row carries a
+router-supplied `idempotency_key`; the old entry's transition-audit row does not, so a replay
+never needs a second row to collide on the same key. `edit` is the one operation that changes
+`text` (structurally — no other op accepts a `text` field) and adds a guard this section does not
+itself specify: it rejects editing an entry whose current state is terminal
+(`MemoryOpError::EntryTerminal`) — an as-built decision, since this task's card is the one that
+owns "kind/state guards" generally and nothing here forces this specific rule.
+
 ## 4. Consolidation `[FIXED]`
 
 Trigger: checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`, startup catch-up.

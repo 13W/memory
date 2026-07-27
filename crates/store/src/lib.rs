@@ -254,6 +254,27 @@
 //! `resolve`/`supersede`/`retract`/`edit` (T14-03) and `merge_memories`
 //! (T14-04) are later tasks composing the same primitives.
 //!
+//! T14-03 adds the **lifecycle/edit ops** in the same module:
+//! [`apply_resolve`]/[`apply_retract`] are thin wrappers over a shared
+//! private helper that reads `(kind, state, entry_version)` once and reuses
+//! [`memory::MemoryState::check_transition`] directly (not
+//! `transition_memory_entry`, which has no notion of `entry_version`).
+//! [`apply_supersede`] is the promotion op: it creates the **new** entry
+//! first, then retires the **old** one to `superseded` — both pre-validated
+//! before either write, mirroring `local_rag_projection::switch::commit_switch`'s
+//! "check both sides, then mutate" shape — and returns the **new** entry's
+//! result only (the old entry's transition is a verified side effect, not a
+//! second value threaded through the return type); only the new entry's
+//! `audit_event` carries the caller's `idempotency_key`, so replay never
+//! risks a second row colliding on the same key. [`apply_edit`] is the one op
+//! allowed to change `text`, and adds [`MemoryOpError::EntryTerminal`] — an
+//! as-built guard (spec 08 §3 leaves the exact "kind/state guards" this
+//! task's card asks for unspecified) rejecting edits to a terminal entry.
+//! This task also fixes **D-020**: spec 04 §5's prose narrates promotion
+//! acting on an already-*confirmed* hypothesis, but T14-01 only allowed
+//! `active → superseded`; `confirmed → superseded` is now legal too (see
+//! `memory::MemoryState::check_transition`'s doc for the full rationale).
+//!
 //! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
 //! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
 //! [`spool::decode_segment`] validates the 16-byte header
@@ -339,15 +360,17 @@ pub use housekeeping::{
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use memory::{
     Actor, AuditEventRow, CandidateState, CandidateTransitionError, CreateMemoryEntryError,
-    CreateMemoryOp, EvidenceInput, GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition,
+    CreateMemoryOp, EditMemoryOp, EvidenceInput, GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition,
     IllegalMemoryTransition, IllegalRunTransition, MemoryKind, MemoryOpError, MemoryOpOutcome,
     MemoryOpResult, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
-    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, ReinforceMemoryOp, RunState,
-    RunTransitionError, ScopeKind, apply_create, apply_noop, apply_reinforce, candidate_state,
-    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
-    find_by_idempotency_key, insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
-    memory_entry_state, memory_evidence_for, processing_cursor, read_audit_events_for_entity,
-    transition_candidate, transition_memory_entry, transition_run, upsert_processing_cursor,
+    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, ReinforceMemoryOp, ResolveMemoryOp,
+    RetractMemoryOp, RunState, RunTransitionError, ScopeKind, SupersedeMemoryOp, apply_create,
+    apply_edit, apply_noop, apply_reinforce, apply_resolve, apply_retract, apply_supersede,
+    candidate_state, consolidation_run_state, create_candidate, create_consolidation_run,
+    create_memory_entry, find_by_idempotency_key, insert_audit_event, insert_candidate_evidence,
+    insert_memory_evidence, memory_entry_state, memory_evidence_for, processing_cursor,
+    read_audit_events_for_entity, transition_candidate, transition_memory_entry, transition_run,
+    upsert_processing_cursor,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{

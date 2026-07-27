@@ -171,6 +171,24 @@ version increment carries a matching `audit_event` means the two must commit tog
 composing that (plus evidence linking, the `expected_version` precondition, and idempotency-key
 retry recognition) is T14-02's transactional memory-op engine, not this task's primitive.
 
+As-built note (D-020, `[SPEC]`, found while planning T14-03): the "Common rule" paragraph above
+the table narrates promotion acting on an *already-confirmed* hypothesis — "a confirmed
+hypothesis stays `kind=hypothesis, state=confirmed`... promotion to `fact` happens only via
+explicit `supersede`... which transitions to `superseded`" — but T14-01's shipped
+`check_transition` only allowed `active → superseded` for `hypothesis`, leaving `confirmed` a
+dead end no test exercised. Fixed by adding exactly `confirmed → superseded`; `confirmed →
+rejected`/`retracted` have no textual basis (the table gives `reject` no role once confirmed,
+and `retracted` isn't in `hypothesis`'s state set at all) and were deliberately not added. As-built
+note (T14-03, `[SPEC]`): `local_rag_store::memory::op::apply_resolve`/`apply_retract` compose
+`MemoryState::check_transition` directly (not `transition_memory_entry`) so the same call also
+bumps `entry_version` and writes the matching `audit_event` this section requires; unlike the raw
+`transition_*` primitives elsewhere in this crate, a legal *self*-transition through the op engine
+still bumps the version and writes an audit row (consistent with `apply_reinforce`'s T14-02
+precedent — every applied op returns a real `audit_id`). `apply_supersede` creates the new entry
+first, then retires the old one to `superseded` second (matching this section's own sentence
+order), pre-validating both sides before either write; only the new entry's `audit_event` carries
+a router-supplied `idempotency_key`, so a retry never risks two rows colliding on the same key.
+
 ## 6. Pending memory candidate
 
 ```

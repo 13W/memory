@@ -118,7 +118,13 @@ impl MemoryState {
     ///
     /// Three disjoint machines, selected by `kind`:
     /// - `task`/`question`: `active → resolved | retracted`
-    /// - `hypothesis`: `active → confirmed | rejected | superseded`
+    /// - `hypothesis`: `active → confirmed | rejected | superseded`, and
+    ///   `confirmed → superseded` (D-020: promotion to a fact acts on an
+    ///   already-confirmed hypothesis — spec 04 §5's own prose: "a confirmed
+    ///   hypothesis stays... promotion to fact happens only via explicit
+    ///   supersede — a new fact entry... pointing at the hypothesis, which
+    ///   transitions to superseded." `confirmed → rejected`/`retracted` have
+    ///   no textual basis and are deliberately not added.)
     /// - `fact`/`decision`/`convention`/`procedure`: `active → superseded | retracted`
     ///
     /// A self-transition (`X → X`) is always legal — an idempotent no-op, the
@@ -143,7 +149,10 @@ impl MemoryState {
             }
             MemoryKind::Hypothesis => matches!(
                 (self, to),
-                (Active, Confirmed) | (Active, Rejected) | (Active, Superseded)
+                (Active, Confirmed)
+                    | (Active, Rejected)
+                    | (Active, Superseded)
+                    | (Confirmed, Superseded)
             ),
             MemoryKind::Fact
             | MemoryKind::Decision
@@ -498,6 +507,7 @@ mod tests {
                     (Active, Confirmed),
                     (Active, Rejected),
                     (Active, Superseded),
+                    (Confirmed, Superseded), // D-020: promotion acts on a confirmed hypothesis
                 ],
                 MemoryKind::Fact
                 | MemoryKind::Decision
