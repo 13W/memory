@@ -226,9 +226,33 @@
 //! primitives compose evidence linking, `audit_event` writing, the
 //! `expected_version` optimistic-concurrency precondition, or
 //! idempotency-key retry recognition — that atomic operation contract (spec 08
-//! §3) is T14-02's transactional memory-op engine; T14-01 ships exactly the
-//! schema and the transition legality it builds on, the same division T05-01
-//! drew relative to the generation builder/switch that followed it.
+//! §3) is T14-02's transactional memory-op engine (below); T14-01 ships
+//! exactly the schema and the transition legality it builds on, the same
+//! division T05-01 drew relative to the generation builder/switch that
+//! followed it.
+//!
+//! T14-02 adds the **transactional memory-op engine** ([`memory::op`], spec 08
+//! §3): [`apply_create`]/[`apply_reinforce`] compose T14-01's primitives into
+//! the atomic mutation+evidence+audit contract, checking
+//! [`memory::find_by_idempotency_key`] **first** inside the same transaction
+//! so a retried router op returns [`MemoryOpOutcome::Replayed`] — the
+//! *original* result, not a freshly recomputed one — without touching
+//! `memory_entry`/`memory_evidence` again. `apply_create` pre-checks
+//! `canonical_key` scope-uniqueness with a typed [`MemoryOpError`] (spec 08
+//! §3 asks for a typed error here, unlike `create_memory_entry`'s own raw
+//! `UNIQUE`-violation bubble-up); `apply_reinforce` enforces
+//! `expected_version` optimistic concurrency and structurally cannot edit
+//! `text` — no such field exists on [`ReinforceMemoryOp`] — but always bumps
+//! `entry_version` on a real mutation, since every apply gets a matching
+//! `audit_event`. `apply_noop` writes **nothing**: the router's op envelope
+//! (spec 08 §4) needs no target/kind/text/scope/confidence for "no action,"
+//! and recording it as its own `audit_event` at the examined entry's
+//! unchanged version would collide with `UNIQUE (entity_kind, entity_id,
+//! entity_version)` the first time two independent consolidation runs both
+//! reach that same "nothing to do" conclusion — a zero-write noop is
+//! idempotent under retry by construction and sidesteps this entirely.
+//! `resolve`/`supersede`/`retract`/`edit` (T14-03) and `merge_memories`
+//! (T14-04) are later tasks composing the same primitives.
 //!
 //! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
 //! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
@@ -315,14 +339,15 @@ pub use housekeeping::{
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use memory::{
     Actor, AuditEventRow, CandidateState, CandidateTransitionError, CreateMemoryEntryError,
-    GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition, IllegalMemoryTransition,
-    IllegalRunTransition, MemoryKind, MemoryState, MemoryTransitionError, NewAuditEvent,
-    NewCandidate, NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunState,
-    RunTransitionError, ScopeKind, candidate_state, consolidation_run_state, create_candidate,
-    create_consolidation_run, create_memory_entry, insert_audit_event, insert_candidate_evidence,
-    insert_memory_evidence, memory_entry_state, memory_evidence_for, processing_cursor,
-    read_audit_events_for_entity, transition_candidate, transition_memory_entry, transition_run,
-    upsert_processing_cursor,
+    CreateMemoryOp, EvidenceInput, GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition,
+    IllegalMemoryTransition, IllegalRunTransition, MemoryKind, MemoryOpError, MemoryOpOutcome,
+    MemoryOpResult, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
+    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, ReinforceMemoryOp, RunState,
+    RunTransitionError, ScopeKind, apply_create, apply_noop, apply_reinforce, candidate_state,
+    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
+    find_by_idempotency_key, insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
+    memory_entry_state, memory_evidence_for, processing_cursor, read_audit_events_for_entity,
+    transition_candidate, transition_memory_entry, transition_run, upsert_processing_cursor,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{
