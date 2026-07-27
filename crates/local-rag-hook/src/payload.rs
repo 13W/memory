@@ -138,6 +138,25 @@ pub fn prepare_payload(
     }
 }
 
+/// Fold a [`PreparedPayload`] into the frame's `payload` field (`None` for
+/// [`PreparedPayload::EnvelopeOnly`], a JSON string of the redacted bytes for
+/// [`PreparedPayload::Included`]) — see
+/// `local_rag_core::spool`'s module docs for why the field is a JSON string
+/// rather than a raw nested object.
+///
+/// `String::from_utf8_lossy` rather than a fallible `from_utf8` even though
+/// `prepare_payload` already guarantees valid UTF-8: this binary's mandate is
+/// "never panic", so a future regression upstream should degrade to
+/// lossy-but-safe output, not crash the hook.
+pub fn payload_field(prepared: &PreparedPayload) -> Option<String> {
+    match prepared {
+        PreparedPayload::EnvelopeOnly => None,
+        PreparedPayload::Included { bytes, .. } => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+    }
+}
+
 /// Whether this event's paths or tool name match the configured deny-list.
 fn is_denied(paths: &[String], tool_name: Option<&str>, deny: &SpoolConfig) -> bool {
     paths.iter().any(|p| path_denied(p, &deny.deny_paths))
@@ -203,5 +222,21 @@ mod tests {
             }
             other => panic!("expected Included, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn payload_field_is_none_for_envelope_only() {
+        assert_eq!(payload_field(&PreparedPayload::EnvelopeOnly), None);
+    }
+
+    #[test]
+    fn payload_field_wraps_included_bytes_as_a_string() {
+        let prepared = PreparedPayload::Included {
+            bytes: b"{\"k\":\"v\"}".to_vec(),
+            redaction_version: 1,
+            secrets_found: 0,
+            truncation: None,
+        };
+        assert_eq!(payload_field(&prepared), Some("{\"k\":\"v\"}".to_string()));
     }
 }

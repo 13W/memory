@@ -2123,6 +2123,7 @@ dependencies = [
  "casefold",
  "libc",
  "serde",
+ "serde_json",
  "toml",
  "unicode-normalization",
 ]

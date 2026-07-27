@@ -35,8 +35,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use local_rag_core::paths::{PathError, StoreLayout, ensure_dir, ensure_file_0600};
-
-use crate::frame::encode_segment_header;
+use local_rag_core::spool::encode_segment_header;
 
 /// Default rotation threshold: "8 MiB" (spec 07 §2 `[SPEC]`). Callers may
 /// inject a smaller value (e.g. in rotation tests) — see [`append_frame`].
@@ -90,7 +89,7 @@ impl From<PathError> for SpoolWriteError {
 }
 
 /// Durably append `frame_bytes` (a complete `len‖crc32c‖payload` frame, see
-/// [`crate::frame::encode_frame`]) to `session_id`'s current spool segment,
+/// [`local_rag_core::spool::encode_frame`]) to `session_id`'s current spool segment,
 /// rotating to a new one first if the current segment already exceeds
 /// `rotate_threshold_bytes`. A freshly created segment gets its 16-byte header
 /// written in the same locked write as the frame (one `write_all` + one
@@ -181,7 +180,7 @@ mod tests {
     fn first_write_creates_segment_one_with_header_and_frame() {
         let home = TempHome::new().expect("temp home");
         let l = layout(&home);
-        let frame = crate::frame::encode_frame_bytes(b"{}").unwrap();
+        let frame = local_rag_core::spool::encode_frame_bytes(b"{}").unwrap();
         append_frame(&l, "sess-1", &frame, DEFAULT_ROTATE_THRESHOLD_BYTES).unwrap();
 
         let seg_path = l.spool_session("sess-1").join("000001.seg");
@@ -194,8 +193,8 @@ mod tests {
     fn second_write_appends_to_the_same_segment_under_the_threshold() {
         let home = TempHome::new().expect("temp home");
         let l = layout(&home);
-        let frame_a = crate::frame::encode_frame_bytes(b"{\"a\":1}").unwrap();
-        let frame_b = crate::frame::encode_frame_bytes(b"{\"b\":2}").unwrap();
+        let frame_a = local_rag_core::spool::encode_frame_bytes(b"{\"a\":1}").unwrap();
+        let frame_b = local_rag_core::spool::encode_frame_bytes(b"{\"b\":2}").unwrap();
         append_frame(&l, "sess-1", &frame_a, DEFAULT_ROTATE_THRESHOLD_BYTES).unwrap();
         append_frame(&l, "sess-1", &frame_b, DEFAULT_ROTATE_THRESHOLD_BYTES).unwrap();
 

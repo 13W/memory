@@ -5,13 +5,19 @@
 //! Frame (repeated): len u32 LE | crc32c u32 LE | payload (len bytes, canonical JSON UTF-8)
 //! ```
 //!
-//! This module only **encodes** — the hook write path is the sole producer of
-//! these bytes. Decoding (a bounded streaming reader that stops at a torn
-//! tail) is a distinct design surface owned by T13-03 on the daemon side;
-//! building it here would preempt decisions (buffering, partial-read handling,
-//! format-version negotiation) that task should make. "Golden wire bytes"
-//! tests assert exact byte equality against hand-built expectations instead of
-//! round-tripping through a decoder.
+//! Shared between the hook write path (`local-rag-hook`, T13-02) and the
+//! daemon-side read path (`local-rag-store::spool`, T13-03) so both encode and
+//! decode against exactly one CRC algorithm and header/frame layout — the same
+//! "single shared component" posture this crate already takes for
+//! [`redaction::Scanner`] (reused by file classification, spool ingestion, and
+//! remote transmission) and [`identity::domain`]'s hashing. This module was
+//! originally built inside `local-rag-hook` (write-only, T13-02); T13-03
+//! relocated the wire-format primitives here — verbatim, no behavior change —
+//! specifically so the new decoder (daemon-side, `local-rag-store`) never
+//! risks drifting from the encoder on the CRC table or header/frame layout.
+//! `local-rag-hook` remains the sole owner of the higher-level write pipeline
+//! (redaction, identity computation, segment rotation/locking) that produces
+//! the bytes this module encodes.
 //!
 //! # `payload` is a JSON string, not a nested object
 //!
@@ -27,8 +33,6 @@
 //! `serde_json::to_vec` over a typed struct, regardless of what happened to
 //! the inner content. `[SPEC]` amendment to 07 §3's illustration.
 
-use crate::payload::PreparedPayload;
-
 /// Segment header magic (spec 07 §3).
 pub const MAGIC: [u8; 4] = *b"LRSP";
 /// Segment wire format version (spec 07 §3 `[SPEC]`).
@@ -36,7 +40,7 @@ pub const FORMAT_VERSION: u16 = 1;
 /// Segment header length in bytes (spec 07 §3).
 pub const HEADER_LEN: usize = 16;
 /// Frame cap: "larger frames are invalid by format" (spec 07 §2). Not reachable
-/// via the normal pipeline (256 KiB `PAYLOAD_CAP_BYTES`, T13-01, plus a few
+/// via the normal hook pipeline (256 KiB `PAYLOAD_CAP_BYTES`, T13-01, plus a few
 /// hundred bytes of envelope fields, is nowhere near 1 MiB) — this is an
 /// internal safety-net invariant, not a realistically-hit path.
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -48,6 +52,76 @@ pub fn encode_segment_header() -> [u8; HEADER_LEN] {
     buf[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     // buf[6..8] flags = 0, buf[8..16] reserved: already zeroed.
     buf
+}
+
+/// A decoded segment header (spec 07 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentHeader {
+    /// The wire format version this segment was written with.
+    pub version: u16,
+    /// Reserved flags bitfield — always `0` in `FORMAT_VERSION` 1.
+    pub flags: u16,
+}
+
+/// A failure decoding a segment header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderError {
+    /// Fewer than [`HEADER_LEN`] bytes were available.
+    Truncated,
+    /// The first 4 bytes are not [`MAGIC`].
+    BadMagic,
+    /// The header's `version` is newer than this build supports — a
+    /// "reportable incompatibility, not silent loss" (spec 11 §4): a newer
+    /// container format may have restructured the frame layout itself, so no
+    /// frame in this segment is attempted.
+    UnsupportedFormatVersion {
+        /// The version found in the header.
+        found: u16,
+        /// The newest version this build's decoder accepts (== [`FORMAT_VERSION`]).
+        max_supported: u16,
+    },
+}
+
+impl std::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeaderError::Truncated => {
+                write!(f, "segment header is truncated (< {HEADER_LEN} bytes)")
+            }
+            HeaderError::BadMagic => write!(f, "segment header magic does not match {MAGIC:?}"),
+            HeaderError::UnsupportedFormatVersion {
+                found,
+                max_supported,
+            } => write!(
+                f,
+                "segment format version {found} is newer than the {max_supported} this build supports"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HeaderError {}
+
+/// Decode and validate a segment header from the start of `bytes` (spec 07
+/// §3). The inverse of [`encode_segment_header`]; symmetric error handling —
+/// an unsupported (newer) version is a distinctly named variant, never folded
+/// into a generic corruption bucket.
+pub fn decode_segment_header(bytes: &[u8]) -> Result<SegmentHeader, HeaderError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(HeaderError::Truncated);
+    }
+    if bytes[0..4] != MAGIC {
+        return Err(HeaderError::BadMagic);
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version > FORMAT_VERSION {
+        return Err(HeaderError::UnsupportedFormatVersion {
+            found: version,
+            max_supported: FORMAT_VERSION,
+        });
+    }
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+    Ok(SegmentHeader { version, flags })
 }
 
 /// A failure building a frame.
@@ -75,11 +149,15 @@ impl std::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-/// One observation, ready to be embedded as a frame's payload bytes (spec 07
-/// §3's frame payload fields). Field order matches the spec's illustration —
-/// `serde_json`'s derived `Serialize` emits fields in declaration order, so
-/// that order is also the wire byte order ("golden wire bytes" pins this).
-#[derive(Debug, Clone, serde::Serialize)]
+/// One observation, as a frame's payload fields (spec 07 §3's frame payload
+/// fields). Field order matches the spec's illustration — `serde_json`'s
+/// derived `Serialize` emits fields in declaration order, so that order is
+/// also the wire byte order ("golden wire bytes" pins this). `Deserialize` is
+/// order-insensitive (only `Serialize`'s declared order is byte-stability
+/// sensitive) and rejects unknown fields, making strong typing the schema
+/// check for identity-critical fields — no bespoke per-field validation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FramePayload {
     pub format_version: u32,
     pub source_event_id: String,
@@ -107,23 +185,6 @@ pub struct FramePayload {
     /// group 14's (spec 12 §2's as-built note, confirmed again by T13-01's
     /// evidence), a distinct field from this group's 256 KiB payload cap.
     pub short_evidence_excerpt: Option<String>,
-}
-
-/// Fold a [`PreparedPayload`] into the frame's `payload` field (`None` for
-/// [`PreparedPayload::EnvelopeOnly`], a JSON string of the redacted bytes for
-/// [`PreparedPayload::Included`]).
-///
-/// `String::from_utf8_lossy` rather than a fallible `from_utf8` even though
-/// `prepare_payload` already guarantees valid UTF-8: this binary's mandate is
-/// "never panic", so a future regression upstream should degrade to
-/// lossy-but-safe output, not crash the hook.
-pub fn payload_field(prepared: &PreparedPayload) -> Option<String> {
-    match prepared {
-        PreparedPayload::EnvelopeOnly => None,
-        PreparedPayload::Included { bytes, .. } => {
-            Some(String::from_utf8_lossy(bytes).into_owned())
-        }
-    }
 }
 
 /// Encode `payload` to a `len ‖ crc32c ‖ payload` frame (spec 07 §3).
@@ -257,25 +318,8 @@ mod tests {
         assert!(encode_frame_bytes(&exact).is_ok());
     }
 
-    #[test]
-    fn payload_field_is_none_for_envelope_only() {
-        assert_eq!(payload_field(&PreparedPayload::EnvelopeOnly), None);
-    }
-
-    #[test]
-    fn payload_field_wraps_included_bytes_as_a_string() {
-        let prepared = PreparedPayload::Included {
-            bytes: b"{\"k\":\"v\"}".to_vec(),
-            redaction_version: 1,
-            secrets_found: 0,
-            truncation: None,
-        };
-        assert_eq!(payload_field(&prepared), Some("{\"k\":\"v\"}".to_string()));
-    }
-
-    #[test]
-    fn frame_payload_serializes_in_declared_field_order() {
-        let fp = FramePayload {
+    fn sample_payload() -> FramePayload {
+        FramePayload {
             format_version: 1,
             source_event_id: "pt:s:t:ok".to_string(),
             dedup_key: Some("pt:s:t:ok".to_string()),
@@ -292,11 +336,68 @@ mod tests {
             paths: vec!["src/a.ts".to_string()],
             payload: Some("{\"tool_output\":\"ok\"}".to_string()),
             short_evidence_excerpt: None,
-        };
+        }
+    }
+
+    #[test]
+    fn frame_payload_serializes_in_declared_field_order() {
+        let fp = sample_payload();
         let bytes = encode_frame(&fp).expect("under cap");
         // Payload begins after the 8-byte len/crc prefix.
         let json = std::str::from_utf8(&bytes[8..]).expect("utf-8");
         let expected = "{\"format_version\":1,\"source_event_id\":\"pt:s:t:ok\",\"dedup_key\":\"pt:s:t:ok\",\"event_type\":\"PostToolUse\",\"captured_at\":1700000000000,\"session_id\":\"s\",\"agent_id\":null,\"turn_id\":null,\"batch_id\":null,\"worktree_root\":\"/repo\",\"commit\":null,\"evidence_kind\":\"tool_result\",\"trust\":\"normal\",\"paths\":[\"src/a.ts\"],\"payload\":\"{\\\"tool_output\\\":\\\"ok\\\"}\",\"short_evidence_excerpt\":null}";
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn frame_payload_round_trips_through_serde() {
+        let fp = sample_payload();
+        let json = serde_json::to_vec(&fp).expect("serialize");
+        let decoded: FramePayload = serde_json::from_slice(&json).expect("deserialize");
+        assert_eq!(decoded, fp);
+    }
+
+    #[test]
+    fn decode_segment_header_accepts_current_version() {
+        let header = encode_segment_header();
+        let decoded = decode_segment_header(&header).expect("valid header");
+        assert_eq!(
+            decoded,
+            SegmentHeader {
+                version: FORMAT_VERSION,
+                flags: 0
+            }
+        );
+    }
+
+    #[test]
+    fn decode_segment_header_rejects_bad_magic() {
+        let mut header = encode_segment_header();
+        header[0] = b'X';
+        assert_eq!(decode_segment_header(&header), Err(HeaderError::BadMagic));
+    }
+
+    #[test]
+    fn decode_segment_header_rejects_truncated_header() {
+        let header = encode_segment_header();
+        assert_eq!(
+            decode_segment_header(&header[..HEADER_LEN - 1]),
+            Err(HeaderError::Truncated)
+        );
+        assert_eq!(decode_segment_header(&[]), Err(HeaderError::Truncated));
+    }
+
+    #[test]
+    fn decode_segment_header_reports_unsupported_newer_version() {
+        let mut header = encode_segment_header();
+        let newer = FORMAT_VERSION + 1;
+        header[4..6].copy_from_slice(&newer.to_le_bytes());
+        assert_eq!(
+            decode_segment_header(&header),
+            Err(HeaderError::UnsupportedFormatVersion {
+                found: newer,
+                max_supported: FORMAT_VERSION,
+            })
+        );
     }
 }

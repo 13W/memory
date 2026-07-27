@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use local_rag_core::paths::StoreLayout;
-use local_rag_hook::frame::encode_frame_bytes;
+use local_rag_core::spool::encode_frame_bytes;
 use local_rag_hook::segment::{DEFAULT_ROTATE_THRESHOLD_BYTES, append_frame};
 use local_rag_test_support::TempHome;
 
