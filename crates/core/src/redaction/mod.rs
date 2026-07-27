@@ -59,6 +59,24 @@ pub const ENTROPY_MIN_LEN: usize = 40;
 /// hex checksums are not flagged, while base64 key material (`≈5.5–6.0`) is.
 pub const ENTROPY_MIN_BITS: f64 = 4.5;
 
+/// The fixed marker substituted for every detected secret span by
+/// [`Scanner::redact`] (spec 07 §2, 12 §2). A single generic marker rather than
+/// one per [`FindingKind`]: the consumer already has `redaction_version` to
+/// audit which rule set produced a verdict, and a kind-specific marker would
+/// leak a hint about what was removed for no operational benefit.
+pub const REDACTION_MARKER: &str = "[REDACTED]";
+
+/// The result of applying [`Scanner::redact`] to a text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redacted {
+    /// `text` with every detected secret span replaced by [`REDACTION_MARKER`].
+    pub text: String,
+    /// How many (merged) secret spans were replaced. Two rules matching the
+    /// same span (e.g. `AssignedSecret` and `HighEntropy` on one value) count as
+    /// one finding here, since exactly one marker was inserted.
+    pub findings: usize,
+}
+
 /// What kind of secret a [`Finding`] identifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingKind {
@@ -141,6 +159,46 @@ impl Scanner {
         findings.sort_by_key(|f| f.start);
         findings
     }
+
+    /// Scan `text` and replace every detected secret span with
+    /// [`REDACTION_MARKER`] (spec 07 §2 "REDACTION" step; 12 §2).
+    ///
+    /// Overlapping or touching findings — e.g. a long assigned quoted value that
+    /// is *also* high-entropy (`token = "<48-char base64>"` matches both
+    /// [`FindingKind::AssignedSecret`] and [`FindingKind::HighEntropy`] on the
+    /// identical span) — are merged into one replaced range first, so the marker
+    /// is inserted exactly once per secret rather than doubled or corrupting
+    /// neighboring bytes. Merged ranges are then replaced in descending `start`
+    /// order so replacing one range never invalidates the (still-ascending, still
+    /// byte-valid) offsets of the ranges before it.
+    pub fn redact(&self, text: &str) -> Redacted {
+        let findings = self.scan(text);
+        let merged = merge_spans(&findings);
+        let mut out = text.to_string();
+        for &(start, end) in merged.iter().rev() {
+            out.replace_range(start..end, REDACTION_MARKER);
+        }
+        Redacted {
+            text: out,
+            findings: merged.len(),
+        }
+    }
+}
+
+/// Merge overlapping or touching ascending `[start, end)` spans (as returned by
+/// [`Scanner::scan`]) into disjoint ranges, so a caller replacing them never
+/// double-processes the same bytes.
+fn merge_spans(findings: &[Finding]) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for f in findings {
+        match merged.last_mut() {
+            Some((_, last_end)) if f.start <= *last_end => {
+                *last_end = (*last_end).max(f.end);
+            }
+            _ => merged.push((f.start, f.end)),
+        }
+    }
+    merged
 }
 
 impl Default for Scanner {
@@ -455,5 +513,65 @@ mod tests {
     fn entropy_of_uniform_alphabet_is_maximal() {
         // Two symbols, equal counts → 1 bit/char.
         assert!((shannon_entropy_bits("abab") - 1.0).abs() < 1e-9);
+    }
+
+    // ---- `Scanner::redact` (T13-01) -----------------------------------------
+
+    #[test]
+    fn redact_replaces_every_finding_with_the_marker() {
+        let s = Scanner::new();
+        let text = "line one\npassword = \"hunter2please\"\nAKIAIOSFODNN7EXAMPLE\nline four";
+        let out = s.redact(text);
+        assert_eq!(out.findings, 2);
+        assert!(!out.text.contains("hunter2please"));
+        assert!(!out.text.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(out.text.matches(REDACTION_MARKER).count(), 2);
+        // Unrelated surrounding text is untouched.
+        assert!(out.text.contains("line one"));
+        assert!(out.text.contains("line four"));
+        assert!(out.text.contains("password = \""));
+    }
+
+    #[test]
+    fn redact_leaves_clean_text_byte_identical() {
+        let s = Scanner::new();
+        let code = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let out = s.redact(code);
+        assert_eq!(out.findings, 0);
+        assert_eq!(out.text, code);
+    }
+
+    #[test]
+    fn redact_output_never_contains_the_original_secret_substrings() {
+        let s = Scanner::new();
+        let b64 = "aGVsbG9Xb3JsZERlYWRCZWVmQ2FmZUJhYmVMMzM3SHVudGVy";
+        let text = format!("key={b64}\nghp_012345678901234567890123456789012345\n");
+        let out = s.redact(&text);
+        assert!(!out.text.contains(b64));
+        assert!(
+            !out.text
+                .contains("ghp_012345678901234567890123456789012345")
+        );
+        assert!(out.findings >= 2);
+    }
+
+    #[test]
+    fn redact_merges_overlapping_findings_without_corruption() {
+        // A long, base64-looking assigned value matches BOTH the line-based
+        // `AssignedSecret` rule (quoted value after `token =`) and the
+        // token-based `HighEntropy` rule (>=40 chars, high entropy) on the
+        // identical span — a real, reachable overlap given the two rules run
+        // as separate passes over the same bytes.
+        let s = Scanner::new();
+        let secret = "aGVsbG9Xb3JsZERlYWRCZWVmQ2FmZUJhYmVMMzM3SHVudGVy";
+        assert!(secret.len() >= ENTROPY_MIN_LEN);
+        let text = format!("token = \"{secret}\"\nafter");
+        let out = s.redact(&text);
+        // Exactly one marker for the overlapping pair, not two, and no corruption.
+        assert_eq!(out.findings, 1);
+        assert_eq!(out.text.matches(REDACTION_MARKER).count(), 1);
+        assert!(!out.text.contains(secret));
+        assert!(out.text.starts_with("token = \""));
+        assert!(out.text.ends_with("\"\nafter"));
     }
 }

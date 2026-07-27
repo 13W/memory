@@ -218,6 +218,25 @@ impl Default for IndexConfig {
     }
 }
 
+/// `[spool]` section of `config.toml` (spec 02 §3.1, 12 §2).
+///
+/// A configurable deny-list: events whose path(s) or tool name match are
+/// captured **envelope-only** (identity + metadata, no payload) rather than
+/// being scanned/redacted (spec 12 §2 `[SPEC]`, T13-01). Empty by default —
+/// opt-in exclusion, no built-in entries — and global-only for v0: unlike
+/// `data_policy` (spec 02 §3.2), the spec does not ask for a per-repository
+/// override here, so `repo_settings` is not extended for this section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct SpoolConfig {
+    /// Denied path prefixes, matched component-wise against an observation's
+    /// normalized path(s) (`secrets` matches `secrets/api.key`, never
+    /// `not-secrets/x` — a directory-prefix match, not a substring match).
+    pub deny_paths: Vec<String>,
+    /// Denied tool names, matched by exact string equality.
+    pub deny_tools: Vec<String>,
+}
+
 /// The typed, validated global configuration (spec 02 §3.1).
 ///
 /// Build it with [`Config::load`] (from a resolved `<config_dir>`),
@@ -236,6 +255,8 @@ pub struct Config {
     pub models: ModelsConfig,
     /// `[index]` section.
     pub index: IndexConfig,
+    /// `[spool]` section.
+    pub spool: SpoolConfig,
 }
 
 impl Default for Config {
@@ -247,6 +268,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             models: ModelsConfig::default(),
             index: IndexConfig::default(),
+            spool: SpoolConfig::default(),
         }
     }
 }
@@ -298,6 +320,7 @@ impl Config {
                 data_policy,
             },
             index: raw.index,
+            spool: raw.spool,
         })
     }
 }
@@ -368,6 +391,7 @@ struct RawConfig {
     storage: StorageConfig,
     models: RawModels,
     index: IndexConfig,
+    spool: SpoolConfig,
 }
 
 impl Default for RawConfig {
@@ -378,6 +402,7 @@ impl Default for RawConfig {
             storage: StorageConfig::default(),
             models: RawModels::default(),
             index: IndexConfig::default(),
+            spool: SpoolConfig::default(),
         }
     }
 }
@@ -426,6 +451,10 @@ data_policy = \"local_only\"
 [index]
 languages = [\"typescript\", \"javascript\", \"rust\"]
 max_file_size_kb = 1024
+
+[spool]
+deny_paths = []
+deny_tools = []
 ";
 
     const ALL_POLICIES: [DataPolicy; 4] = [
@@ -553,5 +582,33 @@ max_file_size_kb = 1024
             config_toml_path(Path::new("/x/config")),
             PathBuf::from("/x/config/config.toml")
         );
+    }
+
+    // ---- `[spool]` section (T13-01) -----------------------------------------
+
+    #[test]
+    fn spool_config_defaults_to_empty_deny_lists() {
+        assert_eq!(SpoolConfig::default().deny_paths, Vec::<String>::new());
+        assert_eq!(SpoolConfig::default().deny_tools, Vec::<String>::new());
+        assert_eq!(Config::default().spool, SpoolConfig::default());
+    }
+
+    #[test]
+    fn missing_spool_section_defaults_to_empty() {
+        let cfg = Config::parse_toml("[models]\ndata_policy = \"local_only\"\n").unwrap();
+        assert_eq!(cfg.spool, SpoolConfig::default());
+    }
+
+    #[test]
+    fn spool_section_round_trips_populated_deny_lists() {
+        let cfg = Config::parse_toml(
+            "[spool]\ndeny_paths = [\"secrets\", \".env\"]\ndeny_tools = [\"Bash\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.spool.deny_paths, vec!["secrets", ".env"]);
+        assert_eq!(cfg.spool.deny_tools, vec!["Bash"]);
+        // Every other section still defaults.
+        assert_eq!(cfg.daemon, DaemonConfig::default());
+        assert_eq!(cfg.index, IndexConfig::default());
     }
 }

@@ -36,6 +36,20 @@ parse hook JSON (stdin)
 - Size caps `[FIXED caps exist, numbers [SPEC]]`: payload cap 256 KiB per event (truncated with
   hash + metadata per 12 §2), frame cap 1 MiB (larger frames are invalid by format).
 
+As-built note (T13-01, `[SPEC]`): the REDACTION step is
+`local_rag_hook::payload::prepare_payload` (`crates/local-rag-hook/src/payload.rs`), a pure,
+event-shape-agnostic transform over an already-extracted payload string/paths/tool-name (parsing
+the actual hook JSON into those fields is T13-02's). Order is **redact, then cap**: a secret
+sitting near the 256 KiB boundary must not survive by escaping redaction inside a half-truncated
+value. Deny-list exclusion (12 §2, `local_rag_core::config::SpoolConfig`) is checked **first** —
+a denied event's raw payload is never even scanned, so envelope-only really means no payload
+content ever reaches this module's output in any form, not merely a redacted-away one. The
+underlying scanner verdict is `local_rag_core::redaction::Scanner` (T03-02); this task adds the
+missing masking half, `Scanner::redact` (spec 12 §2's as-built note has the detail), reused
+verbatim rather than reshaped, so the flow this section names ("spool ingestion… reused") and
+group 16's future remote-transmission flow share byte-identical redaction behavior. `compute
+source identity` and `build frame` remain T13-02's, unstarted here.
+
 ## 3. Segment wire format `[SPEC]`
 
 ```
