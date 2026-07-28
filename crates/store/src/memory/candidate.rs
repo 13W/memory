@@ -214,6 +214,40 @@ pub fn insert_candidate_evidence(
     Ok(())
 }
 
+/// Every `observation_id` linked as provenance for `candidate_id`, ascending
+/// (spec 03 §2.5). [`super::review`]'s `approve_candidate` reads these back to
+/// derive the materializing op's evidence from each observation's own
+/// `evidence_kind`/`session_id` — "FK provenance, not embedded snapshots."
+pub fn candidate_evidence_for(
+    conn: &Connection,
+    candidate_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT observation_id FROM candidate_evidence \
+         WHERE candidate_id = ?1 ORDER BY observation_id",
+    )?;
+    let ids = stmt
+        .query_map(params![candidate_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+/// `(candidate_id, created_at)` for every `pending` candidate, ascending by
+/// `created_at` — the input `housekeeping::run_candidate_expiry_sweep` (spec
+/// 04 §6, `[SPEC]` default 30-day budget) sweeps over. Mirrors
+/// `observation::all_cursors`'s precedent: a plain full-scan reader feeding a
+/// sweep, not a per-candidate lookup.
+pub fn pending_candidate_ages(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT candidate_id, created_at FROM pending_memory_candidate \
+         WHERE review_state = 'pending' ORDER BY created_at",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

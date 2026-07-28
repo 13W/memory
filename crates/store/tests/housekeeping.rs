@@ -25,9 +25,10 @@ use local_rag_store::registry::{
     create_worktree, insert_projection_state, transition_worktree_state,
 };
 use local_rag_store::{
-    SHARD_DESTROY_GRACE_MS, SPOOL_SESSION_ABSENCE_MS, StateDb, import_session_tail,
-    run_expired_shard_sweep, run_orphan_shard_sweep, run_spool_session_sweep,
-    run_unreferenced_space_sweep,
+    CANDIDATE_EXPIRY_MS, CandidateState, NewCandidate, SHARD_DESTROY_GRACE_MS,
+    SPOOL_SESSION_ABSENCE_MS, StateDb, candidate_state, create_candidate, import_session_tail,
+    run_candidate_expiry_sweep, run_expired_shard_sweep, run_orphan_shard_sweep,
+    run_spool_session_sweep, run_unreferenced_space_sweep,
 };
 use local_rag_test_support::TempHome;
 
@@ -844,4 +845,124 @@ async fn a_session_never_imported_is_never_a_candidate() {
 
     assert!(report.is_empty());
     assert!(layout.spool_session(session).is_dir());
+}
+
+/// Seed a `pending_memory_candidate` row directly, born `pending` at
+/// `created_at` — the candidate-expiry sweep's own input.
+async fn pending_candidate(db: &StateDb, candidate_id: &str, created_at: i64) {
+    let id = candidate_id.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            create_candidate(
+                tx,
+                &NewCandidate {
+                    candidate_id: &id,
+                    proposed_operation: "{\"op\":\"resolve\",\"memory_id\":\"m\",\"expected_version\":1}",
+                    conflicts: None,
+                },
+                created_at,
+            )
+        })
+        .await
+        .expect("seed pending candidate")
+}
+
+/// A `pending` candidate past the 30-day expiry budget (spec 04 §6) is
+/// transitioned to `expired`.
+#[tokio::test]
+async fn candidate_past_expiry_budget_is_expired() {
+    let (_home, _layout, db) = open_state();
+    pending_candidate(&db, "cand-old", 1_000).await;
+
+    let now = 1_000 + CANDIDATE_EXPIRY_MS;
+    let report = run_candidate_expiry_sweep(&db, now, CANDIDATE_EXPIRY_MS, false)
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.expired, vec!["cand-old".to_string()]);
+    assert_eq!(report.retained, 0);
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "cand-old").expect("state"),
+        Some(CandidateState::Expired),
+    );
+}
+
+/// One millisecond short of the expiry budget, the candidate is retained.
+#[tokio::test]
+async fn candidate_just_short_of_expiry_budget_is_retained() {
+    let (_home, _layout, db) = open_state();
+    pending_candidate(&db, "cand-recent", 1_000).await;
+
+    let just_before = 1_000 + CANDIDATE_EXPIRY_MS - 1;
+    let report = run_candidate_expiry_sweep(&db, just_before, CANDIDATE_EXPIRY_MS, false)
+        .await
+        .expect("sweep");
+
+    assert!(report.is_empty(), "not due yet: {report:?}");
+    assert_eq!(report.retained, 1);
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "cand-recent").expect("state"),
+        Some(CandidateState::Pending),
+    );
+}
+
+/// A dry run reports what it would expire but transitions nothing; a
+/// repeated real run afterward is idempotent.
+#[tokio::test]
+async fn candidate_expiry_sweep_dry_run_then_idempotent_real_run() {
+    let (_home, _layout, db) = open_state();
+    pending_candidate(&db, "cand-old", 1_000).await;
+    let now = 1_000 + CANDIDATE_EXPIRY_MS;
+
+    let dry = run_candidate_expiry_sweep(&db, now, CANDIDATE_EXPIRY_MS, true)
+        .await
+        .expect("dry run");
+    assert!(dry.dry_run);
+    assert_eq!(dry.expired, vec!["cand-old".to_string()]);
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "cand-old").expect("state"),
+        Some(CandidateState::Pending),
+        "dry run must not transition",
+    );
+    drop(read);
+
+    let first = run_candidate_expiry_sweep(&db, now, CANDIDATE_EXPIRY_MS, false)
+        .await
+        .expect("first real run");
+    assert_eq!(first.expired, vec!["cand-old".to_string()]);
+
+    let second = run_candidate_expiry_sweep(&db, now, CANDIDATE_EXPIRY_MS, false)
+        .await
+        .expect("second real run");
+    assert!(second.is_empty(), "second sweep is a no-op: {second:?}");
+}
+
+/// A candidate already moved out of `pending` (approved here) is never a
+/// sweep candidate, however old its `created_at`.
+#[tokio::test]
+async fn non_pending_candidate_is_never_swept() {
+    let (_home, _layout, db) = open_state();
+    pending_candidate(&db, "cand-approved", 1_000).await;
+    db.writer()
+        .transaction(|tx| {
+            local_rag_store::transition_candidate(tx, "cand-approved", CandidateState::Approved)
+        })
+        .await
+        .expect("transition tx")
+        .expect("legal transition");
+
+    let now = 1_000 + CANDIDATE_EXPIRY_MS;
+    let report = run_candidate_expiry_sweep(&db, now, CANDIDATE_EXPIRY_MS, false)
+        .await
+        .expect("sweep");
+
+    assert!(report.is_empty());
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "cand-approved").expect("state"),
+        Some(CandidateState::Approved),
+    );
 }

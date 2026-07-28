@@ -80,6 +80,7 @@ use std::path::Path;
 
 use local_rag_core::paths::StoreLayout;
 
+use crate::memory::{CandidateState, pending_candidate_ages, transition_candidate};
 use crate::observation::{all_cursors, delete_cursor};
 use crate::registry::{
     WorktreeState, WorktreeStateClock, all_worktree_ids, referenced_model_space_ids,
@@ -129,8 +130,9 @@ pub enum HousekeepingError {
     Sqlite(rusqlite::Error),
     /// A filesystem operation (enumerate or remove) failed.
     Io(io::Error),
-    /// Deleting a swept session's cursor row failed (rolled back; the store is
-    /// unchanged for that session — [`run_spool_session_sweep`] only).
+    /// A swept row's state-transition write failed (rolled back; the store is
+    /// unchanged for that row — [`run_spool_session_sweep`] and
+    /// [`run_candidate_expiry_sweep`] only).
     Write(WriteError),
 }
 
@@ -632,6 +634,97 @@ pub async fn run_spool_session_sweep(
     removed.sort();
     Ok(SpoolSessionSweepReport {
         removed,
+        retained,
+        dry_run,
+    })
+}
+
+/// How long a `pending_memory_candidate` may go without a review action
+/// before it is eligible for expiry (spec 04 §6 `[SPEC: 30 days]`), in
+/// milliseconds. See [`candidate_expiry_due`].
+pub const CANDIDATE_EXPIRY_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// The outcome of a candidate expiry sweep (spec 04 §6, T14-05) — the
+/// candidate ids a real sweep transitioned to `expired` (or those a dry run
+/// **would** transition).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CandidateExpirySweepReport {
+    /// `pending_memory_candidate.candidate_id`s transitioned to `expired` (or,
+    /// for a dry run, that would be), sorted for determinism.
+    pub expired: Vec<String>,
+    /// Still-`pending` candidates left in place (not yet past `expiry_ms`).
+    pub retained: u64,
+    /// Whether this was a dry run (nothing was actually transitioned).
+    pub dry_run: bool,
+}
+
+impl CandidateExpirySweepReport {
+    /// Whether the sweep expired (or would expire) nothing.
+    pub fn is_empty(&self) -> bool {
+        self.expired.is_empty()
+    }
+}
+
+/// Whether a `pending` candidate has gone `expiry_ms` since `created_at`
+/// without a review action (spec 04 §6 `[SPEC: 30 days]`). Pure, mirroring
+/// [`session_gc_due`]'s shape exactly — there is no separate "last touched"
+/// column on `pending_memory_candidate` (spec 03 §2.5), so `created_at` is
+/// the only staleness signal a `pending` row carries.
+pub fn candidate_expiry_due(now_ms: i64, expiry_ms: i64, created_at: i64) -> bool {
+    now_ms.saturating_sub(created_at) >= expiry_ms
+}
+
+/// Transition every `pending` candidate older than `expiry_ms` to `expired`
+/// (spec 04 §6). Async and DB-only, mirroring [`run_spool_session_sweep`]'s
+/// shape minus its filesystem component — candidate expiry never touches
+/// `StoreLayout`.
+///
+/// A candidate a concurrent [`crate::memory::approve_candidate`] or
+/// [`crate::memory::reject_candidate`] moved out of `pending` between this
+/// sweep's read pass and its own write attempt is retained, not treated as a
+/// sweep failure: [`crate::memory::transition_candidate`]'s domain rejection
+/// for that row is swallowed, matching the read-then-write race every other
+/// sweep in this module already accepts.
+pub async fn run_candidate_expiry_sweep(
+    db: &StateDb,
+    now_ms: i64,
+    expiry_ms: i64,
+    dry_run: bool,
+) -> Result<CandidateExpirySweepReport, HousekeepingError> {
+    let candidates = {
+        let conn = db.open_read().map_err(HousekeepingError::Open)?;
+        pending_candidate_ages(&conn).map_err(HousekeepingError::Sqlite)?
+    };
+
+    let mut expired = Vec::new();
+    let mut retained: u64 = 0;
+
+    for (candidate_id, created_at) in candidates {
+        if !candidate_expiry_due(now_ms, expiry_ms, created_at) {
+            retained += 1;
+            continue;
+        }
+
+        if !dry_run {
+            let outcome = db
+                .writer()
+                .transaction({
+                    let candidate_id = candidate_id.clone();
+                    move |tx| transition_candidate(tx, &candidate_id, CandidateState::Expired)
+                })
+                .await
+                .map_err(HousekeepingError::Write)?;
+            if outcome.is_err() {
+                retained += 1;
+                continue;
+            }
+        }
+        expired.push(candidate_id);
+    }
+
+    expired.sort();
+    Ok(CandidateExpirySweepReport {
+        expired,
         retained,
         dry_run,
     })

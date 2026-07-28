@@ -200,6 +200,48 @@ pending ──▶ approved (materializes its proposed_operation as a normal memo
 Approval executes the proposed operation through the same transactional memory-op path as the
 router (same audit, same idempotency), with `actor='user'`.
 
+As-built note (T14-05, `[SPEC]`): `pending_memory_candidate.proposed_operation` (03 §2.5's "JSON:
+op + target + text + …") is a tagged JSON enum, `local_rag_store::memory::ProposedOperation`
+(`#[serde(tag = "op", rename_all = "snake_case")]`), restricted to the five router ops that are
+ever *materializable* — `create`/`reinforce`/`resolve`/`retract`/`supersede`. `noop` (08 §4) writes
+nothing and `propose_candidate` cannot nest itself, so neither is ever a proposal shape; `edit`/
+`merge` are direct review-tool ops (08 §5, 11 §2's table), never candidate-proposed. `kind`/
+`scope_kind` travel as plain strings inside the JSON, parsed via the existing
+`MemoryKind::from_db`/`ScopeKind::from_db` at `approve_candidate` time — deliberately not adding
+`serde` derives to those T14-01 types. `memory_id`(s) are minted by the proposer and embedded in
+the payload at propose time, the same "caller mints the id, never inside the write path"
+discipline every other memory op already follows.
+
+`approve_candidate` derives the materializing op's evidence from `candidate_evidence`'s FK to
+`observation_envelope` rather than storing it a second time: `candidate_evidence` carries no
+`evidence_kind`/`session_id` of its own (unlike `memory_evidence`), so each linked observation's
+own `evidence_kind`/`session_id` (already durable from T13-04) becomes that observation's
+`EvidenceInput` — the same "FK provenance, not embedded snapshots" principle 03 §2.5 states for
+`candidate_evidence` generalized to what it feeds.
+
+An already-`approved` candidate short-circuits `approve_candidate` to `AlreadyApproved` before any
+JSON parsing or op-engine call — the state machine's own self-transition-is-legal convention is
+the primary double-approval guarantee, cheaper than a `find_by_idempotency_key` round-trip. As
+defense-in-depth for a crash mid-transaction, the dispatched op still carries a deterministic
+`idempotency_key` (`"candidate:<candidate_id>"`), so a retry that reaches the op-engine layer
+resolves through 08 §3's replay mechanism regardless. `reject`/`expire` on an already-terminal
+candidate stay ordinary illegal-transition rejections; only `approve → approve` gets this
+treatment, since it is the only case 04 §6's card names.
+
+`pending_memory_candidate` carries no `entry_version`/`updated_at` (unlike `memory_entry`), and 11
+§2's own `edit_memory_candidate(id, patch)` signature (contrast `edit_memory(id, patch,
+expected_version)`) confirms this is intentional. `edit_candidate`'s "conflicting edit" check is
+therefore state-based, not version-based: legal only while `review_state = 'pending'`; editing an
+already-approved/rejected/expired candidate is rejected with no mutation.
+
+Expiry (this section's `[SPEC]` default 30 days) is a batch sweep,
+`local_rag_store::housekeeping::run_candidate_expiry_sweep` (`CANDIDATE_EXPIRY_MS`), mirroring
+this crate's other GC-style sweeps (07 §6's spool session GC, 05 §8's shard sweeps) rather than
+living per-domain — the first sweep in that module with no filesystem component, since a stale
+`pending` row is pure DB state. It tolerates, as a retained row rather than a sweep failure, a
+candidate a concurrent `approve`/`reject` already moved out of `pending` between the sweep's read
+pass and its own write attempt.
+
 ## 7. Worktree
 
 ```
