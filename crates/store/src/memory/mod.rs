@@ -46,7 +46,12 @@
 //! transitions, spec 04 §5), [`op::apply_supersede`] (the promotion op —
 //! create a new entry, retire the old one, one transaction; see D-020 below),
 //! and [`op::apply_edit`] (the one op allowed to change `text`).
-//! `merge_memories` (T14-04) is a later task built on the same primitives.
+//!
+//! T14-04 adds [`op::apply_merge`]: a survivor absorbs evidence from N ≥ 1
+//! losers, each of which transitions to `superseded` with `supersedes_id`
+//! pointing at the survivor — the first op setting that column on an
+//! already-existing row rather than at `INSERT` time. See [`op`]'s own
+//! module doc for the duplicate-evidence and scope-compatibility decisions.
 //!
 //! **D-020** (found while planning T14-03, `[SPEC]`): spec 04 §5's own prose
 //! narrates promotion acting on an *already-confirmed* hypothesis, but
@@ -83,8 +88,9 @@ pub use entry::{
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};
 pub use op::{
     CreateMemoryOp, EditMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome, MemoryOpResult,
-    ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp, SupersedeMemoryOp, apply_create,
-    apply_edit, apply_noop, apply_reinforce, apply_resolve, apply_retract, apply_supersede,
+    MergeLoser, MergeMemoryOp, ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp,
+    SupersedeMemoryOp, apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce,
+    apply_resolve, apply_retract, apply_supersede,
 };
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the

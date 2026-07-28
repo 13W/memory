@@ -20,10 +20,10 @@ use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
     Actor, CreateMemoryOp, EditMemoryOp, EvidenceInput, IllegalMemoryTransition, MemoryOpError,
-    MemoryOpOutcome, ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp, ScopeKind,
-    SupersedeMemoryOp, apply_create, apply_edit, apply_noop, apply_reinforce, apply_resolve,
-    apply_retract, apply_supersede, memory_entry_state, memory_evidence_for,
-    read_audit_events_for_entity,
+    MemoryOpOutcome, MergeLoser, MergeMemoryOp, ReinforceMemoryOp, ResolveMemoryOp,
+    RetractMemoryOp, ScopeKind, SupersedeMemoryOp, apply_create, apply_edit, apply_merge,
+    apply_noop, apply_reinforce, apply_resolve, apply_retract, apply_supersede, memory_entry_state,
+    memory_evidence_for, read_audit_events_for_entity,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{MemoryKind, MemoryState, StateDb};
@@ -314,6 +314,40 @@ async fn edit(
         })
         .await
         .expect("edit tx (infrastructure)")
+}
+
+async fn merge(
+    db: &StateDb,
+    survivor_id: &str,
+    survivor_expected_version: i64,
+    losers: Vec<(String, i64)>,
+    actor: Actor,
+    idempotency_key: Option<&str>,
+) -> Result<MemoryOpOutcome, MemoryOpError> {
+    let (survivor, idem) = (survivor_id.to_string(), idempotency_key.map(str::to_string));
+    db.writer()
+        .transaction(move |tx| {
+            let loser_refs: Vec<MergeLoser<'_>> = losers
+                .iter()
+                .map(|(id, version)| MergeLoser {
+                    memory_id: id,
+                    expected_version: *version,
+                })
+                .collect();
+            apply_merge(
+                tx,
+                &MergeMemoryOp {
+                    survivor_id: &survivor,
+                    survivor_expected_version,
+                    losers: &loser_refs,
+                    actor,
+                    idempotency_key: idem.as_deref(),
+                },
+                6000,
+            )
+        })
+        .await
+        .expect("merge tx (infrastructure)")
 }
 
 fn read_importance(conn: &Connection, memory_id: &str) -> f64 {
@@ -1367,6 +1401,541 @@ async fn same_idempotency_key_replays_the_original_edit_result() {
 
     let read = db.open_read().expect("read conn");
     assert_eq!(read_text(&read, &id), "first edit");
+}
+
+// ---------------------------------------------------------------------------
+// merge: survivor absorbs evidence, losers superseded, audit records the set
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn merge_contract_absorbs_evidence_and_supersedes_losers() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(170);
+    let survivor = uuid(171);
+    let loser1 = uuid(172);
+    let loser2 = uuid(173);
+    let obs1 = seed_observation(&db, 174).await;
+    let obs2 = seed_observation(&db, 175).await;
+
+    create(&db, &survivor, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create survivor");
+    create(
+        &db,
+        &loser1,
+        MemoryKind::Fact,
+        &owner,
+        None,
+        vec![(obs1.clone(), "sess-1")],
+        None,
+    )
+    .await
+    .expect("create loser1");
+    create(
+        &db,
+        &loser2,
+        MemoryKind::Decision,
+        &owner,
+        None,
+        vec![(obs2.clone(), "sess-1")],
+        None,
+    )
+    .await
+    .expect("create loser2");
+
+    let outcome = merge(
+        &db,
+        &survivor,
+        1,
+        vec![(loser1.clone(), 1), (loser2.clone(), 1)],
+        Actor::Router,
+        None,
+    )
+    .await
+    .expect("merge applies");
+    let MemoryOpOutcome::Applied(result) = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(result.memory_id, survivor);
+    assert_eq!(
+        result.entry_version, 2,
+        "survivor absorbing evidence is a real mutation"
+    );
+
+    let read = db.open_read().expect("read conn");
+    // Survivor absorbed both losers' evidence.
+    let mut survivor_evidence = memory_evidence_for(&read, &survivor).expect("evidence");
+    survivor_evidence.sort();
+    let mut expected = vec![obs1.clone(), obs2.clone()];
+    expected.sort();
+    assert_eq!(survivor_evidence, expected);
+
+    // Both losers are superseded, pointing back at the survivor.
+    for loser in [&loser1, &loser2] {
+        assert!(
+            memory_evidence_for(&read, loser)
+                .expect("evidence")
+                .is_empty(),
+            "evidence moved off the loser"
+        );
+        assert_eq!(read_supersedes_id(&read, loser), Some(survivor.clone()));
+    }
+    assert_eq!(
+        memory_entry_state(&read, &loser1).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Superseded)),
+    );
+    assert_eq!(
+        memory_entry_state(&read, &loser2).expect("state"),
+        Some((MemoryKind::Decision, MemoryState::Superseded)),
+    );
+
+    // Audit: 1 create each (3) + 1 merge each (3) = 6 total across the set;
+    // only the survivor's merge row carries the payload.
+    let survivor_audit =
+        read_audit_events_for_entity(&read, "memory_entry", &survivor).expect("audit");
+    assert_eq!(survivor_audit.len(), 2);
+    assert_eq!(survivor_audit[1].op, "merge");
+    assert_eq!(survivor_audit[1].entity_version, 2);
+    assert_eq!(survivor_audit[1].audit_id, result.audit_id);
+    let payload = survivor_audit[1].payload.as_deref().expect("merge payload");
+    let merged: Vec<String> = serde_json::from_str(payload).expect("payload is a JSON array");
+    let mut merged_sorted = merged.clone();
+    merged_sorted.sort();
+    let mut losers_sorted = vec![loser1.clone(), loser2.clone()];
+    losers_sorted.sort();
+    assert_eq!(
+        merged_sorted, losers_sorted,
+        "audit records the exact merge set"
+    );
+
+    for loser in [&loser1, &loser2] {
+        let loser_audit =
+            read_audit_events_for_entity(&read, "memory_entry", loser).expect("audit");
+        assert_eq!(loser_audit.len(), 2, "create + merge");
+        assert_eq!(loser_audit[1].op, "merge");
+        assert_eq!(
+            loser_audit[1].idempotency_key, None,
+            "only the survivor's row carries it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn merge_duplicate_evidence_is_not_duplicated_and_stays_with_loser() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(176);
+    let survivor = uuid(177);
+    let loser = uuid(178);
+    let shared_obs = seed_observation(&db, 179).await;
+
+    create(
+        &db,
+        &survivor,
+        MemoryKind::Fact,
+        &owner,
+        None,
+        vec![(shared_obs.clone(), "sess-1")],
+        None,
+    )
+    .await
+    .expect("create survivor");
+    create(
+        &db,
+        &loser,
+        MemoryKind::Fact,
+        &owner,
+        None,
+        vec![(shared_obs.clone(), "sess-2")],
+        None,
+    )
+    .await
+    .expect("create loser");
+
+    merge(
+        &db,
+        &survivor,
+        1,
+        vec![(loser.clone(), 1)],
+        Actor::Router,
+        None,
+    )
+    .await
+    .expect("merge applies");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_evidence_for(&read, &survivor).expect("evidence"),
+        vec![shared_obs.clone()],
+        "still exactly one row for the shared observation, not two"
+    );
+    assert_eq!(
+        memory_evidence_for(&read, &loser).expect("evidence"),
+        vec![shared_obs],
+        "the duplicate stays attached to the (superseded) loser rather than erroring"
+    );
+}
+
+#[tokio::test]
+async fn merge_incompatible_scope_is_typed_error_and_rolls_back() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner_a = uuid(180);
+    let owner_b = uuid(181);
+    let survivor = uuid(182);
+    let loser = uuid(183);
+    create(
+        &db,
+        &survivor,
+        MemoryKind::Fact,
+        &owner_a,
+        None,
+        vec![],
+        None,
+    )
+    .await
+    .expect("create survivor");
+    create(&db, &loser, MemoryKind::Fact, &owner_b, None, vec![], None)
+        .await
+        .expect("create loser");
+
+    let result = merge(
+        &db,
+        &survivor,
+        1,
+        vec![(loser.clone(), 1)],
+        Actor::Router,
+        None,
+    )
+    .await
+    .expect_err("incompatible scope rejected");
+    assert_eq!(result, MemoryOpError::IncompatibleScope);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &loser).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+        "loser unchanged"
+    );
+    assert_eq!(
+        read_audit_events_for_entity(&read, "memory_entry", &survivor)
+            .expect("audit")
+            .len(),
+        1,
+        "no new audit row on the survivor"
+    );
+}
+
+#[tokio::test]
+async fn merge_illegal_for_task_loser_is_typed_error_and_rolls_back() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(184);
+    let survivor = uuid(185);
+    let loser = uuid(186);
+    create(&db, &survivor, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create survivor");
+    create(&db, &loser, MemoryKind::Task, &owner, None, vec![], None)
+        .await
+        .expect("create loser");
+
+    let result = merge(
+        &db,
+        &survivor,
+        1,
+        vec![(loser.clone(), 1)],
+        Actor::Router,
+        None,
+    )
+    .await
+    .expect_err("task loser cannot be superseded");
+    assert_eq!(
+        result,
+        MemoryOpError::IllegalTransition(IllegalMemoryTransition {
+            kind: MemoryKind::Task,
+            from: MemoryState::Active,
+            to: MemoryState::Superseded,
+        })
+    );
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &loser).expect("state"),
+        Some((MemoryKind::Task, MemoryState::Active)),
+    );
+}
+
+#[tokio::test]
+async fn merge_empty_losers_is_typed_error() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(187);
+    let survivor = uuid(188);
+    create(&db, &survivor, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create survivor");
+
+    let result = merge(&db, &survivor, 1, vec![], Actor::Router, None)
+        .await
+        .expect_err("empty losers rejected");
+    assert_eq!(result, MemoryOpError::EmptyMergeSet);
+}
+
+#[tokio::test]
+async fn merge_survivor_optimistic_conflict_is_typed_error_and_rolls_back() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(189);
+    let survivor = uuid(190);
+    let loser = uuid(191);
+    create(&db, &survivor, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create survivor");
+    create(&db, &loser, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create loser");
+
+    let result = merge(
+        &db,
+        &survivor,
+        99,
+        vec![(loser.clone(), 1)],
+        Actor::Router,
+        None,
+    )
+    .await
+    .expect_err("stale survivor expected_version rejected");
+    assert_eq!(
+        result,
+        MemoryOpError::OptimisticConflict {
+            expected: 99,
+            actual: 1
+        }
+    );
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &loser).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+        "loser untouched when the survivor precondition fails first"
+    );
+}
+
+#[tokio::test]
+async fn merge_loser_optimistic_conflict_is_typed_error_and_rolls_back() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(192);
+    let survivor = uuid(193);
+    let good_loser = uuid(194);
+    let bad_loser = uuid(195);
+    create(&db, &survivor, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create survivor");
+    create(
+        &db,
+        &good_loser,
+        MemoryKind::Fact,
+        &owner,
+        None,
+        vec![],
+        None,
+    )
+    .await
+    .expect("create good_loser");
+    create(
+        &db,
+        &bad_loser,
+        MemoryKind::Fact,
+        &owner,
+        None,
+        vec![],
+        None,
+    )
+    .await
+    .expect("create bad_loser");
+
+    let result = merge(
+        &db,
+        &survivor,
+        1,
+        vec![(good_loser.clone(), 1), (bad_loser.clone(), 99)],
+        Actor::Router,
+        None,
+    )
+    .await
+    .expect_err("stale loser expected_version rejected");
+    assert_eq!(
+        result,
+        MemoryOpError::OptimisticConflict {
+            expected: 99,
+            actual: 1
+        }
+    );
+
+    let read = db.open_read().expect("read conn");
+    // Pre-validate-all-then-mutate: the valid `good_loser` must NOT have been
+    // touched just because a later loser in the same request failed.
+    assert_eq!(
+        memory_entry_state(&read, &good_loser).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+        "good_loser untouched"
+    );
+    assert_eq!(
+        memory_entry_state(&read, &survivor).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+    );
+    assert_eq!(
+        read_audit_events_for_entity(&read, "memory_entry", &survivor)
+            .expect("audit")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn same_idempotency_key_replays_the_original_merge_result() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(196);
+    let survivor = uuid(197);
+    let loser = uuid(198);
+    create(&db, &survivor, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create survivor");
+    create(&db, &loser, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create loser");
+
+    let first = merge(
+        &db,
+        &survivor,
+        1,
+        vec![(loser.clone(), 1)],
+        Actor::Router,
+        Some("idem-merge-1"),
+    )
+    .await
+    .expect("first merge applies");
+    let MemoryOpOutcome::Applied(first_result) = first else {
+        panic!("expected Applied, got {first:?}");
+    };
+
+    // Same key, a different (never-created) bogus loser — the replay
+    // short-circuits before any precondition on it runs.
+    let bogus_loser = uuid(199);
+    let second = merge(
+        &db,
+        &survivor,
+        99,
+        vec![(bogus_loser.clone(), 1)],
+        Actor::Router,
+        Some("idem-merge-1"),
+    )
+    .await
+    .expect("replay applies");
+    let MemoryOpOutcome::Replayed(second_result) = second else {
+        panic!("expected Replayed, got {second:?}");
+    };
+    assert_eq!(second_result, first_result);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &bogus_loser).expect("state"),
+        None,
+        "the replay never touched the bogus loser"
+    );
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn merge_rolls_back_completely_on_failpoint() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(200);
+    let survivor = uuid(201);
+    let loser = uuid(202);
+    let obs = seed_observation(&db, 203).await;
+    create(&db, &survivor, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create survivor");
+    create(
+        &db,
+        &loser,
+        MemoryKind::Fact,
+        &owner,
+        None,
+        vec![(obs.clone(), "sess-1")],
+        None,
+    )
+    .await
+    .expect("create loser");
+
+    arm("memory.op.merge.before_survivor_audit");
+    let (survivor_arg, loser_id) = (survivor.clone(), loser.clone());
+    let result = db
+        .writer()
+        .transaction(move |tx| {
+            apply_merge(
+                tx,
+                &MergeMemoryOp {
+                    survivor_id: &survivor_arg,
+                    survivor_expected_version: 1,
+                    losers: &[MergeLoser {
+                        memory_id: &loser_id,
+                        expected_version: 1,
+                    }],
+                    actor: Actor::Router,
+                    idempotency_key: None,
+                },
+                6000,
+            )
+        })
+        .await;
+    assert!(
+        matches!(result, Err(local_rag_store::WriteError::Sqlite(_))),
+        "the failpoint must fail the call: {result:?}"
+    );
+    disarm("memory.op.merge.before_survivor_audit");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &loser).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+        "no loser transition survives a failure before the survivor's final audit insert"
+    );
+    assert_eq!(
+        memory_evidence_for(&read, &survivor).expect("evidence"),
+        Vec::<String>::new(),
+        "no evidence was absorbed"
+    );
+    assert_eq!(
+        read_audit_events_for_entity(&read, "memory_entry", &survivor)
+            .expect("audit")
+            .len(),
+        1,
+        "no merge audit row on the survivor"
+    );
+    drop(read);
+
+    // Retrying with the failpoint disarmed converges cleanly.
+    merge(
+        &db,
+        &survivor,
+        1,
+        vec![(loser.clone(), 1)],
+        Actor::Router,
+        None,
+    )
+    .await
+    .expect("retry applies");
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &loser).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Superseded)),
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -275,6 +275,21 @@
 //! `active → superseded`; `confirmed → superseded` is now legal too (see
 //! `memory::MemoryState::check_transition`'s doc for the full rationale).
 //!
+//! T14-04 adds [`memory::apply_merge`]: a survivor absorbs evidence from N ≥
+//! 1 losers, each transitioning to `superseded` with `supersedes_id` pointing
+//! at the survivor (the first op setting that column on an already-existing
+//! row, not just at `INSERT` time) — every precondition (both
+//! `expected_version`s, scope compatibility via the new
+//! [`MemoryOpError::IncompatibleScope`], each loser's kind/state guard)
+//! checked before any write. A loser's evidence for an `observation_id` the
+//! survivor already has is left attached to the (superseded) loser rather
+//! than erroring or duplicating, computed with a plain `HashSet` rather than
+//! a self-referential SQL subquery on `memory_evidence`. The response
+//! describes the survivor only; only its `audit_event` carries the caller's
+//! `idempotency_key` and a `serde_json`-encoded array of the merged loser
+//! ids (`serde_json` already in `crates/store`'s graph via `registry::
+//! representation::Coverage`, T11-01).
+//!
 //! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
 //! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
 //! [`spool::decode_segment`] validates the 16-byte header
@@ -362,15 +377,15 @@ pub use memory::{
     Actor, AuditEventRow, CandidateState, CandidateTransitionError, CreateMemoryEntryError,
     CreateMemoryOp, EditMemoryOp, EvidenceInput, GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition,
     IllegalMemoryTransition, IllegalRunTransition, MemoryKind, MemoryOpError, MemoryOpOutcome,
-    MemoryOpResult, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
-    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, ReinforceMemoryOp, ResolveMemoryOp,
-    RetractMemoryOp, RunState, RunTransitionError, ScopeKind, SupersedeMemoryOp, apply_create,
-    apply_edit, apply_noop, apply_reinforce, apply_resolve, apply_retract, apply_supersede,
-    candidate_state, consolidation_run_state, create_candidate, create_consolidation_run,
-    create_memory_entry, find_by_idempotency_key, insert_audit_event, insert_candidate_evidence,
-    insert_memory_evidence, memory_entry_state, memory_evidence_for, processing_cursor,
-    read_audit_events_for_entity, transition_candidate, transition_memory_entry, transition_run,
-    upsert_processing_cursor,
+    MemoryOpResult, MemoryState, MemoryTransitionError, MergeLoser, MergeMemoryOp, NewAuditEvent,
+    NewCandidate, NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, ReinforceMemoryOp,
+    ResolveMemoryOp, RetractMemoryOp, RunState, RunTransitionError, ScopeKind, SupersedeMemoryOp,
+    apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce, apply_resolve,
+    apply_retract, apply_supersede, candidate_state, consolidation_run_state, create_candidate,
+    create_consolidation_run, create_memory_entry, find_by_idempotency_key, insert_audit_event,
+    insert_candidate_evidence, insert_memory_evidence, memory_entry_state, memory_evidence_for,
+    processing_cursor, read_audit_events_for_entity, transition_candidate, transition_memory_entry,
+    transition_run, upsert_processing_cursor,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{

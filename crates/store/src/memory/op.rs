@@ -1,8 +1,7 @@
 //! The shared transactional memory-op engine (spec 08 §3): `create`,
-//! `reinforce`, `noop` (T14-02), plus `resolve`/`supersede`/`retract`/`edit`
-//! (T14-03) — the atomic mutation+evidence+audit+idempotency contract every
-//! memory operation follows. `merge_memories` (T14-04) composes the same
-//! primitives this module establishes; this module does not implement it.
+//! `reinforce`, `noop` (T14-02); `resolve`/`supersede`/`retract`/`edit`
+//! (T14-03); `merge` (T14-04) — the atomic mutation+evidence+audit+idempotency
+//! contract every memory operation follows.
 //!
 //! Mirrors [`crate::observation::import::import_batch`]'s shape: each `apply_*`
 //! is a **sync** `fn(&Transaction<'_>, ...)` that composes several sibling
@@ -45,6 +44,26 @@
 //! that owns "kind/state guards" generally; nothing in spec 08 §3 forces this
 //! specific rule, so it is an as-built decision (see spec 08 §3's own note).
 //!
+//! # `merge` (T14-04)
+//!
+//! `apply_merge` is the only op mutating more than two rows: the survivor
+//! absorbs evidence from every loser, then each loser transitions to
+//! `superseded` with `supersedes_id` set to the survivor — the first place
+//! this column is set on an *already-existing* row rather than at `INSERT`
+//! time. Every precondition (both `expected_version`s, scope compatibility,
+//! each loser's kind/state guard) is checked before any write, mirroring
+//! `apply_supersede`'s shape. A loser's evidence for an `observation_id` the
+//! survivor already has is left attached to the (superseded, still-existing)
+//! loser rather than erroring or duplicating — computed via a plain Rust
+//! `HashSet`, not a self-referential SQL subquery on `memory_evidence` (SQLite
+//! gives no snapshot guarantee for a subquery reading the same table an
+//! `UPDATE` in the same statement writes). The response describes the
+//! **survivor** only (mirrors `apply_supersede`'s "new entry is the headline
+//! result"); only the survivor's `audit_event` carries the caller's
+//! `idempotency_key` and the merge-set payload (`serde_json`-encoded array of
+//! loser ids — already a `crates/store` dependency via `registry::
+//! representation::Coverage`, T11-01).
+//!
 //! # Idempotency (spec 08 §3: "same `idempotency_key` ⇒ recognized as already
 //! applied, returns the original result")
 //!
@@ -72,6 +91,8 @@
 //! were a duplicate. [`apply_noop`] sidesteps this by writing nothing at all:
 //! redoing nothing on retry is still nothing, so it needs no
 //! `idempotency_key` bookkeeping either.
+
+use std::collections::HashSet;
 
 use rusqlite::types::Type;
 use rusqlite::{Error, OptionalExtension, Transaction, params};
@@ -199,6 +220,25 @@ pub struct EditMemoryOp<'a> {
     pub idempotency_key: Option<&'a str>,
 }
 
+/// One entry to merge into a `merge`'s survivor (spec 08 §3).
+#[derive(Debug, Clone, Copy)]
+pub struct MergeLoser<'a> {
+    pub memory_id: &'a str,
+    pub expected_version: i64,
+}
+
+/// A `merge` request: `survivor` absorbs evidence from every entry in
+/// `losers`, each of which transitions to `superseded` with `supersedes_id`
+/// pointing at `survivor` (spec 08 §3). `losers` must be non-empty.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeMemoryOp<'a> {
+    pub survivor_id: &'a str,
+    pub survivor_expected_version: i64,
+    pub losers: &'a [MergeLoser<'a>],
+    pub actor: Actor,
+    pub idempotency_key: Option<&'a str>,
+}
+
 /// What a successful `create`/`reinforce` produced (spec 08 §3: "Response
 /// carries the new `entry_version` and `audit_id`").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +290,12 @@ pub enum MemoryOpError {
     /// `edit` targets an entry whose current state is terminal (spec 04 §5 /
     /// 08 §6) — an as-built guard this task owns (see the module doc).
     EntryTerminal,
+    /// `merge`'s survivor and a loser have different `(scope_kind,
+    /// scope_owner_id)` — an as-built precondition this task's card names
+    /// ("incompatible scope") without further detail from spec 08 §3 itself.
+    IncompatibleScope,
+    /// `merge` was called with an empty `losers` set — nothing to merge.
+    EmptyMergeSet,
 }
 
 impl std::fmt::Display for MemoryOpError {
@@ -270,6 +316,10 @@ impl std::fmt::Display for MemoryOpError {
             MemoryOpError::EntryTerminal => {
                 write!(f, "cannot edit a terminal memory entry")
             }
+            MemoryOpError::IncompatibleScope => {
+                write!(f, "merge survivor and loser have incompatible scope")
+            }
+            MemoryOpError::EmptyMergeSet => write!(f, "merge requires at least one loser"),
         }
     }
 }
@@ -318,6 +368,56 @@ fn read_kind_state_version(
             })?;
             let version: i64 = r.get(2)?;
             Ok((kind, state, version))
+        },
+    )
+    .optional()
+}
+
+/// `(kind, state, entry_version, scope_kind, scope_owner_id)` — see
+/// [`read_kind_state_version_scope`].
+type KindStateVersionScope = (MemoryKind, MemoryState, i64, ScopeKind, String);
+
+/// Read `(kind, state, entry_version, scope_kind, scope_owner_id)` for
+/// `memory_id`, if it exists. Only [`apply_merge`] needs the scope columns
+/// (its "incompatible scope" precondition) — a sibling of
+/// [`read_kind_state_version`] rather than a change to it, so the simpler
+/// 3-tuple every other op already destructures stays untouched.
+fn read_kind_state_version_scope(
+    tx: &Transaction<'_>,
+    memory_id: &str,
+) -> rusqlite::Result<Option<KindStateVersionScope>> {
+    tx.query_row(
+        "SELECT kind, state, entry_version, scope_kind, scope_owner_id \
+         FROM memory_entry WHERE memory_id = ?1",
+        params![memory_id],
+        |r| {
+            let raw_kind: String = r.get(0)?;
+            let raw_state: String = r.get(1)?;
+            let kind = MemoryKind::from_db(&raw_kind).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    0,
+                    Type::Text,
+                    format!("invalid memory_entry.kind {raw_kind:?}").into(),
+                )
+            })?;
+            let state = MemoryState::from_db(&raw_state).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    1,
+                    Type::Text,
+                    format!("invalid memory_entry.state {raw_state:?}").into(),
+                )
+            })?;
+            let version: i64 = r.get(2)?;
+            let raw_scope_kind: String = r.get(3)?;
+            let scope_kind = ScopeKind::from_db(&raw_scope_kind).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    3,
+                    Type::Text,
+                    format!("invalid memory_entry.scope_kind {raw_scope_kind:?}").into(),
+                )
+            })?;
+            let scope_owner_id: String = r.get(4)?;
+            Ok((kind, state, version, scope_kind, scope_owner_id))
         },
     )
     .optional()
@@ -820,6 +920,170 @@ pub fn apply_edit(
         memory_id: request.memory_id.to_string(),
         entry_version: new_version,
         audit_id,
+    })))
+}
+
+/// Apply a `merge` (spec 08 §3): the **survivor** absorbs evidence from every
+/// entry in `losers`, each of which transitions to `superseded` with
+/// `supersedes_id` pointing at the survivor — one transaction, every
+/// precondition (both `expected_version`s, scope compatibility, each loser's
+/// kind/state guard) checked before any write, mirroring `apply_supersede`'s
+/// "pre-validate everything, then mutate" shape. Returns the **survivor**'s
+/// result (mirrors `apply_supersede` describing its own headline entity);
+/// only the survivor's `audit_event` carries the caller's `idempotency_key`.
+pub fn apply_merge(
+    tx: &Transaction<'_>,
+    request: &MergeMemoryOp<'_>,
+    now_ms: i64,
+) -> rusqlite::Result<Result<MemoryOpOutcome, MemoryOpError>> {
+    if let Some(key) = request.idempotency_key
+        && let Some(existing) = find_by_idempotency_key(tx, key)?
+    {
+        return Ok(Ok(MemoryOpOutcome::Replayed(result_from_row(&existing))));
+    }
+
+    if request.losers.is_empty() {
+        return Ok(Err(MemoryOpError::EmptyMergeSet));
+    }
+
+    let Some((_, _, survivor_current_version, survivor_scope_kind, survivor_scope_owner)) =
+        read_kind_state_version_scope(tx, request.survivor_id)?
+    else {
+        return Ok(Err(MemoryOpError::UnknownMemory));
+    };
+    if survivor_current_version != request.survivor_expected_version {
+        return Ok(Err(MemoryOpError::OptimisticConflict {
+            expected: request.survivor_expected_version,
+            actual: survivor_current_version,
+        }));
+    }
+
+    // Pre-validate every loser — no write happens until all of them pass.
+    let mut loser_versions: Vec<i64> = Vec::with_capacity(request.losers.len());
+    for loser in request.losers {
+        let Some((
+            loser_kind,
+            loser_state,
+            loser_current_version,
+            loser_scope_kind,
+            loser_scope_owner,
+        )) = read_kind_state_version_scope(tx, loser.memory_id)?
+        else {
+            return Ok(Err(MemoryOpError::UnknownMemory));
+        };
+        if loser_current_version != loser.expected_version {
+            return Ok(Err(MemoryOpError::OptimisticConflict {
+                expected: loser.expected_version,
+                actual: loser_current_version,
+            }));
+        }
+        if loser_scope_kind != survivor_scope_kind || loser_scope_owner != survivor_scope_owner {
+            return Ok(Err(MemoryOpError::IncompatibleScope));
+        }
+        if let Err(illegal) = loser_state.check_transition(loser_kind, MemoryState::Superseded) {
+            return Ok(Err(MemoryOpError::IllegalTransition(illegal)));
+        }
+        loser_versions.push(loser_current_version);
+    }
+
+    // Absorb evidence: set arithmetic computed in Rust, not a self-referential
+    // SQL subquery on `memory_evidence` (SQLite gives no snapshot guarantee
+    // for a subquery reading the same table an UPDATE in the same statement
+    // writes). Tracked and updated locally across losers so a duplicate
+    // introduced by an earlier loser in this same merge is also skipped for
+    // a later one — never dropped, just left attached to its (superseded)
+    // original loser.
+    let mut survivor_observation_ids: HashSet<String> = {
+        let mut stmt =
+            tx.prepare("SELECT observation_id FROM memory_evidence WHERE memory_id = ?1")?;
+        stmt.query_map(params![request.survivor_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?
+    };
+
+    for (loser, &loser_current_version) in request.losers.iter().zip(&loser_versions) {
+        let loser_observation_ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT observation_id FROM memory_evidence WHERE memory_id = ?1")?;
+            stmt.query_map(params![loser.memory_id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for observation_id in loser_observation_ids {
+            if survivor_observation_ids.contains(&observation_id) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE memory_evidence SET memory_id = ?1 \
+                 WHERE memory_id = ?2 AND observation_id = ?3",
+                params![request.survivor_id, loser.memory_id, observation_id],
+            )?;
+            survivor_observation_ids.insert(observation_id);
+        }
+
+        let loser_new_version = loser_current_version + 1;
+        tx.execute(
+            "UPDATE memory_entry \
+             SET state = ?2, entry_version = ?3, updated_at = ?4, supersedes_id = ?5 \
+             WHERE memory_id = ?1",
+            params![
+                loser.memory_id,
+                MemoryState::Superseded.as_str(),
+                loser_new_version,
+                now_ms,
+                request.survivor_id,
+            ],
+        )?;
+
+        insert_audit_event(
+            tx,
+            &NewAuditEvent {
+                entity_kind: ENTITY_KIND_MEMORY_ENTRY,
+                entity_id: loser.memory_id,
+                entity_version: loser_new_version,
+                op: "merge",
+                actor: request.actor,
+                idempotency_key: None,
+                payload: None,
+            },
+            now_ms,
+        )?;
+    }
+
+    let survivor_new_version = survivor_current_version + 1;
+    tx.execute(
+        "UPDATE memory_entry SET entry_version = ?2, updated_at = ?3 WHERE memory_id = ?1",
+        params![request.survivor_id, survivor_new_version, now_ms],
+    )?;
+
+    let loser_ids: Vec<&str> = request.losers.iter().map(|l| l.memory_id).collect();
+    let payload = serde_json::to_string(&loser_ids)
+        .expect("memory ids serialize infallibly to a JSON string array");
+
+    #[cfg(feature = "failpoints")]
+    local_rag_test_support::fail_point!(
+        "memory.op.merge.before_survivor_audit",
+        Err(rusqlite::Error::ToSqlConversionFailure(
+            "failpoint: memory.op.merge.before_survivor_audit".into()
+        ))
+    );
+
+    let survivor_audit_id = insert_audit_event(
+        tx,
+        &NewAuditEvent {
+            entity_kind: ENTITY_KIND_MEMORY_ENTRY,
+            entity_id: request.survivor_id,
+            entity_version: survivor_new_version,
+            op: "merge",
+            actor: request.actor,
+            idempotency_key: request.idempotency_key,
+            payload: Some(&payload),
+        },
+        now_ms,
+    )?;
+
+    Ok(Ok(MemoryOpOutcome::Applied(MemoryOpResult {
+        memory_id: request.survivor_id.to_string(),
+        entry_version: survivor_new_version,
+        audit_id: survivor_audit_id,
     })))
 }
 

@@ -94,6 +94,26 @@ itself specify: it rejects editing an entry whose current state is terminal
 (`MemoryOpError::EntryTerminal`) — an as-built decision, since this task's card is the one that
 owns "kind/state guards" generally and nothing here forces this specific rule.
 
+As-built note (T14-04, `[SPEC]`): `merge` reassigns a loser's `memory_evidence` rows to the
+survivor rather than duplicating them — a loser's row for an `observation_id` the survivor already
+has stays attached to the (superseded, still-existing) loser instead of erroring or being dropped,
+computed with a plain Rust `HashSet` rather than a self-referential SQL subquery against
+`memory_evidence` (SQLite gives no snapshot guarantee for a subquery reading the same table an
+`UPDATE` in the same statement writes). A precondition this section does not itself name: every
+loser's `(scope_kind, scope_owner_id)` must match the survivor's, or the typed
+`MemoryOpError::IncompatibleScope` aborts the whole merge with no mutation — kind is deliberately
+*not* required to match, since each loser's own eligibility for `superseded` is already enforced
+independently by `MemoryState::check_transition` (which structurally rejects a `task`/`question`
+loser, `superseded` not being in their legal target set at all). Losers → `superseded` with
+`supersedes_id` → survivor is the first place this column is set on an *already-existing* row
+(every earlier use — plain `create`, `supersede`'s new-entry half — only sets it at `INSERT`
+time). "Audit records the merge set" is realized as a `serde_json`-encoded array of the merged
+loser ids on the **survivor's** own `audit_event.payload` (each loser's own transition-audit row
+carries `payload: NULL` — `supersedes_id` already links it back to the survivor structurally, so
+the set doesn't need duplicating on every row); only the survivor's row carries the caller's
+`idempotency_key`, mirroring `supersede`'s "headline row only" placement. The response describes
+the survivor only, for the same reason `supersede`'s describes only the new entry.
+
 ## 4. Consolidation `[FIXED]`
 
 Trigger: checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`, startup catch-up.
