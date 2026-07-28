@@ -70,6 +70,21 @@
 //! evidence from `candidate_evidence`'s FK chain rather than storing it twice.
 //! See [`review`]'s own module doc for the JSON schema, the double-approval
 //! idempotence design, and why the "conflicting edit" check is state-based.
+//!
+//! T14-06 adds **[`runner`]**, the consolidation lease/cursor runner (spec 08
+//! §4): [`consolidation::open_next_run`]/[`consolidation::retry_run`] (step
+//! 1's bounded snapshot + lease acquisition, extended in [`consolidation`]
+//! itself since T14-01 already owns the pure `RunState` machine) and
+//! [`runner::run_once`] (steps 2–4: load the window, call a caller-supplied
+//! generator *outside* any transaction while renewing the lease every 30s,
+//! then apply the ordered op list in one short transaction via
+//! [`runner::commit_apply_run`]). **T14-06 does not implement the router
+//! itself** — [`runner::run_once`] is generic over any generator matching
+//! its signature; T14-07 supplies the real local-generator implementation
+//! against this same contract. See [`runner`]'s own module doc for the
+//! atomicity fix this task's design centers on (a mid-batch op rejection
+//! must roll back the *whole* apply, not just stop short) and the
+//! lease-fencing/failed-routing as-built decisions.
 
 mod audit;
 mod candidate;
@@ -78,6 +93,7 @@ mod entry;
 mod evidence;
 mod op;
 mod review;
+mod runner;
 
 pub use audit::{
     Actor, AuditEventRow, NewAuditEvent, find_by_idempotency_key, insert_audit_event,
@@ -89,8 +105,10 @@ pub use candidate::{
     pending_candidate_ages, transition_candidate,
 };
 pub use consolidation::{
-    IllegalRunTransition, NewConsolidationRun, RunState, RunTransitionError,
-    consolidation_run_state, create_consolidation_run, processing_cursor, transition_run,
+    IllegalRunTransition, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, NewConsolidationRun,
+    RenewError, RunState, RunTransitionError, RunWindow, SnapshotOutcome, StaleRun, acquire_lease,
+    consolidation_run_state, create_consolidation_run, lease_expired, open_next_run,
+    processing_cursor, renew_lease, retry_run, stale_runs, transition_run,
     upsert_processing_cursor,
 };
 pub use entry::{
@@ -108,6 +126,10 @@ pub use op::{
 pub use review::{
     ApproveCandidateOutcome, CandidateRow, ProposedOperation, ReviewError, approve_candidate,
     edit_candidate, list_candidates, propose_candidate, reject_candidate,
+};
+pub use runner::{
+    ApplyReport, ConsolidationWindow, GeneratedOp, RunOutcome, RunOutcomeError, RunnerApplyError,
+    RunnerError, WindowObservation, commit_apply_run, run_once,
 };
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the

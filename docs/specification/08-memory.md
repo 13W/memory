@@ -152,6 +152,43 @@ Router placement rules `[FIXED]`:
   is precisely why the quality gate (§7) exists.
 - Router runs strictly behind the cursor `[FIXED]`.
 
+As-built note (T14-06, `[SPEC]`): `local_rag_store::memory::runner` ships steps 1 (extending
+`consolidation.rs`'s T14-01 primitives with lease acquire/renew and the bounded snapshot) and 2–4
+(`run_once`/`commit_apply_run`) — everything except the router itself (step 3's actual generation
+logic, T14-07, which closes open item O3). Three details this section states less precisely than
+the shipped code:
+
+- **"ONE short tx" is atomic across the whole ops list, not per op.** A single rejected op — an
+  optimistic-conflict, an illegal transition, an unknown evidence observation — rolls back
+  *everything* in that apply attempt: every other op in the same list, the `processing_cursor`
+  advance, and the `run → applied` transition. This is a direct reading of "ONE short tx: apply
+  ops..., advance processing_cursor, run→applied" as one indivisible unit rather than a loose
+  sequence — the alternative (committing whichever earlier ops happened to succeed before the
+  rejection) would silently advance the cursor past observations whose ops never actually landed,
+  in direct conflict with 03 §1.4's "memory mutations, evidence, audit, and consolidation cursor
+  movement are transactionally strict." `commit_apply_run` converts a rejection into a genuine
+  `rusqlite::Error` specifically so the underlying `StateWriter::transaction` (which commits on any
+  *outer* `Ok(_)` regardless of an inner `Err`) actually rolls back rather than silently committing
+  the ops that individually would have succeeded.
+- **A rejected apply routes the run to `failed` immediately** (04 §4's own T14-06 note has the
+  full rationale) rather than leaving it `running` for the lease to eventually expire — the
+  generalization from "router/LLM error" to "any apply-time rejection" is this task's own reading,
+  since the atomicity guarantee above makes the two failure classes behave identically from a
+  retry's perspective (no partial state either way).
+- **No default batch size is specified anywhere normative** in this section, 03 §2.5, or 04 §4 —
+  unlike the lease/renewal numbers, which are explicitly `[SPEC]`-tagged. `open_next_run` therefore
+  takes `batch` as a required caller parameter rather than inventing a crate constant; picking an
+  actual default is deferred to whichever task wires the daemon-level trigger (T15-06).
+
+`idempotency_key = H(memory_op, run_id, op_index)` is realized as
+`format!("consolidation:{run_id}:{op_index}:{op_kind}")` — a plain deterministic string, mirroring
+`approve_candidate`'s own `"candidate:<id>"` precedent (08 §3's own as-built note), not a
+cryptographic hash. Given the atomicity fix above, this key's practical role narrows to
+defense-in-depth against the one genuinely ambiguous case `WriteError` documents (a crash between
+the transaction's commit and the reply reaching the caller) rather than being the primary
+duplicate-prevention mechanism spec 04 §4 step 5's prose seems to assume — transaction atomicity
+already guarantees a rejected batch leaves zero residue for any legitimate retry to duplicate.
+
 ## 5. Explicit tool-initiated memory (`remember`, review tools)
 
 `remember` (11 §2) is an explicit durable operation: creates an `active` entry, `actor='user'`

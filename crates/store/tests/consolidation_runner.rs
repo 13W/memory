@@ -1,0 +1,663 @@
+//! T14-06 acceptance tests for the consolidation lease/cursor runner (spec 08
+//! §4): bounded snapshot never past `to_seq`, lease expiry/renewal while the
+//! generator runs outside any transaction, atomic op apply (a mid-batch
+//! rejection rolls back the *whole* attempt — no partial mutation, no
+//! advanced cursor), retry-after-rejection producing no duplicate rows, and
+//! crash recovery at each of the runner's named failpoints.
+//!
+//! All tests are deterministic: an isolated [`TempHome`], fixed `now_ms`
+//! literals, ids minted from [`uuidv7_from`] with fixed entropy, and — for
+//! the lease-renewal test — paused virtual time (`start_paused = true`) so
+//! nothing here sleeps in real wall-clock time.
+//!
+//! Failpoint tests share [`SERIAL`] with every other test in this file, for
+//! the same reason `crates/store/tests/memory_op.rs` does: the failpoint
+//! registry (`local_rag_test_support::failpoint::global()`) is process-wide,
+//! so an armed-but-not-yet-disarmed failpoint in one test could otherwise
+//! fire in a concurrently running test in this same binary.
+
+use std::time::Duration;
+
+use local_rag_core::identity::uuidv7_from;
+use local_rag_core::paths::StoreLayout;
+#[cfg(feature = "failpoints")]
+use local_rag_store::memory::RunnerError;
+use local_rag_store::memory::{
+    ApplyReport, ConsolidationWindow, GeneratedOp, NewMemoryEntry, ProposedOperation, RunOutcome,
+    RunOutcomeError, RunState, SnapshotOutcome, commit_apply_run, consolidation_run_state,
+    create_memory_entry, open_next_run, processing_cursor, run_once,
+};
+use local_rag_store::rusqlite::{Connection, params};
+use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, MemoryKind, ScopeKind, StateDb};
+use local_rag_test_support::TempHome;
+use tokio::sync::Mutex;
+
+#[cfg(feature = "failpoints")]
+use local_rag_test_support::Action;
+
+static SERIAL: Mutex<()> = Mutex::const_new(());
+
+/// A temporary store with an ensured tree and an opened [`StateDb`] (runs the
+/// full production migration set).
+fn open_state() -> (TempHome, StateDb) {
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+    let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    (home, db)
+}
+
+/// A distinct, deterministic UUIDv7 string keyed by `seed`, never touching the
+/// clock or entropy source.
+fn uuid(seed: u8) -> String {
+    let mut rand = [0u8; 10];
+    rand[9] = seed;
+    uuidv7_from(1000, rand).to_string()
+}
+
+/// Insert `count` standalone `observation_envelope` rows for `session_id`
+/// (received_seq 1..=count, assuming an otherwise-empty session), returning
+/// their `observation_id`s in order.
+async fn seed_envelopes(db: &StateDb, session_id: &str, seed: u8, count: u8) -> Vec<String> {
+    let ids: Vec<String> = (0..count).map(|i| uuid(seed.wrapping_add(i))).collect();
+    let (session, insert_ids) = (session_id.to_string(), ids.clone());
+    db.writer()
+        .transaction(move |tx| {
+            for (i, id) in insert_ids.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO observation_envelope \
+                       (observation_id, source_event_id, payload_hash, event_type, \
+                        evidence_kind, trust, session_id) \
+                     VALUES (?1, ?2, 'deadbeef', 'Stop', 'user_statement', 'normal', ?3)",
+                    params![id, format!("evt-{i}"), session],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed envelopes");
+    ids
+}
+
+/// Open the next run for `session_id`, unwrapping the infrastructure result
+/// (tests assert on the domain [`SnapshotOutcome`] themselves).
+async fn open_run(
+    db: &StateDb,
+    run_id: &str,
+    session_id: &str,
+    batch: i64,
+    now_ms: i64,
+) -> SnapshotOutcome {
+    let (rid, sid) = (run_id.to_string(), session_id.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            open_next_run(tx, &rid, &sid, batch, "v1", LEASE_DURATION_MS, now_ms)
+        })
+        .await
+        .expect("open tx")
+}
+
+/// A worktree-scoped `fact` entry with no canonical key, at `entry_version =
+/// 1`.
+async fn create_memory(db: &StateDb, memory_id: &str, scope_owner: &str) {
+    let (id, owner) = (memory_id.to_string(), scope_owner.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            create_memory_entry(
+                tx,
+                &NewMemoryEntry {
+                    memory_id: &id,
+                    kind: MemoryKind::Fact,
+                    text: "some durable text",
+                    canonical_key: None,
+                    scope_kind: ScopeKind::Worktree,
+                    scope_owner_id: &owner,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                1_000,
+            )
+        })
+        .await
+        .expect("create tx")
+        .expect("create ok");
+}
+
+fn entry_version(conn: &Connection, memory_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT entry_version FROM memory_entry WHERE memory_id = ?1",
+        params![memory_id],
+        |r| r.get(0),
+    )
+    .expect("read entry_version")
+}
+
+fn audit_count_for(conn: &Connection, entity_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT count(*) FROM audit_event WHERE entity_id = ?1",
+        params![entity_id],
+        |r| r.get(0),
+    )
+    .expect("count audit rows")
+}
+
+fn read_lease_until(conn: &Connection, run_id: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT lease_until FROM consolidation_run WHERE run_id = ?1",
+        params![run_id],
+        |r| r.get(0),
+    )
+    .expect("read lease_until")
+}
+
+// ---------------------------------------------------------------------------
+// Never past to_seq
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn open_next_run_never_bounds_the_window_past_max_received_seq() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    seed_envelopes(&db, "sess-1", 1, 5).await;
+
+    match open_run(&db, &uuid(9), "sess-1", 3, 1_000).await {
+        SnapshotOutcome::Opened(window) => {
+            assert_eq!(window.from_received_seq, 1);
+            assert_eq!(
+                window.to_received_seq, 3,
+                "to = min(from+batch-1, max_seq) = min(3, 5) = 3, never past to_seq"
+            );
+        }
+        other => panic!("expected Opened, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generator runs outside any transaction
+// ---------------------------------------------------------------------------
+
+/// Operational proof that `run_once` never holds the writer-queue slot open
+/// across the generator call: while a deliberately-blocked mock generator is
+/// pending, an unrelated write must still complete promptly. Structurally,
+/// the generator closure's parameter type is [`ConsolidationWindow`] — plain
+/// owned data with no database handle of any kind — so it could never reach
+/// the runner's own transaction even if it tried; this test proves the
+/// *operational* consequence of that structural guarantee.
+#[tokio::test]
+async fn generator_runs_outside_any_tx_writer_queue_stays_free_while_it_is_pending() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    seed_envelopes(&db, "sess-1", 60, 2).await;
+    let run_id = uuid(65);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let generate = move |_window: ConsolidationWindow| async move {
+        let _ = started_tx.send(());
+        let _ = unblock_rx.await;
+        Ok::<Vec<GeneratedOp>, String>(vec![GeneratedOp::Noop])
+    };
+
+    let run_fut = run_once(
+        &db,
+        window,
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        generate,
+    );
+
+    let probe_fut = async {
+        started_rx.await.expect("generator started");
+        let probe = tokio::time::timeout(
+            Duration::from_secs(5),
+            db.writer().transaction(|tx| {
+                tx.execute("CREATE TABLE IF NOT EXISTS probe (x INTEGER)", [])?;
+                tx.execute("INSERT INTO probe (x) VALUES (1)", [])
+            }),
+        )
+        .await;
+        assert!(
+            probe.is_ok(),
+            "an unrelated write must not hang while the generator is pending"
+        );
+        let _ = unblock_tx.send(());
+    };
+
+    let (run_result, ()) = tokio::join!(run_fut, probe_fut);
+    assert!(
+        matches!(run_result, Ok(RunOutcome::Applied(_))),
+        "{run_result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lease expiry/renewal
+// ---------------------------------------------------------------------------
+
+/// A generator that outlives one lease duration only survives if the runner
+/// actually renews the lease every [`LEASE_RENEW_INTERVAL_MS`] while it
+/// runs. Paused virtual time (`start_paused = true`) auto-advances whenever
+/// every pending future is blocked purely on a timer (the documented tokio
+/// `test-util` behavior `crates/store/tests/lock.rs` already relies on for
+/// `read_bounded`'s timeout test) — no real sleep anywhere in this test.
+#[tokio::test(start_paused = true)]
+async fn lease_renews_on_cadence_while_the_generator_runs() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    seed_envelopes(&db, "sess-1", 80, 2).await;
+    let run_id = uuid(85);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 0).await else {
+        panic!("expected Opened");
+    };
+    let original_lease_until = LEASE_DURATION_MS; // acquired at now_ms = 0
+
+    let generate = move |_w: ConsolidationWindow| async move {
+        // Longer than one lease duration (120s): only completes without the
+        // run's lease going stale if renewal actually happens every ~30s.
+        tokio::time::sleep(Duration::from_millis(150_000)).await;
+        Ok::<Vec<GeneratedOp>, String>(vec![GeneratedOp::Noop])
+    };
+
+    let run_fut = run_once(
+        &db,
+        window,
+        original_lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        0,
+        generate,
+    );
+
+    let probe_fut = async {
+        // Past the first ~30s renewal cadence, well short of the original
+        // lease's 120s deadline.
+        tokio::time::sleep(Duration::from_millis(45_000)).await;
+        let read = db.open_read().expect("read conn");
+        let lease_until = read_lease_until(&read, &run_id);
+        assert!(
+            lease_until.unwrap_or(0) > original_lease_until,
+            "lease_until must have moved forward by ~45s of virtual time, got {lease_until:?}"
+        );
+    };
+
+    let (run_result, ()) = tokio::join!(run_fut, probe_fut);
+    assert!(
+        matches!(run_result, Ok(RunOutcome::Applied(_))),
+        "{run_result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Atomicity: cursor cannot advance on partial apply
+// ---------------------------------------------------------------------------
+
+/// A later op's rejection must roll back the *whole* batch — including an
+/// earlier op that would, on its own, have succeeded — and must never
+/// advance the cursor. This is the regression guard for T14-06's central
+/// design fix: `StateWriter::transaction` commits on an outer `Ok(_)`
+/// regardless of an inner `Err`, so [`commit_apply_run`] must convert a
+/// rejection into a genuine `rusqlite::Error` rather than returning
+/// `Ok(Err(_))` from the write closure.
+#[tokio::test]
+async fn cursor_cannot_advance_when_a_later_op_is_rejected() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    seed_envelopes(&db, "sess-1", 40, 2).await;
+    let run_id = uuid(45);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    let owner = uuid(46);
+    let memory_id = uuid(47);
+    create_memory(&db, &memory_id, &owner).await;
+
+    let ops = vec![
+        GeneratedOp::Noop, // op 0: would succeed trivially
+        GeneratedOp::Materialize {
+            operation: ProposedOperation::Reinforce {
+                memory_id: memory_id.clone(),
+                expected_version: 7, // wrong -- rejects op 1
+                confidence: Some(0.5),
+            },
+            evidence_observation_ids: vec![],
+        },
+    ];
+
+    let err = commit_apply_run(&db, window.clone(), vec![], lease_until, ops, 2_000)
+        .await
+        .expect_err("op 1's optimistic conflict must reject the whole batch");
+    assert!(matches!(err, RunOutcomeError::Rejected(_)), "{err:?}");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        processing_cursor(&read, "sess-1").expect("cursor"),
+        None,
+        "cursor must not advance -- the whole batch (including op 0's noop) rolled back"
+    );
+    assert_eq!(
+        consolidation_run_state(&read, &run_id).expect("state"),
+        Some(RunState::Running),
+        "run stays running (retry-eligible), never applied"
+    );
+    assert_eq!(
+        entry_version(&read, &memory_id),
+        1,
+        "no mutation landed at all"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Op retry no duplicates
+// ---------------------------------------------------------------------------
+
+/// Given atomic apply (the fix above) plus lease fencing, a *successful*
+/// `commit_apply_run` always finalizes its run to `applied` in the same
+/// transaction — so a legitimate retry can only ever follow a *rejected* (and
+/// therefore fully rolled-back) attempt, never a successful one. This test
+/// proves the actually-reachable "retry no duplicates" property: the
+/// rejected first attempt leaves zero residue, and the corrected retry
+/// produces *exactly one* committed effect, not two.
+#[tokio::test]
+async fn retry_after_a_rejected_batch_produces_exactly_one_set_of_rows() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let ids = seed_envelopes(&db, "sess-1", 30, 2).await;
+    let run_id = uuid(35);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    let owner = uuid(36);
+    let memory_id = uuid(37);
+    create_memory(&db, &memory_id, &owner).await;
+
+    let first_attempt = vec![
+        GeneratedOp::Materialize {
+            operation: ProposedOperation::Reinforce {
+                memory_id: memory_id.clone(),
+                expected_version: 1,
+                confidence: Some(0.9),
+            },
+            evidence_observation_ids: vec![ids[0].clone()],
+        },
+        GeneratedOp::Materialize {
+            operation: ProposedOperation::Reinforce {
+                memory_id: memory_id.clone(),
+                expected_version: 99, // wrong -- rejects the whole batch
+                confidence: Some(0.95),
+            },
+            evidence_observation_ids: vec![ids[1].clone()],
+        },
+    ];
+    let err = commit_apply_run(
+        &db,
+        window.clone(),
+        vec![],
+        lease_until,
+        first_attempt,
+        2_000,
+    )
+    .await
+    .expect_err("op 1's optimistic conflict must reject the whole batch");
+    assert!(matches!(err, RunOutcomeError::Rejected(_)), "{err:?}");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        entry_version(&read, &memory_id),
+        1,
+        "op 0 must not have committed either"
+    );
+    assert_eq!(
+        audit_count_for(&read, &memory_id),
+        0,
+        "no audit row from the rejected attempt"
+    );
+    drop(read);
+
+    // A realistic retry after the router observes current state: just the
+    // corrected op.
+    let retry = vec![GeneratedOp::Materialize {
+        operation: ProposedOperation::Reinforce {
+            memory_id: memory_id.clone(),
+            expected_version: 1,
+            confidence: Some(0.9),
+        },
+        evidence_observation_ids: vec![ids[0].clone()],
+    }];
+    let report = commit_apply_run(&db, window, vec![], lease_until, retry, 3_000)
+        .await
+        .expect("retry succeeds");
+    assert_eq!(
+        report,
+        ApplyReport {
+            applied: 1,
+            replayed: 0,
+            noop: 0,
+            proposed: 0,
+        }
+    );
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        entry_version(&read, &memory_id),
+        2,
+        "exactly one reinforce landed, not two"
+    );
+    assert_eq!(
+        audit_count_for(&read, &memory_id),
+        1,
+        "exactly one audit_event row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Crash at each failpoint
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "failpoints")]
+fn arm(name: &str) {
+    let fp = local_rag_test_support::failpoint::global();
+    fp.register(name);
+    fp.arm(name, Action::Error).expect("arm failpoint");
+}
+
+#[cfg(feature = "failpoints")]
+fn disarm(name: &str) {
+    local_rag_test_support::failpoint::global()
+        .disarm(name)
+        .expect("disarm failpoint");
+}
+
+#[cfg(feature = "failpoints")]
+async fn noop_generator(_w: ConsolidationWindow) -> Result<Vec<GeneratedOp>, String> {
+    Ok(vec![GeneratedOp::Noop])
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn crash_after_snapshot_leaves_the_run_untouched_and_retry_converges() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    seed_envelopes(&db, "sess-1", 50, 2).await;
+    let run_id = uuid(52);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    arm("memory.consolidation.after_snapshot");
+    let result = run_once(
+        &db,
+        window.clone(),
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        noop_generator,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(RunnerError::FailpointInjected)),
+        "{result:?}"
+    );
+    disarm("memory.consolidation.after_snapshot");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        consolidation_run_state(&read, &run_id).expect("state"),
+        Some(RunState::Running),
+        "the failpoint fires before any further write -- nothing changed"
+    );
+    assert_eq!(processing_cursor(&read, "sess-1").expect("cursor"), None);
+    drop(read);
+
+    let outcome = run_once(
+        &db,
+        window,
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        noop_generator,
+    )
+    .await
+    .expect("retry run_once");
+    assert!(matches!(outcome, RunOutcome::Applied(_)), "{outcome:?}");
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn crash_after_generate_leaves_the_run_untouched_and_retry_converges() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    seed_envelopes(&db, "sess-1", 55, 2).await;
+    let run_id = uuid(57);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    arm("memory.consolidation.after_generate");
+    let result = run_once(
+        &db,
+        window.clone(),
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        noop_generator,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(RunnerError::FailpointInjected)),
+        "{result:?}"
+    );
+    disarm("memory.consolidation.after_generate");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        consolidation_run_state(&read, &run_id).expect("state"),
+        Some(RunState::Running),
+        "the failpoint fires after the (successful) generator call but before apply -- \
+         nothing was ever applied"
+    );
+    assert_eq!(processing_cursor(&read, "sess-1").expect("cursor"), None);
+    drop(read);
+
+    let outcome = run_once(
+        &db,
+        window,
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        noop_generator,
+    )
+    .await
+    .expect("retry run_once");
+    assert!(matches!(outcome, RunOutcome::Applied(_)), "{outcome:?}");
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn crash_before_cursor_advance_rolls_back_the_whole_apply() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    seed_envelopes(&db, "sess-1", 58, 2).await;
+    let run_id = uuid(59);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+    let to_seq = window.to_received_seq;
+
+    arm("memory.consolidation.apply.before_cursor_advance");
+    let result = commit_apply_run(
+        &db,
+        window.clone(),
+        vec![],
+        lease_until,
+        vec![GeneratedOp::Noop],
+        2_000,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(RunOutcomeError::Write(_))),
+        "{result:?}"
+    );
+    disarm("memory.consolidation.apply.before_cursor_advance");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        processing_cursor(&read, "sess-1").expect("cursor"),
+        None,
+        "the noop's own zero-write nature doesn't matter -- the cursor advance never committed"
+    );
+    assert_eq!(
+        consolidation_run_state(&read, &run_id).expect("state"),
+        Some(RunState::Running)
+    );
+    drop(read);
+
+    let report = commit_apply_run(
+        &db,
+        window,
+        vec![],
+        lease_until,
+        vec![GeneratedOp::Noop],
+        3_000,
+    )
+    .await
+    .expect("retry succeeds");
+    assert_eq!(
+        report,
+        ApplyReport {
+            applied: 0,
+            replayed: 0,
+            noop: 1,
+            proposed: 0,
+        }
+    );
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        processing_cursor(&read, "sess-1").expect("cursor"),
+        Some(to_seq)
+    );
+    assert_eq!(
+        consolidation_run_state(&read, &run_id).expect("state"),
+        Some(RunState::Applied)
+    );
+}

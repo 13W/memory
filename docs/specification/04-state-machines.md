@@ -142,6 +142,32 @@ realized as an explicit legal edge: the same row is retried under a fresh lease.
 terminal (no edge leaves it). This task ships only the pure state-legality guard; the lease
 `now_ms` comparison that decides *when* a `running` run is eligible for retry is T14-06's runner.
 
+As-built note (T14-06, `[SPEC]`): the runner (`local_rag_store::memory::runner`) composes T14-01's
+pure guard into two decisions this section's prose leaves open.
+
+- **Lease fencing needs no new column.** `StateWriter::transaction` commits whenever its closure
+  returns `Ok(_)` at the *outer* `rusqlite::Result` level, so a naive "loop over ops in one tx,
+  return `Ok(Err(reason))` on a mid-batch rejection" would let an earlier op's mutation commit even
+  though the run never reaches `applied` — the apply-tx's first action is therefore to re-read the
+  run's current `(state, lease_until)` and require `state == running && lease_until == expected`
+  (the value *this* attempt acquired or last renewed) before touching any op, refusing with zero
+  mutation otherwise. This closes the real race a bare "stable `run_id` across a retry" leaves open:
+  a slow-but-alive attempt whose lease has expired while mid-flight, racing a legitimate retry that
+  re-acquired a fresh lease under the same `run_id` — without fencing, the stale attempt could apply
+  under the fresh attempt's `idempotency_key` space. `lease_until` doubles as its own
+  compare-and-swap token, mirroring the `expected_version` optimistic-concurrency idiom 08 §3
+  already uses for `memory_entry` rows — no schema change. `open_next_run`'s own existence-check and
+  insert already happen inside one transaction, so two callers opening for the same `session_id` are
+  fully serialized by the single-writer queue with no separate TOCTOU window.
+- **Any apply-time rejection routes straight to `failed`, not only a router/LLM error.** Since the
+  apply-tx above is genuinely all-or-nothing, no partial-apply state is ever persisted between
+  attempts — so a retry re-invokes the router from scratch regardless of *why* the previous attempt
+  didn't reach `applied`. Marking `failed` immediately (rather than leaving the row `running` for a
+  lease timeout to eventually rediscover the identical rejection) costs nothing under that
+  invariant, and lets the next attempt's router see current state instead of reproducing a
+  router/user race for up to the full lease duration. Consequently the startup/checkpoint retry
+  sweep selects `failed` rows *and* lease-expired `running` rows, not lease-expiry alone.
+
 ## 5. Memory entry — `kind` is origin (immutable), `state` is confirmedness `[FIXED]`
 
 Common rule: a *confirmed hypothesis* stays `kind=hypothesis, state=confirmed` (recall/router
