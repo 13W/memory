@@ -59,6 +59,17 @@
 //! `active → superseded` for `Hypothesis`, leaving `confirmed` a dead end.
 //! Fixed by adding exactly `confirmed → superseded` (see `check_transition`'s
 //! own doc for the full rationale and what was deliberately *not* added).
+//!
+//! T14-05 adds **[`review`]**, the candidate review operations (spec 04 §6, 08
+//! §3/§5/§8): `propose`/`edit`/`reject` are thin wrappers over [`candidate`]'s
+//! machine, and `approve` deserializes the candidate's `proposed_operation`
+//! JSON and dispatches to the matching [`op::apply_create`]/
+//! [`op::apply_reinforce`]/[`op::apply_resolve`]/[`op::apply_retract`]/
+//! [`op::apply_supersede`] with `actor=`[`audit::Actor::User`] — "the same
+//! transactional memory-op path as the router" the spec asks for — deriving
+//! evidence from `candidate_evidence`'s FK chain rather than storing it twice.
+//! See [`review`]'s own module doc for the JSON schema, the double-approval
+//! idempotence design, and why the "conflicting edit" check is state-based.
 
 mod audit;
 mod candidate;
@@ -66,6 +77,7 @@ mod consolidation;
 mod entry;
 mod evidence;
 mod op;
+mod review;
 
 pub use audit::{
     Actor, AuditEventRow, NewAuditEvent, find_by_idempotency_key, insert_audit_event,
@@ -73,7 +85,8 @@ pub use audit::{
 };
 pub use candidate::{
     CandidateState, CandidateTransitionError, IllegalCandidateTransition, NewCandidate,
-    candidate_state, create_candidate, insert_candidate_evidence, transition_candidate,
+    candidate_evidence_for, candidate_state, create_candidate, insert_candidate_evidence,
+    pending_candidate_ages, transition_candidate,
 };
 pub use consolidation::{
     IllegalRunTransition, NewConsolidationRun, RunState, RunTransitionError,
@@ -91,6 +104,10 @@ pub use op::{
     MergeLoser, MergeMemoryOp, ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp,
     SupersedeMemoryOp, apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce,
     apply_resolve, apply_retract, apply_supersede,
+};
+pub use review::{
+    ApproveCandidateOutcome, CandidateRow, ProposedOperation, ReviewError, approve_candidate,
+    edit_candidate, list_candidates, propose_candidate, reject_candidate,
 };
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the

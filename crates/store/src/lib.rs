@@ -290,6 +290,45 @@
 //! ids (`serde_json` already in `crates/store`'s graph via `registry::
 //! representation::Coverage`, T11-01).
 //!
+//! T14-05 adds the **candidate review operations** ([`memory::review`], spec
+//! 04 §6, 08 §3/§5/§8): [`memory::propose_candidate`]/[`memory::edit_candidate`]/
+//! [`memory::reject_candidate`] are thin wrappers over T14-01's
+//! [`CandidateState`] machine, and [`memory::approve_candidate`] is the task's
+//! core — it deserializes the candidate's `proposed_operation` JSON (a
+//! `#[serde(tag = "op")]` [`memory::ProposedOperation`] covering exactly the
+//! five router ops that can be *materialized* — `create`/`reinforce`/
+//! `resolve`/`retract`/`supersede`; `noop` writes nothing and `propose_candidate`
+//! cannot nest itself, so neither is ever proposed, and `edit`/`merge` are
+//! direct review-tool ops per spec 11 §2's table, never candidate-proposed) and
+//! dispatches to the matching `memory::op::apply_*` with `actor=`[`Actor::User`]
+//! — spec 04 §6's "same transactional memory-op path as the router" — inside
+//! one transaction with the candidate's own `pending → approved` transition.
+//! Materialization evidence is derived, not stored twice: `candidate_evidence`
+//! carries only the FK to `observation_envelope` (no `evidence_kind`/
+//! `session_id` columns of its own, unlike `memory_evidence`), so
+//! `approve_candidate` reads each linked observation's own
+//! `evidence_kind`/`session_id` to build the underlying op's evidence — the
+//! DDL's own "FK provenance, not embedded snapshots" principle applied to
+//! candidates. Double-approval is idempotent two ways: an already-`approved`
+//! candidate short-circuits to [`memory::ApproveCandidateOutcome::AlreadyApproved`]
+//! before any JSON parsing or op-engine call — the state machine's own
+//! self-transition-is-legal convention is the primary guarantee — and, as
+//! defense-in-depth for a crash mid-transaction, the dispatched op still
+//! carries a deterministic `idempotency_key` (`candidate:<candidate_id>`)
+//! that resolves through T14-02's replay mechanism if a retry reaches that
+//! far. `pending_memory_candidate` has no `entry_version`/`updated_at` (spec
+//! 11 §2's `edit_memory_candidate(id, patch)` signature, contrasted with
+//! `edit_memory(id, patch, expected_version)`, confirms this is intentional),
+//! so [`memory::edit_candidate`]'s conflict check is state-based: legal only
+//! while `review_state == pending`, [`ReviewError::NotPending`] otherwise.
+//! [`housekeeping::run_candidate_expiry_sweep`] is a fifth sweep alongside
+//! T13-05's spool-session GC — the first sweep in this crate with no
+//! filesystem component — batch-transitioning `pending` candidates past
+//! [`housekeeping::CANDIDATE_EXPIRY_MS`] (spec 04 §6 `[SPEC: 30 days]`) to
+//! `expired`, tolerating (as a retained, not failed, row) a candidate a
+//! concurrent approve/reject already moved out of `pending` since the sweep's
+//! read pass.
+//!
 //! T13-03 adds the **spool segment decoder** ([`spool`], spec 07 §2-§4): a
 //! pure `&[u8]` → `DecodedObservation` transform with no database awareness —
 //! [`spool::decode_segment`] validates the 16-byte header
@@ -366,25 +405,29 @@ pub use eviction::{
     run_embedding_cache_eviction, store_wide_embedding_pins,
 };
 pub use housekeeping::{
-    HousekeepingError, SHARD_DESTROY_GRACE_MS, SPOOL_SESSION_ABSENCE_MS, ShardSweepReport,
-    SpoolSessionSweepReport, expired_shard_ids, is_fully_committed, run_expired_shard_sweep,
+    CANDIDATE_EXPIRY_MS, CandidateExpirySweepReport, HousekeepingError, SHARD_DESTROY_GRACE_MS,
+    SPOOL_SESSION_ABSENCE_MS, ShardSweepReport, SpoolSessionSweepReport, candidate_expiry_due,
+    expired_shard_ids, is_fully_committed, run_candidate_expiry_sweep, run_expired_shard_sweep,
     run_orphan_shard_sweep, run_spool_session_sweep, run_unreferenced_space_sweep, session_gc_due,
     shard_destroy_due, sweep_expired_shard_dirs, sweep_orphan_shard_dirs,
     sweep_unreferenced_space_dirs,
 };
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use memory::{
-    Actor, AuditEventRow, CandidateState, CandidateTransitionError, CreateMemoryEntryError,
-    CreateMemoryOp, EditMemoryOp, EvidenceInput, GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition,
-    IllegalMemoryTransition, IllegalRunTransition, MemoryKind, MemoryOpError, MemoryOpOutcome,
-    MemoryOpResult, MemoryState, MemoryTransitionError, MergeLoser, MergeMemoryOp, NewAuditEvent,
-    NewCandidate, NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, ReinforceMemoryOp,
-    ResolveMemoryOp, RetractMemoryOp, RunState, RunTransitionError, ScopeKind, SupersedeMemoryOp,
-    apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce, apply_resolve,
-    apply_retract, apply_supersede, candidate_state, consolidation_run_state, create_candidate,
-    create_consolidation_run, create_memory_entry, find_by_idempotency_key, insert_audit_event,
-    insert_candidate_evidence, insert_memory_evidence, memory_entry_state, memory_evidence_for,
-    processing_cursor, read_audit_events_for_entity, transition_candidate, transition_memory_entry,
+    Actor, ApproveCandidateOutcome, AuditEventRow, CandidateRow, CandidateState,
+    CandidateTransitionError, CreateMemoryEntryError, CreateMemoryOp, EditMemoryOp, EvidenceInput,
+    GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition, IllegalMemoryTransition,
+    IllegalRunTransition, MemoryKind, MemoryOpError, MemoryOpOutcome, MemoryOpResult, MemoryState,
+    MemoryTransitionError, MergeLoser, MergeMemoryOp, NewAuditEvent, NewCandidate,
+    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, ProposedOperation, ReinforceMemoryOp,
+    ResolveMemoryOp, RetractMemoryOp, ReviewError, RunState, RunTransitionError, ScopeKind,
+    SupersedeMemoryOp, apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce,
+    apply_resolve, apply_retract, apply_supersede, approve_candidate, candidate_evidence_for,
+    candidate_state, consolidation_run_state, create_candidate, create_consolidation_run,
+    create_memory_entry, edit_candidate, find_by_idempotency_key, insert_audit_event,
+    insert_candidate_evidence, insert_memory_evidence, list_candidates, memory_entry_state,
+    memory_evidence_for, pending_candidate_ages, processing_cursor, propose_candidate,
+    read_audit_events_for_entity, reject_candidate, transition_candidate, transition_memory_entry,
     transition_run, upsert_processing_cursor,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};

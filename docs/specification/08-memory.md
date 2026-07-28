@@ -114,6 +114,16 @@ the set doesn't need duplicating on every row); only the survivor's row carries 
 `idempotency_key`, mirroring `supersede`'s "headline row only" placement. The response describes
 the survivor only, for the same reason `supersede`'s describes only the new entry.
 
+As-built note (T14-05, `[SPEC]`): `local_rag_store::memory::review::approve_candidate` is not a
+new operation but a dispatcher onto this section's existing five — it deserializes a candidate's
+`proposed_operation` (04 §6's as-built note has the JSON shape) and calls the matching
+`op::apply_create`/`apply_reinforce`/`apply_resolve`/`apply_retract`/`apply_supersede` with
+`actor=User` and `idempotency_key = "candidate:<candidate_id>"`, inside the same transaction as
+the candidate's own `pending → approved` write — so "same audit, same idempotency" (this section's
+own phrase) holds for candidate approval exactly as it does for the router and `remember` (§5).
+`merge`/`edit`/`noop` are never dispatched from a candidate: `noop` has nothing to materialize and
+`edit`/`merge` are direct review-tool ops per §8, not something a candidate proposes.
+
 ## 4. Consolidation `[FIXED]`
 
 Trigger: checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`, startup catch-up.
@@ -188,3 +198,13 @@ only for plumbing — the gate exists to prevent that.
 `reject_memory_candidate`, `edit_memory_candidate`, `edit_memory`, `retract_memory`,
 `merge_memories`, `inspect_memory_evidence` `[FIXED set]`. All mutations run through §3; all
 list operations expose `entry_version` so edits can carry preconditions.
+
+As-built note (T14-05, `[SPEC]`): the store-level primitives underlying the four
+candidate-review tools now exist —
+`local_rag_store::memory::{propose_candidate, edit_candidate, approve_candidate,
+reject_candidate, list_candidates}` — but the MCP tool surface itself (request/response
+shapes, routing) is out of this task's scope; group 15 wires it. `pending_memory_candidate` has
+no `entry_version` (04 §6's as-built note), so `edit_memory_candidate`'s precondition, once
+wired, is `review_state = 'pending'`, not a version match — `list_candidates` exposes
+`review_state`/`created_at` as this table's own staleness signal instead, paired with
+`candidate_evidence_for` for provenance.
