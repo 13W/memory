@@ -425,6 +425,140 @@ pub fn memory_entry_state(
     .optional()
 }
 
+/// One recall-eligible `memory_entry` row (T14-07): just enough for the
+/// router's own conflict lookup ([`active_entries_for_scope`]) to decide
+/// whether a `reinforce`/`supersede` has a real target, without pulling in
+/// T14-08's scored relevance pipeline. Deliberately not `EntryVersion`/
+/// `entry_version`-named alone — every field a caller needs to both *pick* a
+/// candidate and *cite* it in an op's `expected_version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEntrySummary {
+    pub memory_id: String,
+    pub kind: MemoryKind,
+    pub state: MemoryState,
+    pub text: String,
+    pub scope_kind: ScopeKind,
+    pub scope_owner_id: String,
+    pub canonical_key: Option<String>,
+    pub entry_version: i64,
+}
+
+fn read_summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntrySummary> {
+    let raw_kind: String = r.get(1)?;
+    let kind = MemoryKind::from_db(&raw_kind).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            1,
+            Type::Text,
+            format!("invalid memory_entry.kind {raw_kind:?}").into(),
+        )
+    })?;
+    let raw_state: String = r.get(2)?;
+    let state = MemoryState::from_db(&raw_state).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            format!("invalid memory_entry.state {raw_state:?}").into(),
+        )
+    })?;
+    let raw_scope_kind: String = r.get(4)?;
+    let scope_kind = ScopeKind::from_db(&raw_scope_kind).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            4,
+            Type::Text,
+            format!("invalid memory_entry.scope_kind {raw_scope_kind:?}").into(),
+        )
+    })?;
+    Ok(MemoryEntrySummary {
+        memory_id: r.get(0)?,
+        kind,
+        state,
+        text: r.get(3)?,
+        scope_kind,
+        scope_owner_id: r.get(5)?,
+        canonical_key: r.get(6)?,
+        entry_version: r.get(7)?,
+    })
+}
+
+const SUMMARY_COLUMNS: &str =
+    "memory_id, kind, state, text, scope_kind, scope_owner_id, canonical_key, entry_version";
+
+/// Every recall-eligible entry in `(scope_kind, scope_owner_id)`, optionally
+/// narrowed to one `canonical_key` — T14-07's own minimal conflict lookup
+/// (spec 08 §4 step 3's "candidate conflict set", the part
+/// `local_rag_store::memory::runner`'s own doc reserves for T14-08's scored
+/// pipeline; this is the plain, unscored version a router can use *before*
+/// that pipeline exists). "Recall-eligible" mirrors spec 08 §6's own recall
+/// filter: `!state.is_terminal()` — a `resolved`/`retracted`/`rejected`/
+/// `superseded` row is never offered as a `reinforce`/`supersede` target.
+pub fn active_entries_for_scope(
+    conn: &Connection,
+    scope_kind: ScopeKind,
+    scope_owner_id: &str,
+    canonical_key_filter: Option<&str>,
+) -> rusqlite::Result<Vec<MemoryEntrySummary>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SUMMARY_COLUMNS} FROM memory_entry \
+         WHERE scope_kind = ?1 AND scope_owner_id = ?2 \
+           AND (?3 IS NULL OR canonical_key = ?3) \
+           AND state NOT IN ('resolved', 'retracted', 'rejected', 'superseded') \
+         ORDER BY memory_id"
+    ))?;
+    let rows = stmt
+        .query_map(
+            params![scope_kind.as_str(), scope_owner_id, canonical_key_filter],
+            read_summary_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// One entry's summary by id, regardless of state (unlike
+/// [`active_entries_for_scope`], which only lists recall-eligible rows) — for
+/// re-resolving a specific `memory_id` a generator named directly (T14-07's
+/// `local_rag_memory::recall`), where a terminal state is itself meaningful
+/// information (e.g. "this was already superseded"), not something to filter
+/// out silently.
+pub fn memory_entry_summary(
+    conn: &Connection,
+    memory_id: &str,
+) -> rusqlite::Result<Option<MemoryEntrySummary>> {
+    conn.query_row(
+        &format!("SELECT {SUMMARY_COLUMNS} FROM memory_entry WHERE memory_id = ?1"),
+        params![memory_id],
+        read_summary_row,
+    )
+    .optional()
+}
+
+/// Which `memory_id`, if any, already owns `canonical_key` in `(scope_kind,
+/// scope_owner_id)` — regardless of `state` (T14-07). Mirrors [`super::op`]'s
+/// own private `create_new_entry` pre-check exactly (the `memory_canonical`
+/// unique index has no state filter — a `superseded`/`retracted` row still
+/// occupies its key), so a router-side caller (`local_rag_memory::guard`) can
+/// predict a `create`/`supersede` canonical-key conflict *before* submitting
+/// the op, instead of discovering it only when [`super::op::apply_create`]/
+/// [`super::op::apply_supersede`] rejects it — which would otherwise roll
+/// back the whole consolidation batch (`super::runner`'s own atomicity
+/// guarantee) and reproduce the identical rejection on every deterministic
+/// retry. [`active_entries_for_scope`] cannot serve this purpose: it
+/// deliberately excludes terminal states, exactly the states this check must
+/// still see.
+pub fn canonical_key_owner(
+    conn: &Connection,
+    scope_kind: ScopeKind,
+    scope_owner_id: &str,
+    canonical_key: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT memory_id FROM memory_entry \
+         WHERE scope_kind = ?1 AND scope_owner_id = ?2 AND canonical_key = ?3",
+        params![scope_kind.as_str(), scope_owner_id, canonical_key],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

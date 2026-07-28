@@ -19,9 +19,10 @@ use local_rag_store::memory::{
     Actor, CandidateState, CandidateTransitionError, CreateMemoryEntryError, GLOBAL_SCOPE_OWNER_ID,
     IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition, MemoryKind,
     MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate, NewConsolidationRun,
-    NewMemoryEntry, NewMemoryEvidence, RunState, RunTransitionError, ScopeKind, candidate_state,
-    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
-    insert_audit_event, insert_candidate_evidence, insert_memory_evidence, memory_entry_state,
+    NewMemoryEntry, NewMemoryEvidence, RunState, RunTransitionError, ScopeKind,
+    active_entries_for_scope, candidate_state, canonical_key_owner, consolidation_run_state,
+    create_candidate, create_consolidation_run, create_memory_entry, insert_audit_event,
+    insert_candidate_evidence, insert_memory_evidence, memory_entry_state, memory_entry_summary,
     memory_evidence_for, processing_cursor, read_audit_events_for_entity, transition_candidate,
     transition_memory_entry, transition_run, upsert_processing_cursor,
 };
@@ -1075,5 +1076,220 @@ async fn audit_event_unique_idempotency_key_conflict() {
     assert!(
         matches!(result, Err(WriteError::Sqlite(_))),
         "same idempotency_key must conflict even across entity_versions, got {result:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T14-07: recall primitives (active_entries_for_scope / memory_entry_summary)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn active_entries_for_scope_excludes_terminal_states_and_other_scopes() {
+    let (_home, db) = open_state();
+    let owner = uuid(150);
+    let other_owner = uuid(151);
+
+    let active_id = uuid(152);
+    create_memory(
+        &db,
+        &active_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create active");
+
+    let resolved_id = uuid(153);
+    create_memory(
+        &db,
+        &resolved_id,
+        MemoryKind::Task,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create task");
+    transition_entry(&db, &resolved_id, MemoryState::Resolved)
+        .await
+        .expect("resolve");
+
+    let other_scope_id = uuid(154);
+    create_memory(
+        &db,
+        &other_scope_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &other_owner,
+        None,
+    )
+    .await
+    .expect("create in a different scope");
+
+    let read = db.open_read().expect("read conn");
+    let found = active_entries_for_scope(&read, ScopeKind::Worktree, &owner, None).expect("query");
+    assert_eq!(
+        found
+            .iter()
+            .map(|e| e.memory_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![active_id.as_str()],
+        "only the active entry in this scope is offered as a recall candidate"
+    );
+    assert_eq!(found[0].kind, MemoryKind::Fact);
+    assert_eq!(found[0].entry_version, 1);
+}
+
+#[tokio::test]
+async fn active_entries_for_scope_filters_by_canonical_key_when_given() {
+    let (_home, db) = open_state();
+    let owner = uuid(155);
+
+    let keyed_id = uuid(156);
+    create_memory(
+        &db,
+        &keyed_id,
+        MemoryKind::Decision,
+        ScopeKind::Worktree,
+        &owner,
+        Some("storage-backend"),
+    )
+    .await
+    .expect("create keyed");
+
+    let unkeyed_id = uuid(157);
+    create_memory(
+        &db,
+        &unkeyed_id,
+        MemoryKind::Decision,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create unkeyed");
+
+    let read = db.open_read().expect("read conn");
+    let found =
+        active_entries_for_scope(&read, ScopeKind::Worktree, &owner, Some("storage-backend"))
+            .expect("query");
+    assert_eq!(
+        found
+            .iter()
+            .map(|e| e.memory_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![keyed_id.as_str()]
+    );
+    assert_eq!(found[0].canonical_key.as_deref(), Some("storage-backend"));
+
+    let unfiltered =
+        active_entries_for_scope(&read, ScopeKind::Worktree, &owner, None).expect("query");
+    assert_eq!(unfiltered.len(), 2, "no filter returns both");
+}
+
+#[tokio::test]
+async fn memory_entry_summary_finds_terminal_entries_too() {
+    let (_home, db) = open_state();
+    let owner = uuid(158);
+    let id = uuid(159);
+    create_memory(
+        &db,
+        &id,
+        MemoryKind::Question,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create question");
+    transition_entry(&db, &id, MemoryState::Resolved)
+        .await
+        .expect("resolve");
+
+    let read = db.open_read().expect("read conn");
+    // Unlike active_entries_for_scope, a direct id lookup must still find a
+    // terminal entry -- a caller that already knows the id needs to see
+    // "this was already resolved", not an absence.
+    let summary = memory_entry_summary(&read, &id)
+        .expect("query")
+        .expect("terminal entries are still found by id");
+    assert_eq!(summary.state, MemoryState::Resolved);
+    assert_eq!(summary.kind, MemoryKind::Question);
+
+    assert_eq!(
+        active_entries_for_scope(&read, ScopeKind::Worktree, &owner, None).expect("query"),
+        Vec::new(),
+        "the same entry is excluded from the scope-scan once terminal"
+    );
+}
+
+#[tokio::test]
+async fn memory_entry_summary_is_none_for_an_unknown_id() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_summary(&read, &uuid(160)).expect("query"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn canonical_key_owner_finds_the_owner_regardless_of_state() {
+    let (_home, db) = open_state();
+    let owner = uuid(161);
+    let id = uuid(162);
+    create_memory(
+        &db,
+        &id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        Some("storage-backend"),
+    )
+    .await
+    .expect("create keyed");
+    transition_entry(&db, &id, MemoryState::Retracted)
+        .await
+        .expect("retract");
+
+    let read = db.open_read().expect("read conn");
+    // Unlike active_entries_for_scope, this must still see a terminal row --
+    // the real `memory_canonical` unique index has no state filter, so a
+    // retracted row still blocks the key.
+    assert_eq!(
+        canonical_key_owner(&read, ScopeKind::Worktree, &owner, "storage-backend").expect("query"),
+        Some(id)
+    );
+}
+
+#[tokio::test]
+async fn canonical_key_owner_is_none_when_unclaimed_or_in_a_different_scope() {
+    let (_home, db) = open_state();
+    let owner = uuid(163);
+    let other_owner = uuid(164);
+    let id = uuid(165);
+    create_memory(
+        &db,
+        &id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        Some("storage-backend"),
+    )
+    .await
+    .expect("create keyed");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        canonical_key_owner(&read, ScopeKind::Worktree, &owner, "unclaimed-key").expect("query"),
+        None
+    );
+    assert_eq!(
+        canonical_key_owner(&read, ScopeKind::Worktree, &other_owner, "storage-backend")
+            .expect("query"),
+        None,
+        "the same key text in a different scope is a different slot"
     );
 }

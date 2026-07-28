@@ -14,7 +14,9 @@ schemas of a vector store. Fixture families:
 3. Search fixtures: the 49-query benchmark corpus (queries + relevance judgments).
 4. Memory-quality fixtures: labeled observation streams → expected ops
    (`create|reinforce|supersede|noop`), covering decision vs hypothesis vs negation, RU/EN
-   mixed transcripts `[FIXED, new in rev 6]`.
+   mixed transcripts `[FIXED, new in rev 6]`. As-built (T14-07, `[SPEC]`): 42
+   `memory.router.op.*` cases inside `fixtures/memory/index.json` (GAP-04) — see 08 §7's own
+   as-built note for the full op vocabulary and harness shape.
 5. Adversarial recall fixtures (12 §4).
 6. Fault-injection scripts (05 §10, 07 §7).
 
@@ -39,8 +41,20 @@ stated justification ("tuning changes are versioned"). They are derived from the
 baseline**, deliberately not from the first v2 run: that run regressed, and deriving a threshold
 from a regressed measurement would encode the regression as acceptable (O2). The gate consequently
 **failed on the first v2 run** — MRR 0.5646 vs the 0.6963 baseline, Recall@5 0.7755 — which was
-registered as `D-016` rather than papered over. The `latency`/`resources`/`memory-quality` rows
-remain `[BASELINE]`-pending (T14-07, T17-05).
+registered as `D-016` rather than papered over. The `latency`/`resources` rows remain
+`[BASELINE]`-pending (T17-05); `memory-quality` closed as of T14-07/ADR-0006 (see below).
+
+As-built note (T14-07, `[SPEC]`): the `memory-quality` row's `P`/`R` are now set —
+`min_precision = 0.60`, `min_recall = 0.55` — in `fixtures/memory/baseline/thresholds.json`,
+mirroring `quality`'s own "not in code, a reviewable diff" convention. These numbers went through
+two rounds (ADR-0006): a first baseline run against `qwen2.5-0.5b-instruct-gguf-q4km` (precision
+0.3784, recall 0.3182), then, after the user asked directly whether Gemma could be used, a second
+run against `gemma-4-e2b-it-gguf-q4-0` (precision 0.6667, recall 0.6364) — both greedy, both the
+identical 42-case fixture set (08 §7's own as-built note) — with Gemma 4 E2B replacing Qwen2.5 as
+the shipped default and the thresholds re-derived from its run; the Qwen2.5 run stays on disk as
+historical evidence, not deleted. Unlike `quality`, there is no prior v1 measurement to regress
+against — GAP-04's own text already states the corpus "is absent in v1" — so this is a floor a
+real margin below the current default's own run, not a regression budget.
 
 As-built note (D-018, `[SPEC]`): **the `quality` gate now passes on the shipped default mode** —
 MRR 0.7007 against the 0.6963 baseline, Recall@5 0.8367 against the 0.80 floor. It got there by
@@ -116,6 +130,19 @@ T00-01 explicitly declined. The report therefore carries full per-query detail f
 
 The first recorded run and its per-leg diagnostics live in `fixtures/search/baseline/`; the
 regression they expose is `D-016`.
+
+As-built note (T14-07, `[SPEC]`): the memory-router benchmark runner is `cargo xtask
+memory-bench` (`crates/xtask/src/memory_bench/`), split the same way `cargo xtask bench` is:
+`corpus` loads the labeled `memory.router.op.*` cases, `score` holds op-kind matching (a
+multiset comparison — a small local model has no obligation to emit ops in the fixture's own
+observation order) and micro-averaged precision/recall, `report` shapes the output, `gate` turns
+a report plus versioned thresholds into a verdict, and `run` is the only piece needing the
+installed GGUF weights. Unlike the search benchmark, there is no v1 baseline to diff against
+(GAP-04), so the report carries no `baseline`/`diff` fields at all. Every recorded run — both
+Qwen2.5 sizes from round one, and the `Gemma 4 E2B` run that replaced them as the shipped default
+in round two — lives in `fixtures/memory/baseline/`, never deleted even once superseded; the
+model-selection decisions (including the `chat_template_override` mechanism round two needed)
+are ADR-0006.
 
 As-built note (T10-02, `[SPEC]`): for the brute-force candidate, warm search p95 /
 open / close / registry-startup are measured generically by

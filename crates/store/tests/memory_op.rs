@@ -2070,3 +2070,247 @@ async fn reinforce_rolls_back_completely_on_failpoint() {
     let read = db.open_read().expect("read conn");
     assert_eq!(read_confidence(&read, &id), 0.99);
 }
+
+// ---------------------------------------------------------------------------
+// T14-07: ModelClaimOnlyProvenance backstop (spec 12 §4 `[FIXED]`)
+// ---------------------------------------------------------------------------
+
+/// Like [`create`], but with explicit control over `actor` and each evidence
+/// row's `evidence_kind` — what the model-claim-only-provenance backstop
+/// tests need that the narrower [`create`] helper (fixed `ToolResult`/
+/// `Router`) does not give.
+async fn create_with_evidence(
+    db: &StateDb,
+    memory_id: &str,
+    kind: MemoryKind,
+    scope_owner_id: &str,
+    actor: Actor,
+    evidence: Vec<(String, local_rag_store::EvidenceKind)>,
+) -> Result<MemoryOpOutcome, MemoryOpError> {
+    let (id, owner) = (memory_id.to_string(), scope_owner_id.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            let evidence_inputs: Vec<EvidenceInput<'_>> = evidence
+                .iter()
+                .map(|(oid, evidence_kind)| EvidenceInput {
+                    observation_id: oid,
+                    evidence_kind: *evidence_kind,
+                    session_id: "sess-1",
+                    agent_id: None,
+                    commit_hash: None,
+                })
+                .collect();
+            apply_create(
+                tx,
+                &CreateMemoryOp {
+                    memory_id: &id,
+                    kind,
+                    text: "candidate durable text",
+                    canonical_key: None,
+                    scope_kind: ScopeKind::Worktree,
+                    scope_owner_id: &owner,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    evidence: &evidence_inputs,
+                    actor,
+                    idempotency_key: None,
+                },
+                1000,
+            )
+        })
+        .await
+        .expect("create tx (infrastructure)")
+}
+
+#[tokio::test]
+async fn router_promotion_with_only_model_claim_evidence_is_rejected() {
+    let (_home, db) = open_state();
+    let owner = uuid(220);
+    let id = uuid(221);
+    let obs = seed_observation(&db, 222).await;
+
+    let result = create_with_evidence(
+        &db,
+        &id,
+        MemoryKind::Fact,
+        &owner,
+        Actor::Router,
+        vec![(obs, local_rag_store::EvidenceKind::ModelClaim)],
+    )
+    .await;
+    assert_eq!(result, Err(MemoryOpError::ModelClaimOnlyProvenance));
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &id).expect("state"),
+        None,
+        "no row created"
+    );
+}
+
+#[tokio::test]
+async fn router_promotion_with_no_evidence_at_all_is_not_the_backstops_concern() {
+    // Empty evidence is a different, pre-existing concern (every earlier
+    // T14-0N op-engine test already exercises evidence-less router ops for
+    // reasons unrelated to trust) -- the backstop triggers specifically on
+    // the `model_claim` *marking*, not on evidence being absent.
+    let (_home, db) = open_state();
+    let owner = uuid(223);
+    let id = uuid(224);
+
+    let result = create_with_evidence(
+        &db,
+        &id,
+        MemoryKind::Decision,
+        &owner,
+        Actor::Router,
+        vec![],
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(MemoryOpOutcome::Applied(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn router_promotion_with_at_least_one_non_model_claim_row_succeeds() {
+    let (_home, db) = open_state();
+    let owner = uuid(225);
+    let id = uuid(226);
+    let obs_claim = seed_observation(&db, 227).await;
+    let obs_real = seed_observation(&db, 228).await;
+
+    let result = create_with_evidence(
+        &db,
+        &id,
+        MemoryKind::Convention,
+        &owner,
+        Actor::Router,
+        vec![
+            (obs_claim, local_rag_store::EvidenceKind::ModelClaim),
+            (obs_real, local_rag_store::EvidenceKind::ToolResult),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(MemoryOpOutcome::Applied(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn router_task_and_hypothesis_are_exempt_from_the_backstop() {
+    let (_home, db) = open_state();
+    let owner = uuid(229);
+
+    for (seed, kind) in [(230, MemoryKind::Task), (231, MemoryKind::Hypothesis)] {
+        let id = uuid(seed);
+        let obs = seed_observation(&db, seed + 10).await;
+        let result = create_with_evidence(
+            &db,
+            &id,
+            kind,
+            &owner,
+            Actor::Router,
+            vec![(obs, local_rag_store::EvidenceKind::ModelClaim)],
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(MemoryOpOutcome::Applied(_))),
+            "{kind:?}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn user_actor_promotion_with_only_model_claim_evidence_is_allowed() {
+    let (_home, db) = open_state();
+    let owner = uuid(232);
+    let id = uuid(233);
+    let obs = seed_observation(&db, 234).await;
+
+    // spec 08 §5's carve-out: `remember`/candidate-approval carries
+    // user-equivalent trust even when its own evidence is `model_claim`.
+    let result = create_with_evidence(
+        &db,
+        &id,
+        MemoryKind::Procedure,
+        &owner,
+        Actor::User,
+        vec![(obs, local_rag_store::EvidenceKind::ModelClaim)],
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(MemoryOpOutcome::Applied(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn supersede_new_entry_model_claim_only_is_rejected_and_old_entry_is_untouched() {
+    let (_home, db) = open_state();
+    let owner = uuid(235);
+    let old_id = uuid(236);
+    let new_id = uuid(237);
+    let obs = seed_observation(&db, 238).await;
+
+    // A real, user-backed old fact -- supersedable per the kind/state machine.
+    create_with_evidence(
+        &db,
+        &old_id,
+        MemoryKind::Fact,
+        &owner,
+        Actor::User,
+        vec![(obs.clone(), local_rag_store::EvidenceKind::UserStatement)],
+    )
+    .await
+    .expect("old entry create");
+
+    let (old, new, own, ob) = (old_id.clone(), new_id.clone(), owner.clone(), obs.clone());
+    let result = db
+        .writer()
+        .transaction(move |tx| {
+            let evidence = [EvidenceInput {
+                observation_id: &ob,
+                evidence_kind: local_rag_store::EvidenceKind::ModelClaim,
+                session_id: "sess-1",
+                agent_id: None,
+                commit_hash: None,
+            }];
+            apply_supersede(
+                tx,
+                &SupersedeMemoryOp {
+                    old_memory_id: &old,
+                    old_expected_version: 1,
+                    new_memory_id: &new,
+                    new_kind: MemoryKind::Fact,
+                    new_text: "router-claimed replacement",
+                    new_canonical_key: None,
+                    new_scope_kind: ScopeKind::Worktree,
+                    new_scope_owner_id: &own,
+                    new_confidence: 0.5,
+                    new_importance: 0.5,
+                    new_valid_from_tree: None,
+                    new_last_verified_tree: None,
+                    evidence: &evidence,
+                    actor: Actor::Router,
+                    idempotency_key: None,
+                },
+                2000,
+            )
+        })
+        .await
+        .expect("supersede tx (infrastructure)");
+    assert_eq!(result, Err(MemoryOpError::ModelClaimOnlyProvenance));
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &old_id).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+        "the old entry must be completely untouched -- not just the new one refused"
+    );
+    assert_eq!(memory_entry_state(&read, &new_id).expect("state"), None);
+}

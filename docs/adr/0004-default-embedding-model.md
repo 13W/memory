@@ -12,10 +12,12 @@ weights delivery; local generator crate"**
 ([spec 15 §4](../specification/15-roadmap.md)), whose resolution path is "model
 evaluation + [10 §5](../specification/10-models-and-embeddings.md)". Delivered by
 task **T11-03** ([group 11](../implementation-plan/groups/11-embeddings-and-model-spaces.md)).
-The other two halves of O3 stay open and visible, each with its own owner:
-**weights delivery** is T11-06 (spec 10 §5's installer), and the **local
-generator crate** (`llama-cpp-2` / `mistral.rs` / `kalosm`, spec 10 §1
-`[OPEN — pick with default model]`) is T14-07. Partial closure follows the
+The other two halves of O3 stayed open and visible at the time of writing, each
+with its own owner: **weights delivery** was T11-06 (spec 10 §5's installer,
+closed by ADR-0005), and the **local generator crate** (`llama-cpp-2` /
+`mistral.rs` / `kalosm`, spec 10 §1 `[OPEN — pick with default model]`) was
+T14-07, closed by [ADR-0006](0006-local-router-runtime.md) (`llama-cpp-2`
+selected, matching the first-listed candidate here). Partial closure follows the
 precedent of ADR-0002, which resolved the `SyntaxLocator` half of O7 and left
 graph semantics open. Convention (`docs/adr/NNNN-title.md`, Nygard sections,
 English) is ADR-0001's.
@@ -268,7 +270,8 @@ for a 3-text batch, ≈2.7 s session load (`crates/models/tests/onnx.rs`, this h
 * Spec 10 §5's `[OPEN]` "Default model choice" is resolved to
   `embeddinggemma-300m` and recorded as a `[SPEC]` as-built note citing this
   ADR; spec 15 §4's O3 row is amended to show the embedding half resolved with
-  the delivery and generator halves still open (T11-06, T14-07). No `[FIXED]`
+  the delivery and generator halves open at the time (T11-06, T14-07) and
+  since closed (ADR-0005, ADR-0006). No `[FIXED]`
   text is changed by this ADR; only `[OPEN]` → resolved `[SPEC]` amendments.
 * **T11-03 ships no ONNX runtime.** The provider pool, the policy guard, the
   retry/fallback contract and a deterministic in-process provider land now;

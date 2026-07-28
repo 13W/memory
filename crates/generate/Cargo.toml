@@ -1,0 +1,64 @@
+[package]
+name = "local-rag-generate"
+description = "Local generative model asset installer and the llama.cpp-backed Generator provider for local-rag (spec 10 §1/§5, ADR-0006, T14-07)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+local-rag-core = { path = "../core" }
+local-rag-embed = { path = "../embed" }
+
+# The HTTPS client behind the installer's `AssetFetcher` seam — the same role
+# `local-rag-models`' own `ureq` dependency plays for ONNX weights (spec 10 §5
+# `[FIXED policy]` is not embedding-specific: "weights are not in npm" applies
+# to any local model this project installs). Duplicated here rather than
+# shared via `local-rag-core` deliberately: every crate in the workspace
+# depends on `core`, and a real HTTP client there would leak far beyond what
+# only `models`/`generate` need (ADR-0006's own "why a separate crate"
+# reasoning, mirroring ADR-0005's for `crates/models`).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# The local generation runtime (ADR-0006): Rust bindings to llama.cpp.
+# `llama-cpp-sys-2`'s published crate vendors the llama.cpp/GGML C/C++ source
+# tree directly (verified against its real `Cargo.toml` `include` list, not
+# assumed) — `cargo fetch` alone is sufficient, no network call happens during
+# `cargo build`, keeping this offline exactly like every other native-linking
+# dependency in this workspace (rusqlite/zstd/tree-sitter's own `bundled`
+# builds). The real, disclosed cost is a *host toolchain* requirement instead:
+# `cmake` + `libclang` (bindgen) to compile the vendored source, heavier than
+# `ort`'s `load-dynamic` (which needs no C++ toolchain at all). Default
+# features minus `openmp` (would additionally require a system OpenMP
+# library, e.g. Homebrew's `libomp` on macOS — an extra host dependency this
+# task does not need to require) and `android-shared-stdcxx` (irrelevant off
+# Android); `common` stays enabled (llama.cpp's shared sampling/grammar
+# helpers).
+llama-cpp-2 = { version = "0.1", default-features = false, features = [
+    "common",
+] }
+
+# `token_to_piece`'s decoder parameter (`llama_cpp_2::model::LlamaModel::
+# token_to_piece`) is an `encoding_rs::Decoder` — already resolved
+# transitively via `llama-cpp-2` itself, so this is 0 new external sources,
+# only a direct dependency edge to construct `UTF_8.new_decoder()`.
+encoding_rs = "0.8"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Optional, dev-only path crate (0 external sources): enabled ONLY by the
+# `failpoints` feature so the installer can host its named crash point between
+# committed files, mirroring `local-rag-models`' own precedent exactly.
+local-rag-test-support = { path = "../test-support", optional = true }
+
+[features]
+# Compiles `generate.install.between_files`, the crash point fired after a
+# file has been renamed into place and before the next one starts.
+failpoints = ["dep:local-rag-test-support"]
+
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
+
+[lints]
+workspace = true

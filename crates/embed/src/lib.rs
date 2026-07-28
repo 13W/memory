@@ -40,10 +40,27 @@
 //! registered under a different `model_id` can never be confused with the
 //! production one, because `model_id` is one of the six fields of the canonical
 //! [`RepresentationKey`](local_rag_store::RepresentationKey) (spec 03 §2.2).
+//!
+//! # T14-07: `Generator`/`GeneratorPool`
+//!
+//! Spec 10 §1 `[FIXED]` pins `Embedder` and `Generator` in the same code
+//! block, so T14-07 (the consolidation router's local generative model,
+//! closing the generator half of open question O3) adds [`Generator`]/
+//! [`GenRequest`]/[`GenResponse`] to `contract.rs` and [`GeneratorPool`]
+//! alongside them, in its own `gen_pool` module — same crate, same
+//! guard-before-selection/primary-fallback/retry order, same
+//! [`RetryPolicy`]/[`Sleeper`] reused verbatim. [`NoopGenerator`] is [`HashingEmbedder`]'s honest counterpart: it
+//! cannot fake classification, so it deterministically reports an empty ops
+//! list rather than pretending to have decided anything (see its own doc). The
+//! real GGUF-backed provider lives in a separate crate (`local-rag-generate`)
+//! for the same reason `local-rag-models` is separate from this one — this
+//! crate stays free of any ML runtime, asserted structurally by
+//! `tests/offline_smoke.rs`.
 
 pub mod backfill;
 
 mod contract;
+mod gen_pool;
 mod local;
 mod pool;
 mod registry;
@@ -54,10 +71,14 @@ pub use backfill::{
     BackfillError, BackfillParams, BackfillReport, DEFAULT_EMBED_BATCH, DEFAULT_WRITE_BATCH_ROWS,
     InFlight, promote_if_covered, run_backfill,
 };
-pub use contract::{EmbedError, EmbedRequest, Embedder, ProviderFailure, Vector};
+pub use contract::{
+    EmbedError, EmbedRequest, Embedder, FinishReason, GenError, GenMessage, GenRequest,
+    GenResponse, GenRole, Generator, ProviderFailure, Sampling, Vector,
+};
+pub use gen_pool::{GeneratorEntry, GeneratorPool};
 pub use local::{
     HashingEmbedder, LOCAL_BOOTSTRAP_DIMENSIONS, LOCAL_BOOTSTRAP_MODEL_ID,
-    LOCAL_BOOTSTRAP_NORMALIZATION_VERSION, LOCAL_BOOTSTRAP_REPRESENTATION_VERSION,
+    LOCAL_BOOTSTRAP_NORMALIZATION_VERSION, LOCAL_BOOTSTRAP_REPRESENTATION_VERSION, NoopGenerator,
     model_assets_dir, require_model_assets,
 };
 pub use policy::{Locality, allows};

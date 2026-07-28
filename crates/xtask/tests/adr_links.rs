@@ -213,6 +213,38 @@ fn model_delivery_adr_is_well_formed() {
     );
 }
 
+#[test]
+fn local_router_runtime_adr_is_well_formed() {
+    let path = adr_dir().join("0006-local-router-runtime.md");
+    let adr = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for section in ["## Status", "## Context", "## Decision", "## Consequences"] {
+        assert!(
+            adr.contains(section),
+            "ADR-0006 must contain a `{section}` section"
+        );
+    }
+    assert!(
+        adr.contains("Accepted"),
+        "ADR-0006 must record an Accepted status"
+    );
+    assert!(
+        adr.contains("O3"),
+        "ADR-0006 must reference the open question it closes the generator-crate half of"
+    );
+    assert!(
+        adr.contains("O2"),
+        "ADR-0006 must reference O2's memory-router baseline numbers it produces"
+    );
+    assert!(
+        adr.contains("llama-cpp-2"),
+        "ADR-0006 must name the selected runtime binding"
+    );
+    assert!(
+        adr.contains("mistral.rs"),
+        "ADR-0006 must name the researched-but-rejected runtime candidate"
+    );
+}
+
 /// The ADR's measurement artifact must exist and stay machine-readable: the
 /// decision cites numbers, and a citation to a missing or unparsable file is not
 /// evidence.

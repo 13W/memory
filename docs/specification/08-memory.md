@@ -24,6 +24,17 @@ confidence = clamp01( base(source reliability)
 Weights are constants in the router config, versioned by `router_version` `[SPEC values TBD
 with the fixture set]`. `reinforce` may raise confidence; it never edits text (§3).
 
+As-built note (T14-07, `[SPEC]`): the seven weights above stay `[SPEC values TBD]` — several
+need signals that do not exist yet (`w_repeat` cross-session counting, `w_code` code-state
+diffing, `w_contra` conflict detection, all T14-08+ territory), and inventing numbers to fit a
+formula with nothing measured to derive them from is exactly what O2's "collect metrics, never
+invent thresholds" rule forbids. `local_rag_memory::router` instead has the model emit a
+qualitative `confidence_signal`/`importance_signal ∈ {low, medium, high}` per op (never a raw
+float — this section's own heading), mapped in `local_rag_memory::schema` to fixed placeholder
+constants (`0.3`/`0.6`/`0.85`). `router_version = "v0"` is recorded in every memory-quality
+benchmark report's provenance (spec 14 §7) so a future weight retune is visibly a different
+version, never a silent change.
+
 ## 3. Transactional memory operations `[FIXED]`
 
 Operations: `create | reinforce | resolve | supersede | retract | noop`
@@ -155,7 +166,8 @@ Router placement rules `[FIXED]`:
 As-built note (T14-06, `[SPEC]`): `local_rag_store::memory::runner` ships steps 1 (extending
 `consolidation.rs`'s T14-01 primitives with lease acquire/renew and the bounded snapshot) and 2–4
 (`run_once`/`commit_apply_run`) — everything except the router itself (step 3's actual generation
-logic, T14-07, which closes open item O3). Three details this section states less precisely than
+logic, shipped separately by T14-07, which closes open item O3's generator-crate half — see the
+as-built note after this list). Three details this section states less precisely than
 the shipped code:
 
 - **"ONE short tx" is atomic across the whole ops list, not per op.** A single rejected op — an
@@ -188,6 +200,25 @@ defense-in-depth against the one genuinely ambiguous case `WriteError` documents
 the transaction's commit and the reply reaching the caller) rather than being the primary
 duplicate-prevention mechanism spec 04 §4 step 5's prose seems to assume — transaction atomicity
 already guarantees a rejected batch leaves zero residue for any legitimate retry to duplicate.
+
+As-built note (T14-07, `[SPEC]`): the router itself (step 3) is `local_rag_memory::router::route`
+— the `generate` closure `run_once` is generic over, composed at the daemon/`xtask` call site with
+a concrete `local_rag_generate::LlamaGenerator` (ADR-0006). One `Generator` call per window (not
+per observation): a negation only makes sense read against an earlier claim in the same window,
+matching this section's own "ordered ops list" wording. The model never emits a raw `confidence`/
+`importance` float (§2's own as-built note) and never addresses an existing entry by
+`canonical_key` — only by the `memory_id` `local_rag_memory::recall::candidate_conflict_set` shows
+it in the prompt, since the same key text can legitimately exist in more than one scope. Two-tier
+malformed-output handling: a structurally invalid response (bad JSON, an unknown enum value) gets
+one bounded corrective re-prompt before the whole window fails (the "router/LLM error ⇒ failed
+(retryable)" edge, 04 §4); a semantically-valid but referentially-hallucinated value (an unknown
+`target_memory_id`, an unresolvable scope) degrades only that one op to `noop`, never the whole
+batch — `local_rag_memory::guard` also pre-checks a `canonical_key` collision
+(`local_rag_store::canonical_key_owner`, which — unlike `active_entries_for_scope` — sees
+terminal rows too, matching the real unique index) before ever submitting a `create`/`supersede`,
+for the identical livelock reason. §4's two placement rules (below) are enforced by
+`local_rag_memory::guard` independently of what the model claims, using each window observation's
+own `evidence_kind` (set at write time, T13-04) — never the model's self-report.
 
 ## 5. Explicit tool-initiated memory (`remember`, review tools)
 
@@ -228,6 +259,32 @@ negation, and RU/EN mixed transcripts. Precision/recall of the consolidation rou
 set is an acceptance gate (14 §2) on par with the 49-query code-search benchmark. Target P/R
 numbers are set after the baseline run `[OPEN]`. Without this, the memory pillar has criteria
 only for plumbing — the gate exists to prevent that.
+
+As-built note (T14-07, `[SPEC]`, closing this section's `[OPEN]` target-P/R item): the fixture
+set is 42 `memory.router.op.*` cases inside `fixtures/memory/index.json` (GAP-04), not a new
+top-level family — `fixtures/schema/manifest.schema.json`'s `families` array is fixed-size and
+closed-enum, and GAP-04 already scoped this corpus under the existing `memory` family. The
+harness is `cargo xtask memory-bench` (`crates/xtask/src/memory_bench/`), split the same way
+`cargo xtask bench` is (14 §7's own as-built note): `corpus` loads the labeled cases, `score`
+holds op-kind matching (a multiset comparison per window, since a small local model has no
+obligation to emit ops in the order a fixture author wrote observations in) and micro-averaged
+precision/recall math over the full op vocabulary (`create | reinforce | resolve | retract |
+supersede | noop | propose_candidate` — broader than this section's illustrative four, since
+`propose_candidate` must be independently scoreable or a guard failure to downgrade would hide
+inside a false "correct create"), `report` shapes the output, `gate` turns a report plus
+versioned thresholds into a verdict, and `run` is the only piece needing the installed GGUF
+weights. The real baseline went through two rounds (ADR-0006): round one measured both
+`qwen2.5-{0.5b,1.5b}-instruct-gguf-q4km` (F1 0.3457/0.3529, modest); round two, after the user
+asked directly whether Gemma could be used, measured `gemma-4-e2b-it-gguf-q4-0` and found it
+roughly doubled the F1 (precision 0.6667, recall 0.6364, F1 0.6512,
+`fixtures/memory/baseline/run-gemma-4-e2b.json`), which is why it replaced Qwen2.5-0.5B as the
+shipped default despite being ~7× larger to download — disclosed as a real, measured trade-off,
+not a free upgrade. `fixtures/memory/baseline/thresholds.json` sets the 14 §2 gate floor a real
+margin below the round-two run (`min_precision = 0.60`, `min_recall = 0.55`); the round-one runs
+stay on disk as historical evidence, not deleted. T14-09 (`docs/implementation-plan/groups/
+14-memory.md`) tracks generalizing the per-model chat-template handling this round's Gemma 4
+candidate needed (see ADR-0006's own Consequences) into a mechanism that supports arbitrary
+models without hardcoding.
 
 ## 8. Review tools (surface in 11 §2)
 

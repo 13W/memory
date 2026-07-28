@@ -1,0 +1,706 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "commit": "e49f585",
+    "corpus_path": "fixtures/memory/index.json",
+    "corpus_version": "1.0.0",
+    "case_count": 42,
+    "model_id": "gemma-4-e2b-it-gguf-q4-0",
+    "sampling": "greedy",
+    "router_version": "v0",
+    "host": "aarch64-macos"
+  },
+  "metrics": {
+    "precision": 0.6666666666666666,
+    "recall": 0.6363636363636364,
+    "f1": 0.6511627906976744,
+    "exact_match_rate": 0.6190476190476191
+  },
+  "per_case": [
+    {
+      "id": "memory.router.op.create-decision-en-clean",
+      "tags": [
+        "router",
+        "create",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-decision-ru-clean",
+      "tags": [
+        "router",
+        "create",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-convention-en-clean",
+      "tags": [
+        "router",
+        "create",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-convention-ru-clean",
+      "tags": [
+        "router",
+        "create",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-procedure-en-clean",
+      "tags": [
+        "router",
+        "create",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-procedure-ru-clean",
+      "tags": [
+        "router",
+        "create",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-task-en-clean",
+      "tags": [
+        "router",
+        "create",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-task-ru-clean",
+      "tags": [
+        "router",
+        "create",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-hypothesis-en-brainstorm",
+      "tags": [
+        "router",
+        "create",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.create-hypothesis-ru-brainstorm",
+      "tags": [
+        "router",
+        "create",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.create-question-en",
+      "tags": [
+        "router",
+        "create",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.create-question-ru",
+      "tags": [
+        "router",
+        "create",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-fact-en",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-fact-ru",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-decision-en",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-decision-ru",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.propose-candidate-negation-no-target-en",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "en",
+        "adversarial"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.propose-candidate-negation-no-target-ru",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "ru",
+        "adversarial"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.propose-candidate-temporary-suggestion-en",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "en",
+        "adversarial"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.propose-candidate-temporary-suggestion-ru",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "ru",
+        "adversarial"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.noop-routine-tool-result-en",
+      "tags": [
+        "router",
+        "noop",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "noop"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.noop-routine-tool-result-ru",
+      "tags": [
+        "router",
+        "noop",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "noop"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.noop-small-talk-en",
+      "tags": [
+        "router",
+        "noop",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "noop"
+      ],
+      "predicted": [
+        "noop"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.noop-small-talk-ru",
+      "tags": [
+        "router",
+        "noop",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "noop"
+      ],
+      "predicted": [
+        "noop"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.retract-existing-en",
+      "tags": [
+        "router",
+        "retract",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "retract"
+      ],
+      "predicted": [
+        "retract"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.retract-existing-ru",
+      "tags": [
+        "router",
+        "retract",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "retract"
+      ],
+      "predicted": [
+        "retract"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.reinforce-existing-en",
+      "tags": [
+        "router",
+        "reinforce",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "reinforce"
+      ],
+      "predicted": [
+        "reinforce"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.reinforce-existing-ru",
+      "tags": [
+        "router",
+        "reinforce",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "reinforce"
+      ],
+      "predicted": [
+        "reinforce"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.reinforce-vs-create-duplicate-en",
+      "tags": [
+        "router",
+        "reinforce",
+        "en",
+        "adversarial"
+      ],
+      "expected": [
+        "reinforce"
+      ],
+      "predicted": [
+        "reinforce"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.supersede-existing-en",
+      "tags": [
+        "router",
+        "supersede",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "supersede"
+      ],
+      "predicted": [
+        "retract"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.supersede-existing-ru",
+      "tags": [
+        "router",
+        "supersede",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "supersede"
+      ],
+      "predicted": [
+        "retract"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.resolve-existing-task-en",
+      "tags": [
+        "router",
+        "resolve",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "resolve"
+      ],
+      "predicted": [
+        "reinforce"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.resolve-existing-task-ru",
+      "tags": [
+        "router",
+        "resolve",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "resolve"
+      ],
+      "predicted": [
+        "reinforce"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.resolve-existing-question-en",
+      "tags": [
+        "router",
+        "resolve",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "resolve"
+      ],
+      "predicted": [
+        "reinforce"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.resolve-existing-question-ru",
+      "tags": [
+        "router",
+        "resolve",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "resolve"
+      ],
+      "predicted": [
+        "reinforce"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.code-switch-ru-en-decision",
+      "tags": [
+        "router",
+        "create",
+        "ru",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.code-switch-en-ru-convention",
+      "tags": [
+        "router",
+        "create",
+        "en",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.code-switch-ru-en-noop",
+      "tags": [
+        "router",
+        "noop",
+        "ru",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "noop"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.multi-observation-mixed-window-en",
+      "tags": [
+        "router",
+        "noop",
+        "create",
+        "en",
+        "clean"
+      ],
+      "expected": [
+        "noop",
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.multi-observation-mixed-window-ru",
+      "tags": [
+        "router",
+        "noop",
+        "create",
+        "ru",
+        "clean"
+      ],
+      "expected": [
+        "noop",
+        "create"
+      ],
+      "predicted": [
+        "create"
+      ],
+      "correct": false
+    },
+    {
+      "id": "memory.router.op.adversarial-code-state-alone-en",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "en",
+        "adversarial"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    },
+    {
+      "id": "memory.router.op.adversarial-code-state-alone-ru",
+      "tags": [
+        "router",
+        "propose_candidate",
+        "ru",
+        "adversarial"
+      ],
+      "expected": [
+        "propose_candidate"
+      ],
+      "predicted": [
+        "propose_candidate"
+      ],
+      "correct": true
+    }
+  ],
+  "latency": {
+    "install_ms": 0,
+    "load_ms": 1030,
+    "route_p50_ms": 819.5600840000001,
+    "route_p95_ms": 924.172708
+  }
+}

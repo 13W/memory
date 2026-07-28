@@ -1,7 +1,7 @@
 {
   "family": "memory",
   "version": "1.0.0",
-  "description": "Memory-pipeline behavior imported neutrally as request/stream -> observable outcome. Internal storage shape is NOT imported: old-vs-new payload schema and colForType collection-name mapping are backend-specific (excluded per 01 §7). The rev6 labeled-observation-stream corpus with create|reinforce|supersede|noop ops (14 §1 item 4, [FIXED new in rev6]) is not present in v1 and is registered as GAP-04.",
+  "description": "Memory-pipeline behavior imported neutrally as request/stream -> observable outcome. Internal storage shape is NOT imported: old-vs-new payload schema and colForType collection-name mapping are backend-specific (excluded per 01 §7). The rev6 labeled-observation-stream corpus with create|reinforce|supersede|noop ops (14 §1 item 4, [FIXED new in rev6]) is RESOLVED (T14-07): the `memory.router.op.*` cases below are that corpus, scored by `cargo xtask memory-bench` (`crates/xtask/src/memory_bench/`) against `local_rag_memory::router::route`.",
   "cases": [
     {
       "id": "memory.store.reject-invalid-type",
@@ -273,6 +273,525 @@
       "provenance": { "source": "src/scoring.test.ts", "ref": "finalScore: produces values in a reasonable range [0, 1]" },
       "input": { "cosine": 0.75, "importance": 0.8, "apply_decay": true },
       "expected": { "in_range": [0, 1] }
+    },
+    {
+      "id": "memory.router.op.create-decision-en-clean",
+      "title": "An explicit English decision is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule: 'we decided X'" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "We decided to use pnpm instead of npm for this repository." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-decision-ru-clean",
+      "title": "An explicit Russian decision is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Мы решили использовать pnpm вместо npm в этом репозитории." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-convention-en-clean",
+      "title": "An explicit English convention ('always') is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Always run the linter before committing any change." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-convention-ru-clean",
+      "title": "An explicit Russian convention is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Всегда запускай тесты перед коммитом." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-procedure-en-clean",
+      "title": "An explicit English procedure is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "To deploy: first run the migration, then restart the service, then check the health endpoint." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-procedure-ru-clean",
+      "title": "An explicit Russian procedure is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Чтобы задеплоить: сначала прогони миграции, потом перезапусти сервис, потом проверь health endpoint." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-task-en-clean",
+      "title": "An explicit English task instruction is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule covers kind=task too" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "We need to fix the memory leak in the parser before the next release." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-task-ru-clean",
+      "title": "An explicit Russian task instruction is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 explicit-durable rule covers kind=task too, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Нужно исправить утечку памяти в парсере до следующего релиза." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-hypothesis-en-brainstorm",
+      "title": "An English brainstorm ('what if') is created as a hypothesis, not auto-saved as fact",
+      "status": "active",
+      "tags": ["router", "create", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4: brainstorms route to hypothesis, exempt from the durable gate" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "What if we cached the parsed AST between runs to speed things up?" }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-hypothesis-ru-brainstorm",
+      "title": "A Russian brainstorm is created as a hypothesis",
+      "status": "active",
+      "tags": ["router", "create", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 brainstorm -> hypothesis, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "А что если кэшировать распарсенное AST между запусками?" }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-question-en",
+      "title": "An explicit English open question is created as a question",
+      "status": "active",
+      "tags": ["router", "create", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4: questions exempt from the durable gate" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Why does the embedding step take so much longer on the CI runner than locally?" }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.create-question-ru",
+      "title": "An explicit Russian open question is created as a question",
+      "status": "active",
+      "tags": ["router", "create", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 question -> question kind, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Почему шаг эмбеддинга на CI выполняется намного дольше, чем локально?" }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-fact-en",
+      "title": "A low-trust English model-claim fact is proposed, never auto-created",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 12 §4 model-claims are never auto-promoted to facts" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "model_claim", "trust": "low", "text": "This module is likely the main entry point of the CLI." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-fact-ru",
+      "title": "A low-trust Russian model-claim fact is proposed, never auto-created",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 12 §4 model-claim-only, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "model_claim", "trust": "low", "text": "Похоже, этот модуль является главной точкой входа CLI." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-decision-en",
+      "title": "An inferred English 'decision' with only model-claim evidence is proposed",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 12 §4 model-claim-only applies to decision too" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "model_claim", "trust": "low", "text": "It looks like this project prefers pnpm over npm, based on the lockfile present." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-model-claim-decision-ru",
+      "title": "An inferred Russian 'decision' with only model-claim evidence is proposed",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 12 §4 model-claim-only, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "model_claim", "trust": "low", "text": "Судя по lock-файлу, в проекте, похоже, предпочитают pnpm, а не npm." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-negation-no-target-en",
+      "title": "An English prohibition with no existing entry to retract is proposed, not auto-created",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "en", "adversarial"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4's own example: 'do not use X' is a negation, not an auto-saved decision" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Do not use global mutable state anywhere in this codebase." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-negation-no-target-ru",
+      "title": "A Russian prohibition with no existing entry to retract is proposed",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "ru", "adversarial"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 negation without a target, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Не используй глобальное изменяемое состояние в этом коде." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-temporary-suggestion-en",
+      "title": "An English temporary suggestion is proposed, not auto-created",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "en", "adversarial"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4: temporary suggestions are not auto-saved" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Maybe let's try increasing the batch size for now, just to see if it helps." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.propose-candidate-temporary-suggestion-ru",
+      "title": "A Russian temporary suggestion is proposed, not auto-created",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "ru", "adversarial"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 temporary suggestion, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Может, попробуем пока увеличить размер батча, просто чтобы проверить." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.noop-routine-tool-result-en",
+      "title": "A routine English test-run result is a noop",
+      "status": "active",
+      "tags": ["router", "noop", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "nothing durable to record" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "tool_result", "trust": "normal", "text": "pytest: 128 passed, 0 failed in 4.2s" }
+      ] },
+      "expected": { "op_kinds": ["noop"] }
+    },
+    {
+      "id": "memory.router.op.noop-routine-tool-result-ru",
+      "title": "A routine tool result (Russian transcript context) is a noop",
+      "status": "active",
+      "tags": ["router", "noop", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "routine tool result, RU transcript" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "tool_result", "trust": "normal", "text": "cargo test: 42 passed; 0 failed" }
+      ] },
+      "expected": { "op_kinds": ["noop"] }
+    },
+    {
+      "id": "memory.router.op.noop-small-talk-en",
+      "title": "English small talk with no durable content is a noop",
+      "status": "active",
+      "tags": ["router", "noop", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "nothing durable to record" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Thanks, that looks good, let's move on." }
+      ] },
+      "expected": { "op_kinds": ["noop"] }
+    },
+    {
+      "id": "memory.router.op.noop-small-talk-ru",
+      "title": "Russian small talk with no durable content is a noop",
+      "status": "active",
+      "tags": ["router", "noop", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "small talk, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Спасибо, выглядит хорошо, поехали дальше." }
+      ] },
+      "expected": { "op_kinds": ["noop"] }
+    },
+    {
+      "id": "memory.router.op.retract-existing-en",
+      "title": "An explicit English negation targeting an existing entry retracts it",
+      "status": "active",
+      "tags": ["router", "retract", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "negation with a real target is a retract, not a gated create" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "convention", "scope_kind": "global", "canonical_key": "cross-db-writes", "text": "Use SQLite ATTACH for cross-database writes." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Stop using SQLite ATTACH for cross-database writes, it's been causing data corruption." }
+        ]
+      },
+      "expected": { "op_kinds": ["retract"] }
+    },
+    {
+      "id": "memory.router.op.retract-existing-ru",
+      "title": "An explicit Russian negation targeting an existing entry retracts it",
+      "status": "active",
+      "tags": ["router", "retract", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "negation with a real target, RU" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "convention", "scope_kind": "global", "canonical_key": "cross-db-writes-ru", "text": "Использовать SQLite ATTACH для межбазовых записей." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Больше не используй SQLite ATTACH для межбазовых записей, из-за этого повреждаются данные." }
+        ]
+      },
+      "expected": { "op_kinds": ["retract"] }
+    },
+    {
+      "id": "memory.router.op.reinforce-existing-en",
+      "title": "An English confirmation of an existing decision reinforces it",
+      "status": "active",
+      "tags": ["router", "reinforce", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §3 reinforce adds evidence, never edits text" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "decision", "scope_kind": "global", "canonical_key": "package-manager", "text": "Use pnpm instead of npm for this repository." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Yes, confirmed, we're definitely sticking with pnpm." }
+        ]
+      },
+      "expected": { "op_kinds": ["reinforce"] }
+    },
+    {
+      "id": "memory.router.op.reinforce-existing-ru",
+      "title": "A Russian confirmation of an existing decision reinforces it",
+      "status": "active",
+      "tags": ["router", "reinforce", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "reinforce, RU" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "decision", "scope_kind": "global", "canonical_key": "package-manager-ru", "text": "Использовать pnpm вместо npm в этом репозитории." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Да, точно, мы остаёмся на pnpm." }
+        ]
+      },
+      "expected": { "op_kinds": ["reinforce"] }
+    },
+    {
+      "id": "memory.router.op.reinforce-vs-create-duplicate-en",
+      "title": "Reaffirming an existing convention reinforces it rather than creating a duplicate",
+      "status": "active",
+      "tags": ["router", "reinforce", "en", "adversarial"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "tests the model prefers reinforce over a duplicate create when an equivalent entry already exists" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "convention", "scope_kind": "global", "canonical_key": "lint-before-commit", "text": "Run the linter before every commit." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Right, we should keep running the linter before every commit -- that rule still stands." }
+        ]
+      },
+      "expected": { "op_kinds": ["reinforce"] }
+    },
+    {
+      "id": "memory.router.op.supersede-existing-en",
+      "title": "An English explicit change of an existing decision supersedes it",
+      "status": "active",
+      "tags": ["router", "supersede", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 04 §5 promotion/supersede" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "decision", "scope_kind": "global", "canonical_key": "internal-api-protocol", "text": "Use REST for the internal API." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "We changed our mind: the internal API will use gRPC instead of REST from now on." }
+        ]
+      },
+      "expected": { "op_kinds": ["supersede"] }
+    },
+    {
+      "id": "memory.router.op.supersede-existing-ru",
+      "title": "A Russian explicit change of an existing decision supersedes it",
+      "status": "active",
+      "tags": ["router", "supersede", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "supersede, RU" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "decision", "scope_kind": "global", "canonical_key": "internal-api-protocol-ru", "text": "Использовать REST для внутреннего API." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Мы передумали: теперь внутренний API будет на gRPC вместо REST." }
+        ]
+      },
+      "expected": { "op_kinds": ["supersede"] }
+    },
+    {
+      "id": "memory.router.op.resolve-existing-task-en",
+      "title": "Confirmation that an English task is done resolves it",
+      "status": "active",
+      "tags": ["router", "resolve", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 04 §5 task active -> resolved" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "task", "scope_kind": "global", "text": "Fix the memory leak in the parser." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "The memory leak in the parser is fixed now, confirmed by the test suite." }
+        ]
+      },
+      "expected": { "op_kinds": ["resolve"] }
+    },
+    {
+      "id": "memory.router.op.resolve-existing-task-ru",
+      "title": "Confirmation that a Russian task is done resolves it",
+      "status": "active",
+      "tags": ["router", "resolve", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "resolve task, RU" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "task", "scope_kind": "global", "text": "Исправить утечку памяти в парсере." }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Утечка памяти в парсере теперь исправлена, тесты подтверждают." }
+        ]
+      },
+      "expected": { "op_kinds": ["resolve"] }
+    },
+    {
+      "id": "memory.router.op.resolve-existing-question-en",
+      "title": "An answer to an existing English question resolves it",
+      "status": "active",
+      "tags": ["router", "resolve", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 04 §5 question active -> resolved" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "question", "scope_kind": "global", "text": "Why does the embedding step take so long on CI?" }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Turns out the CI runner was using the CPU-only build -- that's why embedding was slow there." }
+        ]
+      },
+      "expected": { "op_kinds": ["resolve"] }
+    },
+    {
+      "id": "memory.router.op.resolve-existing-question-ru",
+      "title": "An answer to an existing Russian question resolves it",
+      "status": "active",
+      "tags": ["router", "resolve", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "resolve question, RU" },
+      "input": {
+        "existing_entries": [
+          { "ref": "e1", "kind": "question", "scope_kind": "global", "text": "Почему шаг эмбеддинга на CI такой медленный?" }
+        ],
+        "observations": [
+          { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Оказалось, CI использовал сборку только для CPU -- вот почему эмбеддинг был таким медленным." }
+        ]
+      },
+      "expected": { "op_kinds": ["resolve"] }
+    },
+    {
+      "id": "memory.router.op.code-switch-ru-en-decision",
+      "title": "A code-switched RU/EN decision within one message is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "ru", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 14 §1 item 4: RU/EN mixed transcripts" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Окей, we decided to go with the hybrid search approach вместо чистого lexical." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.code-switch-en-ru-convention",
+      "title": "A code-switched EN/RU convention within one message is auto-created",
+      "status": "active",
+      "tags": ["router", "create", "en", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "RU/EN mixed transcript, convention" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "New rule: всегда format the code with rustfmt before committing, no exceptions." }
+      ] },
+      "expected": { "op_kinds": ["create"] }
+    },
+    {
+      "id": "memory.router.op.code-switch-ru-en-noop",
+      "title": "A code-switched routine tool result stays a noop",
+      "status": "active",
+      "tags": ["router", "noop", "ru", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "RU/EN mixed transcript, routine tool result" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "tool_result", "trust": "normal", "text": "cargo build: Compiling done, warnings: 0, ошибок нет." }
+      ] },
+      "expected": { "op_kinds": ["noop"] }
+    },
+    {
+      "id": "memory.router.op.multi-observation-mixed-window-en",
+      "title": "A window with a routine result and a real decision yields exactly one noop and one create",
+      "status": "active",
+      "tags": ["router", "noop", "create", "en", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 step 3: the router sees the whole window, not one observation at a time" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "tool_result", "trust": "normal", "text": "cargo test: 10 passed, 0 failed" },
+        { "id": "o2", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "We decided to bump the MSRV to 1.85." }
+      ] },
+      "expected": { "op_kinds": ["noop", "create"] }
+    },
+    {
+      "id": "memory.router.op.multi-observation-mixed-window-ru",
+      "title": "A Russian window with a routine result and a real decision yields one noop and one create",
+      "status": "active",
+      "tags": ["router", "noop", "create", "ru", "clean"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "multi-observation window, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "tool_result", "trust": "normal", "text": "pytest: 5 passed, 0 failed" },
+        { "id": "o2", "event_type": "UserPromptSubmit", "evidence_kind": "user_statement", "trust": "normal", "text": "Мы решили поднять минимальную версию Rust до 1.85." }
+      ] },
+      "expected": { "op_kinds": ["noop", "create"] }
+    },
+    {
+      "id": "memory.router.op.adversarial-code-state-alone-en",
+      "title": "A bare code-state fact with no user statement is proposed, not auto-created",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "en", "adversarial"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "spec 08 §4 durable gate requires evidence_kind=user_statement specifically; code_state alone does not satisfy it, even though it is not model_claim either" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "code_state", "trust": "normal", "text": "The repository's CI configuration only runs on Linux runners." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
+    },
+    {
+      "id": "memory.router.op.adversarial-code-state-alone-ru",
+      "title": "A bare Russian code-state fact with no user statement is proposed, not auto-created",
+      "status": "active",
+      "tags": ["router", "propose_candidate", "ru", "adversarial"],
+      "provenance": { "source": "T14-07 fixture authoring", "note": "code_state alone does not satisfy the durable gate, RU" },
+      "input": { "observations": [
+        { "id": "o1", "event_type": "PostToolUse", "evidence_kind": "code_state", "trust": "normal", "text": "В CI конфигурации репозитория используются только Linux раннеры." }
+      ] },
+      "expected": { "op_kinds": ["propose_candidate"] }
     }
   ]
 }

@@ -37,9 +37,14 @@ fixtures/
   `code_vector`, `payload`, `collection`, `parent_id`, …) MUST NOT appear anywhere. The
   validator enforces this — it is the machine-checkable proof that no vector-store schema leaked
   in.
-- **Thresholds are TBD**: gate numbers (MRR/Recall@5, router P/R, latency/resource p95) are
-  `[BASELINE]`/`[OPEN]`. We record the *metrics* and the v1 baseline *numbers*, never invented
-  *thresholds* (O2: "collect metrics, do not invent thresholds"). See `manifest.json → baseline`.
+- **Thresholds are TBD in `manifest.json`'s own index** (`manifest.json → baseline →
+  thresholds`, schema-enforced to stay the literal string `"TBD"` for every key — it is a
+  directory of threshold *names*, not a live mirror of their values, so it never drifts out of
+  sync with the per-family files below). The **real** numbers, once a baseline exists, live in
+  each family's own `<family>/baseline/thresholds.json` — `search/baseline/thresholds.json`
+  (T12-05) and `memory/baseline/thresholds.json` (T14-07) both exist today; latency/resource
+  thresholds are still `[BASELINE]`/`[OPEN]` (T17-05). We record the *metrics* and the baseline
+  *numbers*, never invented *thresholds* (O2: "collect metrics, do not invent thresholds").
 
 ## Validate
 
@@ -57,7 +62,8 @@ The validator runs the four T00-01 checks: schema validation, id uniqueness, run
 Six fixture families (14 §1). Each has either imported fixtures or an explicitly registered
 blocking gap in `manifest.json → gaps` (parser is gap-only: v1 has no chunking goldens).
 Gaps resolve in later tasks (e.g. parser goldens in T04, generation diffs in T05, F/S executable
-scripts in T00-03/T07-05/T13-06, rev6 memory-op corpus in T14-07). Deferred v0 scope (15 §3) is
+scripts in T00-03/T07-05/T13-06; the rev6 memory-op corpus, GAP-04, resolved in T14-07 as the
+`memory.router.op.*` cases inside `memory/index.json`). Deferred v0 scope (15 §3) is
 listed under `manifest.json → deferred` and is never encoded as v0 expected behavior.
 
 This is a bootstrap: T00-03's Rust fixture/failpoint harness will consume these same files and

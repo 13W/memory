@@ -48,6 +48,38 @@ integrity, matching semantics, metric math, the gate — is ordinary
 workspace members, so this adds **no** package to `Cargo.lock`; the cost is build
 time for a dev-only crate that `default-members` already excludes.
 
+## Memory-quality benchmark (`cargo xtask memory-bench`)
+
+The memory-router benchmark (spec 08 §7, T14-07) is a **separate** command and
+deliberately *not* part of `cargo xtask ci`:
+
+```
+cargo xtask memory-bench [--corpus <path>] [--model <catalog-id>] [--out <path>]
+```
+
+It runs `local_rag_memory::router::route` against every `memory.router.op.*` case
+in `fixtures/memory/index.json` (default `--corpus`), one fresh throwaway
+`state.sqlite` per case, and writes a report next to the recorded baselines in
+`fixtures/memory/baseline/`. `--model` selects a different
+`crates/generate::catalog::CATALOG` entry (default
+`local_rag_generate::DEFAULT_MODEL_ID`) — how ADR-0006's two comparison rounds
+(0.5B vs. 1.5B Qwen2.5, then Gemma 4 E2B) were actually measured, not guessed at;
+`--out` writes the report (and its `.report.md`) somewhere other than
+`memory/baseline/run.json`, so a comparison run does not overwrite the shipped
+baseline. Two reasons it stays out of the gate: it needs the installed GGUF
+weights (~3.2 GiB for the default model, `Gemma 4 E2B` — fetched by the pinned
+catalog on first run and cached in `$LOCAL_RAG_BENCH_MODEL_HOME` — the same
+cache root the search benchmark's ONNX weights use, namespaced by `model_id`) and
+the `cmake`/`libclang` toolchain `llama-cpp-sys-2` needs to compile llama.cpp from
+its vendored source. Everything *scored* — corpus loading, op-kind matching,
+metric math, the gate — is ordinary `cargo test -p xtask` and therefore does run
+in `ci`.
+
+Unlike the search benchmark, there is no v1 baseline to diff against (GAP-04): the
+report carries no `baseline`/`diff` fields, and the gate
+(`fixtures/memory/baseline/thresholds.json`) is a floor on the one real run that
+exists, not a regression budget.
+
 ## Toolchain / MSRV
 
 - Pinned toolchain: **1.96.1** via `rust-toolchain.toml` (components `rustfmt`,
@@ -105,6 +137,7 @@ the license check. Additions require a new row here.
 | `ort` (`default-features = false`, features `load-dynamic`, `ndarray`, `api-24`) + `ndarray` | `crates/models` | Spec 10 §1 `[FIXED]` fixes that embeddings run **in-process** on ONNX Runtime or Candle; ADR-0005 picks ONNX Runtime, and `ort` is its Rust binding. **`load-dynamic` is the load-bearing feature**: `ort-sys` compiles with linking disabled and resolves `libonnxruntime` at runtime through `libloading`, so `cargo build` downloads no binary and the offline rule below still holds — the exact objection `D-008` raised against the default `download-binaries`. `api-24` pins the ONNX Runtime API level (without an explicit level the crate does not compile). `ndarray` is `ort`'s own tensor type (pinned to **0.17**, the version `ort` resolves) and is how token ids/attention masks are handed to a session; `std` has no n-dimensional array. Which shared library ships per platform package is T17-03's "ORT bundling verified before the final CI matrix". Native-linking transitive set: `ort-sys`, `libloading` (ISC), `ndarray`, `matrixmultiply`, `rawpointer`, `num-traits`/`num-complex`/`num-integer`, `portable-atomic`(-util), `tracing`/`tracing-core`, `rayon`(-core) (shared with `tokenizers`), `either`. | MIT OR Apache-2.0 |
 | `tokenizers` (`default-features = false`, feature `onig`) | `crates/models` | An embedding model's vectors are only meaningful if input is encoded with the *same* tokenizer it was trained on; `tokenizer.json` ships with the weights and `std` has no BPE/SentencePiece implementation. This is the reference implementation the model card assumes (T11-06). `default-features = false` drops `progressbar` (indicatif) and `esaxx_fast` (a C++ trainer this project never uses — inference only); `onig` stays because it is the only regex backend a non-wasm build can select (the alternative, `fancy-regex`, is reachable only through `unstable_wasm`, which forces `getrandom/wasm_js`). `onig_sys` vendors and compiles the Oniguruma C library (BSD-2-Clause) via the already-present `cc`. Native-linking transitive set: `onig`/`onig_sys` (MIT; vendored C BSD-2-Clause), `esaxx-rs` (pure-Rust without `cpp`), `spm_precompiled`, `compact_str`, `castaway`, `daachorse`, `derive_builder`(+`darling`, build-time), `monostate`, `macro_rules_attribute`, `unicode-normalization-alignments`, `unicode-segmentation`, `unicode_categories`, `itertools`, `ahash`, `rand`/`rand_chacha`/`rand_core`/`getrandom`/`ppv-lite86`/`zerocopy`, `rayon`(-core, -cond), `dary_heap`, `fnv`, `paste`, `static_assertions`, `nom`/`minimal-lexical`. Not a network or dense-backend SDK: it neither downloads (`http`/`hf-hub` features off) nor stores vectors. | Apache-2.0 |
 | `notify` (`default-features = false`, feature `macos_fsevent`) | `crates/index` | The reconcile scheduler needs filesystem-change notifications (spec 06 §1: "Watcher (`notify`) events"; the `[FIXED]` principle is watcher = hint, reconcile = truth). `std` has no FS-notification API. Live watching is confined to `reconcile::watcher`; the pure `WatchEvent → Trigger` mapping is what the tests cover, and the OS watcher itself is never in the CI suite (its event timing is not reproducible). `default-features = false` drops the `crossbeam-channel` default (the thin wrapper uses `std`/tokio channels), keeping the set minimal like `ignore`. Runtime crates compiled on the targets this project ships: `notify` (CC0-1.0) + `notify-types` (MIT OR Apache-2.0); on macOS `fsevent-sys` (MIT); on Linux `inotify` + `inotify-sys` (ISC) and `mio` (MIT). Reused (already in the tree): `bitflags`, `libc`, `log`, `walkdir`, `same-file`. `Cargo.lock` additionally records — but never compiles for v0's macOS/Linux targets — `kqueue`/`kqueue-sys` (MIT, BSD), the `windows-sys`/`windows-targets`/`windows_*` family (MIT OR Apache-2.0, `cfg(windows)`), and `wasi` (wasm), gated exactly like rusqlite's wasm subtree. Not a dense-backend/model/network SDK. | CC0-1.0 |
+| `llama-cpp-2` (`default-features = false`, feature `common`) + `llama-cpp-sys-2` | `crates/generate` | Spec 10 §1 `[FIXED]` fixes that generation runs **in-process**; ADR-0006 picks `llama.cpp` for the local generative model (Qwen2.5-Instruct and Gemma 4 GGUF, both measured; Gemma 4 shipped as the default), and `llama-cpp-2` is its Rust binding — the generation-side analog of `ort` for embeddings. Unlike `ort`'s `load-dynamic` (resolves `libonnxruntime` at runtime, no C++ toolchain needed), `llama-cpp-sys-2` **vendors and compiles** the llama.cpp/GGML C/C++ source tree from the published crate package via `cmake`/`bindgen` — the real, disclosed cost (ADR-0006): every build host needs `cmake` + `libclang` (bindgen), which `ort`'s runtime-resolution approach specifically avoided. `cargo fetch` alone still gets everything needed (the source is vendored in the crate, not downloaded at build time), so the offline-build rule holds. Native-linking transitive set: `encoding_rs` ((Apache-2.0 OR MIT) AND BSD-3-Clause, token→text decoding), `enumflags2`/`enumflags2_derive` (MIT OR Apache-2.0, sampler/model-param bitflags), `bindgen` (BSD-3-Clause) + `cexpr` (Apache-2.0/MIT) + `clang-sys` (Apache-2.0) + `prettyplease`/`rustc-hash`/`shlex` (build-time only, generating the FFI bindings), `cmake` (MIT OR Apache-2.0, invokes the system `cmake` to build GGML), `find_cuda_helper` (MIT OR Apache-2.0, build-time CUDA toolkit probe — always resolved, never compiled into anything: this build enables no CUDA feature) , `glob` (MIT OR Apache-2.0). `tracing`/`tracing-core`/`thiserror`/`cfg-if` are reused (already in the tree); `tracing-attributes`/`valuable` are new but pulled in only as `tracing`'s own optional-feature transitives. Two packages resolve a **second, older version** alongside one `ort` already pinned — `itertools 0.13.0` (`ort`'s tree already has 0.14.0) and `libloading 0.8.9` (`ort`'s tree already has 0.9.0) — both build-time/FFI-glue only, not a security-relevant duplication, disclosed here rather than silently accepted. None of the above are network SDKs — `llama-cpp-sys-2`'s own feature list (`common`/`cuda`/`metal`/`vulkan`/`rocm`/`opencl`/`mkl`/`openmp`/`system-ggml`/`dynamic-link`/...) is entirely backend/build-toggle, with no download- or network-shaped feature at all. | MIT OR Apache-2.0 (llama-cpp-2/llama-cpp-sys-2) |
 
 The earlier "zero external sources" property (T00-02) is therefore superseded by
 this explicit allowlist plus the no-dense/model-SDK-before-T10 rule above.
@@ -114,14 +147,24 @@ rewritten.
 ## Workspace layout
 
 - Libraries (`crates/*`): `core`, `store`, `index`, `projection`, `embed`,
-  `models`, `search`, `memory`, `protocol`. `embed` (T11-03) is the embedding
-  provider pool — the `Embedder` contract, the central remote-policy guard,
-  primary/fallback + retry, and the in-process default provider — plus, as of
-  T11-04, the resumable coverage backfill worker. It depends only on other
-  workspace crates. `models` (T11-06) is the other side of the model-asset
-  contract: the checksum-verified atomic installer (spec 10 §5) and the ONNX
-  provider that loads what it installs. The split is deliberate — the heavy,
-  externally-facing dependencies (`ort`, `tokenizers`, `ureq`) live there so
+  `models`, `generate`, `search`, `memory`, `protocol`. `embed` (T11-03) is the
+  embedding provider pool — the `Embedder`/`Generator` contracts (spec 10 §1),
+  the central remote-policy guard, primary/fallback + retry, and the in-process
+  default/no-op providers — plus, as of T11-04, the resumable coverage backfill
+  worker. It depends only on other workspace crates. `models` (T11-06) and
+  `generate` (T14-07) are the two heavy-runtime sides of the model-asset
+  contract: `models` is the checksum-verified ONNX installer/provider (spec 10
+  §5), `generate` is its `llama.cpp`/GGUF analog for the local router (spec 08
+  §4, ADR-0006) — a **separate** crate from `models` rather than folded in,
+  because `llama-cpp-sys-2` needs a materially different build toolchain
+  (`cmake`+`libclang`) than ONNX's `load-dynamic` (no C++ toolchain at all);
+  mixing them would force every ONNX-only contributor to also carry a C++
+  toolchain they do not need. `memory` (T14-07) is the router itself
+  (`local_rag_memory::router::route`) — it depends on `embed`'s `Generator`
+  trait/pool only, never on `generate` directly, the same seam `search` uses
+  for `Embedder`/`models`. The split is deliberate throughout — the heavy,
+  externally-facing dependencies (`ort`/`tokenizers`/`ureq` in `models`;
+  `llama-cpp-2`/`llama-cpp-sys-2` in `generate`) live in isolated crates so
   `embed`'s "no network client, no model runtime" lint stays a true statement
   about the pool rather than being relaxed.
 - Product binaries: `local-rag` (daemon + CLI), `local-rag-proxy` (stdio MCP
@@ -143,7 +186,11 @@ rewritten.
   (`embed.backfill.between_batches`, the crash point after a committed cache-write
   batch — spec 10 §4 step 2's "resumable"); as of T11-06, `models`'s installer
   (`models.install.between_files`, fired after a file is verified and renamed into
-  place and before the next one starts — spec 10 §5's resumable download); and, as of T07-05, the write-ahead
+  place and before the next one starts — spec 10 §5's resumable download); as of T14-07,
+  `generate`'s installer has the identical seam under its own name
+  (`generate.install.between_files`) — a deliberate duplicate rather than a shared
+  helper (see the "Approved external dependencies" table's `llama-cpp-2` row for why
+  `generate` is a separate crate from `models`); and, as of T07-05, the write-ahead
   switch's own `projection.switch.before_commit` seam (fires after the shard write lands but
   before the final `state.sqlite` commit — spec 05 §10 F4, the one kill point
   none of the fake shard's own seams could reach). It is never enabled in a
