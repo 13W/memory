@@ -55,13 +55,14 @@
     {
       "name": "memory",
       "spec_ref": "14 §1.4, 08 §7",
-      "coverage": "partial",
+      "coverage": "full",
       "artifact": "memory/index.json",
       "provenance": [
         "src/util.storeMemory.test.ts",
         "src/util.test.ts",
         "src/scoring.test.ts",
-        "src/router.test.ts (valid-op extraction, confidence threshold)"
+        "src/router.test.ts (valid-op extraction, confidence threshold)",
+        "T14-07 authored the rev6 router-op corpus directly (memory.router.op.* cases; no v1 source, see GAP-04)"
       ],
       "gaps": ["GAP-04"]
     },
@@ -115,7 +116,7 @@
     {
       "id": "GAP-04",
       "family": "memory",
-      "description": "The rev6 labeled observation-stream corpus (transcript -> expected ops create|reinforce|supersede|noop, covering decision vs hypothesis vs negation, RU/EN mixed) is [FIXED, new in rev 6] and absent in v1. v1 store/dedup/scoring/router-extraction mechanics are imported; the op-quality corpus is not.",
+      "description": "RESOLVED (T14-07). The rev6 labeled observation-stream corpus (transcript -> expected ops, covering decision vs hypothesis vs negation, RU/EN mixed and RU/EN code-switched) did not exist in v1. It now does: 42 `memory.router.op.*` cases in memory/index.json, scored by `cargo xtask memory-bench` (crates/xtask/src/memory_bench/) against local_rag_memory::router::route. The P/R gate thresholds themselves remain a separate open item -- see baseline.thresholds.memory_router_precision_p/memory_router_recall_r below, set only after a real baseline run (O2).",
       "blocking": false,
       "resolves_in": "T14-07"
     },
@@ -160,6 +161,39 @@
         "hit3": 0.7959183673469388,
         "hit5": 0.8367346938775511,
         "mrr": 0.6962585034013605
+      },
+      {
+        "file": "memory/baseline/run.json",
+        "model": "qwen2.5-0.5b-instruct-gguf-q4km",
+        "flags": "greedy decoding; 42 memory.router.op.* cases; ADR-0006 round 1 default, superseded by round 2 (Gemma 4 E2B) -- kept as historical evidence",
+        "date": "2026-07-28",
+        "cases_scored": 42,
+        "precision": 0.3783783783783784,
+        "recall": 0.3181818181818182,
+        "f1": 0.345679012345679,
+        "exact_match_rate": 0.30952380952380953
+      },
+      {
+        "file": "memory/baseline/run-1.5b.json",
+        "model": "qwen2.5-1.5b-instruct-gguf-q4km",
+        "flags": "greedy decoding; 42 memory.router.op.* cases; ADR-0006 round 1 comparison candidate, not adopted",
+        "date": "2026-07-28",
+        "cases_scored": 42,
+        "precision": 0.36585365853658536,
+        "recall": 0.3409090909090909,
+        "f1": 0.3529411764705882,
+        "exact_match_rate": 0.3333333333333333
+      },
+      {
+        "file": "memory/baseline/run-gemma-4-e2b.json",
+        "model": "gemma-4-e2b-it-gguf-q4-0",
+        "flags": "greedy decoding; chat_template_override=\"gemma\" (native Gemma 4 template unrecognized by this llama-cpp-sys-2 version, see ADR-0006/T14-09); 42 memory.router.op.* cases; ADR-0006 round 2, shipped default",
+        "date": "2026-07-28",
+        "cases_scored": 42,
+        "precision": 0.6666666666666666,
+        "recall": 0.6363636363636364,
+        "f1": 0.6511627906976744,
+        "exact_match_rate": 0.6190476190476191
       }
     ]
   },

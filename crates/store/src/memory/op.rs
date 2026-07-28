@@ -91,6 +91,23 @@
 //! were a duplicate. [`apply_noop`] sidesteps this by writing nothing at all:
 //! redoing nothing on retry is still nothing, so it needs no
 //! `idempotency_key` bookkeeping either.
+//!
+//! # Model-claim-only provenance backstop (T14-07, spec 12 §4 `[FIXED]`)
+//!
+//! `apply_create` and `apply_supersede`'s new-entry half both reject
+//! (zero mutation, [`MemoryOpError::ModelClaimOnlyProvenance`]) a
+//! router-originated (`actor == Router`) promotion into `fact`/`decision`/
+//! `convention`/`procedure` whose evidence is nothing but `model_claim` rows.
+//! This exists here — not only in `local_rag_memory`'s router — because
+//! [`super::runner::run_once`] is generic over *any* `generate` closure: spec
+//! 12 §4's "model-claims are never auto-promoted to
+//! facts" cannot be considered enforced in code if it only lives inside one
+//! particular generator implementation. `actor == User` is exempt by
+//! construction (not a special case in the check itself): spec 08 §5's
+//! `remember`/candidate-approval path already carries user-equivalent trust
+//! even when its own evidence happens to be `model_claim` — a human already
+//! vouched for it. See [`is_model_claim_only_provenance`]'s own doc for the
+//! exact kind/actor conditions.
 
 use std::collections::HashSet;
 
@@ -296,6 +313,14 @@ pub enum MemoryOpError {
     IncompatibleScope,
     /// `merge` was called with an empty `losers` set — nothing to merge.
     EmptyMergeSet,
+    /// T14-07 (spec 12 §4 `[FIXED]` "model-claims are never auto-promoted to
+    /// facts"): a router-originated `create`/`supersede` promoting into
+    /// `fact`/`decision`/`convention`/`procedure` was backed by nothing but
+    /// `model_claim` evidence (or no evidence at all). This is a
+    /// defense-in-depth backstop, independent of any particular generator —
+    /// see [`apply_create`]'s own doc for why the store, not only the router,
+    /// enforces this.
+    ModelClaimOnlyProvenance,
 }
 
 impl std::fmt::Display for MemoryOpError {
@@ -320,6 +345,11 @@ impl std::fmt::Display for MemoryOpError {
                 write!(f, "merge survivor and loser have incompatible scope")
             }
             MemoryOpError::EmptyMergeSet => write!(f, "merge requires at least one loser"),
+            MemoryOpError::ModelClaimOnlyProvenance => write!(
+                f,
+                "a router-originated promotion to fact/decision/convention/procedure needs \
+                 at least one non-model-claim evidence row"
+            ),
         }
     }
 }
@@ -423,6 +453,49 @@ fn read_kind_state_version_scope(
     .optional()
 }
 
+/// Kinds a promotion (`create`, or `supersede`'s new-entry half) into is
+/// subject to the model-claim-only-provenance backstop (spec 12 §4
+/// `[FIXED]`). `task`/`question`/`hypothesis` are exempt: they exist
+/// precisely to hold uncertain/unconfirmed content, so a model claim
+/// originating one is not a promotion in the sense the rule guards against.
+fn is_promotion_kind(kind: MemoryKind) -> bool {
+    matches!(
+        kind,
+        MemoryKind::Fact | MemoryKind::Decision | MemoryKind::Convention | MemoryKind::Procedure
+    )
+}
+
+/// Whether `evidence` is non-empty and consists of nothing but `model_claim`
+/// rows — spec 12 §4's `[FIXED]` "model-claims are never auto-promoted to
+/// facts", enforced here as a backstop independent of whatever generator
+/// produced this op (T14-07). Only checked for a router-originated promotion
+/// (`actor == Router`) into a promotion-eligible kind
+/// ([`is_promotion_kind`]): spec 08 §5's `remember`/candidate-approval path
+/// explicitly carries `actor=User`-equivalent trust even when its own
+/// evidence is `model_claim` (a human already vouched for it), so `actor ==
+/// User` is exempt by construction rather than by a special case here.
+///
+/// Deliberately **not** triggered by empty evidence: spec 12 §4's rule is
+/// about the `model_claim` *marking* specifically ("model-claims are never
+/// auto-promoted"), not about evidence being present at all — a router op
+/// with no evidence at all is a different, pre-existing concern this task's
+/// card does not own (every earlier T14-0N op-engine test already exercises
+/// evidence-less router ops for reasons unrelated to trust, e.g. optimistic
+/// conflict / audit contiguity, and this backstop must not retroactively
+/// reject them).
+fn is_model_claim_only_provenance(
+    actor: Actor,
+    kind: MemoryKind,
+    evidence: &[EvidenceInput<'_>],
+) -> bool {
+    actor == Actor::Router
+        && is_promotion_kind(kind)
+        && !evidence.is_empty()
+        && evidence
+            .iter()
+            .all(|e| e.evidence_kind == EvidenceKind::ModelClaim)
+}
+
 /// Shared by `apply_create` and `apply_supersede`'s new-entry half: the typed
 /// canonical-key scope-uniqueness pre-check + [`create_memory_entry`] call.
 /// `supersedes_id` is `None` for a plain `create`, `Some(old_id)` for a
@@ -520,6 +593,10 @@ pub fn apply_create(
         && let Some(existing) = find_by_idempotency_key(tx, key)?
     {
         return Ok(Ok(MemoryOpOutcome::Replayed(result_from_row(&existing))));
+    }
+
+    if is_model_claim_only_provenance(request.actor, request.kind, request.evidence) {
+        return Ok(Err(MemoryOpError::ModelClaimOnlyProvenance));
     }
 
     if let Err(e) = create_new_entry(
@@ -787,6 +864,10 @@ pub fn apply_supersede(
     }
     if let Err(illegal) = old_state.check_transition(old_kind, MemoryState::Superseded) {
         return Ok(Err(MemoryOpError::IllegalTransition(illegal)));
+    }
+
+    if is_model_claim_only_provenance(request.actor, request.new_kind, request.evidence) {
+        return Ok(Err(MemoryOpError::ModelClaimOnlyProvenance));
     }
 
     if let Err(e) = create_new_entry(

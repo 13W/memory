@@ -135,6 +135,20 @@ A single XML tag is not a boundary. Defenses, all mandatory:
 5. **Adversarial tests** in the acceptance suite (14 §6): prompt-injection payloads stored as
    memories must survive round-trip as inert text.
 
+As-built note (T14-07, `[SPEC]`): item 4's "model-claims are never auto-promoted to facts" is
+enforced twice, independently, on purpose. First, proactively:
+`local_rag_memory::guard::materialize` downgrades a router-proposed `create`/`supersede` of kind
+`fact | decision | convention | procedure` to `propose_candidate` whenever every cited
+observation's `evidence_kind` (set at write time, T13-04 — never the model's own claim) is
+`model_claim`. Second, as a backstop that cannot be bypassed by a future generator, a bug in the
+router, or a direct `commit_apply_run` call: `local_rag_store::memory::op::apply_create`/
+`apply_supersede` reject the identical condition with `MemoryOpError::ModelClaimOnlyProvenance`
+before any mutation, whenever `actor == Router` — `actor == User` is exempt by construction
+(spec 08 §5's `remember`/candidate-approval path, where a human already vouched for the claim).
+`local_rag_store::run_once` is generic over any `generate` closure (08 §4's own as-built note),
+so only the second layer is the one this guarantee's correctness actually rests on; the first
+exists so the common case never needs the backstop to fire at all.
+
 ## 5. Source-blob policy — strict invariant `[FIXED]`
 
 ```

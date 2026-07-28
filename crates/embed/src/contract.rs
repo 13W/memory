@@ -28,6 +28,29 @@
 //! * errors distinguish **retryable** from **permanent** (the v1 behavioral
 //!   contract's central distinction, 01 §7) and carry an optional server-supplied
 //!   `retry_after_ms`.
+//!
+//! # `Generator`/`GenRequest`/`GenResponse` (T14-07, spec 10 §1 `[FIXED]` trait
+//! pinned in the same code block as `Embedder`, hence the same crate)
+//!
+//! Unlike `EmbedRequest`, a generation request is **not** a batch — the
+//! consolidation router (spec 08 §4) makes one call per bounded window, not one
+//! per text, so [`GenRequest`] carries a chat-style `messages` list (system +
+//! few-shot + the window's own content, built by `local_rag_memory::prompt`)
+//! rather than a `Vec<String>`. [`Generator`] has no `key()` analog: generation
+//! has no [`RepresentationKey`](local_rag_store::RepresentationKey) — nothing
+//! about a generated op list is cached by representation, so there is nothing
+//! for a pool-level dimension/count contract to validate. [`GenResponse`]
+//! carries **raw text**, never parsed JSON — the op-schema/grammar knowledge
+//! belongs to the caller (`local_rag_memory`), keeping this crate model-agnostic
+//! the same way it stays representation-agnostic for `Embedder`.
+//! [`Sampling::Greedy`] is the shipped decode path: "same weights, same runtime
+//! build, same input ⇒ same greedy token path" is this task's determinism
+//! story — not a claim of cross-platform/thread-count bit-exactness, the same
+//! honesty level this codebase already applies to other "byte-stable where it
+//! matters" guarantees. [`GenError`] mirrors [`EmbedError`]'s shape
+//! (retryable/permanent, policy-blocked, no-provider, model-assets-missing,
+//! all-providers-failed) plus one generation-specific variant with no
+//! `Embedder` analog: [`GenError::ContextOverflow`].
 
 use std::fmt;
 
@@ -305,6 +328,229 @@ pub trait Embedder: Send + Sync {
     fn key(&self) -> RepresentationKey;
 }
 
+// ---------------------------------------------------------------------------
+// Generator / GenRequest / GenResponse (T14-07, spec 10 §1 `[FIXED]`). See the
+// module doc's "Generator/GenRequest/GenResponse" section for the shape
+// rationale.
+// ---------------------------------------------------------------------------
+
+/// One message in a [`GenRequest`]'s chat-style input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenMessage {
+    pub role: GenRole,
+    pub content: String,
+}
+
+/// Who a [`GenMessage`] is attributed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenRole {
+    /// Instructions/placement rules/few-shot framing (`local_rag_memory::prompt`).
+    System,
+    /// The window's own content — what the router is asking to be classified.
+    User,
+    /// A prior turn's output, for multi-turn corrective re-prompting
+    /// (`local_rag_memory::parse`'s bounded "that wasn't valid JSON" retry).
+    Assistant,
+}
+
+/// How [`Generator::generate`] decodes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Sampling {
+    /// Deterministic (greedy) decoding — the shipped path; see the module
+    /// doc's determinism note.
+    Greedy,
+    /// Sampled decoding with an explicit seed. Not the default: a router that
+    /// must be reproducible for the memory-quality benchmark (spec 08 §7)
+    /// has no reason to sample.
+    Temperature { temperature: f32, seed: u64 },
+}
+
+/// A generation request (spec 10 §1's `GenRequest`, shape `[SPEC]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenRequest {
+    /// Chat-style input, in order.
+    pub messages: Vec<GenMessage>,
+    /// Upper bound on generated tokens (a malformed/looping model must not run
+    /// unbounded).
+    pub max_tokens: u32,
+    pub sampling: Sampling,
+    /// A JSON Schema the caller wants the output constrained to. A runtime
+    /// that supports grammar-constrained decoding compiles this into its own
+    /// grammar; a runtime that doesn't ignores it — the field is advisory, not
+    /// part of the `[FIXED]` contract, so every `Generator` impl stays valid
+    /// whether or not it honors it.
+    pub json_schema: Option<String>,
+}
+
+impl GenRequest {
+    /// A request over `messages`, greedy-decoded, with no schema constraint.
+    pub fn new(messages: Vec<GenMessage>, max_tokens: u32) -> Self {
+        GenRequest {
+            messages,
+            max_tokens,
+            sampling: Sampling::Greedy,
+            json_schema: None,
+        }
+    }
+
+    /// Constrain output to `json_schema` (builder-style).
+    pub fn with_json_schema(mut self, json_schema: impl Into<String>) -> Self {
+        self.json_schema = Some(json_schema.into());
+        self
+    }
+}
+
+/// Why generation stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model emitted its own end-of-turn signal.
+    Stop,
+    /// `max_tokens` was reached before the model finished.
+    Length,
+    /// A runtime-specific stop condition with no `[FIXED]` name of its own.
+    Other(String),
+}
+
+/// A generation response (spec 10 §1's `GenResponse`, shape `[SPEC]`).
+///
+/// Carries **raw text** — this crate does not parse it. Structured-output
+/// parsing/validation is `local_rag_memory::parse`'s concern, keeping the
+/// op-schema knowledge in exactly one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenResponse {
+    pub text: String,
+    pub finish_reason: FinishReason,
+    /// `None` when the provider does not report a token count.
+    pub tokens_generated: Option<u32>,
+}
+
+/// A typed generation failure — mirrors [`EmbedError`]'s shape (see the module
+/// doc); [`GenError::ContextOverflow`] is the one variant with no `Embedder`
+/// analog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GenError {
+    /// A transient failure. The pool retries the same provider up to the
+    /// policy's attempt budget.
+    Retryable {
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
+    /// A non-transient failure. The pool never retries it and moves to the
+    /// next provider.
+    Permanent { message: String },
+    /// The effective `data_policy` forbids every remaining candidate because
+    /// they are remote (spec 12 §1, 02 §6 `POLICY_BLOCKED_REMOTE`).
+    PolicyBlockedRemote {
+        policy: DataPolicy,
+        blocked: Vec<String>,
+    },
+    /// The pool holds no generator at all.
+    NoProvider,
+    /// A local provider's model assets are not installed yet (spec 10 §5).
+    ModelAssetsMissing {
+        model_id: String,
+        expected_path: String,
+    },
+    /// The request's `messages` (plus expected output) exceed the model's
+    /// context window — a failure mode with no `Embedder` analog, since an
+    /// embedding batch has no comparable single-sequence limit.
+    ContextOverflow {
+        requested_tokens: usize,
+        max_context_tokens: usize,
+    },
+    /// Every allowed provider failed; carries each one's terminal outcome in
+    /// pool order.
+    AllProvidersFailed { failures: Vec<ProviderFailure> },
+}
+
+impl GenError {
+    /// A transient failure with no server-supplied delay hint.
+    pub fn retryable(message: impl Into<String>) -> Self {
+        GenError::Retryable {
+            message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+
+    /// A non-transient failure.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        GenError::Permanent {
+            message: message.into(),
+        }
+    }
+
+    /// Whether the pool may retry the *same* provider for this error.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, GenError::Retryable { .. })
+    }
+}
+
+impl fmt::Display for GenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenError::Retryable {
+                message,
+                retry_after_ms,
+            } => match retry_after_ms {
+                Some(ms) => write!(
+                    f,
+                    "transient generation failure (retry after {ms} ms): {message}"
+                ),
+                None => write!(f, "transient generation failure: {message}"),
+            },
+            GenError::Permanent { message } => {
+                write!(f, "permanent generation failure: {message}")
+            }
+            GenError::PolicyBlockedRemote { policy, blocked } => write!(
+                f,
+                "data_policy {} forbids remote providers [{}]",
+                policy.as_str(),
+                blocked.join(", ")
+            ),
+            GenError::NoProvider => write!(f, "no generation provider configured"),
+            GenError::ModelAssetsMissing {
+                model_id,
+                expected_path,
+            } => write!(
+                f,
+                "model assets for {model_id} are not installed at {expected_path}"
+            ),
+            GenError::ContextOverflow {
+                requested_tokens,
+                max_context_tokens,
+            } => write!(
+                f,
+                "request needs {requested_tokens} tokens, model context is {max_context_tokens}"
+            ),
+            GenError::AllProvidersFailed { failures } => {
+                write!(f, "all generation providers failed: ")?;
+                for (i, failure) in failures.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{failure}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for GenError {}
+
+/// The `[FIXED]` generation provider contract (spec 10 §1).
+///
+/// `generate` is synchronous, matching the spec signature and mirroring
+/// [`Embedder::embed`] — a provider that blocks (local inference) is expected
+/// to be driven from a blocking worker
+/// (`local_rag_store::memory::runner::run_once`'s generator closure runs
+/// outside any transaction for exactly this reason), not from inside an async
+/// reactor.
+pub trait Generator: Send + Sync {
+    fn generate(&self, req: GenRequest) -> Result<GenResponse, GenError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +617,67 @@ mod tests {
         assert_eq!(req.len(), 2);
         assert!(!req.is_empty());
         assert!(EmbedRequest::new(RepresentationKind::Memory, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn gen_request_defaults_to_greedy_with_no_schema() {
+        let req = GenRequest::new(
+            vec![GenMessage {
+                role: GenRole::User,
+                content: "classify this".to_string(),
+            }],
+            64,
+        );
+        assert_eq!(req.sampling, Sampling::Greedy);
+        assert_eq!(req.json_schema, None);
+        assert_eq!(req.max_tokens, 64);
+    }
+
+    #[test]
+    fn gen_request_with_json_schema_sets_the_schema() {
+        let req = GenRequest::new(Vec::new(), 32).with_json_schema("{\"type\":\"array\"}");
+        assert_eq!(req.json_schema.as_deref(), Some("{\"type\":\"array\"}"));
+    }
+
+    #[test]
+    fn only_the_retryable_gen_error_variant_is_retryable() {
+        assert!(GenError::retryable("500").is_retryable());
+        assert!(!GenError::permanent("400").is_retryable());
+        assert!(!GenError::NoProvider.is_retryable());
+    }
+
+    #[test]
+    fn gen_errors_render_their_cause() {
+        assert_eq!(
+            GenError::retryable("upstream busy").to_string(),
+            "transient generation failure: upstream busy"
+        );
+        assert_eq!(
+            GenError::PolicyBlockedRemote {
+                policy: DataPolicy::LocalOnly,
+                blocked: vec!["hosted-llm".to_string()],
+            }
+            .to_string(),
+            "data_policy local_only forbids remote providers [hosted-llm]"
+        );
+        assert_eq!(
+            GenError::ContextOverflow {
+                requested_tokens: 5_000,
+                max_context_tokens: 4_096,
+            }
+            .to_string(),
+            "request needs 5000 tokens, model context is 4096"
+        );
+        assert_eq!(
+            GenError::AllProvidersFailed {
+                failures: vec![ProviderFailure {
+                    provider: "llama-local".to_string(),
+                    attempts: 2,
+                    message: "context overflow".to_string(),
+                }],
+            }
+            .to_string(),
+            "all generation providers failed: llama-local (after 2 attempts): context overflow"
+        );
     }
 }

@@ -7,8 +7,13 @@
 //! `cargo xtask bench` runs the 49-query search benchmark (spec 14 §7, T12-05).
 //! It is **not** part of `ci`: it needs model weights and a corpus checkout that
 //! the repository does not ship.
+//!
+//! `cargo xtask memory-bench` runs the memory-router benchmark (spec 08 §7,
+//! T14-07). Also **not** part of `ci`: it needs the installed GGUF weights
+//! and the `llama-cpp-2` toolchain (ADR-0006).
 
 mod bench;
+mod memory_bench;
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -17,8 +22,9 @@ fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("ci") => run_ci(),
         Some("bench") => run_bench(),
+        Some("memory-bench") => run_memory_bench(),
         other => {
-            eprintln!("usage: cargo xtask <ci|bench>");
+            eprintln!("usage: cargo xtask <ci|bench|memory-bench>");
             eprintln!("unknown task: {}", other.unwrap_or("<none>"));
             ExitCode::from(2)
         }
@@ -196,6 +202,90 @@ fn run_bench() -> ExitCode {
     }
 }
 
+/// `cargo xtask memory-bench [--corpus <path>] [--model <catalog-id>] [--out <path>]`
+fn run_memory_bench() -> ExitCode {
+    let mut case_index_path: Option<PathBuf> = None;
+    let mut model_id: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--corpus" => case_index_path = args.next().map(PathBuf::from),
+            "--model" => model_id = args.next(),
+            "--out" => out = args.next().map(PathBuf::from),
+            other => {
+                eprintln!("unknown argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let case_index_path = case_index_path.unwrap_or_else(memory_bench::case_index_path);
+    let out = out.unwrap_or_else(|| memory_bench::baseline_dir().join("run.json"));
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("memory-bench: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match runtime.block_on(memory_bench::run::run(&memory_bench::run::Options {
+        case_index_path,
+        model_id,
+    })) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("memory-bench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let json = serde_json::to_string_pretty(&report).expect("report serializes");
+    if let Err(e) = std::fs::write(&out, json + "\n") {
+        eprintln!("memory-bench: writing {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+    let md_path = out.with_extension("report.md");
+    if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
+        eprintln!("memory-bench: writing {}: {e}", md_path.display());
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "memory-bench: wrote {} and {}",
+        out.display(),
+        md_path.display()
+    );
+    eprintln!(
+        "[memory-bench] precision={:.4} recall={:.4} f1={:.4} exact_match_rate={:.4}",
+        report.metrics.precision,
+        report.metrics.recall,
+        report.metrics.f1,
+        report.metrics.exact_match_rate,
+    );
+
+    // The gate only runs once thresholds exist; before that the run *is* the
+    // evidence they are derived from (O2: collect metrics, never invent them).
+    match memory_bench::gate::Thresholds::load(&memory_bench::thresholds_path()) {
+        Ok(thresholds) => {
+            let outcome = memory_bench::gate::evaluate(&report, &thresholds);
+            if outcome.passed() {
+                eprintln!("[memory-bench] gate: PASS");
+                ExitCode::SUCCESS
+            } else {
+                for violation in &outcome.violations {
+                    eprintln!("[memory-bench] gate: {violation}");
+                }
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("[memory-bench] gate: skipped (no thresholds yet: {e})");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 /// The single full-check pipeline. Kept in sync with `CONTRIBUTING.md` and
 /// asserted against the CI workflow by `tests/ci_config.rs`.
 fn run_ci() -> ExitCode {
@@ -319,6 +409,29 @@ fn run_ci() -> ExitCode {
             "warnings",
         ],
         &["test", "-p", "local-rag-models", "--features", "failpoints"],
+        // `local-rag-generate` (T14-07): the identical
+        // `generate.install.between_files` crash point for the local
+        // generator's GGUF installer (spec 10 §5's atomic-download policy,
+        // applied to generation the same way `local-rag-models` applies it to
+        // embeddings; ADR-0006).
+        &[
+            "clippy",
+            "-p",
+            "local-rag-generate",
+            "--all-targets",
+            "--features",
+            "failpoints",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "test",
+            "-p",
+            "local-rag-generate",
+            "--features",
+            "failpoints",
+        ],
         // The dense-backend spike (T10-01) is a SEPARATE workspace with its own
         // Cargo.lock (`spike/`, `exclude`d from the root — CONTRIBUTING.md §
         // Workspace layout), so `test --workspace` above never reaches it. `fmt`

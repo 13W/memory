@@ -13,7 +13,8 @@ task. Delivered by **T11-06**
 ([group 11](../implementation-plan/groups/11-embeddings-and-model-spaces.md)),
 which is also the owner of `D-008`
 ([DEVIATIONS](../implementation-plan/DEVIATIONS.md)). The **local generator
-crate** half of O3 stays open under T14-07. Convention
+crate** half of O3 stayed open under T14-07 at the time this ADR was written;
+it is now closed by [ADR-0006](0006-local-router-runtime.md). Convention
 (`docs/adr/NNNN-title.md`, Nygard sections, English) is ADR-0001's.
 
 ## Context
@@ -144,7 +145,7 @@ candidates.
 
 * **O3's delivery half is resolved**; spec 15 §4's row is amended to show the
   model and delivery halves closed (ADR-0004, ADR-0005) with the local generator
-  crate still open under T14-07. Spec 10 §5's remaining `[OPEN]` delivery detail
+  crate half closed separately by T14-07/ADR-0006. Spec 10 §5's remaining `[OPEN]` delivery detail
   becomes a `[SPEC]` as-built note citing this ADR. No `[FIXED]` text changes.
 * **D-008 is resolved.** The in-process provider spec 10 §1 requires now exists
   (`local_rag_models::OnnxEmbedder`), reaches its weights only through

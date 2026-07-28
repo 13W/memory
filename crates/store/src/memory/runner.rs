@@ -113,6 +113,11 @@ pub struct WindowObservation {
     pub evidence_kind: EvidenceKind,
     pub trust: TrustLevel,
     pub session_id: String,
+    /// Which repository/worktree this observation was captured against, if
+    /// any (T14-07: the router resolves a promotion's `scope_kind=
+    /// repository|worktree` target from this).
+    pub repo_id: Option<String>,
+    pub worktree_id: Option<String>,
     pub agent_id: Option<String>,
     pub commit_hash: Option<String>,
     pub short_evidence_excerpt: Option<String>,
@@ -495,6 +500,8 @@ async fn load_window(
             evidence_kind: r.evidence_kind,
             trust: r.trust,
             session_id: window.session_id.clone(),
+            repo_id: r.repo_id,
+            worktree_id: r.worktree_id,
             agent_id: r.agent_id,
             commit_hash: r.commit_hash,
             short_evidence_excerpt: r.short_evidence_excerpt,

@@ -441,6 +441,13 @@ pub(crate) struct WindowEnvelopeRow {
     pub event_type: String,
     pub evidence_kind: EvidenceKind,
     pub trust: TrustLevel,
+    /// Which repository/worktree this observation was captured against, if
+    /// any (T14-07: the router resolves a `create`/`supersede`'s
+    /// `scope_kind=repository|worktree` target from this — see
+    /// `local_rag_memory::recall`'s own doc for how a window with more than
+    /// one distinct value is handled).
+    pub repo_id: Option<String>,
+    pub worktree_id: Option<String>,
     pub agent_id: Option<String>,
     pub commit_hash: Option<String>,
     pub short_evidence_excerpt: Option<String>,
@@ -460,7 +467,8 @@ pub(crate) fn envelopes_in_range(
 ) -> rusqlite::Result<Vec<WindowEnvelopeRow>> {
     let mut stmt = conn.prepare(
         "SELECT e.received_seq, e.observation_id, e.event_type, e.evidence_kind, e.trust, \
-                e.agent_id, e.commit_hash, e.short_evidence_excerpt, p.redacted_payload \
+                e.repo_id, e.worktree_id, e.agent_id, e.commit_hash, e.short_evidence_excerpt, \
+                p.redacted_payload \
          FROM observation_envelope e \
          LEFT JOIN observation_payload p ON p.observation_id = e.observation_id \
          WHERE e.session_id = ?1 AND e.received_seq BETWEEN ?2 AND ?3 \
@@ -493,10 +501,12 @@ pub(crate) fn envelopes_in_range(
                     event_type: r.get(2)?,
                     evidence_kind,
                     trust,
-                    agent_id: r.get(5)?,
-                    commit_hash: r.get(6)?,
-                    short_evidence_excerpt: r.get(7)?,
-                    payload: r.get(8)?,
+                    repo_id: r.get(5)?,
+                    worktree_id: r.get(6)?,
+                    agent_id: r.get(7)?,
+                    commit_hash: r.get(8)?,
+                    short_evidence_excerpt: r.get(9)?,
+                    payload: r.get(10)?,
                 })
             },
         )?

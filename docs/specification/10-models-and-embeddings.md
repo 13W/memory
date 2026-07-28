@@ -56,6 +56,37 @@ As-built note (T11-03, `[SPEC]`): the pool is `local_rag_embed`
   the six canonical key fields (03 §2.2), bootstrap vectors can never be mistaken for production
   ones.
 
+As-built note (T14-07, `[SPEC]`, closes O3's `[OPEN — pick with default model]` local-generation
+half — ADR-0006): `llama-cpp-2` (Rust bindings to `llama.cpp`) was selected over `mistral.rs`
+(verified non-optional `reqwest`/`hf-hub`/`image`/`scraper`/`html2text`/`tokio-tungstenite`/
+`symphonia` dependency bloat — the same class `D-008` already rejected once) and `kalosm` (not
+independently verified, flagged as a research gap). `[FIXED]`'s `trait Generator` above is
+`local_rag_embed::contract::Generator` verbatim; `GenRequest`/`GenResponse`'s shape (not
+`[FIXED]`, per this section's own convention for what the spec names but does not shape) adds
+`messages`/`max_tokens`/`sampling`/`json_schema` and `text`/`finish_reason`/`tokens_generated`
+respectively. The provider (`local_rag_generate::LlamaGenerator`, an isolated crate — the same
+reason `crates/models` is isolated from `crates/embed`: `llama-cpp-sys-2` needs
+`cmake`+`libclang`, a heavier host toolchain than ONNX's `load-dynamic`) implements only
+`Sampling::Greedy` (spec 08 §7's benchmark needs reproducible runs) and ignores `json_schema`
+(no JSON-Schema-to-grammar conversion in v0 — output reliability comes from the prompt and the
+router's own malformed-output handling instead, 08 §4's as-built note). The default model went
+through two measured rounds (ADR-0006): `Qwen2.5-0.5B-Instruct` (`q4_k_m`) first, chosen over a
+`Qwen2.5-1.5B-Instruct` comparison candidate that scored within ~2 points of F1, not
+meaningfully better; then, after the user asked directly whether Gemma could be used, a second
+round measured `Gemma 4 E2B` (`q4_0`, Apache-2.0 — a real license change from prior Gemma
+generations' custom terms, verified against the actual license text) and found it scored roughly
+double the F1 of either Qwen2.5 candidate, so it replaced Qwen2.5-0.5B as the default despite
+being ~7× larger to download. `GeneratorCatalogEntry::chat_template_override` (`Some("gemma")`
+for the Gemma 4 entry, `None` for both Qwen entries) forces a specific named `llama.cpp` chat
+template when the model's own embedded template is not recognized by this pinned
+`llama-cpp-sys-2` version's detector — verified necessary for Gemma 4 by a real `FfiError(-1)`
+failure, traced to source, not guessed; T14-09 tracks generalizing this into a mechanism that
+supports arbitrary models without per-entry hardcoding.
+`local_rag_embed::local::NoopGenerator` is this trait's `HashingEmbedder` analog: deterministic,
+returns an empty ops list rather than pretending to classify anything (`run_once` already
+handles an empty batch correctly), so "the local backend is the working default" stays literally
+true before real weights are installed.
+
 ## 2. Representations registry
 
 `representation` rows are the canonical serialization of `RepresentationKey`

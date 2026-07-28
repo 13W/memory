@@ -518,16 +518,23 @@ fn candidate_state_and_proposal(
 
 /// An `observation_envelope`'s own `(evidence_kind, session_id)`, if it
 /// exists — what [`approve_candidate`] derives the materializing op's
-/// evidence from (see the module doc). `pub(crate)`: T14-06's consolidation
-/// runner (`crate::memory::runner`) reuses this as its own evidence-lookup
-/// fallback for an `observation_id` outside the current window (e.g.
-/// reinforcing an older entry) rather than duplicating the query.
-pub(crate) fn observation_evidence_source(
-    tx: &Transaction<'_>,
+/// evidence from (see the module doc). `pub`, not `pub(crate)`: T14-07's
+/// router (`local_rag_memory`, a separate crate — `local-rag-store` has no
+/// upward dependency on it) reuses this as its own evidence-lookup fallback
+/// for an `observation_id` outside the current consolidation window (e.g.
+/// reinforcing an older entry) rather than duplicating the query. Takes a
+/// plain `&Connection`, not `&Transaction<'_>` (widened for that same
+/// reuse — a `Transaction` derefs to `Connection`, so every existing
+/// in-transaction caller still compiles unchanged): the router's own reads
+/// happen on a read connection outside any transaction, exactly like
+/// [`local_rag_store::memory::runner`]'s own module doc requires for the
+/// generator step.
+pub fn observation_evidence_source(
+    conn: &Connection,
     observation_id: &str,
 ) -> rusqlite::Result<Option<(EvidenceKind, String)>> {
     use rusqlite::OptionalExtension;
-    tx.query_row(
+    conn.query_row(
         "SELECT evidence_kind, session_id FROM observation_envelope WHERE observation_id = ?1",
         params![observation_id],
         |r| {

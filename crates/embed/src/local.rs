@@ -30,7 +30,10 @@ use std::path::PathBuf;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{DistanceMetric, RepresentationKey, RepresentationKind};
 
-use crate::contract::{EmbedError, EmbedRequest, Embedder, Vector};
+use crate::contract::{
+    EmbedError, EmbedRequest, Embedder, FinishReason, GenError, GenRequest, GenResponse, Generator,
+    Vector,
+};
 
 /// The bootstrap local model identifier (`[SPEC]`).
 ///
@@ -149,6 +152,31 @@ impl Embedder for HashingEmbedder {
 
     fn key(&self) -> RepresentationKey {
         self.key.clone()
+    }
+}
+
+/// A deterministic, dependency-free local generator (T14-07, spec 10 §1's
+/// "local backend is the working default" — the `Generator` half).
+///
+/// Unlike [`HashingEmbedder`], `NoopGenerator` cannot fake classification —
+/// there is no hash-based analog of "decide whether this window contains a
+/// durable decision." It deterministically reports an empty ops list
+/// (`"[]"`), which `local_rag_store::memory::runner::run_once` already
+/// handles correctly: an empty batch still advances the cursor and applies
+/// the run. This keeps "the local backend is the working default" literally
+/// true before real GGUF weights are installed (`crates/generate`, T14-07),
+/// without ever claiming to have considered and decided anything — strictly
+/// safer than emitting a per-observation `noop` op, which *would* be a claim.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopGenerator;
+
+impl Generator for NoopGenerator {
+    fn generate(&self, _req: GenRequest) -> Result<GenResponse, GenError> {
+        Ok(GenResponse {
+            text: "[]".to_string(),
+            finish_reason: FinishReason::Stop,
+            tokens_generated: Some(0),
+        })
     }
 }
 
@@ -319,5 +347,15 @@ mod tests {
         let b = HashingEmbedder::new(RepresentationKind::CodeRaw);
         assert_ne!(a.key(), b.key());
         assert_eq!(a.embed_one("fn main() {}").dimensions(), 64);
+    }
+
+    #[test]
+    fn noop_generator_deterministically_reports_an_empty_ops_list() {
+        let g = NoopGenerator;
+        let req = crate::contract::GenRequest::new(Vec::new(), 16);
+        let resp = g.generate(req).expect("noop generator never fails");
+        assert_eq!(resp.text, "[]");
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert_eq!(resp.tokens_generated, Some(0));
     }
 }

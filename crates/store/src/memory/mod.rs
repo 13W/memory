@@ -112,8 +112,9 @@ pub use consolidation::{
     upsert_processing_cursor,
 };
 pub use entry::{
-    CreateMemoryEntryError, IllegalMemoryTransition, MemoryKind, MemoryState,
-    MemoryTransitionError, NewMemoryEntry, ScopeKind, create_memory_entry, memory_entry_state,
+    CreateMemoryEntryError, IllegalMemoryTransition, MemoryEntrySummary, MemoryKind, MemoryState,
+    MemoryTransitionError, NewMemoryEntry, ScopeKind, active_entries_for_scope,
+    canonical_key_owner, create_memory_entry, memory_entry_state, memory_entry_summary,
     transition_memory_entry,
 };
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};
@@ -125,7 +126,8 @@ pub use op::{
 };
 pub use review::{
     ApproveCandidateOutcome, CandidateRow, ProposedOperation, ReviewError, approve_candidate,
-    edit_candidate, list_candidates, propose_candidate, reject_candidate,
+    edit_candidate, list_candidates, observation_evidence_source, propose_candidate,
+    reject_candidate,
 };
 pub use runner::{
     ApplyReport, ConsolidationWindow, GeneratedOp, RunOutcome, RunOutcomeError, RunnerApplyError,
