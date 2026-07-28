@@ -316,7 +316,14 @@ pub fn approve_candidate(
         .collect();
 
     let idempotency_key = format!("candidate:{candidate_id}");
-    let outcome = match materialize(tx, &proposed, &evidence, &idempotency_key, now_ms)? {
+    let outcome = match apply_proposed_operation(
+        tx,
+        &proposed,
+        &evidence,
+        Actor::User,
+        &idempotency_key,
+        now_ms,
+    )? {
         Ok(outcome) => outcome,
         Err(e) => return Ok(Err(e)),
     };
@@ -329,13 +336,20 @@ pub fn approve_candidate(
     Ok(Ok(ApproveCandidateOutcome::Materialized(outcome)))
 }
 
-/// Dispatch `proposed` to the matching `op::apply_*`, `actor=User` (spec 04
-/// §6). Parses `kind`/`scope_kind` strings here, surfacing a bad value as
+/// Dispatch `proposed` to the matching `op::apply_*` (spec 04 §6/08 §4).
+/// Parses `kind`/`scope_kind` strings here, surfacing a bad value as
 /// [`ReviewError::InvalidProposedOperation`] before any write.
-fn materialize(
+///
+/// `pub(crate)`, not private: [`approve_candidate`] dispatches with
+/// `actor=User` (spec 04 §6's own wording); T14-06's consolidation runner
+/// (`crate::memory::runner`) reuses this exact dispatcher with `actor=Router`
+/// rather than duplicating the five-variant match — same op envelope (spec
+/// 08 §4), different caller.
+pub(crate) fn apply_proposed_operation(
     tx: &Transaction<'_>,
     proposed: &ProposedOperation,
     evidence: &[EvidenceInput<'_>],
+    actor: Actor,
     idempotency_key: &str,
     now_ms: i64,
 ) -> rusqlite::Result<Result<MemoryOpOutcome, ReviewError>> {
@@ -376,7 +390,7 @@ fn materialize(
                     valid_from_tree: valid_from_tree.as_deref(),
                     last_verified_tree: last_verified_tree.as_deref(),
                     evidence,
-                    actor: Actor::User,
+                    actor,
                     idempotency_key: Some(idempotency_key),
                 },
                 now_ms,
@@ -393,7 +407,7 @@ fn materialize(
                 expected_version: *expected_version,
                 confidence: *confidence,
                 evidence,
-                actor: Actor::User,
+                actor,
                 idempotency_key: Some(idempotency_key),
             },
             now_ms,
@@ -407,7 +421,7 @@ fn materialize(
                 memory_id,
                 expected_version: *expected_version,
                 evidence,
-                actor: Actor::User,
+                actor,
                 idempotency_key: Some(idempotency_key),
             },
             now_ms,
@@ -421,7 +435,7 @@ fn materialize(
                 memory_id,
                 expected_version: *expected_version,
                 evidence,
-                actor: Actor::User,
+                actor,
                 idempotency_key: Some(idempotency_key),
             },
             now_ms,
@@ -466,7 +480,7 @@ fn materialize(
                     new_valid_from_tree: new_valid_from_tree.as_deref(),
                     new_last_verified_tree: new_last_verified_tree.as_deref(),
                     evidence,
-                    actor: Actor::User,
+                    actor,
                     idempotency_key: Some(idempotency_key),
                 },
                 now_ms,
@@ -504,8 +518,11 @@ fn candidate_state_and_proposal(
 
 /// An `observation_envelope`'s own `(evidence_kind, session_id)`, if it
 /// exists — what [`approve_candidate`] derives the materializing op's
-/// evidence from (see the module doc).
-fn observation_evidence_source(
+/// evidence from (see the module doc). `pub(crate)`: T14-06's consolidation
+/// runner (`crate::memory::runner`) reuses this as its own evidence-lookup
+/// fallback for an `observation_id` outside the current window (e.g.
+/// reinforcing an older entry) rather than duplicating the query.
+pub(crate) fn observation_evidence_source(
     tx: &Transaction<'_>,
     observation_id: &str,
 ) -> rusqlite::Result<Option<(EvidenceKind, String)>> {

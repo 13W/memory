@@ -33,7 +33,8 @@ pub use import::{
 };
 pub use payload_ttl::{PayloadSweepError, PayloadSweepReport, run_payload_ttl_sweep};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::types::Type;
+use rusqlite::{Connection, Error, OptionalExtension, Transaction, params};
 
 /// Version-7 migration DDL: the spool-derived observation ledger (spec 03
 /// §2.5, the `observation_envelope`/`observation_path`/`observation_payload`/
@@ -411,6 +412,98 @@ pub(crate) fn delete_cursor(tx: &Transaction<'_>, session_id: &str) -> rusqlite:
     Ok(())
 }
 
+/// The highest `received_seq` recorded for `session_id`, or `None` if the
+/// session has never appended an envelope (T14-06: bounds a consolidation
+/// run's snapshot, spec 08 §4 step 1 — `to_received_seq = min(cursor+batch,
+/// max_seq)`). `SELECT MAX(...)` always returns exactly one row even over
+/// zero matching envelopes, with a `NULL` aggregate — no `.optional()` needed.
+pub(crate) fn max_received_seq(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT MAX(received_seq) FROM observation_envelope WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )
+}
+
+/// One envelope inside a consolidation window, plus its still-live payload if
+/// any (T14-06, spec 08 §4 step 2: "Load envelopes (+ surviving payloads) of
+/// the window"). `payload: None` is the normal case for a payload the TTL
+/// sweep already removed ([`payload_ttl`]) or an envelope-only (denied/
+/// redacted-away) event — never an error, mirroring `observation_payload`'s
+/// own DDL comment ("short TTL; envelope survives it").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowEnvelopeRow {
+    pub received_seq: i64,
+    pub observation_id: String,
+    pub event_type: String,
+    pub evidence_kind: EvidenceKind,
+    pub trust: TrustLevel,
+    pub agent_id: Option<String>,
+    pub commit_hash: Option<String>,
+    pub short_evidence_excerpt: Option<String>,
+    pub payload: Option<Vec<u8>>,
+}
+
+/// Every envelope for `session_id` with `received_seq` in
+/// `[from_received_seq, to_received_seq]` (both ends inclusive), ascending —
+/// T14-06's window load (spec 08 §4 step 2), left-joined against any
+/// still-live `observation_payload` row so a swept/absent payload reads back
+/// as `WindowEnvelopeRow::payload == None` rather than shortening the result.
+pub(crate) fn envelopes_in_range(
+    conn: &Connection,
+    session_id: &str,
+    from_received_seq: i64,
+    to_received_seq: i64,
+) -> rusqlite::Result<Vec<WindowEnvelopeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.received_seq, e.observation_id, e.event_type, e.evidence_kind, e.trust, \
+                e.agent_id, e.commit_hash, e.short_evidence_excerpt, p.redacted_payload \
+         FROM observation_envelope e \
+         LEFT JOIN observation_payload p ON p.observation_id = e.observation_id \
+         WHERE e.session_id = ?1 AND e.received_seq BETWEEN ?2 AND ?3 \
+         ORDER BY e.received_seq",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![session_id, from_received_seq, to_received_seq],
+            |r| {
+                let raw_evidence_kind: String = r.get(3)?;
+                let evidence_kind = EvidenceKind::from_db(&raw_evidence_kind).ok_or_else(|| {
+                    Error::FromSqlConversionFailure(
+                        3,
+                        Type::Text,
+                        format!("invalid observation_envelope.evidence_kind {raw_evidence_kind:?}")
+                            .into(),
+                    )
+                })?;
+                let raw_trust: String = r.get(4)?;
+                let trust = TrustLevel::from_db(&raw_trust).ok_or_else(|| {
+                    Error::FromSqlConversionFailure(
+                        4,
+                        Type::Text,
+                        format!("invalid observation_envelope.trust {raw_trust:?}").into(),
+                    )
+                })?;
+                Ok(WindowEnvelopeRow {
+                    received_seq: r.get(0)?,
+                    observation_id: r.get(1)?,
+                    event_type: r.get(2)?,
+                    evidence_kind,
+                    trust,
+                    agent_id: r.get(5)?,
+                    commit_hash: r.get(6)?,
+                    short_evidence_excerpt: r.get(7)?,
+                    payload: r.get(8)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +801,91 @@ mod tests {
             !recent_same_source_event_exists(&read, "sess-1", source_event_id, i64::MAX, 512)
                 .unwrap(),
             "obs-orig now falls outside the last-512 window (and the time clause never fires)",
+        );
+    }
+
+    #[tokio::test]
+    async fn max_received_seq_is_none_for_an_unknown_session_then_tracks_inserts() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        assert_eq!(max_received_seq(&read, "sess-1").unwrap(), None);
+        drop(read);
+
+        db.writer()
+            .transaction(|tx| {
+                insert_envelope(tx, &row("obs-1", "sess-1", "evt-1", None, Some(1)))?;
+                insert_envelope(tx, &row("obs-2", "sess-1", "evt-2", None, Some(2)))?;
+                // A different session must not influence sess-1's max.
+                insert_envelope(tx, &row("obs-3", "sess-2", "evt-3", None, Some(3)))
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(max_received_seq(&read, "sess-1").unwrap(), Some(2));
+        assert_eq!(max_received_seq(&read, "sess-2").unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn envelopes_in_range_is_inclusive_both_ends_ordered_and_session_scoped() {
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(|tx| {
+                for (i, sess) in [(1, "sess-1"), (2, "sess-1"), (3, "sess-1"), (4, "sess-1")] {
+                    let id = format!("obs-{i}");
+                    let evt = format!("evt-{i}");
+                    insert_envelope(tx, &row(&id, sess, &evt, None, Some(i)))?;
+                }
+                // Out-of-session row at the same received_seq range must never surface.
+                insert_envelope(tx, &row("obs-other", "sess-2", "evt-other", None, Some(5)))
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        let window = envelopes_in_range(&read, "sess-1", 2, 3).expect("window read");
+        assert_eq!(
+            window
+                .iter()
+                .map(|r| r.observation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["obs-2", "obs-3"],
+            "boundary-inclusive at both ends, ascending by received_seq",
+        );
+        for r in &window {
+            assert_eq!(r.evidence_kind, EvidenceKind::ModelClaim);
+            assert_eq!(r.trust, TrustLevel::Low);
+            assert_eq!(r.event_type, "Stop");
+            assert_eq!(
+                r.payload, None,
+                "no observation_payload row was ever inserted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn envelopes_in_range_reports_a_live_payload_and_none_once_it_is_absent() {
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(|tx| {
+                insert_envelope(tx, &row("obs-with", "sess-1", "evt-1", None, Some(1)))?;
+                insert_envelope(tx, &row("obs-without", "sess-1", "evt-2", None, Some(2)))?;
+                insert_payload(tx, "obs-with", b"{\"x\":1}", 5000)
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        let window = envelopes_in_range(&read, "sess-1", 1, 2).expect("window read");
+        assert_eq!(window.len(), 2);
+        assert_eq!(
+            window[0].payload.as_deref(),
+            Some(&b"{\"x\":1}"[..]),
+            "obs-with still has a live observation_payload row"
+        );
+        assert_eq!(
+            window[1].payload, None,
+            "obs-without never had a payload row (envelope-only event) — not an error"
         );
     }
 }
