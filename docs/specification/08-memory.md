@@ -366,10 +366,31 @@ roughly doubled the F1 (precision 0.6667, recall 0.6364, F1 0.6512,
 shipped default despite being ~7× larger to download — disclosed as a real, measured trade-off,
 not a free upgrade. `fixtures/memory/baseline/thresholds.json` sets the 14 §2 gate floor a real
 margin below the round-two run (`min_precision = 0.60`, `min_recall = 0.55`); the round-one runs
-stay on disk as historical evidence, not deleted. T14-09 (`docs/implementation-plan/groups/
-14-memory.md`) tracks generalizing the per-model chat-template handling this round's Gemma 4
-candidate needed (see ADR-0006's own Consequences) into a mechanism that supports arbitrary
-models without hardcoding.
+stay on disk as historical evidence, not deleted.
+
+As-built note (T14-09, `[SPEC]`, closes the item immediately above): chat-template rendering was
+generalized — `local_rag_generate::chat_template::render` (a real Jinja interpreter, `minijinja`)
+applies each model's own raw embedded template directly, replacing the vendored `llama.cpp`'s
+fixed-signature template detector and the per-model `chat_template_override` it forced for Gemma
+4. Measured effect, not assumed: two independent `cargo xtask memory-bench` runs of the
+unchanged default (`gemma-4-e2b-it-gguf-q4-0`) under the new native-template rendering scored
+precision/recall/F1 **0.6486/0.5455/0.5926** and **0.6757/0.5682/0.6173** —
+`fixtures/memory/baseline/run-gemma-4-e2b-native-template.json` and `-2.json` — both *lower* than
+the superseded override-path run (0.6667/0.6364/0.6512), disclosed as measured rather than
+smoothed into the "higher ceiling" this section's own T14-09 forward-reference only speculated
+about. The two runs also directly quantified real run-to-run variance under nominally
+deterministic greedy decoding on this host (Metal backend, ~0.03 precision / ~0.02 recall
+between back-to-back runs) that the gate floor must now absorb, not only cross-host variance.
+`thresholds.json` was re-derived a wider margin below the *lower* of the two runs:
+`min_precision = 0.60` (unchanged), `min_recall = 0.50` (down from `0.55`) — see that file's own
+`derivation` field for the full accounting. Both Qwen2.5 ChatML entries were independently
+re-measured under the same new rendering path and showed no material change. ADR-0006's own
+Amendment section has the full mechanism trace, including a fourth catalog entry
+(`phi-3-mini-4k-instruct-gguf-q4`, a third template family, no override) proving the mechanism
+itself needs none — and that entry's own real, disclosed, unrelated template limitation (a
+`system`-role turn silently dropped by its specific embedded template, measured at
+precision=recall=F1=0.0000 on the full corpus, since the router's own system instructions never
+reached the model).
 
 ## 8. Review tools (surface in 11 §2)
 

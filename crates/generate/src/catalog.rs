@@ -43,16 +43,28 @@ pub struct GeneratorCatalogEntry {
     pub context_length: u32,
     /// Files to install, in install order.
     pub files: &'static [AssetFile],
-    /// Force a specific *named* `llama.cpp` chat template
-    /// (`llama-chat.cpp`'s `LLM_CHAT_TEMPLATES` map, e.g. `"chatml"` or
-    /// `"gemma"`) instead of auto-detecting one from the GGUF's own embedded
-    /// Jinja template string. `None` for every entry whose embedded template
-    /// this pinned `llama-cpp-sys-2` version's detector already recognizes
-    /// (both Qwen entries — confirmed by real inference, T14-07 Phase 5/7).
-    /// Only set when detection is verified to fail for a specific entry —
-    /// see [`GEMMA4_E2B_IT_Q4_0`]'s own doc for the one case that needed
-    /// this.
-    pub chat_template_override: Option<&'static str>,
+    /// A literal Jinja chat-template *source* to render instead of the
+    /// GGUF's own embedded `tokenizer.chat_template` metadata (T14-09; see
+    /// `crate::chat_template` for the renderer). `None` for every entry
+    /// whose GGUF carries usable template metadata — which, since T14-09
+    /// replaced `llama.cpp`'s fixed-signature template detector with a real
+    /// Jinja interpreter (`minijinja`) rendering that raw metadata directly,
+    /// is every entry in this catalog today, Gemma 4 included (see
+    /// [`GEMMA4_E2B_IT_Q4_0`]'s own doc for that history). Reserved as a
+    /// rare escape hatch for a future model whose GGUF conversion ships no
+    /// `tokenizer.chat_template` metadata at all, or one `minijinja` cannot
+    /// parse/render even after `crate::chat_template`'s own preprocessing.
+    ///
+    /// Before T14-09 this field held a *name* (`"chatml"`, `"gemma"`) into
+    /// `llama-chat.cpp`'s `LLM_CHAT_TEMPLATES` map, forcing
+    /// `llama_chat_apply_template`'s heuristic detector to a specific known
+    /// template instead of auto-detecting one from the GGUF's own text — a
+    /// different mechanism with the opposite failure mode (a name the
+    /// detector already knows, vs. literal source text rendered directly).
+    /// The field was renamed alongside that semantic change so old
+    /// comments/history could not silently mislead a reader into thinking
+    /// the meaning had stayed the same.
+    pub raw_chat_template_override: Option<&'static str>,
 }
 
 impl GeneratorCatalogEntry {
@@ -118,7 +130,7 @@ pub const QWEN2_5_0_5B_INSTRUCT_Q4KM: GeneratorCatalogEntry = GeneratorCatalogEn
     license_url: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/blob/main/LICENSE",
     context_length: 32_768,
     files: QWEN2_5_0_5B_INSTRUCT_Q4KM_FILES,
-    chat_template_override: None,
+    raw_chat_template_override: None,
 };
 
 const QWEN2_5_1_5B_INSTRUCT_Q4KM_FILES: &[AssetFile] = &[AssetFile {
@@ -144,7 +156,7 @@ pub const QWEN2_5_1_5B_INSTRUCT_Q4KM: GeneratorCatalogEntry = GeneratorCatalogEn
     license_url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/blob/main/LICENSE",
     context_length: 32_768,
     files: QWEN2_5_1_5B_INSTRUCT_Q4KM_FILES,
-    chat_template_override: None,
+    raw_chat_template_override: None,
 };
 
 const GEMMA4_E2B_IT_Q4_0_FILES: &[AssetFile] = &[AssetFile {
@@ -187,34 +199,31 @@ const GEMMA4_E2B_IT_Q4_0_FILES: &[AssetFile] = &[AssetFile {
 /// which this catalog does not do. `google/gemma-4-*` repositories are
 /// **not** gated as of this entry's verification.
 ///
-/// `chat_template_override: Some("gemma")` — verified necessary, not a
-/// guess: real inference against the installed weights failed with
-/// `ApplyChatTemplateError::FfiError(-1)` when using the GGUF's own embedded
-/// Jinja template unmodified. Tracing this into the vendored
-/// `llama-chat.cpp` (`llama-cpp-sys-2` 0.1.152) shows why —
+/// **History (T14-07/ADR-0006):** this entry originally shipped with
+/// `chat_template_override: Some("gemma")` because real inference against
+/// the installed weights failed outright (`ApplyChatTemplateError::
+/// FfiError(-1)`) when handing the GGUF's own embedded Jinja template,
+/// unmodified, to `llama_chat_apply_template`. That function's
 /// `llm_chat_detect_template` pattern-matches a **fixed set** of known
-/// template signatures against the raw Jinja string (it is not a Jinja
-/// interpreter); Gemma 4's own template text does not match any of them
-/// (including the existing `tmpl_contains("<start_of_turn>")` check,
-/// apparently written against Gemma 1-3's simpler template shape), so
-/// detection falls through to `LLM_CHAT_TEMPLATE_UNKNOWN` and formatting
-/// hard-fails via that function's final `else { return -1; }`. Passing the
-/// short **name** `"gemma"` instead of the raw template string skips
-/// detection entirely and selects `LLM_CHAT_TEMPLATE_GEMMA` directly (the
-/// `google/gemma-7b-it`-era format) — confirmed by a real, successful
-/// `cargo xtask memory-bench --model gemma-4-e2b-it-gguf-q4-0` run.
+/// template signatures against the raw Jinja string — it is not a Jinja
+/// interpreter — and Gemma 4's own template text (a real, newer shape;
+/// Gemma 4's README advertises native system-role support Gemma 1-3 lacked)
+/// matched none of them, so detection fell through to
+/// `LLM_CHAT_TEMPLATE_UNKNOWN` and hard-failed. The named override worked
+/// around it by skipping detection entirely and forcing the older
+/// `LLM_CHAT_TEMPLATE_GEMMA` (`google/gemma-7b-it`-era) format, whose own
+/// implementation merges the system turn into the first user turn instead of
+/// emitting it as its own turn — a real, disclosed quality cost, since it
+/// could not exercise Gemma 4's actual native system-role template.
 ///
-/// The real, disclosed cost: `LLM_CHAT_TEMPLATE_GEMMA`'s own implementation
-/// carries a comment — *"there is no system message for gemma, but we will
-/// merge it with user prompt"* — merging the system turn into the first
-/// user turn rather than emitting it as its own turn. Gemma 4's README
-/// advertises **native system-role support** as a new capability over prior
-/// generations; this override cannot exercise that (this pinned llama.cpp
-/// snapshot has no branch that knows Gemma 4's own newer template shape).
-/// The comparison this entry supports is therefore "Gemma 4 E2B on a
-/// system-message-merged prompt", not "Gemma 4 E2B using its full native
-/// template" — recorded here, not smoothed over, exactly like ADR-0004's
-/// own license-column judgment call.
+/// **As-built (T14-09):** `raw_chat_template_override` is now `None`. The
+/// prompt is rendered by `crate::chat_template::render` — a real Jinja
+/// interpreter (`minijinja`) applied directly to this GGUF's own embedded
+/// template — bypassing `llm_chat_detect_template` altogether, so the
+/// detector's signature list is no longer relevant to this entry at all.
+/// Gemma 4's actual native template, system turn included, is what gets
+/// rendered now. See `docs/adr/0006-local-router-runtime.md`'s Amendment
+/// section for the real, measured effect on the memory-quality benchmark.
 pub const GEMMA4_E2B_IT_Q4_0: GeneratorCatalogEntry = GeneratorCatalogEntry {
     model_id: DEFAULT_MODEL_ID,
     source: "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf",
@@ -223,7 +232,52 @@ pub const GEMMA4_E2B_IT_Q4_0: GeneratorCatalogEntry = GeneratorCatalogEntry {
     license_url: "https://ai.google.dev/gemma/docs/gemma_4_license",
     context_length: 32_768,
     files: GEMMA4_E2B_IT_Q4_0_FILES,
-    chat_template_override: Some("gemma"),
+    raw_chat_template_override: None,
+};
+
+const PHI3_MINI_4K_INSTRUCT_Q4_FILES: &[AssetFile] = &[AssetFile {
+    relative_path: "model.gguf",
+    source_path: "Phi-3-mini-4k-instruct-q4.gguf",
+    size: 2_393_231_072,
+    sha256: "8a83c7fb9049a9b2e92266fa7ad04933bb53aa1e85136b7b30f1b8000ff2edef",
+}];
+
+/// T14-09's proof that the general chat-template mechanism (`crate::
+/// chat_template::render`) needs no per-entry override: a fourth catalog
+/// entry from a **third** template family (neither Qwen's ChatML nor
+/// Gemma's `<start_of_turn>`), added with no `raw_chat_template_override`
+/// at all — Microsoft's own official `q4` GGUF release of
+/// `Phi-3-mini-4k-instruct` (MIT; live digest/gating/license verified the
+/// same way ADR-0004/0005/0006 verified theirs — `gated: false` confirmed
+/// against the real HuggingFace API response, license text fetched and
+/// read, not transcribed from a model card). `context_length` is `4096`,
+/// the model's real native window (its own name says so; no `n_ctx`
+/// oversizing judgment call like [`GEMMA4_E2B_IT_Q4_0`]'s needed here).
+///
+/// **Disclosed, verified limitation of this specific template — not a
+/// rendering-mechanism defect**: this GGUF's embedded chat template only
+/// branches on `message['role'] in ('user', 'assistant')`; a `system`-role
+/// turn (this router always sends one, `local_rag_memory::prompt`) matches
+/// neither branch and is silently omitted from the rendered prompt. This
+/// is Phi-3-mini-4k-instruct's own real, well-known template limitation
+/// (confirmed against the live GGUF metadata, not assumed) — exactly the
+/// kind of per-model quirk `raw_chat_template_override` exists to work
+/// around *if* a project wanted this specific entry's quality improved
+/// without a runtime change, but is not exercised here since fixing a
+/// specific model's prompt quality is out of this task's scope (only the
+/// mechanism is). `crate::chat_template::render` renders this template's
+/// real logic faithfully either way, dropped system turn included; this is
+/// what makes the fixture test in `crate::chat_template` a meaningful
+/// end-to-end check rather than a hand-picked easy case.
+pub const PHI3_MINI_4K_INSTRUCT_Q4: GeneratorCatalogEntry = GeneratorCatalogEntry {
+    model_id: "phi-3-mini-4k-instruct-gguf-q4",
+    source: "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf",
+    revision: MAIN_REVISION,
+    license: "MIT",
+    license_url: "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/blob/main/LICENSE",
+    context_length: 4_096,
+    files: PHI3_MINI_4K_INSTRUCT_Q4_FILES,
+    raw_chat_template_override: None,
 };
 
 /// Every model this build knows how to install. [`GEMMA4_E2B_IT_Q4_0`] (the
@@ -233,6 +287,7 @@ pub const CATALOG: &[GeneratorCatalogEntry] = &[
     GEMMA4_E2B_IT_Q4_0,
     QWEN2_5_0_5B_INSTRUCT_Q4KM,
     QWEN2_5_1_5B_INSTRUCT_Q4KM,
+    PHI3_MINI_4K_INSTRUCT_Q4,
 ];
 
 /// Look a model up by id.
@@ -295,11 +350,11 @@ mod tests {
         assert_eq!(entry.license, "Apache-2.0");
         assert_eq!(entry.context_length, 32_768);
         assert!(entry.total_bytes() > QWEN2_5_0_5B_INSTRUCT_Q4KM.total_bytes());
-        assert_eq!(CATALOG.len(), 3);
+        assert_eq!(CATALOG.len(), 4);
     }
 
     #[test]
-    fn the_gemma_4_default_is_catalogued_with_only_the_text_gguf_and_a_template_override() {
+    fn the_gemma_4_default_is_catalogued_with_only_the_text_gguf_and_no_template_override() {
         let entry = find("gemma-4-e2b-it-gguf-q4-0").expect("Gemma 4 E2B is catalogued");
         assert_eq!(entry.model_id, DEFAULT_MODEL_ID);
         assert_eq!(entry.license, "Apache-2.0");
@@ -309,7 +364,10 @@ mod tests {
             1,
             "the mmproj vision-encoder file must not be catalogued -- text-only Generator"
         );
-        assert_eq!(entry.chat_template_override, Some("gemma"));
+        assert_eq!(
+            entry.raw_chat_template_override, None,
+            "T14-09: minijinja renders Gemma 4's own embedded template directly, no override needed"
+        );
     }
 
     #[test]
@@ -318,6 +376,29 @@ mod tests {
         assert!(
             (450.0..=500.0).contains(&mib),
             "unexpected budget: {mib:.1} MiB"
+        );
+    }
+
+    #[test]
+    fn the_fourth_family_entry_is_catalogued_distinctly_with_a_real_digest_and_no_override() {
+        let entry =
+            find("phi-3-mini-4k-instruct-gguf-q4").expect("Phi-3-mini-4k-instruct is catalogued");
+        assert_ne!(entry.model_id, DEFAULT_MODEL_ID);
+        assert_eq!(entry.license, "MIT");
+        assert_eq!(entry.context_length, 4_096);
+        assert_eq!(entry.files.len(), 1);
+        let file = entry.gguf_file();
+        assert_eq!(file.sha256.len(), 64);
+        assert!(
+            file.sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert!(file.size > 0);
+        assert_eq!(
+            entry.raw_chat_template_override, None,
+            "T14-09: proves the general mechanism needs no per-entry override for a third \
+             template family (neither Qwen ChatML nor Gemma)"
         );
     }
 }

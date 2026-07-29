@@ -76,12 +76,26 @@ meaningfully better; then, after the user asked directly whether Gemma could be 
 round measured `Gemma 4 E2B` (`q4_0`, Apache-2.0 — a real license change from prior Gemma
 generations' custom terms, verified against the actual license text) and found it scored roughly
 double the F1 of either Qwen2.5 candidate, so it replaced Qwen2.5-0.5B as the default despite
-being ~7× larger to download. `GeneratorCatalogEntry::chat_template_override` (`Some("gemma")`
-for the Gemma 4 entry, `None` for both Qwen entries) forces a specific named `llama.cpp` chat
-template when the model's own embedded template is not recognized by this pinned
-`llama-cpp-sys-2` version's detector — verified necessary for Gemma 4 by a real `FfiError(-1)`
-failure, traced to source, not guessed; T14-09 tracks generalizing this into a mechanism that
-supports arbitrary models without per-entry hardcoding.
+being ~7× larger to download.
+
+As-built note (T14-09, `[SPEC]`, closes the item immediately above): chat-template rendering no
+longer goes through `LlamaModel::apply_chat_template` (the vendored `llama.cpp`'s
+`llm_chat_detect_template`, a fixed-signature heuristic matcher verified — by real
+`FfiError(-1)` failures traced to source, not guessed — to not recognize every model's own
+embedded template text). `local_rag_generate::chat_template::render` applies a real Jinja
+interpreter (`minijinja`, plus `minijinja-contrib`'s `pycompat` for the plain Python dict/str
+methods real HuggingFace-authored templates call) directly to each model's raw
+`tokenizer.chat_template` GGUF metadata instead — the exact escape hatch `llama-cpp-2`'s own doc
+comment on `LlamaModel::chat_template` names. `GeneratorCatalogEntry::chat_template_override`
+(a *name* into `llama.cpp`'s fixed template table) is renamed
+`raw_chat_template_override` (literal Jinja *source text*, a rare escape hatch for a model whose
+GGUF carries no usable template metadata at all) and is `None` on every catalogued entry,
+including Gemma 4 — whose real native template, system turn included, now renders directly
+rather than through the superseded named-template workaround. A fourth catalog entry
+(`phi-3-mini-4k-instruct-gguf-q4`, a third template family, Microsoft's own official GGUF
+release) was added with no override at all, demonstrating the general mechanism; ADR-0006's own
+Amendment section has the full trace, the measured effect on the memory-quality benchmark (08
+§7), and this specific entry's own disclosed, unrelated template limitation.
 `local_rag_embed::local::NoopGenerator` is this trait's `HashingEmbedder` analog: deterministic,
 returns an empty ops list rather than pretending to classify anything (`run_once` already
 handles an empty batch correctly), so "the local backend is the working default" stays literally

@@ -46,7 +46,7 @@ pub fn fixture_entry(source: &str) -> GeneratorCatalogEntry {
         license_url: "https://example.invalid/terms",
         context_length: 4_096,
         files: Box::leak(vec![file].into_boxed_slice()),
-        chat_template_override: None,
+        raw_chat_template_override: None,
     }
 }
 
