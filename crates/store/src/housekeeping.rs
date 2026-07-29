@@ -81,7 +81,7 @@ use std::path::Path;
 use local_rag_core::paths::StoreLayout;
 
 use crate::memory::{CandidateState, pending_candidate_ages, transition_candidate};
-use crate::observation::{all_cursors, delete_cursor};
+use crate::observation::{all_cursors, delete_cursor, known_spool_sessions, read_cursor};
 use crate::registry::{
     WorktreeState, WorktreeStateClock, all_worktree_ids, referenced_model_space_ids,
     worktree_state_clocks,
@@ -637,6 +637,40 @@ pub async fn run_spool_session_sweep(
         retained,
         dry_run,
     })
+}
+
+/// Whether the store has any spool bytes not yet imported into `state.sqlite`
+/// (spec 02 §4.3's idle-shutdown gate: "no unimported spool bytes") — T15-01.
+///
+/// Composes the same two primitives [`run_spool_session_sweep`] uses to decide
+/// "fully committed" ([`is_fully_committed`], [`read_commit_state`]), but over
+/// **every** session directory on disk ([`known_spool_sessions`]), not just
+/// those with a cursor row: a session the importer has never touched yet has
+/// no `spool_import_cursor` row at all, and defaults to `(segment_seq: 1,
+/// committed_offset: 0)` — the same default
+/// [`import_session_tail`](crate::observation::import_session_tail) itself
+/// uses — so a brand-new, never-imported session correctly counts as pending.
+/// Short-circuits on the first pending session found.
+pub fn store_has_pending_spool_bytes(
+    db: &StateDb,
+    layout: &StoreLayout,
+) -> Result<bool, HousekeepingError> {
+    let sessions = known_spool_sessions(layout).map_err(HousekeepingError::Io)?;
+    if sessions.is_empty() {
+        return Ok(false);
+    }
+    let conn = db.open_read().map_err(HousekeepingError::Open)?;
+    for session_id in &sessions {
+        let (segment_seq, committed_offset) = read_cursor(&conn, session_id)
+            .map_err(HousekeepingError::Sqlite)?
+            .unwrap_or((1, 0));
+        let (current_len, next_exists) =
+            read_commit_state(layout, session_id, segment_seq).map_err(HousekeepingError::Io)?;
+        if !is_fully_committed(current_len, next_exists, committed_offset) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// How long a `pending_memory_candidate` may go without a review action

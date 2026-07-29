@@ -439,12 +439,15 @@ fn ensure_nextest_available() -> Result<(), String> {
 // spec 07 §7), `local-rag-hook` (T13-06's S1/S2 real-subprocess hook kill
 // seam, spec 07 §7), `local-rag-index` (generation-builder phase seams, spec
 // 04 §1 build → failed edge, T05-05), `local-rag-projection` (fake-shard
-// fault matrix seams + inspect/corrupt controls, spec 05 §10, T07-01), and
+// fault matrix seams + inspect/corrupt controls, spec 05 §10, T07-01),
 // `local-rag-search` (forwards to `local-rag-projection/failpoints` so
 // `projection.switch.before_commit` fires under a concurrent search load,
-// T09-04's `switch_failpoint_load.rs`). Each `--features failpoints` lane
-// also runs `test --doc`: `cargo nextest` never runs doctests, so that
-// coverage would otherwise silently disappear.
+// T09-04's `switch_failpoint_load.rs`), and `local-rag` (T15-01: the
+// `LOCAL_RAG_TEST_RESUME_DELAY_MS` startup-resume pause knob
+// `tests/serve_subprocess.rs`'s SIGTERM-at-safe-points scenario needs, spec
+// 02 §4.3). Each `--features failpoints` lane also runs `test --doc`:
+// `cargo nextest` never runs doctests, so that coverage would otherwise
+// silently disappear.
 const ROOT_FMT: &[Argv] = &[&["fmt", "--all", "--check"]];
 const ROOT_CLIPPY: &[Argv] = &[&[
     "clippy",
@@ -552,6 +555,20 @@ const GENERATE_CLIPPY_FAILPOINTS: &[Argv] = &[&[
     "clippy",
     "-p",
     "local-rag-generate",
+    "--all-targets",
+    "--features",
+    "failpoints",
+    "--",
+    "-D",
+    "warnings",
+]];
+// `local-rag` (T15-01): the daemon's `LOCAL_RAG_TEST_RESUME_DELAY_MS`
+// startup-resume pause knob, exercised by `tests/serve_subprocess.rs`'s
+// real-subprocess "SIGTERM at safe points" scenario (spec 02 §4.3).
+const LOCAL_RAG_CLIPPY_FAILPOINTS: &[Argv] = &[&[
+    "clippy",
+    "-p",
+    "local-rag",
     "--all-targets",
     "--features",
     "failpoints",
@@ -688,6 +705,22 @@ const ROOT_TEST_CHAIN: &[Argv] = &[
         "--doc",
         "-p",
         "local-rag-generate",
+        "--features",
+        "failpoints",
+    ],
+    &[
+        "nextest",
+        "run",
+        "-p",
+        "local-rag",
+        "--features",
+        "failpoints",
+    ],
+    &[
+        "test",
+        "--doc",
+        "-p",
+        "local-rag",
         "--features",
         "failpoints",
     ],
@@ -828,6 +861,10 @@ fn ci_jobs() -> Vec<Job<&'static [Argv]>> {
         Job {
             name: "generate:clippy-failpoints",
             payload: GENERATE_CLIPPY_FAILPOINTS,
+        },
+        Job {
+            name: "local-rag:clippy-failpoints",
+            payload: LOCAL_RAG_CLIPPY_FAILPOINTS,
         },
         Job {
             name: "spike:clippy-harness",

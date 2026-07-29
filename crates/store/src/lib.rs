@@ -350,6 +350,7 @@ pub use local_rag_core::VERSION;
 pub use rusqlite;
 
 mod cache;
+mod checkpoint;
 mod clock;
 pub mod code;
 pub mod eviction;
@@ -409,8 +410,8 @@ pub use housekeeping::{
     SPOOL_SESSION_ABSENCE_MS, ShardSweepReport, SpoolSessionSweepReport, candidate_expiry_due,
     expired_shard_ids, is_fully_committed, run_candidate_expiry_sweep, run_expired_shard_sweep,
     run_orphan_shard_sweep, run_spool_session_sweep, run_unreferenced_space_sweep, session_gc_due,
-    shard_destroy_due, sweep_expired_shard_dirs, sweep_orphan_shard_dirs,
-    sweep_unreferenced_space_dirs,
+    shard_destroy_due, store_has_pending_spool_bytes, sweep_expired_shard_dirs,
+    sweep_orphan_shard_dirs, sweep_unreferenced_space_dirs,
 };
 pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, held_level};
 pub use memory::{
@@ -449,10 +450,11 @@ pub use registry::{
     WorktreeStateClock, WorktreeSummary, WorktreeTransitionError, active_generations,
     all_worktree_ids, allocate_generation, attach, create_repository, create_worktree,
     current_generation, current_path, current_worktree_path, effective_data_policy,
-    find_repositories_by_remote, find_repository_by_path, find_worktree_by_current_path,
-    find_worktrees_by_path_fingerprint, generation_number, generation_state, get_repo_setting,
-    observe_repository_path, observe_worktree_path, path_history, repo_data_policy, repo_settings,
-    resolve, set_current_generation, set_repo_data_policy, set_repo_setting, transition_generation,
+    ensure_store_instance_uuid, find_repositories_by_remote, find_repository_by_path,
+    find_worktree_by_current_path, find_worktrees_by_path_fingerprint, generation_number,
+    generation_state, get_repo_setting, observe_repository_path, observe_worktree_path,
+    path_history, repo_data_policy, repo_settings, resolve, set_current_generation,
+    set_repo_data_policy, set_repo_setting, store_instance_uuid, transition_generation,
     transition_worktree_state, worktree_path_history, worktree_state, worktree_state_clocks,
     worktree_summary, worktrees_of_repo,
 };
@@ -480,7 +482,10 @@ pub use spool::{
     ClassificationError, DecodedObservation, DedupClass, FrameDecodeError, SegmentTailDecode,
     StopReason, decode_frames, decode_segment,
 };
-pub use state::{DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter, WriteError};
+pub use state::{
+    CheckpointMode, CheckpointStats, DEFAULT_WRITE_QUEUE_CAPACITY, OpenError, StateDb, StateWriter,
+    WriteError,
+};
 pub use subjects::{
     SubjectSet, expected_subject_keys, pinned_generations, protected_model_space_ids,
     protected_subject_keys,

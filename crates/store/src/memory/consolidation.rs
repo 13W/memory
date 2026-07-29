@@ -524,6 +524,13 @@ pub struct StaleRun {
     pub session_id: String,
     pub state: RunState,
     pub lease_until: Option<i64>,
+    /// The run's snapshot window (spec 04 §4 step 1) — carried here (not just
+    /// `run_id`/`session_id`) so a caller can go straight from [`stale_runs`]
+    /// to [`crate::memory::runner::run_once`]'s `RunWindow` without a second
+    /// read (T15-01's startup consolidation-resume driver, spec 02 §4.1
+    /// step 5, is the first such caller).
+    pub from_received_seq: i64,
+    pub to_received_seq: i64,
 }
 
 /// Every run eligible for a startup/checkpoint retry: `failed` (spec 04 §4's
@@ -538,7 +545,8 @@ pub struct StaleRun {
 /// lease-expiry alone, or a `failed` run would never be picked back up.
 pub fn stale_runs(conn: &Connection, now_ms: i64) -> rusqlite::Result<Vec<StaleRun>> {
     let mut stmt = conn.prepare(
-        "SELECT run_id, session_id, state, lease_until FROM consolidation_run \
+        "SELECT run_id, session_id, state, lease_until, from_received_seq, to_received_seq \
+         FROM consolidation_run \
          WHERE state = 'failed' \
             OR (state = 'running' AND (lease_until IS NULL OR lease_until <= ?1)) \
          ORDER BY created_at",
@@ -556,11 +564,15 @@ pub fn stale_runs(conn: &Connection, now_ms: i64) -> rusqlite::Result<Vec<StaleR
                 )
             })?;
             let lease_until: Option<i64> = r.get(3)?;
+            let from_received_seq: i64 = r.get(4)?;
+            let to_received_seq: i64 = r.get(5)?;
             Ok(StaleRun {
                 run_id,
                 session_id,
                 state,
                 lease_until,
+                from_received_seq,
+                to_received_seq,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -930,15 +942,21 @@ mod tests {
             .expect("seed runs");
 
         let read = db.open_read().expect("read conn");
-        let mut ids: Vec<String> = stale_runs(&read, 5_000)
-            .expect("stale runs")
-            .into_iter()
-            .map(|r| r.run_id)
-            .collect();
+        let stale = stale_runs(&read, 5_000).expect("stale runs");
+        let mut ids: Vec<String> = stale.iter().map(|r| r.run_id.clone()).collect();
         ids.sort();
         assert_eq!(
             ids,
             vec!["run-expired".to_string(), "run-failed".to_string()]
         );
+
+        // The window bounds must round-trip too (T15-01 builds a `RunWindow`
+        // straight from these, with no second read).
+        let expired = stale
+            .iter()
+            .find(|r| r.run_id == "run-expired")
+            .expect("run-expired present");
+        assert_eq!(expired.from_received_seq, 1);
+        assert_eq!(expired.to_received_seq, 5);
     }
 }

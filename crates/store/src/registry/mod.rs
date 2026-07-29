@@ -61,6 +61,7 @@
 //! (T05-01).
 
 mod generation;
+mod instance;
 mod projection_state;
 mod repository;
 mod representation;
@@ -72,6 +73,8 @@ pub use generation::{
     GenerationState, GenerationTransitionError, IllegalGenerationTransition, active_generations,
     allocate_generation, generation_number, generation_state, transition_generation,
 };
+
+pub use instance::{ensure_store_instance_uuid, store_instance_uuid};
 
 pub(crate) use projection_state::SCHEMA_V4;
 pub use projection_state::{
