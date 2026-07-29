@@ -186,9 +186,9 @@ pub struct FramePayload {
     /// The redacted event body, JSON-encoded as a string (see module docs).
     /// `None` for an envelope-only (denied) event.
     pub payload: Option<String>,
-    /// Left unpopulated at write time: the 4 KiB evidence-excerpt cap is
-    /// group 14's (spec 12 §2's as-built note, confirmed again by T13-01's
-    /// evidence), a distinct field from this group's 256 KiB payload cap.
+    /// The already-redacted payload text, capped to 4 KiB (spec 12 §2
+    /// `[SPEC]`, D-021) — `local_rag_hook::payload::short_evidence_excerpt_field`.
+    /// `None` for an envelope-only (denied) event, same as `payload`.
     pub short_evidence_excerpt: Option<String>,
 }
 

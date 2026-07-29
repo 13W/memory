@@ -207,7 +207,7 @@ fn spool_write_pipeline(raw: &[u8]) -> Result<(), HookError> {
         paths,
         redaction_version: payload::redaction_version_field(&prepared),
         payload: payload::payload_field(&prepared),
-        short_evidence_excerpt: None,
+        short_evidence_excerpt: payload::short_evidence_excerpt_field(&prepared),
     };
 
     let frame_bytes = local_rag_core::spool::encode_frame(&frame_payload)?;

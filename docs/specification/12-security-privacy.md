@@ -83,6 +83,16 @@ redaction_version` carries it over the wire (07 §3's own D-019 note), and migra
 (`observation_envelope.redaction_version`, 03 §2.5's own D-019 note) persists it — `None`/`NULL`
 for an envelope-only (denied) event, whose payload this scanner never touches.
 
+As-built note (D-021, `[SPEC]`, found at gate G14): the **4 KiB evidence-excerpt cap** — left to
+group 14 by this section's own note above, and never picked up by any T14-0N card — is now
+implemented, following the identical idiom `PAYLOAD_CAP_BYTES` established: `EXCERPT_CAP_BYTES =
+4 * 1024` in `local_rag_hook::payload`, walked back to a UTF-8 boundary over the same
+already-redacted bytes the payload cap uses (not a second scan), with no `{hash, original_size}`
+sidecar of its own — the excerpt is a secondary, prompt-facing slice of already-tracked content,
+not the authoritative capture. `short_evidence_excerpt_field` populates `FramePayload
+.short_evidence_excerpt` (07 §3's own D-021 note) at write time; the field round-trips through
+import to `observation_envelope.short_evidence_excerpt` (03 §2.5) unchanged.
+
 **Scanner rule set v0 (as-built, T03-02) `[SPEC]`.** The scanner is a single shared component
 (`local-rag-core::redaction`, `redaction_version = 1`) reused by file classification, spool
 ingestion, and remote transmission so verdicts stay consistent and auditable against one version.

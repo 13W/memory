@@ -86,9 +86,11 @@ event type (not provided by Claude Code's own JSON) are this project's own class
 `model_claim`/`low` (directly justified by 12 §4 `[FIXED]` "model-claims are never auto-promoted
 to facts" — both carry the model's own generated `last_assistant_message`); `SessionStart`/
 `SessionEnd` → `code_state`/`normal` (by elimination — no tool ran, no party "stated" or
-"claimed" anything). `short_evidence_excerpt` is left `null` at write time — it is not this
-task's to populate (see 12 §2's as-built note on the 4 KiB evidence-excerpt cap remaining group
-14's).
+"claimed" anything). `short_evidence_excerpt` was left `null` at write time by this task — the 4
+KiB evidence-excerpt cap was group 14's (12 §2's as-built note on this task's own `PAYLOAD_CAP_BYTES`
+comment named it explicitly), and D-021 (gate G14) closed it:
+`local_rag_hook::payload::short_evidence_excerpt_field` now populates the field from the same
+already-redacted bytes `payload_field` wraps, capped separately at `EXCERPT_CAP_BYTES = 4 * 1024`.
 
 As-built note (T13-03, `[SPEC]`, corrects and extends T13-02's note above): the frame reader is
 now real. The wire-format primitives named just above —
