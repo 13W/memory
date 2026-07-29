@@ -1,0 +1,407 @@
+//! The daemon startup/shutdown orchestrator (spec 02 §4.1's five ordered
+//! startup steps, §4.3's shutdown sequence) — T15-01.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use local_rag_core::DataPolicy;
+use local_rag_core::identity::UuidSource;
+use local_rag_core::paths::StoreLayout;
+use local_rag_store::{CacheDb, CacheOpenError, OpenError, StateDb, WriteError};
+use tokio::net::UnixListener;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
+
+use super::error::migration_only_reason;
+use super::handshake_stub::serve_handshake_stub;
+use super::idle::{IdleGateInputs, idle_eligible};
+use super::jobs::JobRegistry;
+use super::lock::{self, StoreLockError, StoreLockGuard, StoreLockInfo};
+use super::mode::DaemonMode;
+use super::probe::SocketLivenessProbe;
+use super::resume::{build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs};
+use super::session::SessionRegistry;
+use super::shutdown::{ShutdownSignal, drain_and_shutdown};
+
+/// Why [`DaemonHandle::start`] could not bring the daemon up at all (distinct
+/// from [`DaemonMode::MigrationOnly`], which is a *successful* start in a
+/// degraded serving mode — these are the conditions that leave nothing
+/// reachable at all).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DaemonStartupError {
+    /// Step 1: the store is held by another live instance, or a lock I/O
+    /// error.
+    Lock(StoreLockError),
+    /// Step 2: `state.sqlite` could not even be opened for a non-migration
+    /// reason (migration failures instead produce
+    /// [`DaemonMode::MigrationOnly`] — see [`DaemonHandle::start`]'s doc).
+    State(OpenError),
+    /// Step 2: seeding/reading `store_instance_uuid` failed.
+    StoreInstanceUuid(WriteError),
+    /// Step 3: `cache.sqlite` could not be opened.
+    Cache(CacheOpenError),
+    /// Step 4: binding the UDS endpoint failed.
+    Bind(std::io::Error),
+    /// Step 4: writing the readiness marker into `store.lock` failed.
+    MarkReady(std::io::Error),
+}
+
+impl std::fmt::Display for DaemonStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonStartupError::Lock(e) => write!(f, "{e}"),
+            DaemonStartupError::State(e) => write!(f, "could not open state.sqlite: {e}"),
+            DaemonStartupError::StoreInstanceUuid(e) => {
+                write!(f, "could not seed store_instance_uuid: {e}")
+            }
+            DaemonStartupError::Cache(e) => write!(f, "could not open cache.sqlite: {e}"),
+            DaemonStartupError::Bind(e) => write!(f, "could not bind the daemon socket: {e}"),
+            DaemonStartupError::MarkReady(e) => {
+                write!(f, "could not write the store.lock readiness marker: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DaemonStartupError {}
+
+/// Startup parameters (spec 02 §4.1) — every value the section leaves to the
+/// caller (config, clock, entropy) rather than fixing.
+pub struct StartOptions {
+    pub layout: StoreLayout,
+    pub daemon_version: String,
+    pub now_ms: i64,
+    pub uuids: Arc<dyn UuidSource + Send + Sync>,
+    pub write_queue_capacity: usize,
+    pub payload_ttl_hours: u64,
+    pub consolidation_lease_ms: i64,
+    pub consolidation_renew_interval_ms: i64,
+    pub data_policy: DataPolicy,
+}
+
+/// A running daemon instance, in-process (spec 02 §4.1 steps 1–5 complete;
+/// step 5's two resume passes run in the background — see
+/// [`DaemonHandle::resume_handles`]).
+///
+/// This is what tests drive directly (no subprocess needed for pure
+/// lock/lifecycle/idle-gating scenarios) and what [`run`] wraps with the
+/// OS-signal/idle wait for the real `serve` binary.
+pub struct DaemonHandle {
+    pub layout: StoreLayout,
+    pub mode: watch::Receiver<DaemonMode>,
+    pub sessions: SessionRegistry,
+    pub jobs: JobRegistry,
+    pub lock_info: StoreLockInfo,
+    pub socket_path: PathBuf,
+    state_db: Option<Arc<StateDb>>,
+    cache_db: Option<CacheDb>,
+    lock_guard: Option<StoreLockGuard>,
+    handshake_stop: Option<oneshot::Sender<()>>,
+    handshake_join: Option<JoinHandle<()>>,
+    /// The two startup catch-up passes (spec 02 §4.1 step 5), spawned
+    /// non-blocking relative to readiness. `run`/`shutdown` await these to
+    /// completion before draining — spec 02 §4.3's "cancel reconciles at the
+    /// next safe point" applied to the only background work this task's own
+    /// scope has (see `shutdown::drain_and_shutdown`'s doc).
+    resume_handles: Vec<JoinHandle<()>>,
+}
+
+impl DaemonHandle {
+    /// Run spec 02 §4.1's five startup steps, in order.
+    ///
+    /// A migration failure (`state.sqlite` newer than this binary, a
+    /// checksum drift, or any other migration-framework refusal) does
+    /// **not** abort startup: steps 3 and 5 are skipped (there is no usable
+    /// `state.sqlite` to bind them to), but step 4 still runs — the socket
+    /// still binds and the lock still gets marked ready — so the daemon
+    /// enters [`DaemonMode::MigrationOnly`] instead of leaving nothing
+    /// reachable at all (spec 02 §6 `[FIXED]`: "nothing degrades silently").
+    /// Every other startup failure (lock contention, a non-migration state
+    /// error, a cache-open failure, a bind failure) is a genuine
+    /// [`DaemonStartupError`] — nothing is reachable, and the caller
+    /// (`main.rs`) reports it and exits.
+    pub async fn start(opts: StartOptions) -> Result<DaemonHandle, DaemonStartupError> {
+        let StartOptions {
+            layout,
+            daemon_version,
+            now_ms,
+            uuids,
+            write_queue_capacity,
+            payload_ttl_hours,
+            consolidation_lease_ms,
+            consolidation_renew_interval_ms,
+            data_policy,
+        } = opts;
+
+        layout.ensure().map_err(|e| {
+            DaemonStartupError::Bind(std::io::Error::other(format!("store tree: {e}")))
+        })?;
+
+        // Step 1: store lock (L0), with stale-owner recovery.
+        let instance_uuid = uuids.next_uuid().to_string();
+        let pid = std::process::id();
+        // `acquire` does blocking file-lock and (on contention) blocking
+        // socket I/O (`SocketLivenessProbe`, up to `LIVENESS_PROBE_TIMEOUT_MS`).
+        // Called directly, that blocking work would run *on this async task's
+        // own executor thread* — on a single-worker runtime, that starves the
+        // very handshake-stub task (spec 02 §4.1 step 4) another instance's
+        // probe would need answered, making every liveness check spuriously
+        // time out. `spawn_blocking` moves it to the blocking thread pool,
+        // the same discipline `StateWriter`/`CacheWriter` already use for
+        // their own blocking SQLite I/O (dedicated OS threads, never inline
+        // on an async task).
+        let mut lock_guard = {
+            let layout = layout.clone();
+            let instance_uuid = instance_uuid.clone();
+            let daemon_version = daemon_version.clone();
+            tokio::task::spawn_blocking(move || {
+                let probe = SocketLivenessProbe::new(layout.socket_path());
+                lock::acquire(
+                    &layout,
+                    &instance_uuid,
+                    pid,
+                    &daemon_version,
+                    now_ms,
+                    &probe,
+                )
+            })
+            .await
+            .expect("the lock-acquire task must not panic")
+            .map_err(DaemonStartupError::Lock)?
+        };
+
+        // Step 2: open state.sqlite (runs migrations under L1 internally).
+        let (mode_tx, mode_rx) = watch::channel(DaemonMode::Normal);
+        let (state_db, cache_db) =
+            match StateDb::open_with_capacity(layout.state_db(), write_queue_capacity) {
+                Ok(state_db) => {
+                    let candidate = uuids.next_uuid().to_string();
+                    let store_instance_uuid = state_db
+                        .writer()
+                        .transaction(move |tx| {
+                            local_rag_store::ensure_store_instance_uuid(tx, &candidate)
+                        })
+                        .await
+                        .map_err(DaemonStartupError::StoreInstanceUuid)?;
+
+                    // Step 3: open/validate cache.sqlite.
+                    let cache_db = CacheDb::open(layout.cache_db(), &store_instance_uuid)
+                        .map_err(DaemonStartupError::Cache)?;
+                    (Some(Arc::new(state_db)), Some(cache_db))
+                }
+                Err(OpenError::Migration(boxed)) => {
+                    let reason = migration_only_reason(&boxed);
+                    let _ = mode_tx.send(DaemonMode::MigrationOnly { reason });
+                    (None, None)
+                }
+                Err(other) => return Err(DaemonStartupError::State(other)),
+            };
+
+        // Step 4: bind endpoint, write readiness marker, start the
+        // (provisional) handshake responder.
+        let listener =
+            UnixListener::bind(layout.socket_path()).map_err(DaemonStartupError::Bind)?;
+        lock_guard
+            .mark_ready(now_ms, &layout.socket_path())
+            .map_err(DaemonStartupError::MarkReady)?;
+        let lock_info = lock_guard.info().clone();
+
+        let (handshake_stop_tx, handshake_stop_rx) = oneshot::channel();
+        let handshake_join = tokio::spawn(serve_handshake_stub(
+            listener,
+            Arc::from(instance_uuid.as_str()),
+            Arc::from(daemon_version.as_str()),
+            mode_rx.clone(),
+            handshake_stop_rx,
+        ));
+
+        // Step 5: resume passes — startup catch-up only (see `daemon::resume`'s
+        // own scope note), spawned non-blocking relative to readiness.
+        let jobs = JobRegistry::new();
+        let mut resume_handles = Vec::new();
+        if let Some(ref db) = state_db {
+            resume_handles.push(tokio::spawn(spawn_spool_resume(
+                Arc::clone(db),
+                layout.clone(),
+                Arc::clone(&uuids),
+                jobs.clone(),
+                now_ms,
+                payload_ttl_hours,
+            )));
+            resume_handles.push(tokio::spawn(spawn_consolidation_resume(
+                Arc::clone(db),
+                layout.clone(),
+                jobs.clone(),
+                consolidation_lease_ms,
+                consolidation_renew_interval_ms,
+                now_ms,
+                data_policy,
+                Arc::clone(&uuids),
+            )));
+        }
+
+        Ok(DaemonHandle {
+            socket_path: layout.socket_path(),
+            layout,
+            mode: mode_rx,
+            sessions: SessionRegistry::new(),
+            jobs,
+            lock_info,
+            state_db,
+            cache_db,
+            lock_guard: Some(lock_guard),
+            handshake_stop: Some(handshake_stop_tx),
+            handshake_join: Some(handshake_join),
+            resume_handles,
+        })
+    }
+
+    /// The idle-shutdown gate's current inputs (spec 02 §4.3).
+    pub fn idle_inputs(&self) -> IdleGateInputs {
+        let pending_spool_bytes = match &self.state_db {
+            Some(db) => {
+                local_rag_store::store_has_pending_spool_bytes(db, &self.layout).unwrap_or(true)
+            }
+            // `MigrationOnly`: no usable state.sqlite, so no spool import is
+            // happening either — never the reason to refuse an idle exit.
+            None => false,
+        };
+        IdleGateInputs {
+            live_sessions: self.sessions.len(),
+            pending_spool_bytes,
+            running_jobs: self.jobs.len(),
+        }
+    }
+
+    /// Whether the daemon is currently eligible for idle shutdown (spec 02
+    /// §4.3).
+    pub fn is_idle_eligible(&self) -> bool {
+        idle_eligible(&self.idle_inputs())
+    }
+
+    /// Drain and release the store (spec 02 §4.3): await the startup resume
+    /// passes to their natural completion (the only "safe point" this task's
+    /// own background work has — see `shutdown::drain_and_shutdown`'s doc),
+    /// then checkpoint, close the cache, and release the lock.
+    pub async fn shutdown(mut self) {
+        for handle in self.resume_handles.drain(..) {
+            let _ = handle.await;
+        }
+        if let Some(handshake_join) = self.handshake_join.take() {
+            // Aborted rather than awaited after the stop signal below fires:
+            // a handshake connection already in flight is a single greeting
+            // write with no state to lose, so this is safe by construction
+            // the same way a hard kill is (spec 02 §4.3).
+            handshake_join.abort();
+        }
+        let lock_guard = self.lock_guard.take().expect("shutdown runs once");
+        drain_and_shutdown(
+            &self.layout,
+            self.state_db.take(),
+            self.cache_db.take(),
+            lock_guard,
+            self.handshake_stop.take(),
+        )
+        .await;
+    }
+}
+
+async fn spawn_spool_resume(
+    db: Arc<StateDb>,
+    layout: StoreLayout,
+    uuids: Arc<dyn UuidSource + Send + Sync>,
+    jobs: JobRegistry,
+    now_ms: i64,
+    payload_ttl_hours: u64,
+) {
+    resume_spool_import(&db, &layout, &*uuids, &jobs, now_ms, payload_ttl_hours).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_consolidation_resume(
+    db: Arc<StateDb>,
+    layout: StoreLayout,
+    jobs: JobRegistry,
+    lease_ms: i64,
+    renew_interval_ms: i64,
+    now_ms: i64,
+    data_policy: DataPolicy,
+    uuids: Arc<dyn UuidSource + Send + Sync>,
+) {
+    let pool = build_best_effort_pool(&layout);
+    let generate =
+        |window| local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window);
+    let _ =
+        resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
+            .await;
+}
+
+/// Why [`run`] stopped waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    /// SIGTERM or CTRL-C.
+    Signal,
+    /// Continuously idle-eligible for the configured grace period (spec 02
+    /// §3.1 `idle_shutdown_secs`).
+    Idle,
+}
+
+/// Wait for whichever comes first: an OS shutdown signal (already installed
+/// — see [`ShutdownSignal`]'s own doc for why installation must have
+/// happened before `start()`, not here), or continuous idle eligibility for
+/// `idle_shutdown_secs`. `poll_interval` is how often the idle gate is
+/// re-checked while waiting — a plain parameter (no `[SPEC]` number exists
+/// for it), so tests can drive it with `tokio::time::pause`/`advance`
+/// instead of real sleeps.
+pub async fn wait_for_shutdown_trigger(
+    handle: &DaemonHandle,
+    signal: &mut ShutdownSignal,
+    idle_shutdown_secs: u64,
+    poll_interval: Duration,
+) -> ShutdownReason {
+    let idle_budget = Duration::from_secs(idle_shutdown_secs);
+    let mut idle_since: Option<tokio::time::Instant> = None;
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = signal.wait() => return ShutdownReason::Signal,
+            _ = ticker.tick() => {
+                if handle.is_idle_eligible() {
+                    let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= idle_budget {
+                        return ShutdownReason::Idle;
+                    }
+                } else {
+                    idle_since = None;
+                }
+            }
+        }
+    }
+}
+
+/// The full daemon lifecycle: install the shutdown-signal handler, start,
+/// serve until a shutdown trigger fires, drain. This is what `main.rs`'s
+/// `serve` command runs.
+///
+/// The signal handler is installed **before** [`DaemonHandle::start`] runs —
+/// see [`ShutdownSignal`]'s own doc comment for why that ordering is load-
+/// bearing, not stylistic: a SIGTERM arriving during startup (lock/migrate/
+/// cache/bind, spec 02 §4.1) must be caught too, not just one arriving after
+/// the wait loop begins.
+pub async fn run(
+    opts: StartOptions,
+    idle_shutdown_secs: u64,
+    idle_poll_interval: Duration,
+) -> Result<ShutdownReason, DaemonStartupError> {
+    let mut signal = ShutdownSignal::install();
+    let handle = DaemonHandle::start(opts).await?;
+    let reason =
+        wait_for_shutdown_trigger(&handle, &mut signal, idle_shutdown_secs, idle_poll_interval)
+            .await;
+    handle.shutdown().await;
+    Ok(reason)
+}

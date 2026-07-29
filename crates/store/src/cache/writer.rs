@@ -54,6 +54,8 @@ impl std::error::Error for CacheWriteError {
     }
 }
 
+pub use crate::checkpoint::{CheckpointMode, CheckpointStats};
+
 /// A cloneable handle to the single `cache.sqlite` writer.
 ///
 /// Cloning shares the same queue and writer thread; the thread lives until all
@@ -145,6 +147,37 @@ impl CacheWriter {
         })
         .await
     }
+
+    /// Run a `PRAGMA wal_checkpoint` on the cache writer thread (spec 02
+    /// §4.3's shutdown-time "flush WAL checkpoint"). Spec 03 §4 states no WAL
+    /// checkpoint policy of its own for `cache.sqlite`; this adopts the same
+    /// `PASSIVE`/`TRUNCATE` policy 03 §3 fixes for `state.sqlite` — safe here
+    /// too, and more so, since a cache checkpoint's worst case is an
+    /// evictable, rebuildable cache, never the state-side "never data loss"
+    /// guarantee 03 §4's own `synchronous=NORMAL` rationale already relies on.
+    ///
+    /// Like [`transaction`](Self::transaction), runs directly against `&mut
+    /// Connection` — SQLite refuses `wal_checkpoint` while a transaction is
+    /// open, and no other path to the raw connection exists outside this
+    /// writer thread.
+    pub async fn checkpoint(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<CheckpointStats, CacheWriteError> {
+        crate::lock::checked_scope_async(crate::lock::LockLevel::L4b, async move {
+            let (resp_tx, resp_rx) = oneshot::channel::<Result<CheckpointStats, CacheWriteError>>();
+            let job: Job = Box::new(move |conn: &mut Connection| {
+                let outcome = run_checkpoint(conn, mode);
+                let _ = resp_tx.send(outcome);
+            });
+            self.sender
+                .send(job)
+                .await
+                .map_err(|_| CacheWriteError::WriterGone)?;
+            resp_rx.await.unwrap_or(Err(CacheWriteError::WriterGone))
+        })
+        .await
+    }
 }
 
 /// Execute `f` in a fresh transaction: `BEGIN` → `f` → `COMMIT`, rolling back on
@@ -165,4 +198,18 @@ where
             Err(CacheWriteError::Sqlite(e))
         }
     }
+}
+
+fn run_checkpoint(
+    conn: &mut Connection,
+    mode: CheckpointMode,
+) -> Result<CheckpointStats, CacheWriteError> {
+    conn.query_row(mode.pragma(), [], |row| {
+        Ok(CheckpointStats {
+            busy: row.get::<_, i64>(0)? != 0,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
+    })
+    .map_err(CacheWriteError::Sqlite)
 }

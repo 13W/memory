@@ -13,9 +13,57 @@ local-rag-index = { path = "../index" }
 local-rag-projection = { path = "../projection" }
 local-rag-memory = { path = "../memory" }
 local-rag-protocol = { path = "../protocol" }
+local-rag-embed = { path = "../embed" }
+local-rag-generate = { path = "../generate" }
+# The daemon (T15-01) is the first product binary that owns a *full* tokio
+# executor: every library crate below it (store/index/memory/embed) deliberately
+# stops at `rt`/`sync`/`time` (task_local!/timeout only — see each crate's own
+# Cargo.toml comment, "the daemon (T15) still selects the runtime flavor").
+# `rt-multi-thread`: the daemon's own executor. `net`: the store-lock liveness
+# probe and the MCP UDS listener (spec 02 §2.1, §4.1). `signal`: SIGTERM/CTRL-C
+# shutdown (spec 02 §4.3). `time`: the idle-shutdown timer and the bounded
+# liveness-probe timeout. `sync`: `watch`/`oneshot` for daemon-mode/shutdown
+# signaling (already resolved transitively via local-rag-store; a direct edge
+# here since this crate uses it directly too). `io-util`: `AsyncWriteExt` for
+# the handshake-stub greeting write. `macros`: `#[tokio::main]`/`#[tokio::test]`.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "time",
+    "sync",
+    "io-util",
+    "macros",
+] }
+# `store.lock` JSON (spec 02 §2: "flock'd JSON: {instance_uuid, pid,
+# daemon_version, started_at}") and the store-liveness-probe greeting line.
+# Already resolved via local-rag-core/local-rag-store — 0 new external sources.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `rusqlite::Error` appears in this crate's own error types (the resume
+# drivers surface a stale-run-set read failure directly). Same
+# version/features as `local-rag-store` — 0 new external sources, only a
+# direct edge for the type name.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[target.'cfg(unix)'.dependencies]
+# `kill(pid, SIGTERM)` is not exposed by `std::process::Child::kill` (unix-only
+# SIGKILL). Test-only use (dev-dependency below) sends a real SIGTERM for the
+# "SIGTERM at safe points" acceptance test; see CONTRIBUTING's dependency
+# table (`local-rag-core` was previously the sole `libc` consumer).
+libc = "0.2"
 
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
+
+[features]
+# Compiles in a single test-only pause knob the resume drivers check before
+# finishing a job (an env-var-read delay, not the shared `Failpoints`
+# registry — there is exactly one call site, so the registry's declare/arm
+# machinery would add ceremony without benefit). Off by default → zero-cost;
+# the release/distribution build never compiles it in, mirroring
+# `local-rag-hook`'s identical `failpoints` feature.
+failpoints = []
 
 [lints]
 workspace = true

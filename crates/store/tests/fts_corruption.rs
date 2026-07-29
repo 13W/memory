@@ -577,7 +577,10 @@ async fn delete_whole_cache_file_is_fully_restored() {
 
     let before = state_snapshot(&state, &wt);
     let cache_path = cache.path().to_path_buf();
-    drop(cache); // release the writer thread's connection before deleting files
+    // `close()`, not `drop` (D-009 / D-022): `Drop` is asynchronous by design
+    // (the writer thread is detached), so a bare `drop` here can race the
+    // reopen below onto the same `-wal`/`-shm` sidecar names.
+    cache.close();
 
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(append_suffix(&cache_path, suffix));

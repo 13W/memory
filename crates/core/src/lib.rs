@@ -12,11 +12,14 @@
 //! and the [`spool`] LRSP wire-format primitives (T13-03, relocated here from
 //! `local-rag-hook` so the hook write path and the daemon-side read path
 //! share one CRC/header/frame implementation, never two that could drift).
+//! [`process`] adds the one OS-process liveness primitive the daemon's store
+//! lock needs (T15-01, spec 02 §4.1).
 
 pub mod config;
 pub mod hash;
 pub mod identity;
 pub mod paths;
+pub mod process;
 pub mod redaction;
 pub mod spool;
 

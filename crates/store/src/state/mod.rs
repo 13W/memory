@@ -11,7 +11,7 @@ mod open;
 mod writer;
 
 pub use open::OpenError;
-pub use writer::{StateWriter, WriteError};
+pub use writer::{CheckpointMode, CheckpointStats, StateWriter, WriteError};
 
 use std::path::{Path, PathBuf};
 

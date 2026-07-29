@@ -49,6 +49,8 @@ impl std::error::Error for WriteError {
     }
 }
 
+pub use crate::checkpoint::{CheckpointMode, CheckpointStats};
+
 /// A cloneable handle to the single `state.sqlite` writer.
 ///
 /// Cloning shares the same queue and writer thread; the thread lives until all
@@ -131,6 +133,32 @@ impl StateWriter {
         })
         .await
     }
+
+    /// Run a `PRAGMA wal_checkpoint` on the writer thread (spec 02 §4.3's
+    /// shutdown-time "flush WAL checkpoint"; spec 03 §3's checkpoint policy).
+    ///
+    /// Unlike [`transaction`](Self::transaction), the closure this dispatches
+    /// runs directly against `&mut Connection`, never wrapped in a
+    /// [`Transaction`] — SQLite refuses `wal_checkpoint` while a transaction
+    /// is open, and no other path to the raw connection exists outside this
+    /// writer thread (spec 02 §5: writable connections never leave the
+    /// queue). Still one job on the same queue, so it never races an
+    /// in-flight write.
+    pub async fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointStats, WriteError> {
+        crate::lock::checked_scope_async(crate::lock::LockLevel::L4a, async move {
+            let (resp_tx, resp_rx) = oneshot::channel::<Result<CheckpointStats, WriteError>>();
+            let job: Job = Box::new(move |conn: &mut Connection| {
+                let outcome = run_checkpoint(conn, mode);
+                let _ = resp_tx.send(outcome);
+            });
+            self.sender
+                .send(job)
+                .await
+                .map_err(|_| WriteError::WriterGone)?;
+            resp_rx.await.unwrap_or(Err(WriteError::WriterGone))
+        })
+        .await
+    }
 }
 
 /// Execute `f` in a fresh transaction: `BEGIN` → `f` → `COMMIT`, rolling back on
@@ -151,4 +179,18 @@ where
             Err(WriteError::Sqlite(e))
         }
     }
+}
+
+fn run_checkpoint(
+    conn: &mut Connection,
+    mode: CheckpointMode,
+) -> Result<CheckpointStats, WriteError> {
+    conn.query_row(mode.pragma(), [], |row| {
+        Ok(CheckpointStats {
+            busy: row.get::<_, i64>(0)? != 0,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
+    })
+    .map_err(WriteError::Sqlite)
 }

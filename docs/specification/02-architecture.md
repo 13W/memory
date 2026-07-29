@@ -61,6 +61,21 @@ default per-user ACLs of `%LOCALAPPDATA%` apply. `sha256(user SID)[..12]` is the
 lowercase hex characters of the SHA-256 of the user SID. macOS is a POSIX target and uses the
 XDG fallbacks (not `~/Library/Application Support`).
 
+As-built note (T15-01, `[SPEC]`): `store.lock`'s JSON carries the four documented fields plus a
+readiness marker written by §4.1 step 4 — `local_rag::daemon::lock::StoreLockInfo { instance_uuid,
+pid, daemon_version, started_at, ready: bool, ready_at: Option<i64>, socket_path:
+Option<String> }`. `ready`/`ready_at`/`socket_path` are `false`/`None`/`None` from step 1's initial
+write and are set only once, by `StoreLockGuard::mark_ready`, through the *same* open, `flock`'d
+file handle (truncate-and-rewrite, never close/reopen — a close/reopen would risk a window with no
+lock held at all mid-swap).
+
+As-built note (T15-01, `[SPEC]`): the socket at `run/daemon.sock` already answers every connection
+with a one-line JSON greeting — `{instance_uuid, daemon_version, mode}` — well before T15-02's real
+HELLO/WELCOME protocol exists (11 §1/§4). This is deliberately minimal and provisional: T15-01
+needs *something* live on the socket for the store-lock liveness probe (§4.1 step 1) to talk to;
+T15-02 replaces only this per-connection handler with a real framed parse, never the listener, the
+bind, or the store lock itself.
+
 ## 3. Configuration model
 
 ### 3.1 Global config — `<config_dir>/config.toml` `[SPEC]`
@@ -183,6 +198,42 @@ resolver is a pure registry lookup over those facts.
 5. Resume: pending spool import (07 §6), crashed consolidation runs with expired leases (08 §4),
    interrupted projection switches are *not* resumed — they are detected lazily at shard open (05).
 
+As-built note (T15-01, `[SPEC]`): step 1's recovery algorithm, `local_rag::daemon::lock::acquire`,
+has two independent branches, not one — the wording "on failure... retry once" describes only the
+second:
+
+- **On a successful non-blocking `flock`** (the common post-crash path): POSIX `flock` is
+  per-open-file-description and releases automatically when its holder's process exits — a crashed
+  prior daemon cannot leave a "stale but still `flock`'d" lock file behind. So reaching this branch
+  already proves no live process holds the lock; this instance is the sole legitimate owner, and it
+  best-effort removes any orphaned `run/daemon.sock` (§4.4) before binding — the socket file itself
+  has no such auto-cleanup and can genuinely outlive a `SIGKILL`ed daemon.
+- **On `WouldBlock`**: a real contender exists *at this instant*. The owner's PID and its socket
+  greeting (§2's as-built note) must **both** check out — except when the owner's own lock record
+  has `ready: false` (still between step 1 and step 4, most commonly a large store's migration
+  still running at step 2): in that narrow window there is genuinely no socket to answer yet, so the
+  liveness check trusts the PID alone rather than misreading "no listener yet" as "dead" and
+  wrongly reclaiming a lock a live, still-starting daemon still holds (its real `flock` is never
+  released by such a reclaim — the reclaiming instance would only ever win a fresh lock on the
+  *path*, leaving two daemons each convinced they alone own the store). Once `ready: true`, the
+  full two-part check applies exactly as written above.
+
+As-built note (T15-01, `[SPEC]`): step 2's `store_instance_uuid` (03 §2.1, consumed by step 3's
+cache-open) is seeded here, inside the same step — `local_rag_store::registry::
+ensure_store_instance_uuid`, a first-writer-wins atomic upsert (`INSERT ... ON CONFLICT DO UPDATE
+... RETURNING`) called with a freshly minted candidate UUID immediately after migrations succeed.
+T01-05's own as-built note had flagged this seeding as deferred to daemon wiring; this is that
+wiring.
+
+As-built note (T15-01, `[SPEC]`): a step 2 failure does not abort startup outright when the cause is
+a migration-framework refusal (`local_rag_store::migrate::MigrationError::{IncompatibleStore,
+ChecksumDrift, ...}`) — steps 3 and 5 are skipped (no usable `state.sqlite` exists to bind them to),
+but step 4 still runs: the socket still binds, the lock is still marked ready, and the daemon
+reports itself as `DaemonMode::MigrationOnly` (§6 `MIGRATION_IN_PROGRESS`/`INCOMPATIBLE_STORE`
+disambiguated by `details`) rather than leaving nothing reachable at all — see §6's "nothing
+degrades silently" `[FIXED]`. Every *other* step-1–4 failure (lock contention, a non-migration state
+error, a cache-open failure, a bind failure) remains a genuine startup abort.
+
 ### 4.2 Proxy → daemon handshake
 
 ```
@@ -207,11 +258,51 @@ running index/consolidation/GC jobs `[FIXED]`. SIGTERM/CTRL-C: stop accepting, c
 reconciles at the next safe point (state tx boundaries), flush WAL checkpoint, release lock.
 Kill at any point is safe by construction (05, 07).
 
+As-built note (T15-01, `[SPEC]`): the idle gate's three inputs are
+`local_rag::daemon::idle::IdleGateInputs { live_sessions: usize, pending_spool_bytes: bool,
+running_jobs: usize }`, read from a protocol-agnostic `SessionRegistry` (registered by T15-02's
+future per-connection HELLO handler; T15-01's own tests register directly), a `JobRegistry`
+tracking the startup resume passes below, and
+`local_rag_store::store_has_pending_spool_bytes`. `idle_eligible` is a pure `&&` of all three —
+a single non-idle input refuses regardless of the other two, per this section's own "**all**".
+This task's own scope covers only the two *startup* resume jobs (07 §6, 08 §4) — continuous
+consolidation triggering (checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`) is
+T15-06's, per T14-06's own as-built note; no reconcile-watcher or periodic-GC scheduling exists yet
+either (no card names an owner narrower than "group 15" for either).
+
+As-built note (T15-01, `[SPEC]`): the four shutdown steps are, in order: (1) stop accepting — signal
+the socket's accept loop to return, then best-effort unlink `run/daemon.sock`; (2) cancel at the
+next safe point — T15-01's own only background work is the two startup resume passes, and the
+caller already `.await`s their completion before proceeding, which *is* "let the current job finish,
+refuse new ones" here (a `StateWriter`/`CacheWriter` job's only unit of work is already one SQL
+transaction — there is no smaller safe point); (3) flush WAL checkpoint — `TRUNCATE` on both
+`state.sqlite` and `cache.sqlite` (03 §4's own as-built note), then `CacheDb::close` (D-009's
+blocking, join-the-writer-thread variant — exactly the "process going away" case it was built for);
+`state.sqlite`'s own writer thread stays detached, safe by construction once step 2 already
+guarantees nothing is mid-transaction; (4) release the store lock.
+
+As-built note (T15-01, `[SPEC]`): the OS signal handler (`tokio::signal::unix::signal`) is
+installed **before** step 1 of §4.1 even begins, not lazily once the wait loop starts — registration
+happens at that call, not at the first read, so a `SIGTERM` delivered at any point during startup
+(even before the lock is acquired) is captured and observed on the first wait, never lost to the OS
+default terminate-immediately disposition. Installing it later (this task's own first draft) leaves
+a real window, between the lock being marked ready and the wait loop actually starting, where a
+signal kills the process ungracefully instead of draining it — caught by
+`tests/serve_subprocess.rs` flaking under concurrent test-suite load before the fix.
+
 ### 4.4 Ownership invariants
 
 One daemon per OS user per store `[FIXED]`. Identity = `instance_uuid` (+ PID as advisory)
 `[FIXED]`. Orphan artifacts (stale socket, stale lock, orphan shard temp dirs, spool of dead
 sessions) are cleaned at startup and by periodic GC.
+
+As-built note (T15-01, `[SPEC]`): of this list, T15-01 cleans the stale socket and stale lock
+classes, both at startup (§4.1's as-built note above) and, for the socket, again as part of an
+orderly shutdown (§4.3). Orphan shard temp dirs and dead-session spool cleanup are the three
+existing `local_rag_store::housekeeping` sweeps (T06-03, D-007, D-011, T13-05) — implemented and
+tested, but periodic/startup *scheduling* of them remains unclaimed by any card narrower than
+"group 15," the same gap this section's own as-built notes above already flag for
+reconcile-watcher and GC triggering generally.
 
 ## 5. Concurrency & lock order `[SPEC]`
 
@@ -283,6 +374,11 @@ already-public `checked_scope_sync`/`checked_scope_async` around it, unchanged. 
 *structural*, lock-object-free realization of `L2`'s write side) or the projection switch is
 explicitly **not** this task — T09-04 and group 15 own that wiring; the read side is adopted by
 T09-03 (below).
+
+As-built note (T15-01, `[SPEC]`): `L0` is now a real participant, not a `LockLevel`-only
+placeholder — `local_rag::daemon::lock::acquire` wraps its whole body in
+`checked_scope_sync(LockLevel::L0, ...)`, the same in-place instrumentation `L1`/`L4a`/`L4b`
+already carry. `L3` (the shard-manager map) remains unclaimed.
 
 As-built note (T09-03, `[SPEC]`): `local_rag_search::SearchEngine::search_code`
 (`crates/search/src/pipeline.rs`) is the first caller of `WorktreeLockRegistry::read` — via a new
@@ -379,3 +475,21 @@ joined into `details`. `Resolution::Ambiguous` (02 §3.3 — a worktree resolvab
 explicit `attach()`) is folded into `WORKTREE_NOT_INDEXED` for now: no dedicated code exists for it
 in this table, and the wire-facing outcome ("code search cannot proceed for this request") is the
 same either way — flagged as a judgment call, not a new taxonomy row.
+
+As-built note (T15-01, `[SPEC]`): two of the T09-03 note's remaining three variants now exist,
+added by the daemon-lifecycle code that first detects each condition (`crates/local-rag/src/
+daemon/`). `ErrorCode::StoreLocked` (`STORE_LOCKED`) is produced when §4.1 step 1's `acquire`
+returns `Locked{owner}`; `details` names the owner's `pid`/`instance_uuid`, `retryable = false`.
+`ErrorCode::IncompatibleStore` (`INCOMPATIBLE_STORE`) is produced when step 2's migration fails for
+a schema reason (`daemon::error::migration_only_reason`/`error_envelope` map the already-typed
+`local_rag_store::migrate::MigrationError` variants, never re-deriving the condition); `details` is
+this section's own two examples verbatim — `"store_version {n} > binary_max {m}"` /
+`"checksum drift at version {n} ({name})"`. `ErrorCode::MigrationInProgress`
+(`MIGRATION_IN_PROGRESS`, `retryable = true`) also now exists, but its call site is not inside the
+daemon's own request path (a store legitimately mid-migration at step 2 has not bound its socket
+yet, per this section's own step ordering, so no *response* can carry this code during that window)
+— it is produced by `local-rag serve`'s own CLI-level startup-failure message when `Locked{owner}`
+names an owner whose lock record has `ready: false` (still starting, most commonly still
+migrating, see §4.1's as-built note above), naming the code for a human or launcher-script reading
+stderr, not for a wire response. Group 15 (T15-02+) still owns wiring these into the real MCP/proxy
+transport.

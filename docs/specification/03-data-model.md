@@ -129,6 +129,11 @@ CREATE TABLE store_settings (        -- store_instance_uuid, default_model_space
 -- `active` — so 04 §3's "the default space MUST be active" is enforced where the
 -- value is established rather than assumed by its readers (05 §8's dormant
 -- migration, `subjects::protected_model_space_ids`). Migration 4 seeds it.
+-- As-built (T15-01, [SPEC]): `store_instance_uuid` has exactly one producer,
+-- `registry::ensure_store_instance_uuid` (first-writer-wins atomic upsert, no
+-- migration seed — the value is inherently random). The daemon calls it once,
+-- inside 02 §4.1 step 2, strictly before step 3 opens `cache.sqlite` (§4.4
+-- below consumes it).
 
 CREATE TABLE migration_progress (    -- resumable-migration checkpoints (13 §3); rows exist
   version  INTEGER NOT NULL,         -- only for the in-flight migration, cleared on finalize
@@ -750,6 +755,15 @@ PRAGMA synchronous=NORMAL;        -- loss ⇒ rebuild, never data loss [SPEC]
 PRAGMA busy_timeout=5000;
 ```
 
+As-built note (T15-01, `[SPEC]`): unlike §3's `state.sqlite` write policy, this section fixes no
+WAL-checkpoint policy of its own. `local_rag_store::cache::CacheWriter::checkpoint` adopts §3's
+literal `PASSIVE` opportunistically / `TRUNCATE` policy for `cache.sqlite` too, called on shutdown
+(02 §4.3's "flush WAL checkpoint" step) alongside `state.sqlite`'s own checkpoint. This is a
+deliberately more aggressive policy than a rebuildable cache strictly needs, but it is strictly
+*safe* here — this section's own `synchronous=NORMAL` rationale ("loss ⇒ rebuild, never data
+loss") already accepts a cache-side loss as the worst case, and adopting one proven policy is
+simpler than inventing a second, unneeded one.
+
 ### 4.1 Meta / binding
 
 ```sql
@@ -976,6 +990,20 @@ next open rebuilds — idempotent convergence, `state.sqlite` never touched. The
 `store_instance_uuid` is supplied by the caller (the daemon reads it from `store_settings` at
 startup, §4.1 / 02 §4.1); seeding that value into state is deferred to the UUIDv7 generator
 (step 2) and daemon wiring (step 15).
+
+As-built note (T15-01, `[SPEC]`): the deferred seeding above is now wired. §2.1's
+`store_settings` table carries `store_instance_uuid` as an ordinary `(key, value)` row, produced
+by `local_rag_store::registry::ensure_store_instance_uuid(tx, candidate)` — a first-writer-wins
+atomic upsert (`INSERT ... ON CONFLICT(key) DO UPDATE SET value = store_settings.value
+RETURNING value`, the same idiom `register_representation` already uses for its own
+converge-on-first-registered-id upsert). `local_rag::daemon::lifecycle::DaemonHandle::start`
+calls it once, inside one short transaction, immediately after 02 §4.1 step 2's migrations
+succeed and strictly before step 3 opens the cache — `candidate` is a fresh UUIDv7 minted by the
+caller before the call (entropy stays out of the write path, mirroring
+`create_repository`'s own caller-mints-the-id discipline), discarded on every open after the
+first. This value is the store's own durable identity across restarts, distinct from a running
+daemon's own per-process `instance_uuid` (02 §2/§4.1) — the latter is fresh every start, the
+former must survive them for `cache.sqlite`'s binding to mean anything.
 
 Close semantics (D-009, `[SPEC]`): dropping a `CacheDb` closes the write queue but does **not**
 wait for the writer thread to finish closing its connection — asynchronous teardown is the
