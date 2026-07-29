@@ -38,6 +38,7 @@
 //! different crate," never a `crates/memory` rewrite.
 
 pub mod catalog;
+pub mod chat_template;
 pub mod fetch;
 pub mod install;
 pub mod llama;
@@ -45,8 +46,9 @@ pub mod manifest;
 
 pub use catalog::{
     AssetFile, CATALOG, DEFAULT_MODEL_ID, GEMMA4_E2B_IT_Q4_0, GeneratorCatalogEntry,
-    QWEN2_5_0_5B_INSTRUCT_Q4KM, QWEN2_5_1_5B_INSTRUCT_Q4KM, find,
+    PHI3_MINI_4K_INSTRUCT_Q4, QWEN2_5_0_5B_INSTRUCT_Q4KM, QWEN2_5_1_5B_INSTRUCT_Q4KM, find,
 };
+pub use chat_template::ChatTemplateError;
 pub use fetch::{AssetFetcher, FetchError, HttpFetcher, LocalFetcher};
 pub use install::{
     InstallError, InstallReport, MANIFEST_FILE, OK_MARKER, PART_SUFFIX, install_model,

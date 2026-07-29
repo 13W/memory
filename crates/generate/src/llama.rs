@@ -32,11 +32,18 @@
 //!
 //! # The prompt uses the model's own embedded chat template
 //!
-//! [`GenMessage`]s are rendered via [`LlamaModel::chat_template`] +
-//! [`LlamaModel::apply_chat_template`] — the same `llama_chat_apply_template`
-//! engine `llama.cpp`'s own CLI uses, reading the Jinja-ish template GGUF
-//! conversion bakes into the file (`tokenizer.chat_template` metadata), not a
-//! format this crate assumes. An earlier version of this file hand-rolled
+//! [`GenMessage`]s are rendered against the model's own raw, embedded Jinja
+//! chat template (`tokenizer.chat_template` GGUF metadata, read via
+//! [`LlamaModel::chat_template`]) through [`crate::chat_template::render`] —
+//! a real Jinja interpreter (`minijinja`), not
+//! [`LlamaModel::apply_chat_template`]. That method calls the vendored
+//! `llama.cpp`'s `llama_chat_apply_template`, which internally uses
+//! `llm_chat_detect_template` — a fixed-signature heuristic matcher, not a
+//! Jinja interpreter — and does not recognize every model's embedded
+//! template text (ADR-0006 needed a one-off `chat_template_override` for
+//! Gemma 4 specifically because of this; T14-09 replaced that per-model
+//! patch with this general mechanism, `crate::chat_template`'s own module
+//! doc has the full trace). An earlier version of this file hand-rolled
 //! Qwen2.5-Instruct's ChatML template (`<|im_start|>...`) directly; that
 //! happened to work for the Qwen catalog entries but would have silently
 //! produced garbled prompts for a model expecting a different template (e.g.
@@ -53,15 +60,17 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_embed::{
-    FinishReason, GenError, GenMessage, GenRequest, GenResponse, GenRole, Generator, Sampling,
+    FinishReason, GenError, GenMessage, GenRequest, GenResponse, Generator, Sampling,
 };
 
 use crate::catalog::GeneratorCatalogEntry;
+use crate::chat_template::{self, ChatTemplateError};
 use crate::install::OK_MARKER;
 
 /// Why loading or running the local generator failed.
@@ -83,6 +92,11 @@ pub enum LlamaError {
     /// [`Sampling::Temperature`] was requested — not implemented (see the
     /// module doc's determinism section).
     UnsupportedSampling,
+    /// Rendering the model's chat template (`crate::chat_template::render`)
+    /// failed — a bad template, a message sequence the template itself
+    /// rejects, or a template bug. Never retryable: waiting will not fix a
+    /// template.
+    ChatTemplate(ChatTemplateError),
     /// Any other llama.cpp-side failure (backend init, model/context load,
     /// tokenize, batch, decode, detokenize). `llama-cpp-2` gives each of
     /// these its own distinct error type; this crate does not need to branch
@@ -110,6 +124,7 @@ impl std::fmt::Display for LlamaError {
             LlamaError::UnsupportedSampling => {
                 write!(f, "only greedy sampling is implemented")
             }
+            LlamaError::ChatTemplate(e) => write!(f, "{e}"),
             LlamaError::Runtime(message) => write!(f, "llama.cpp error: {message}"),
         }
     }
@@ -137,6 +152,7 @@ impl From<LlamaError> for GenError {
                 max_context_tokens,
             },
             LlamaError::UnsupportedSampling => GenError::permanent("unsupported sampling mode"),
+            LlamaError::ChatTemplate(e) => GenError::permanent(e.to_string()),
             LlamaError::Runtime(message) => GenError::permanent(message),
         }
     }
@@ -151,15 +167,18 @@ pub struct LlamaGenerator {
     backend: LlamaBackend,
     model: LlamaModel,
     context_length: u32,
-    /// See [`GeneratorCatalogEntry::chat_template_override`]'s doc.
-    chat_template_override: Option<&'static str>,
+    /// See [`GeneratorCatalogEntry::raw_chat_template_override`]'s doc.
+    raw_chat_template_override: Option<&'static str>,
 }
 
 impl std::fmt::Debug for LlamaGenerator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlamaGenerator")
             .field("context_length", &self.context_length)
-            .field("chat_template_override", &self.chat_template_override)
+            .field(
+                "raw_chat_template_override",
+                &self.raw_chat_template_override.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -180,23 +199,24 @@ impl LlamaGenerator {
         Self::load_with_template(
             &model_path,
             entry.context_length,
-            entry.chat_template_override,
+            entry.raw_chat_template_override,
         )
     }
 
-    /// Load a GGUF file directly (tests / non-catalog use), auto-detecting
-    /// its chat template. Equivalent to
+    /// Load a GGUF file directly (tests / non-catalog use), using its own
+    /// embedded chat template. Equivalent to
     /// [`Self::load_with_template`]`(model_path, context_length, None)`.
     pub fn load(model_path: &Path, context_length: u32) -> Result<Self, LlamaError> {
         Self::load_with_template(model_path, context_length, None)
     }
 
-    /// Load a GGUF file directly, with an optional named chat-template
-    /// override (see [`GeneratorCatalogEntry::chat_template_override`]).
+    /// Load a GGUF file directly, with an optional literal Jinja
+    /// chat-template source overriding the GGUF's own embedded metadata (see
+    /// [`GeneratorCatalogEntry::raw_chat_template_override`]).
     pub fn load_with_template(
         model_path: &Path,
         context_length: u32,
-        chat_template_override: Option<&'static str>,
+        raw_chat_template_override: Option<&'static str>,
     ) -> Result<Self, LlamaError> {
         let mut backend = LlamaBackend::init().map_err(runtime_err)?;
         backend.void_logs();
@@ -209,28 +229,43 @@ impl LlamaGenerator {
             backend,
             model,
             context_length,
-            chat_template_override,
+            raw_chat_template_override,
         })
     }
 
-    /// Render `messages` through the model's own embedded chat template (see
-    /// the module doc). `role_str` is pure and unit-tested on its own; the
-    /// template lookup/application itself needs a real loaded model, so it
-    /// is covered by `tests/llama.rs`'s SKIP-able real-inference test
-    /// instead of a pure unit test.
-    fn build_prompt(&self, messages: &[GenMessage]) -> Result<String, LlamaError> {
-        let tmpl = match self.chat_template_override {
-            Some(name) => LlamaChatTemplate::new(name).map_err(runtime_err)?,
-            None => self.model.chat_template(None).map_err(runtime_err)?,
-        };
-        let chat = messages
-            .iter()
-            .map(|m| LlamaChatMessage::new(role_str(m.role).to_string(), m.content.clone()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(runtime_err)?;
+    /// Convert a special token (BOS/EOS) to the exact string a chat template
+    /// expects in its `bos_token`/`eos_token` context variables — never
+    /// hardcoded, always read from the model's own vocabulary.
+    fn token_text(&self, token: LlamaToken) -> Result<String, LlamaError> {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
         self.model
-            .apply_chat_template(&tmpl, &chat, true)
+            .token_to_piece(token, &mut decoder, true, None)
             .map_err(runtime_err)
+    }
+
+    /// Render `messages` through the model's own embedded chat template (see
+    /// the module doc) using a real Jinja interpreter
+    /// (`crate::chat_template::render`), not the vendored `llama.cpp`'s
+    /// fixed-signature template detector. Pure rendering logic lives in
+    /// `crate::chat_template` and is unit-tested there against real template
+    /// strings; this method only supplies what needs a loaded model: the raw
+    /// template source and the vocabulary's own BOS/EOS strings.
+    fn build_prompt(&self, messages: &[GenMessage]) -> Result<String, LlamaError> {
+        let template_source = match self.raw_chat_template_override {
+            Some(text) => text.to_string(),
+            None => self
+                .model
+                .chat_template(None)
+                .map_err(runtime_err)?
+                .to_string()
+                .map_err(runtime_err)?,
+        };
+        let bos = self.token_text(self.model.token_bos())?;
+        let eos = self.token_text(self.model.token_eos())?;
+
+        let rendered = chat_template::render(&template_source, messages, &bos, &eos, true)
+            .map_err(LlamaError::ChatTemplate)?;
+        Ok(chat_template::strip_leading_bos(&rendered, &bos).to_string())
     }
 
     fn generate_greedy(&self, prompt: &str, max_tokens: u32) -> Result<GenResponse, LlamaError> {
@@ -327,17 +362,6 @@ impl Generator for LlamaGenerator {
     }
 }
 
-/// The role name string `llama_chat_apply_template` expects — the same
-/// `"system"`/`"user"`/`"assistant"` vocabulary every template llama.cpp
-/// supports is written against.
-fn role_str(role: GenRole) -> &'static str {
-    match role {
-        GenRole::System => "system",
-        GenRole::User => "user",
-        GenRole::Assistant => "assistant",
-    }
-}
-
 /// Where the default catalog entry's GGUF file would live under `layout` —
 /// convenience for callers that already checked [`LlamaGenerator::open`]'s
 /// precondition themselves.
@@ -350,13 +374,6 @@ pub fn default_model_path(layout: &StoreLayout, entry: &GeneratorCatalogEntry) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn role_str_covers_every_gen_role_with_the_apply_template_vocabulary() {
-        assert_eq!(role_str(GenRole::System), "system");
-        assert_eq!(role_str(GenRole::User), "user");
-        assert_eq!(role_str(GenRole::Assistant), "assistant");
-    }
 
     #[test]
     fn temperature_sampling_is_reported_as_unsupported() {

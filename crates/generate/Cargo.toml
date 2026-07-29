@@ -44,6 +44,31 @@ llama-cpp-2 = { version = "0.1", default-features = false, features = [
 # only a direct dependency edge to construct `UTF_8.new_decoder()`.
 encoding_rs = "0.8"
 
+# T14-09: renders a GGUF's own embedded Jinja chat template ourselves,
+# replacing `llama-cpp-2::apply_chat_template` (which calls the vendored
+# `llama.cpp`'s `llm_chat_detect_template` -- a fixed-signature heuristic
+# matcher, not a Jinja interpreter, and the root cause of ADR-0006's
+# per-model `chat_template_override`). `llama-cpp-2`'s own doc comment on
+# `LlamaModel::chat_template` names this exact crate as the intended escape
+# hatch. Pure Rust, no new host-toolchain requirement (this crate already
+# needs cmake+libclang for `llama-cpp-sys-2`). `json` enables the `tojson`
+# filter, `loop_controls` enables `{% break %}`/`{% continue %}` -- both
+# used by real HuggingFace-authored chat templates.
+minijinja = { version = "2", features = ["json", "loop_controls"] }
+
+# Real, HuggingFace-authored chat templates are written and tested against
+# Python's Jinja2 and lean on plain Python dict/str/list methods (`.get()`,
+# `.split()`, `.items()`, ...) `minijinja`'s own value types do not implement
+# natively (verified live against Gemma 4's and Qwen2.5's actual embedded
+# templates, T14-09 -- both call `message.get(...)`). `pycompat` is this
+# crate's own author's purpose-built compatibility shim for exactly this gap
+# (`minijinja::Environment::set_unknown_method_callback`'s own doc names it
+# directly), registered once in `chat_template::render`'s `Environment`
+# rather than hand-rolling a `.get()` callback ourselves.
+minijinja-contrib = { version = "2", default-features = false, features = [
+    "pycompat",
+] }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

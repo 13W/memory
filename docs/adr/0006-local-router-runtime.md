@@ -287,3 +287,132 @@ Concretely:
   reusing ADR-0005's own cache-root convention — the GGUF weights and the
   ONNX weights live in sibling `models/<model_id>/` subdirectories under one
   root, since `StoreLayout::model_dir` already namespaces by `model_id`.
+
+## Amendment: generalized chat-template rendering (T14-09)
+
+**`crates/generate::chat_template::render` — a real Jinja interpreter
+(`minijinja` + `minijinja-contrib`'s `pycompat`) applied directly to each
+model's own raw, embedded `tokenizer.chat_template` GGUF metadata — replaces
+`LlamaModel::apply_chat_template` for every catalog entry.**
+`GeneratorCatalogEntry::chat_template_override` (a *name* into
+`llama-chat.cpp`'s fixed template table) is renamed
+`raw_chat_template_override` (literal Jinja *source text*, a rare escape
+hatch) and is `None` on all four entries, Gemma 4 included.
+
+### Why
+
+This ADR's own Consequences section disclosed the gap `chat_template_override:
+Some("gemma")` left open: `llama_chat_apply_template`'s `llm_chat_detect_
+template` is a fixed-signature heuristic matcher, not a Jinja interpreter, so
+it cannot recognize Gemma 4's real template text at all; the override worked
+around that by forcing the vendored llama.cpp's *older* `LLM_CHAT_TEMPLATE_
+GEMMA` (Gemma 1-3-era) formatter, which merges the system turn into the first
+user turn — Gemma 4's own advertised native system-role support went
+unexercised. T14-09 was registered specifically to generalize this, per the
+task's own "verify before inventing" discipline: even the current upstream
+llama.cpp does not solve this at the layer `llama-cpp-2` binds (its own
+lightweight `llm_chat_detect_template`/`llama_chat_apply_template` C API has
+no native Gemma 4 signature and, per real-world reports, cannot represent
+Gemma 4's actual template — which uses macros, `namespace()`, and `dictsort`
+— at all; the fuller Jinja-capable engine upstream ships, `minja`, lives in
+`tools/server`/`common/chat.cpp`, C++-only, not exposed through the plain C
+`llama.h` this crate's bindings wrap). `LlamaModel::chat_template`'s own doc
+comment in `llama-cpp-2` 0.1.152 names `minijinja` directly as the intended
+escape hatch for exactly this gap.
+
+### What changed
+
+* `LlamaGenerator::build_prompt` no longer calls `apply_chat_template`. It
+  reads the raw template via `chat_template(None)`, reads `bos_token`/
+  `eos_token` from the model's own vocabulary (`token_bos()`/`token_eos()` +
+  the existing `token_to_piece` detokenization path — never hardcoded), and
+  renders through `chat_template::render` with the same context shape
+  HuggingFace's own `apply_chat_template` exposes (`messages`, `bos_token`,
+  `eos_token`, `add_generation_prompt`). A new `strip_leading_bos` step
+  removes a template-emitted leading `bos_token` (Gemma's pattern) before
+  tokenization, so `AddBos::Always` stays the single source of truth for BOS
+  rather than duplicating it.
+* `minijinja`'s default `UndefinedBehavior::Lenient` is used, not `Strict`.
+  An initial implementation reasoned by analogy to HuggingFace's own
+  `StrictUndefined` and used `Strict`; that assumption failed against both
+  real templates tested (Gemma 4 and Qwen2.5 ChatML), which reference
+  optional context (`{% if tools %}`, no `default()` guard) and optional
+  per-message fields (`message.get('tool_calls')`, present only on
+  tool-calling turns this router never emits) with no guard at all, relying
+  on ordinary lenient Jinja semantics. `Lenient` still fails loudly on
+  attribute access chained off an *already*-undefined value, so a genuinely
+  out-of-place template reference is not silently swallowed.
+* Real templates also call plain Python dict/str methods `minijinja`'s own
+  value types do not implement natively (`message.get('reasoning')`,
+  `text.split(...)` — verified live: Gemma 4's real template fails with
+  `unknown method: map has no method named get` without this).
+  `minijinja-contrib::pycompat::unknown_method_callback`, written by
+  `minijinja`'s own author specifically for this class of gap, is registered
+  on every render.
+* A fourth catalog entry, `phi-3-mini-4k-instruct-gguf-q4`
+  (`crates/generate::catalog::PHI3_MINI_4K_INSTRUCT_Q4`), was added from a
+  **third** template family (`<|user|>...<|end|>` — neither Qwen's ChatML nor
+  Gemma's `<|turn>`), Microsoft's own official `q4` GGUF release (MIT;
+  `gated: false` and the license text verified live against the real
+  HuggingFace API/file, the same discipline this ADR's own model-selection
+  section already applied), catalogued with **no**
+  `raw_chat_template_override` — direct proof the general mechanism needs no
+  per-entry override to render an arbitrary new model. This specific GGUF's
+  own embedded template has a real, disclosed limitation unrelated to the
+  rendering mechanism: it only branches on `role in ('user', 'assistant')`,
+  so a `system`-role turn (this router always sends one) is silently absent
+  from the rendered prompt — confirmed both by the exact rendered text
+  (`crates/generate/src/chat_template.rs`'s fixture tests) and by a real
+  `cargo xtask memory-bench --model phi-3-mini-4k-instruct-gguf-q4` run
+  scoring **precision=0.0000, recall=0.0000, f1=0.0000** on the full 42-case
+  corpus (every case's `predicted` came back empty — the router's system
+  prompt, which the parser depends on to shape output, never reached the
+  model). This is not a candidate for the default model (unchanged, out of
+  this task's scope) — it is disclosed evidence that `raw_chat_template_
+  override` remains a real, occasionally-necessary escape hatch for a
+  specific template's own quality, even though the *rendering mechanism*
+  itself needs no such override to function.
+
+### Measured effect on the memory-quality benchmark
+
+Two independent `cargo xtask memory-bench` runs of the new default (identical
+model/corpus/harness/greedy sampling) produced *different* numbers from each
+other — real, measured run-to-run variance under nominally deterministic
+greedy decoding on this host (Apple M5 Pro, Metal backend):
+
+| Run | Precision | Recall | F1 | Exact match |
+| --- | --- | --- | --- | --- |
+| Override path (`chat_template_override="gemma"`, superseded) | 0.6667 | 0.6364 | 0.6512 | 0.6190 |
+| Native template, run 1 | 0.6486 | 0.5455 | 0.5926 | 0.5238 |
+| Native template, run 2 | 0.6757 | 0.5682 | 0.6173 | 0.5476 |
+
+Both native-template runs score **lower** than the override path they
+replace — disclosed as measured, not smoothed into a flattering number. This
+ADR's own Consequences section only speculated T14-09 might unlock a higher
+ceiling by exercising Gemma 4's real native system-role turn ("possibly...
+higher, not lower" — never a guarantee); the real runs do not bear that out
+for this router's specific system prompt and few-shot wording
+(`local_rag_memory::prompt`), which were themselves only ever tuned against
+the override path's merged-system-into-user-turn framing. A plausible
+explanation, not yet independently confirmed: the router's prompt may simply
+read differently to the model when the system instructions arrive in their
+own distinct turn rather than prepended to the user content — a real
+interaction between prompt design and template correctness, and now an
+argued case for revisiting the router's own prompt wording against the
+template it actually runs on, tracked as future work (spec 08 §7's own
+"raising the floor further" list), not this task's scope. Both Qwen2.5
+ChatML entries were independently re-measured under the same new rendering
+path as a regression check and showed no material change (round-one → new:
+0.5B precision 0.3784→0.3590/recall 0.3182→0.3182/f1 0.3457→0.3373; 1.5B
+precision 0.3659→0.3571/recall 0.3409→0.3409/f1 0.3529→0.3488), consistent
+with Qwen's template already having been correctly recognized by the old
+`llm_chat_detect_template` path.
+
+`fixtures/memory/baseline/thresholds.json` was re-derived from the *lower*
+of the two native-template runs, with a wider margin than the override
+path's own derivation specifically to absorb the newly-quantified run-to-run
+variance itself (`min_precision=0.60`, `min_recall=0.50`, down from
+`0.60`/`0.55`) — see that file's own `derivation` field for the full
+numeric accounting. All prior run files stay on disk as historical evidence,
+per this project's "do not rewrite prior progress evidence" rule; the new
+runs are additional files, not replacements.
