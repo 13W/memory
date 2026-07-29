@@ -15,5 +15,9 @@ jobs:
       - name: Install pinned toolchain
         # rust-toolchain.toml drives the exact channel + components.
         run: rustup show
+      - name: Install cargo-nextest
+        # cargo xtask ci runs its test jobs through nextest (parallel
+        # test-binary execution) instead of `cargo test`; see CONTRIBUTING.md.
+        run: cargo install cargo-nextest --locked
       - name: Run full check
         run: cargo xtask ci
