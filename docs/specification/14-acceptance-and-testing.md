@@ -56,6 +56,15 @@ historical evidence, not deleted. Unlike `quality`, there is no prior v1 measure
 against — GAP-04's own text already states the corpus "is absent in v1" — so this is a floor a
 real margin below the current default's own run, not a regression budget.
 
+As-built note (T14-09, `[SPEC]`, found stale at gate G14): the thresholds above are superseded.
+Generalizing chat-template rendering (08 §7's own T14-09 as-built note has the full mechanism and
+measurement trace) moved the shipped default off the `chat_template_override` workaround this
+row's numbers were measured under; re-derivation on the two resulting native-template runs set
+`fixtures/memory/baseline/thresholds.json` to `min_precision = 0.60` (unchanged), `min_recall =
+0.50` (down from `0.55`). This paragraph was not updated when T14-09 landed, leaving it stale
+relative to the shipped `thresholds.json` and to 08 §7's own account — corrected here, no
+behavior changed.
+
 As-built note (D-018, `[SPEC]`): **the `quality` gate now passes on the shipped default mode** —
 MRR 0.7007 against the 0.6963 baseline, Recall@5 0.8367 against the 0.80 floor. It got there by
 holding the thresholds still and fixing what they measured: `D-016` (corpus scope and the 1024-token

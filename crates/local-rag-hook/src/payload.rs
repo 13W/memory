@@ -42,10 +42,17 @@ use local_rag_core::identity::domain::truncated_excerpt;
 use local_rag_core::redaction::Scanner;
 
 /// The spool-payload size cap (spec 12 §2 `[SPEC]`: "spool payload 256 KiB").
-/// The 4 KiB evidence-excerpt cap and 8 KiB snippet cap are different sites —
-/// the former is group 14's (memory evidence), the latter is already built
-/// (T12-04, `local_rag_search::SNIPPET_CAP_BYTES`).
+/// The 4 KiB evidence-excerpt cap ([`EXCERPT_CAP_BYTES`], D-021) and 8 KiB
+/// snippet cap are different sites (T12-04, `local_rag_search::SNIPPET_CAP_BYTES`).
 pub const PAYLOAD_CAP_BYTES: usize = 256 * 1024;
+
+/// The evidence-excerpt size cap (spec 12 §2 `[SPEC]`: "evidence excerpt 4 KiB";
+/// D-021). Applies to the same already-redacted bytes [`PAYLOAD_CAP_BYTES`]
+/// caps, sliced further and separately — the excerpt is a *secondary*, short
+/// slice for the memory router's prompt, not the authoritative capture of
+/// what was observed, so it carries no `{hash, original_size}` metadata of
+/// its own (unlike [`PayloadTruncation`]).
+pub const EXCERPT_CAP_BYTES: usize = 4 * 1024;
 
 /// The `{hash, original_size}` metadata a truncated payload leaves behind
 /// (spec 12 §2 `[FIXED]`), over the **full** pre-truncation (but
@@ -120,10 +127,7 @@ pub fn prepare_payload(
     // Over the cap: move the cut back to a UTF-8 boundary (identical idiom to
     // `local_rag_search::snippet::cut` — at most three bytes, since no UTF-8
     // sequence is longer than four).
-    let mut cut_at = PAYLOAD_CAP_BYTES;
-    while cut_at > 0 && (full[cut_at] & 0b1100_0000) == 0b1000_0000 {
-        cut_at -= 1;
-    }
+    let cut_at = utf8_safe_cut(&full, PAYLOAD_CAP_BYTES);
     let truncation = PayloadTruncation {
         hash: truncated_excerpt(&full),
         original_size: full.len() as u64,
@@ -136,6 +140,22 @@ pub fn prepare_payload(
         secrets_found: redacted.findings,
         truncation: Some(truncation),
     }
+}
+
+/// Walk `cap` back to the nearest UTF-8 character boundary at or before it
+/// (at most three bytes, since no UTF-8 sequence is longer than four) —
+/// shared by [`prepare_payload`]'s payload cap and
+/// [`short_evidence_excerpt_field`]'s excerpt cap. `cap >= bytes.len()` is a
+/// no-op (returns `bytes.len()`).
+fn utf8_safe_cut(bytes: &[u8], cap: usize) -> usize {
+    if cap >= bytes.len() {
+        return bytes.len();
+    }
+    let mut cut_at = cap;
+    while cut_at > 0 && (bytes[cut_at] & 0b1100_0000) == 0b1000_0000 {
+        cut_at -= 1;
+    }
+    cut_at
 }
 
 /// Fold a [`PreparedPayload`] into the frame's `payload` field (`None` for
@@ -167,6 +187,26 @@ pub fn redaction_version_field(prepared: &PreparedPayload) -> Option<u32> {
         PreparedPayload::Included {
             redaction_version, ..
         } => Some(*redaction_version),
+    }
+}
+
+/// Fold a [`PreparedPayload`] into the frame's `short_evidence_excerpt` field
+/// (spec 12 §2 `[SPEC]`, spec 03 §2.5's `observation_envelope
+/// .short_evidence_excerpt`, D-021): `None` for
+/// [`PreparedPayload::EnvelopeOnly`] (a denied event's payload is never
+/// scanned, so there is no text to excerpt); for [`PreparedPayload::Included`],
+/// the already-redacted `bytes` sliced to [`EXCERPT_CAP_BYTES`] on a UTF-8
+/// boundary. This is the memory router's evidence-excerpt input
+/// (`local_rag_memory::prompt`'s `short_evidence_excerpt`), not a new
+/// redaction pass — the bytes are already the same redacted content
+/// [`payload_field`] wraps, merely capped tighter for prompt display.
+pub fn short_evidence_excerpt_field(prepared: &PreparedPayload) -> Option<String> {
+    match prepared {
+        PreparedPayload::EnvelopeOnly => None,
+        PreparedPayload::Included { bytes, .. } => {
+            let cut_at = utf8_safe_cut(bytes, EXCERPT_CAP_BYTES);
+            Some(String::from_utf8_lossy(&bytes[..cut_at]).into_owned())
+        }
     }
 }
 
@@ -266,5 +306,121 @@ mod tests {
         let scanner = Scanner::new();
         let prepared = prepare_payload("clean text", &[], None, &no_deny(), &scanner);
         assert_eq!(redaction_version_field(&prepared), Some(scanner.version()));
+    }
+
+    #[test]
+    fn short_evidence_excerpt_field_is_none_for_envelope_only() {
+        assert_eq!(
+            short_evidence_excerpt_field(&PreparedPayload::EnvelopeOnly),
+            None
+        );
+    }
+
+    #[test]
+    fn short_evidence_excerpt_field_passes_through_under_cap_text_unchanged() {
+        let prepared = PreparedPayload::Included {
+            bytes: b"we decided to use pnpm instead of npm".to_vec(),
+            redaction_version: 1,
+            secrets_found: 0,
+            truncation: None,
+        };
+        assert_eq!(
+            short_evidence_excerpt_field(&prepared),
+            Some("we decided to use pnpm instead of npm".to_string())
+        );
+    }
+
+    #[test]
+    fn short_evidence_excerpt_field_passes_through_text_at_exactly_the_cap() {
+        let bytes = vec![b'a'; EXCERPT_CAP_BYTES];
+        let prepared = PreparedPayload::Included {
+            bytes: bytes.clone(),
+            redaction_version: 1,
+            secrets_found: 0,
+            truncation: None,
+        };
+        let excerpt = short_evidence_excerpt_field(&prepared).unwrap();
+        assert_eq!(excerpt.len(), EXCERPT_CAP_BYTES);
+        assert_eq!(excerpt.as_bytes(), &bytes[..]);
+    }
+
+    #[test]
+    fn short_evidence_excerpt_field_truncates_text_over_the_cap() {
+        let bytes = vec![b'a'; EXCERPT_CAP_BYTES + 100];
+        let prepared = PreparedPayload::Included {
+            bytes,
+            redaction_version: 1,
+            secrets_found: 0,
+            truncation: None,
+        };
+        let excerpt = short_evidence_excerpt_field(&prepared).unwrap();
+        assert_eq!(excerpt.len(), EXCERPT_CAP_BYTES);
+    }
+
+    #[test]
+    fn short_evidence_excerpt_field_cuts_on_a_utf8_boundary_not_mid_character() {
+        // A 2-byte UTF-8 character ("р", U+0440) starts exactly one byte
+        // before the cap, so the cap itself lands on its continuation byte —
+        // the cut must move back before the character, not split it, and the
+        // result must still be valid UTF-8.
+        let filler = "a".repeat(EXCERPT_CAP_BYTES - 1);
+        let text = format!("{filler}решили");
+        assert_eq!(
+            text.as_bytes()[EXCERPT_CAP_BYTES] & 0b1100_0000,
+            0b1000_0000,
+            "test setup: byte at the cap must be a continuation byte (mid-character)"
+        );
+        let prepared = PreparedPayload::Included {
+            bytes: text.into_bytes(),
+            redaction_version: 1,
+            secrets_found: 0,
+            truncation: None,
+        };
+        let excerpt = short_evidence_excerpt_field(&prepared).unwrap();
+        assert!(excerpt.len() <= EXCERPT_CAP_BYTES);
+        assert_eq!(
+            excerpt, filler,
+            "the split multi-byte char must be dropped, not mangled"
+        );
+    }
+
+    #[test]
+    fn short_evidence_excerpt_survives_the_full_frame_round_trip() {
+        use local_rag_core::spool::{FramePayload, encode_frame};
+
+        let scanner = Scanner::new();
+        let prepared = prepare_payload(
+            "we decided to use pnpm instead of npm for this repo",
+            &[],
+            None,
+            &no_deny(),
+            &scanner,
+        );
+        let fp = FramePayload {
+            format_version: 1,
+            source_event_id: "ups:s:t:1".to_string(),
+            dedup_key: None,
+            event_type: "UserPromptSubmit".to_string(),
+            captured_at: 1_700_000_000_000,
+            session_id: "s".to_string(),
+            agent_id: None,
+            turn_id: None,
+            batch_id: None,
+            worktree_root: Some("/repo".to_string()),
+            commit: None,
+            evidence_kind: "user_statement".to_string(),
+            trust: "normal".to_string(),
+            paths: vec![],
+            redaction_version: redaction_version_field(&prepared),
+            payload: payload_field(&prepared),
+            short_evidence_excerpt: short_evidence_excerpt_field(&prepared),
+        };
+        let bytes = encode_frame(&fp).expect("under cap");
+        let decoded = local_rag_store::decode_frames(&bytes, 1);
+        assert_eq!(decoded.frames.len(), 1, "one frame decoded: {decoded:?}");
+        assert_eq!(
+            decoded.frames[0].payload.short_evidence_excerpt.as_deref(),
+            Some("we decided to use pnpm instead of npm for this repo")
+        );
     }
 }
