@@ -239,7 +239,10 @@ async fn occurrences_collapse_to_distinct_content_subjects() {
 }
 
 /// A required kind whose subject function does not exist yet is reported, not
-/// silently dropped. `memory` is the last one (group 14).
+/// silently dropped. `structural_description` is the last one (post-v0,
+/// CLAUDE.md guardrails: "Do not implement deferred description... scope");
+/// `memory` moved out of this set in T14-08/D-013 — see
+/// [`memory_subjects_are_computed_from_every_memory_entry_row`].
 #[tokio::test(flavor = "multi_thread")]
 async fn kinds_without_a_subject_function_are_reported() {
     let (_home, db) = open_state();
@@ -248,7 +251,7 @@ async fn kinds_without_a_subject_function_are_reported() {
     require_kind(
         &db,
         "88888888-8888-7888-8888-888888888888",
-        RepresentationKind::Memory,
+        RepresentationKind::StructuralDescription,
     )
     .await;
 
@@ -258,8 +261,8 @@ async fn kinds_without_a_subject_function_are_reported() {
 
     assert_eq!(
         set.unsupported.iter().copied().collect::<Vec<_>>(),
-        vec![RepresentationKind::Memory],
-        "memory's tables arrive in group 14"
+        vec![RepresentationKind::StructuralDescription],
+        "structural_description is post-v0, no subject function yet"
     );
     assert!(
         set.keys
@@ -267,6 +270,103 @@ async fn kinds_without_a_subject_function_are_reported() {
             .all(|k| k.representation_id == REPRESENTATION_ID),
         "no key is minted for an unsupported kind"
     );
+}
+
+/// `memory` (T14-08, closes D-013): every `memory_entry` row — including a
+/// terminal one — gets a subject, independent of `generations` (memory is not
+/// generation-scoped at all, unlike `code_raw`/`code_context`) and independent
+/// of spec 08 §6's recall-eligibility filter, which is a *different* question
+/// ("what should be embedded" vs. "what recall surfaces").
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_subjects_are_computed_from_every_memory_entry_row() {
+    let (_home, db) = open_state();
+    let representation_id = require_kind(&db, REPRESENTATION_ID, RepresentationKind::Memory).await;
+
+    let scope_owner = uuid(200);
+    let active_id = uuid(201);
+    let terminal_id = uuid(202);
+    let (a, t, owner) = (active_id.clone(), terminal_id.clone(), scope_owner.clone());
+    db.writer()
+        .transaction(move |tx| {
+            local_rag_store::memory::create_memory_entry(
+                tx,
+                &local_rag_store::memory::NewMemoryEntry {
+                    memory_id: &a,
+                    kind: local_rag_store::memory::MemoryKind::Fact,
+                    text: "an active fact",
+                    canonical_key: None,
+                    scope_kind: local_rag_store::memory::ScopeKind::Worktree,
+                    scope_owner_id: &owner,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                NOW,
+            )?
+            .expect("create active memory entry");
+            local_rag_store::memory::create_memory_entry(
+                tx,
+                &local_rag_store::memory::NewMemoryEntry {
+                    memory_id: &t,
+                    kind: local_rag_store::memory::MemoryKind::Task,
+                    text: "a retracted task",
+                    canonical_key: None,
+                    scope_kind: local_rag_store::memory::ScopeKind::Worktree,
+                    scope_owner_id: &owner,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                NOW,
+            )?
+            .expect("create terminal memory entry");
+            local_rag_store::memory::transition_memory_entry(
+                tx,
+                &t,
+                local_rag_store::memory::MemoryState::Retracted,
+            )
+        })
+        .await
+        .expect("seed memory entries")
+        .expect("transition retracted");
+
+    let read = db.open_read().expect("read");
+    let set = expected_subject_keys(&read, DEFAULT_MODEL_SPACE_ID, &BTreeSet::new())
+        .expect("subjects (memory ignores `generations`)");
+
+    assert!(
+        set.unsupported.is_empty(),
+        "memory has a subject function now (T14-08/D-013)"
+    );
+    let expected_active = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: local_rag_core::identity::domain::subject_memory_entry(
+            &active_id,
+            "an active fact",
+        ),
+        representation_id: representation_id.clone(),
+    };
+    let expected_terminal = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: local_rag_core::identity::domain::subject_memory_entry(
+            &terminal_id,
+            "a retracted task",
+        ),
+        representation_id,
+    };
+    assert!(
+        set.keys.contains(&expected_active),
+        "an active entry's subject is expected"
+    );
+    assert!(
+        set.keys.contains(&expected_terminal),
+        "a terminal entry's subject is expected too — subject computation is not the recall filter"
+    );
+    assert_eq!(set.keys.len(), 2);
 }
 
 /// Context subjects do **not** share across occurrences (spec 03 §4.2, D-016).

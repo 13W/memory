@@ -1,6 +1,6 @@
 [package]
 name = "local-rag-memory"
-description = "Durable memory + observations layer for local-rag: the local router (T14-07)."
+description = "Durable memory + observations layer for local-rag: the local router (T14-07) and recall pipeline (T14-08)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,12 @@ publish.workspace = true
 local-rag-core = { path = "../core" }
 local-rag-store = { path = "../store" }
 local-rag-embed = { path = "../embed" }
+# Only for the pure scoring math (`contract::similarity`, `DistanceMetric`)
+# the bounded brute-force cosine leg reuses verbatim from the same function
+# the production dense backend calls — not for
+# `BruteForceProjectionStore`/`ShardManager`, which are shard/generation-
+# shaped and do not fit a transient, scope-unioned recall scan (T14-08).
+local-rag-projection = { path = "../projection" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

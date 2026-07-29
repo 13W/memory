@@ -237,6 +237,27 @@ pub struct SpoolConfig {
     pub deny_tools: Vec<String>,
 }
 
+/// `[memory]` section of `config.toml` (spec 08 §6, T14-08).
+///
+/// Spec 08 §6's recall pipeline names a "token budget `[SPEC default 1500
+/// tokens, config]`" without fixing a TOML layout the way `[storage]`/
+/// `[spool]` are shown verbatim — as-built here, the same way T13-01 added
+/// `[spool]` for a section the spec named but did not lay out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Recall's `additionalContext` token budget (spec 08 §6, 11 §5).
+    pub recall_token_budget: u32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig {
+            recall_token_budget: 1500,
+        }
+    }
+}
+
 /// The typed, validated global configuration (spec 02 §3.1).
 ///
 /// Build it with [`Config::load`] (from a resolved `<config_dir>`),
@@ -257,10 +278,13 @@ pub struct Config {
     pub index: IndexConfig,
     /// `[spool]` section.
     pub spool: SpoolConfig,
+    /// `[memory]` section.
+    pub memory: MemoryConfig,
 }
 
 impl Default for Config {
-    /// The spec 02 §3.1 defaults verbatim.
+    /// The spec 02 §3.1 defaults verbatim, plus `[memory]` (T14-08's as-built
+    /// addition to that section, spec 08 §6).
     fn default() -> Self {
         Config {
             schema_version: SUPPORTED_SCHEMA_VERSION,
@@ -269,6 +293,7 @@ impl Default for Config {
             models: ModelsConfig::default(),
             index: IndexConfig::default(),
             spool: SpoolConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -321,6 +346,7 @@ impl Config {
             },
             index: raw.index,
             spool: raw.spool,
+            memory: raw.memory,
         })
     }
 }
@@ -392,6 +418,7 @@ struct RawConfig {
     models: RawModels,
     index: IndexConfig,
     spool: SpoolConfig,
+    memory: MemoryConfig,
 }
 
 impl Default for RawConfig {
@@ -403,6 +430,7 @@ impl Default for RawConfig {
             models: RawModels::default(),
             index: IndexConfig::default(),
             spool: SpoolConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -455,6 +483,9 @@ max_file_size_kb = 1024
 [spool]
 deny_paths = []
 deny_tools = []
+
+[memory]
+recall_token_budget = 1500
 ";
 
     const ALL_POLICIES: [DataPolicy; 4] = [
@@ -610,5 +641,28 @@ deny_tools = []
         // Every other section still defaults.
         assert_eq!(cfg.daemon, DaemonConfig::default());
         assert_eq!(cfg.index, IndexConfig::default());
+    }
+
+    // ---- `[memory]` section (T14-08) ----------------------------------------
+
+    #[test]
+    fn memory_config_defaults_to_1500_token_budget() {
+        assert_eq!(MemoryConfig::default().recall_token_budget, 1500);
+        assert_eq!(Config::default().memory, MemoryConfig::default());
+    }
+
+    #[test]
+    fn missing_memory_section_defaults() {
+        let cfg = Config::parse_toml("[models]\ndata_policy = \"local_only\"\n").unwrap();
+        assert_eq!(cfg.memory, MemoryConfig::default());
+    }
+
+    #[test]
+    fn memory_section_round_trips_a_custom_budget() {
+        let cfg = Config::parse_toml("[memory]\nrecall_token_budget = 3000\n").unwrap();
+        assert_eq!(cfg.memory.recall_token_budget, 3000);
+        // Every other section still defaults.
+        assert_eq!(cfg.daemon, DaemonConfig::default());
+        assert_eq!(cfg.spool, SpoolConfig::default());
     }
 }

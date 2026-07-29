@@ -279,6 +279,66 @@ pub fn delete_embedding(tx: &Transaction<'_>, key: &EmbeddingKey) -> rusqlite::R
     Ok(removed > 0)
 }
 
+/// One row of a bulk [`embeddings_for_subject_kind`] scan: the row's
+/// `subject_hash` (the other two key fields are the scan's own filter, so
+/// repeating them per row would be redundant) alongside its full vector
+/// payload, undecoded/unverified (same contract as [`get_embedding`] — the
+/// caller decodes via [`decode_vector_le`] and verifies via
+/// [`verify_cached_embedding`] before trusting the bytes, matching every
+/// other consumer of this cache).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingCacheEntry {
+    /// The domain-separated subject hash (spec 03 §1.2).
+    pub subject_hash: String,
+    /// The row's vector payload and integrity fields.
+    pub row: EmbeddingCacheRow,
+}
+
+/// Every `embedding_cache` row for one `(subject_kind, representation_id)`,
+/// capped at `limit` rows (T14-08's own `[SPEC ≤ 20k entries]` guard, spec 08
+/// §6 — this reader does not invent the bound, it only accepts one; a caller
+/// with no bound in mind should not call this over an unbounded subject kind).
+///
+/// No existing reader serves this shape: [`get_embedding`] is single-key,
+/// [`all_embedding_meta`] is kind-agnostic and carries no vector bytes (it
+/// exists for eviction's LRU scan, which never needs to score anything).
+/// Ordered by `subject_hash` for a deterministic scan order independent of
+/// SQLite's physical row order.
+pub fn embeddings_for_subject_kind(
+    conn: &Connection,
+    subject_kind: SubjectKind,
+    representation_id: &str,
+    limit: i64,
+) -> rusqlite::Result<Vec<EmbeddingCacheEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT subject_hash, dimensions, vector_f32, byte_size, checksum, created_at, \
+                last_used_at \
+         FROM embedding_cache \
+         WHERE subject_kind = ?1 AND representation_id = ?2 \
+         ORDER BY subject_hash \
+         LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![subject_kind.as_str(), representation_id, limit],
+            |r| {
+                Ok(EmbeddingCacheEntry {
+                    subject_hash: r.get(0)?,
+                    row: EmbeddingCacheRow {
+                        dimensions: r.get(1)?,
+                        vector_f32: r.get(2)?,
+                        byte_size: r.get(3)?,
+                        checksum: r.get(4)?,
+                        created_at: r.get(5)?,
+                        last_used_at: r.get(6)?,
+                    },
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Every `embedding_cache` row's meta projection, for the eviction scan
 /// ([`crate::eviction::rows_to_evict`]).
 ///

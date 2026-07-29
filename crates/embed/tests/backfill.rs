@@ -512,15 +512,18 @@ async fn a_corrupt_row_is_repaired() {
 /// A `required` kind with no subject function refuses the run rather than
 /// reporting zero expected subjects (which would read as "fully covered").
 ///
-/// `memory` is the last such kind — its tables arrive in group 14. D-016 moved
-/// `code_context` out of this set, so the case below is the *positive* one.
+/// `structural_description` is the last such kind — it is post-v0, and
+/// CLAUDE.md's guardrails forbid implementing it ahead of schedule. D-016
+/// moved `code_context` out of this set, and T14-08/D-013 moved `memory` out
+/// of it too (see [`a_memory_only_run_embeds_every_memory_entry`]), so the
+/// case below is the *positive* one for whichever kind is left.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unsupported_required_kind_refuses_the_run() {
     let f = store::seeded(&BODIES).await;
     store::register_kind(
         &f.state,
         "66666666-6666-7666-8666-666666666666",
-        store::foreign_key(RepresentationKind::Memory),
+        store::foreign_key(RepresentationKind::StructuralDescription),
     )
     .await;
 
@@ -536,16 +539,118 @@ async fn an_unsupported_required_kind_refuses_the_run() {
         NOW,
     )
     .await
-    .expect_err("memory has no subject function yet");
+    .expect_err("structural_description has no subject function yet");
 
     assert!(
         matches!(
             err,
             BackfillError::UnsupportedRequiredKind {
-                kind: RepresentationKind::Memory
+                kind: RepresentationKind::StructuralDescription
             }
         ),
         "expected UnsupportedRequiredKind, got {err}"
+    );
+}
+
+/// T14-08/D-013: `memory` has a real subject function now — a run that
+/// requires it embeds every `memory_entry` row and reaches full coverage, the
+/// same shape [`full_required_coverage_gates_projection_ready`] exercises for
+/// `code_raw`. Uses an empty code corpus (`store::seeded(&[])`) so `code_raw`'s
+/// own expected set is trivially zero and the assertions are about `memory`
+/// alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_only_run_embeds_every_memory_entry() {
+    let f = store::seeded(&[]).await;
+    building(&f).await;
+
+    let memory_representation_id = "99999999-9999-7999-8999-999999999999";
+    let memory_key = HashingEmbedder::new(RepresentationKind::Memory).key();
+    store::register_kind(&f.state, memory_representation_id, memory_key).await;
+
+    let owner = store::uuid(90);
+    let entries = [
+        (store::uuid(91), "remember this decision"),
+        (store::uuid(92), "and this convention too"),
+    ];
+    for (id, text) in &entries {
+        let (id, owner, text) = (id.clone(), owner.clone(), text.to_string());
+        f.state
+            .writer()
+            .transaction(move |tx| {
+                local_rag_store::memory::create_memory_entry(
+                    tx,
+                    &local_rag_store::memory::NewMemoryEntry {
+                        memory_id: &id,
+                        kind: local_rag_store::memory::MemoryKind::Fact,
+                        text: &text,
+                        canonical_key: None,
+                        scope_kind: local_rag_store::memory::ScopeKind::Worktree,
+                        scope_owner_id: &owner,
+                        confidence: 0.5,
+                        importance: 0.5,
+                        valid_from_tree: None,
+                        last_verified_tree: None,
+                        supersedes_id: None,
+                    },
+                    NOW,
+                )
+            })
+            .await
+            .expect("seed tx")
+            .expect("seed domain");
+    }
+
+    let pool = ProviderPool::new(vec![
+        ProviderEntry::local("code", CountingEmbedder::new()),
+        ProviderEntry::local(
+            "memory",
+            Arc::new(HashingEmbedder::new(RepresentationKind::Memory)) as Arc<dyn Embedder>,
+        ),
+    ]);
+
+    let report = run_backfill(
+        &f.state,
+        &f.cache,
+        &pool,
+        DataPolicy::LocalOnly,
+        local_rag_store::registry::DEFAULT_MODEL_SPACE_ID,
+        &params(8, 500),
+        &retention(),
+        &InFlight::new(),
+        NOW,
+    )
+    .await
+    .expect("backfill");
+
+    let memory_coverage = report
+        .coverage
+        .get(RepresentationKind::Memory)
+        .expect("memory tracked in coverage");
+    assert_eq!(memory_coverage.expected, 2);
+    assert_eq!(memory_coverage.ready, 2);
+    assert_eq!(memory_coverage.failed, 0);
+    assert_eq!(report.embedded, 2);
+
+    let read = f.cache.open_read().expect("cache read");
+    let rows = local_rag_store::embeddings_for_subject_kind(
+        &read,
+        SubjectKind::MemoryEntry,
+        memory_representation_id,
+        100,
+    )
+    .expect("bulk scan");
+    assert_eq!(rows.len(), 2, "both memory entries were embedded");
+
+    let after = promote_if_covered(
+        &f.state,
+        local_rag_store::registry::DEFAULT_MODEL_SPACE_ID,
+        NOW + 1,
+    )
+    .await
+    .expect("attempted");
+    assert!(
+        after.is_ok(),
+        "full coverage (code_raw trivially empty, memory fully covered) must promote: {after:?}"
     );
 }
 

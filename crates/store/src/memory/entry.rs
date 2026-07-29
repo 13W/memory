@@ -531,6 +531,115 @@ pub fn memory_entry_summary(
     .optional()
 }
 
+/// One recall-eligible `memory_entry` row, scored-pipeline shape (spec 08 §6,
+/// T14-08). Unlike [`MemoryEntrySummary`] (T14-07's plain conflict-lookup
+/// shape), this carries `confidence`/`created_at`: the formatter needs
+/// `confidence` for the `additionalContext` `c=` field (11 §5) and
+/// `created_at` for the deterministic tie-break (`score desc, created_at
+/// desc, memory_id`) — neither is read by any existing caller, so adding them
+/// to `MemoryEntrySummary` would widen every query that type already serves
+/// for no benefit to those callers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallCandidate {
+    pub memory_id: String,
+    pub kind: MemoryKind,
+    pub state: MemoryState,
+    pub text: String,
+    pub confidence: f64,
+    pub created_at: i64,
+}
+
+fn read_recall_candidate_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecallCandidate> {
+    let raw_kind: String = r.get(1)?;
+    let kind = MemoryKind::from_db(&raw_kind).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            1,
+            Type::Text,
+            format!("invalid memory_entry.kind {raw_kind:?}").into(),
+        )
+    })?;
+    let raw_state: String = r.get(2)?;
+    let state = MemoryState::from_db(&raw_state).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            format!("invalid memory_entry.state {raw_state:?}").into(),
+        )
+    })?;
+    Ok(RecallCandidate {
+        memory_id: r.get(0)?,
+        kind,
+        state,
+        text: r.get(3)?,
+        confidence: r.get(4)?,
+        created_at: r.get(5)?,
+    })
+}
+
+/// Every recall-eligible entry in `(scope_kind, scope_owner_id)` — spec 08
+/// §6's candidate-set step, one scope at a time; a caller unions `Global`,
+/// `Repository(repo_id)` and `Worktree(worktree_id)` (T14-08's own scope
+/// resolution) the same way [`active_entries_for_scope`] already does for
+/// T14-07's narrower conflict lookup. "Recall-eligible" is the identical
+/// `!state.is_terminal()` filter — a `resolved`/`retracted`/`rejected`/
+/// `superseded` row is excluded here for the same reason it is excluded
+/// there (spec 04 §5, 08 §6).
+pub fn recall_candidates_for_scope(
+    conn: &Connection,
+    scope_kind: ScopeKind,
+    scope_owner_id: &str,
+) -> rusqlite::Result<Vec<RecallCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, kind, state, text, confidence, created_at FROM memory_entry \
+         WHERE scope_kind = ?1 AND scope_owner_id = ?2 \
+           AND state NOT IN ('resolved', 'retracted', 'rejected', 'superseded') \
+         ORDER BY memory_id",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![scope_kind.as_str(), scope_owner_id],
+            read_recall_candidate_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// One entry's [`RecallCandidate`] projection by id, **regardless of
+/// state** — unlike [`recall_candidates_for_scope`], which only lists
+/// recall-eligible rows. For the recall pipeline's lifecycle re-check
+/// (spec 08 §6's second, post-fusion filter box): between the initial
+/// candidate-set read and the final budget-fill, a concurrent
+/// `retract`/`supersede` is possible (memory recall holds no lock spanning
+/// the whole pipeline, unlike code search's `L2.read`), so the pipeline
+/// re-fetches each short-listed entry fresh, immediately before formatting,
+/// and itself decides whether the *current* state is still eligible — the
+/// same "terminal state is itself meaningful information, not something to
+/// filter out silently" reasoning [`memory_entry_summary`] already states.
+pub fn recall_candidate_by_id(
+    conn: &Connection,
+    memory_id: &str,
+) -> rusqlite::Result<Option<RecallCandidate>> {
+    conn.query_row(
+        "SELECT memory_id, kind, state, text, confidence, created_at FROM memory_entry \
+         WHERE memory_id = ?1",
+        params![memory_id],
+        read_recall_candidate_row,
+    )
+    .optional()
+}
+
+/// Every `memory_entry` row's `(memory_id, text)`, regardless of scope or
+/// state — the raw material [`crate::subjects::memory_entry_subject_keys`]
+/// hashes into subject keys and the backfill worker
+/// (`local_rag_embed::backfill`) resolves a pending subject's text from, the
+/// same "one crate owns the SQL" discipline every other cross-crate memory
+/// reader here follows.
+pub fn all_memory_entries_with_text(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT memory_id, text FROM memory_entry")?;
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
+}
+
 /// Which `memory_id`, if any, already owns `canonical_key` in `(scope_kind,
 /// scope_owner_id)` — regardless of `state` (T14-07). Mirrors [`super::op`]'s
 /// own private `create_new_entry` pre-check exactly (the `memory_canonical`

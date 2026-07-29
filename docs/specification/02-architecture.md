@@ -91,6 +91,9 @@ max_file_size_kb = 1024
 [spool]
 deny_paths = []   # configurable deny-list (12 §2); matching events captured envelope-only
 deny_tools = []
+
+[memory]
+recall_token_budget = 1500   # additionalContext token budget (08 §6, 11 §5)
 ```
 
 As-built note (T02-05, `[SPEC]`): the global config is parsed by
@@ -118,6 +121,11 @@ equality. **Global-only for v0**: unlike `data_policy` (§3.2), this section is 
 extending the generic repo-settings bridge here would be scope beyond what either section
 requires. The section's consumer, `local_rag_hook::payload::prepare_payload`, is documented at
 07 §2's as-built note.
+
+As-built note (T14-08, `[SPEC]`): the `[memory]` section is `local_rag_core::config::
+MemoryConfig` (`recall_token_budget`, default `1500`) — 08 §6 names "token budget `[SPEC
+default 1500 tokens, config]`" without fixing a TOML layout, so this is as-built the same
+way `[spool]` was for T13-01.
 
 ### 3.2 Per-repository settings `[SPEC]`
 
