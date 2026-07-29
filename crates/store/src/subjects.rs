@@ -34,19 +34,38 @@
 //!
 //! # Kinds whose subject cannot be computed yet
 //!
-//! `memory`'s tables do not exist before group 14, so it is
-//! reported in [`SubjectSet::unsupported`] rather than silently skipped, and each
-//! caller decides: eviction ignores them (a missing pin for a row that cannot
-//! exist is harmless), while the backfill worker refuses to run, because
-//! "silently zero expected" would make `Coverage::fully_covered` true for an
-//! uncovered kind and promote the model space on a lie (spec 02 §6: nothing
-//! degrades silently).
+//! Every `required` representation kind this module knows about today
+//! (`code_raw`, `code_context`, `memory`, T14-08/D-013) has a subject
+//! function; [`SubjectSet::unsupported`] exists for whichever kind a future
+//! representation introduces before its own subject function ships — each
+//! caller decides what to do with one: eviction ignores unsupported kinds (a
+//! missing pin for a row that cannot exist is harmless), while the backfill
+//! worker refuses to run, because "silently zero expected" would make
+//! `Coverage::fully_covered` true for an uncovered kind and promote the model
+//! space on a lie (spec 02 §6: nothing degrades silently).
+//!
+//! # `memory` is not generation-scoped (T14-08, closes D-013)
+//!
+//! Unlike `code_raw`/`code_context`, `memory_entry` rows have no relationship
+//! to a code generation at all — spec 03 §2.5's memory tables are scoped by
+//! `(scope_kind, scope_owner_id)`, never by `generation_id`. So the `Memory`
+//! arm of [`expected_subject_keys`] ignores its `generations` parameter
+//! entirely and enumerates every `memory_entry` row directly
+//! ([`memory_entry_subject_keys`]) — the same "collapse by the kind's own
+//! subject function" shape as the other two kinds, just keyed by the whole
+//! table instead of a generation's occurrences. This closes D-013's forward
+//! reference ("group 14 owns the `memory`-half of spec 10 §3: the subject
+//! function"); registering `memory` as a `required` representation kind for
+//! any real model space remains a later, separate concern (production
+//! wiring — `init` — is T15-07's, matching `code_raw`'s own precedent: no
+//! production code calls `set_model_space_representation` today, only tests
+//! and `xtask bench`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::Connection;
 
-use local_rag_core::identity::domain::subject_content_blob;
+use local_rag_core::identity::domain::{subject_content_blob, subject_memory_entry};
 
 use crate::cache::{EmbeddingKey, SubjectKind};
 use crate::code::{content_blob_ids_for_generation, context_subjects_for_generation};
@@ -63,9 +82,10 @@ use crate::retention::{ExternalPins, RetentionParams, pinned_generation_roots};
 pub struct SubjectSet {
     /// Every `embedding_cache` key the model space is expected to hold.
     pub keys: BTreeSet<EmbeddingKey>,
-    /// `required` kinds that could not be resolved to subjects at all
-    /// (`memory`: no tables before group 14). `code_context` left this set in
-    /// D-016, when the benchmark decided its serialization (spec 09 §3).
+    /// `required` kinds that could not be resolved to subjects at all — empty
+    /// today (`code_context` left this set in D-016, `memory` in T14-08/D-013);
+    /// kept for whichever kind a future representation introduces before its
+    /// own subject function ships.
     pub unsupported: BTreeSet<RepresentationKind>,
     /// The generations the set was computed over (the pin roots).
     pub generations: BTreeSet<String>,
@@ -212,6 +232,14 @@ pub fn expected_subject_keys(
                     }
                 }
             }
+            RepresentationKind::Memory => {
+                // Not generation-scoped at all — see the module doc's "memory
+                // is not generation-scoped" section. `generations` plays no
+                // role here.
+                for key in memory_entry_subject_keys(conn, representation_id)? {
+                    set.keys.insert(key);
+                }
+            }
             // No subject function exists for these yet — see the module docs.
             other => {
                 set.unsupported.insert(*other);
@@ -219,6 +247,30 @@ pub fn expected_subject_keys(
         }
     }
     Ok(set)
+}
+
+/// Every `memory` subject key for one `representation_id` (T14-08, closes
+/// D-013): one [`EmbeddingKey`] per `memory_entry` row, via the existing
+/// [`subject_memory_entry`] identity constructor (`H(memory_id, text)`,
+/// spec 03 §1.2/§4.2, already used by T11-02's cache tests). Every row —
+/// terminal states included — gets a subject: this answers "what should be
+/// embedded", a backfill-coverage question, independent of "what recall
+/// surfaces", which is spec 08 §6's own, separate eligibility filter. Text
+/// changes only through `edit`/`supersede` (spec 08 §3), each of which mints
+/// a fresh `subject_hash` (the text is part of the hash), so a stale subject
+/// simply stops being expected rather than needing an update path here.
+pub fn memory_entry_subject_keys(
+    conn: &Connection,
+    representation_id: &str,
+) -> rusqlite::Result<BTreeSet<EmbeddingKey>> {
+    Ok(crate::memory::all_memory_entries_with_text(conn)?
+        .into_iter()
+        .map(|(memory_id, text)| EmbeddingKey {
+            subject_kind: SubjectKind::MemoryEntry,
+            subject_hash: subject_memory_entry(&memory_id, &text),
+            representation_id: representation_id.to_string(),
+        })
+        .collect())
 }
 
 /// Every protected subject key in the store: the pin set eviction must honor.

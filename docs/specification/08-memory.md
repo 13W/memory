@@ -251,6 +251,91 @@ recency/importance → diversity/dedup, top 20–50 `[FIXED deferral]`.
 
 **Recalled memory is untrusted data** — encoding and prompt rules in 12 §4.
 
+As-built note (T14-08, `[SPEC]`): the pipeline is `local_rag_memory::recall::pipeline::recall`
+(`crates/memory/src/recall/pipeline.rs`), a plain function — not a struct/engine — matching this
+crate's existing style (`router::route`, `guard::materialize`). Seven decisions this section
+states less precisely than the shipped code:
+
+- **Scope resolution** reuses `local_rag_store::resolve` (the same worktree-root resolver
+  `local_rag_search::SearchEngine::search_code` calls) to get `{repo_id, worktree_id}` from a
+  `RequestRoot` in one call — `Resolution::Resolved` unions `global ∪ repository(repo_id) ∪
+  worktree(worktree_id)`; `GlobalOnly`/`Ambiguous` both degrade to `global` alone, the same
+  principle 02 §6's own table states ("Worktree unknown / never indexed … memory tools work in
+  repo/global scope").
+- **The lexical leg is ephemeral, not a persisted materialized view.** Code's FTS view
+  (06 §4) is rebuilt at the frequency of *generation switches* — infrequent, atomic events —
+  which a persisted, validate-on-open `cache.sqlite` structure fits. Memory mutates through many
+  small, individually-transactional ops (create/edit/retract/supersede/merge, 08 §3); there is no
+  generation-shaped checkpoint to hang a manifest off, and a persisted index kept transactionally
+  current with every `state.sqlite` memory op would need a cross-database write per op, which
+  03 §1.4 forbids. Given the guard already bounds the candidate set in memory,
+  `local_rag_memory::recall::lexical::lexical_leg` instead builds a short-lived, in-process FTS5
+  table per call (`CREATE VIRTUAL TABLE … USING fts5(memory_id UNINDEXED, body)`, SQLite's
+  built-in `unicode61` tokenizer — memory text is natural-language prose, not code identifiers,
+  so this does **not** reuse `local_rag_store::tokenize_identifier`'s camelCase/snake_case
+  splitter), seeded from the already-fetched candidate set and dropped when the call returns.
+  Query-term handling mirrors `local_rag_store::cache::fts_query`'s established idiom for the
+  identical reason it was chosen there (09 §2's as-built note): lowercase, split on
+  non-alphanumeric boundaries, quote each term (`"term"`, embedded `"` doubled), combine with
+  `OR`; no surviving terms ⇒ the leg returns empty without issuing SQL at all.
+- **The dense leg does not use `BruteForceProjectionStore`.** The production dense backend
+  (05 §1, ADR-0003) is disk-shard-shaped — `open()` takes a directory, every mutation rewrites
+  `points.bin`, a `ProjectionHead` proves generation/model-space consistency on open — none of
+  which fits a transient, scope-unioned scan with no shard and no generation.
+  `local_rag_memory::recall::dense::dense_leg` instead bulk-reads `embedding_cache` rows via a
+  new `local_rag_store::embeddings_for_subject_kind(conn, SubjectKind::MemoryEntry,
+  representation_id, limit)` reader and scores them with the exact free function the shard itself
+  calls, `local_rag_projection::contract::similarity` — "behind the relevance-backend trait" is
+  `local_rag_memory::recall::dense::MemoryDenseBackend`, whose only impl,
+  `BruteForceCosine`, a future ANN swap would replace without touching the pipeline around it.
+  Query embedding is a second injected seam, `QueryEmbedder` (mirrors
+  `local_rag_search::pipeline::QueryEmbedder`'s exact shape — a **new, independent** trait, not a
+  shared one: this crate depending on `crates/search` for 15 lines would be backwards), defaulting
+  to `UnavailableEmbedder`. "Same `representation_id` as the active memory representation"
+  resolves via the request's worktree's `active_model_space_id`
+  (`worktree_projection_state`) when one exists — mirroring how code resolves its own active
+  representation, and matching this section's own "model-space migration covers the memory
+  representation exactly like code" — falling back to `store_settings.default_model_space_id`
+  (05 §8's "a dormant worktree migrates to the default space") for a `GlobalOnly`/`Ambiguous`
+  resolution or a worktree that has not yet opened a projection tuple. No representation
+  resolvable at all ⇒ the leg degrades (`DenseLegUnavailable::NoRepresentation`), never an error —
+  the lexical leg still serves.
+- **Fusion is unweighted**, unlike 09 §4's own D-018-weighted RRF: that weight was *derived* from
+  a 49-query code benchmark measuring an unweighted hybrid scoring below its own dense leg; no
+  equivalent per-query relevance-judged benchmark exists for memory recall (08 §7's benchmark
+  scores the *router*, not recall), and inventing a weight to fit the formula with nothing
+  measured to derive it from would repeat exactly what this section's own §2 as-built note calls
+  out for confidence weights ("collect metrics, never invent thresholds", O2). Ships as
+  `local_rag_memory::recall::fusion::rrf` — same `RRF_K = 60`, same `f64` accumulator, keyed by
+  `memory_id` rather than `occurrence_id` — until a recall-quality fixture set exists to derive a
+  weight from.
+- **Two filter boxes, one predicate, two moments.** This section's diagram names candidate-set
+  filtering *and* a later, separate "lifecycle filters" step; both are the identical
+  `!state.is_terminal()`. The first is `recall_candidates_for_scope`'s own `WHERE` clause; the
+  second — `local_rag_store::recall_candidate_by_id`, a fresh single-row re-read — exists because,
+  unlike code search's `L2.read`-spanned pipeline (02 §5), memory recall holds **no lock across
+  the pipeline at all** (no `crates/store/src/memory/*.rs` file touches
+  `WorktreeLockRegistry`; memory writes lean on `state.sqlite`'s per-op transactional strictness,
+  08 §3, not a read-side lock). A concurrent `retract`/`supersede` between the initial candidate
+  read and formatting is therefore possible, and the re-check runs immediately before an entry
+  joins the budget — cheap, since by then the list is the short, ranked, budget-bounded one.
+- **Every eligible candidate participates in the final order, not only the ones a leg
+  matched.** RRF only scores `memory_id`s a leg actually returned; a termless recall (the hook's
+  `SessionStart` case, before any prompt exists) makes both legs empty, and RRF alone would then
+  order nothing. This section's own ordering step is read literally: **every** candidate
+  participates in `(score desc, created_at desc, memory_id)`, defaulting to score `0.0` when
+  neither leg matched it — so a termless query still surfaces the scope's most-recent eligible
+  memories, generalizing the "termless query is healthy, not empty" idiom 09 §2/§3 already apply
+  to a single leg.
+- **The token budget is a heuristic estimate, `chars.div_ceil(4)` plus a small fixed per-entry
+  overhead**, not a real tokenizer — no token-count utility exists anywhere in this workspace (the
+  two "token" constants found elsewhere, `MAX_SEQUENCE_TOKENS`/`MAX_GENERATION_TOKENS`, bound
+  unrelated ONNX/llama-context subsystems). This section fixes only the number
+  (`recall_token_budget`, `[memory]` config section, 02 §3.1's own T14-08 as-built note), not an
+  estimation method. Entries are added in the final deterministic order until the next one would
+  overflow the budget, then the walk stops — a ranked prefix, never a skip-ahead search for a
+  smaller entry further down the order.
+
 ## 7. Memory-quality benchmark `[FIXED, new in rev 6]`
 
 A labeled fixture set of observation streams → expected memory ops

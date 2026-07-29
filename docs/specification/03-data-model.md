@@ -885,6 +885,25 @@ no worktree references stays unprotected, which is exactly when "its cache rows 
 (10 §4 step 6). `EvictionParams` therefore carries the retention `K`/`T` as well as the byte budget,
 and `run_embedding_cache_eviction` takes `now_ms` — both come from the one `[storage]` section.
 
+As-built note (T14-08, `[SPEC]`, closes D-013): `memory` had no subject function before this task —
+`local_rag_store::subjects::expected_subject_keys` reported it in `SubjectSet::unsupported`, and
+the backfill worker refused to run rather than report a silent zero-coverage lie (spec 04 §3, 02
+§6). `RepresentationKind::Memory` now resolves through a new
+`local_rag_store::subjects::memory_entry_subject_keys(conn, representation_id)`, called from
+`expected_subject_keys`'s own `Memory` arm — **ignoring** that function's `generations` parameter
+entirely, since `memory_entry` rows have no relationship to a code generation at all (unlike
+`code_raw`/`code_context`). Every row (terminal states included — subject computation answers
+"what should be embedded", a backfill-coverage question, independent of spec 08 §6's own,
+separate recall-eligibility filter) gets one `EmbeddingKey` via the existing `subject_memory_entry`
+identity constructor. `local_rag_embed::backfill`'s text-resolution step gained a matching
+`SubjectKind::MemoryEntry` arm (a new `memory_index` reading `memory_entry.text` directly — no
+normalization step, unlike `code_raw`'s `content_blob`-derived text). What remains **out** of this
+task's scope, matching how `code_raw`'s own registration is production-wired only by a later
+task (T15-07's `init`): no production code calls `set_model_space_representation(..,
+RepresentationKind::Memory, required=true, ..)` yet — every existing caller of that function is a
+test or `xtask bench`. This task only makes the subject function exist so that registration,
+whenever it happens, does not hit `BackfillError::UnsupportedRequiredKind`.
+
 ### 4.3 FTS materialized view
 
 ```sql

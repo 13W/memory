@@ -23,8 +23,9 @@ use local_rag_store::memory::{
     active_entries_for_scope, candidate_state, canonical_key_owner, consolidation_run_state,
     create_candidate, create_consolidation_run, create_memory_entry, insert_audit_event,
     insert_candidate_evidence, insert_memory_evidence, memory_entry_state, memory_entry_summary,
-    memory_evidence_for, processing_cursor, read_audit_events_for_entity, transition_candidate,
-    transition_memory_entry, transition_run, upsert_processing_cursor,
+    memory_evidence_for, processing_cursor, read_audit_events_for_entity,
+    recall_candidates_for_scope, transition_candidate, transition_memory_entry, transition_run,
+    upsert_processing_cursor,
 };
 use local_rag_store::{StateDb, WriteError};
 use local_rag_test_support::TempHome;
@@ -391,6 +392,185 @@ async fn terminal_states_excluded_from_recall_by_default() {
             "{id}: {state:?}.is_terminal()"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// memory_entry: recall_candidates_for_scope (T14-08)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recall_candidates_for_scope_excludes_terminal_states() {
+    let (_home, db) = open_state();
+    let scope_owner = uuid(70);
+
+    let active = uuid(71);
+    create_memory(
+        &db,
+        &active,
+        MemoryKind::Task,
+        ScopeKind::Worktree,
+        &scope_owner,
+        None,
+    )
+    .await
+    .expect("create active");
+
+    let confirmed = uuid(72);
+    create_memory(
+        &db,
+        &confirmed,
+        MemoryKind::Hypothesis,
+        ScopeKind::Worktree,
+        &scope_owner,
+        None,
+    )
+    .await
+    .expect("create hypothesis");
+    transition_entry(&db, &confirmed, MemoryState::Confirmed)
+        .await
+        .expect("confirm");
+
+    let superseded = uuid(73);
+    create_memory(
+        &db,
+        &superseded,
+        MemoryKind::Decision,
+        ScopeKind::Worktree,
+        &scope_owner,
+        None,
+    )
+    .await
+    .expect("create decision");
+    transition_entry(&db, &superseded, MemoryState::Superseded)
+        .await
+        .expect("supersede");
+
+    let read = db.open_read().expect("read conn");
+    let candidates = recall_candidates_for_scope(&read, ScopeKind::Worktree, &scope_owner)
+        .expect("recall candidates");
+    let ids: Vec<&str> = candidates.iter().map(|c| c.memory_id.as_str()).collect();
+
+    assert!(ids.contains(&active.as_str()), "active must be eligible");
+    assert!(
+        ids.contains(&confirmed.as_str()),
+        "confirmed hypothesis must be eligible"
+    );
+    assert!(
+        !ids.contains(&superseded.as_str()),
+        "superseded must be excluded"
+    );
+    assert_eq!(candidates.len(), 2);
+}
+
+#[tokio::test]
+async fn recall_candidates_for_scope_isolates_by_scope() {
+    let (_home, db) = open_state();
+    let worktree_a = uuid(80);
+    let worktree_b = uuid(81);
+
+    let in_a = uuid(82);
+    create_memory(
+        &db,
+        &in_a,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &worktree_a,
+        None,
+    )
+    .await
+    .expect("create in a");
+
+    let in_b = uuid(83);
+    create_memory(
+        &db,
+        &in_b,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &worktree_b,
+        None,
+    )
+    .await
+    .expect("create in b");
+
+    let in_global = uuid(84);
+    create_memory(
+        &db,
+        &in_global,
+        MemoryKind::Fact,
+        ScopeKind::Global,
+        GLOBAL_SCOPE_OWNER_ID,
+        None,
+    )
+    .await
+    .expect("create global");
+
+    let read = db.open_read().expect("read conn");
+
+    let a = recall_candidates_for_scope(&read, ScopeKind::Worktree, &worktree_a)
+        .expect("scope a")
+        .into_iter()
+        .map(|c| c.memory_id)
+        .collect::<Vec<_>>();
+    assert_eq!(a, vec![in_a.clone()], "worktree a sees only its own entry");
+
+    let b = recall_candidates_for_scope(&read, ScopeKind::Worktree, &worktree_b)
+        .expect("scope b")
+        .into_iter()
+        .map(|c| c.memory_id)
+        .collect::<Vec<_>>();
+    assert_eq!(b, vec![in_b], "worktree b sees only its own entry");
+
+    let global = recall_candidates_for_scope(&read, ScopeKind::Global, GLOBAL_SCOPE_OWNER_ID)
+        .expect("scope global")
+        .into_iter()
+        .map(|c| c.memory_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        global,
+        vec![in_global],
+        "global scope isolated from both worktrees"
+    );
+}
+
+#[tokio::test]
+async fn recall_candidates_for_scope_carries_confidence_and_created_at() {
+    let (_home, db) = open_state();
+    let scope_owner = uuid(90);
+    let memory_id = uuid(91);
+    let (id, owner) = (memory_id.clone(), scope_owner.clone());
+    db.writer()
+        .transaction(move |tx| {
+            create_memory_entry(
+                tx,
+                &NewMemoryEntry {
+                    memory_id: &id,
+                    kind: MemoryKind::Fact,
+                    text: "confidence and timestamp round trip",
+                    canonical_key: None,
+                    scope_kind: ScopeKind::Worktree,
+                    scope_owner_id: &owner,
+                    confidence: 0.73,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                4_242,
+            )
+        })
+        .await
+        .expect("create memory tx (infrastructure)")
+        .expect("create memory (domain)");
+
+    let read = db.open_read().expect("read conn");
+    let candidates = recall_candidates_for_scope(&read, ScopeKind::Worktree, &scope_owner)
+        .expect("recall candidates");
+    assert_eq!(candidates.len(), 1);
+    let candidate = &candidates[0];
+    assert_eq!(candidate.memory_id, memory_id);
+    assert_eq!(candidate.text, "confidence and timestamp round trip");
+    assert!((candidate.confidence - 0.73).abs() < f64::EPSILON);
+    assert_eq!(candidate.created_at, 4_242);
 }
 
 // ---------------------------------------------------------------------------

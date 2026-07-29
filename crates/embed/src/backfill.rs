@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Mutex;
 
 use local_rag_core::config::DataPolicy;
+use local_rag_core::identity::domain::subject_memory_entry;
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
     CacheDb, CacheOpenError, CacheWriteError, Coverage, CoverageEntry, EmbeddingKey, ExternalPins,
@@ -111,9 +112,10 @@ pub struct BackfillReport {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum BackfillError {
-    /// A `required` representation kind has no computable subject: `code_context`
-    /// (serialization `[OPEN]`, spec 09 §3) or `memory` (tables arrive in group
-    /// 14).
+    /// A `required` representation kind has no computable subject —
+    /// `structural_description` (post-v0, no serialization decided yet) is the
+    /// only one left; `code_raw`/`code_context`/`memory` all have subject
+    /// functions (`memory`'s landed in T14-08/D-013).
     ///
     /// Refusing is deliberate. Treating such a kind as "zero expected subjects"
     /// would make [`Coverage::fully_covered`] true for it and let the model space
@@ -492,15 +494,26 @@ async fn embed_and_write(
     } else {
         BTreeMap::new()
     };
+    // …and subject_hash → text for every `memory` subject, gated the same way
+    // (a code-only run never reads `memory_entry` at all).
+    let memories = if pending
+        .iter()
+        .any(|p| p.key.subject_kind == local_rag_store::SubjectKind::MemoryEntry)
+    {
+        memory_index(state_read)?
+    } else {
+        BTreeMap::new()
+    };
 
     let mut written: Vec<(EmbeddingKey, i64, Vec<f32>)> = Vec::new();
     for chunk in pending.chunks(params.embed_batch.max(1)) {
         let mut texts = Vec::with_capacity(chunk.len());
         let mut keys = Vec::with_capacity(chunk.len());
         for subject in chunk {
-            // Every expected key came from a generation in `expected`, so its
-            // source must be in the matching index; an absence means the two
-            // views disagree, which is a defect, not a recoverable state.
+            // Every expected key came from a generation in `expected` (or, for
+            // `memory`, from the same table read twice), so its source must be
+            // in the matching index; an absence means the two views disagree,
+            // which is a defect, not a recoverable state.
             let text = match subject.key.subject_kind {
                 local_rag_store::SubjectKind::OccurrenceContext => contexts
                     .get(subject.key.subject_hash.as_str())
@@ -508,7 +521,13 @@ async fn embed_and_write(
                     .ok_or_else(|| BackfillError::MissingSource {
                         blob_id: subject.key.subject_hash.clone(),
                     })?,
-                _ => {
+                local_rag_store::SubjectKind::MemoryEntry => memories
+                    .get(subject.key.subject_hash.as_str())
+                    .cloned()
+                    .ok_or_else(|| BackfillError::MissingSource {
+                        blob_id: subject.key.subject_hash.clone(),
+                    })?,
+                local_rag_store::SubjectKind::ContentBlob => {
                     let source =
                         sources
                             .get(subject.key.subject_hash.as_str())
@@ -665,6 +684,26 @@ fn context_index(
         }
     }
     Ok(index)
+}
+
+/// `subject_hash → text` for every `memory_entry` row (T14-08). Built only
+/// when some pending subject actually needs it, mirroring [`context_index`]'s
+/// own gating: a `code_raw`/`code_context`-only run has no reason to read the
+/// memory table at all. Unlike [`blob_index`]/[`context_index`], this does not
+/// filter by `expected.generations` — memory is not generation-scoped (see
+/// `local_rag_store::subjects`'s own module doc) — so it simply re-derives
+/// every row's hash the identical way `memory_entry_subject_keys` did when
+/// building `expected` in the first place; the two independently agreeing is
+/// what lets [`embed_and_write`]'s `.ok_or(MissingSource)` below catch a real
+/// disagreement between the two views rather than assuming one.
+fn memory_index(state: &Connection) -> Result<BTreeMap<String, String>, BackfillError> {
+    Ok(local_rag_store::all_memory_entries_with_text(state)?
+        .into_iter()
+        .map(|(memory_id, text)| {
+            let hash = subject_memory_entry(&memory_id, &text);
+            (hash, text)
+        })
+        .collect())
 }
 
 fn blob_index(

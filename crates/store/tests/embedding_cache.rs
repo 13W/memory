@@ -730,3 +730,86 @@ async fn all_embedding_meta_reflects_real_rows_for_pure_eviction_planning() {
     let evict = rows_to_evict(&meta, &std::collections::BTreeSet::new(), 0);
     assert_eq!(evict, vec![a]);
 }
+
+// ---- embeddings_for_subject_kind (T14-08) -----------------------------------
+
+#[tokio::test]
+async fn embeddings_for_subject_kind_filters_by_kind_and_representation() {
+    let (_home, _state, cache) = open_both();
+
+    let memory_a = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: subject_memory_entry("memory-a", "text a"),
+        representation_id: "memory-repr".to_string(),
+    };
+    let memory_b = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: subject_memory_entry("memory-b", "text b"),
+        representation_id: "memory-repr".to_string(),
+    };
+    // Same subject kind, different representation — must not leak in.
+    let memory_other_repr = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: subject_memory_entry("memory-c", "text c"),
+        representation_id: "other-repr".to_string(),
+    };
+    // Same representation, different subject kind — must not leak in either.
+    let content_same_repr = EmbeddingKey {
+        subject_kind: SubjectKind::ContentBlob,
+        subject_hash: subject_content_blob("blob-shares-repr-id"),
+        representation_id: "memory-repr".to_string(),
+    };
+
+    put(&cache, &memory_a, 2, &[1.0, 0.0], NOW).await;
+    put(&cache, &memory_b, 2, &[0.0, 1.0], NOW).await;
+    put(&cache, &memory_other_repr, 2, &[9.0, 9.0], NOW).await;
+    put(&cache, &content_same_repr, 2, &[8.0, 8.0], NOW).await;
+
+    let read = cache.open_read().expect("read conn");
+    let rows = local_rag_store::embeddings_for_subject_kind(
+        &read,
+        SubjectKind::MemoryEntry,
+        "memory-repr",
+        100,
+    )
+    .expect("bulk scan");
+
+    let hashes: Vec<&str> = rows.iter().map(|r| r.subject_hash.as_str()).collect();
+    let mut expected = vec![
+        memory_a.subject_hash.as_str(),
+        memory_b.subject_hash.as_str(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        hashes, expected,
+        "deterministic subject_hash-ascending order, other kind/representation excluded"
+    );
+
+    for row in &rows {
+        assert_eq!(verify_cached_embedding(&row.row), Ok(()));
+    }
+}
+
+#[tokio::test]
+async fn embeddings_for_subject_kind_respects_the_limit() {
+    let (_home, _state, cache) = open_both();
+
+    for seed in 0..5u8 {
+        let key = EmbeddingKey {
+            subject_kind: SubjectKind::MemoryEntry,
+            subject_hash: subject_memory_entry(&format!("memory-{seed}"), "t"),
+            representation_id: "memory-repr".to_string(),
+        };
+        put(&cache, &key, 1, &[seed as f32], NOW).await;
+    }
+
+    let read = cache.open_read().expect("read conn");
+    let rows = local_rag_store::embeddings_for_subject_kind(
+        &read,
+        SubjectKind::MemoryEntry,
+        "memory-repr",
+        3,
+    )
+    .expect("bulk scan");
+    assert_eq!(rows.len(), 3, "bounded by the caller-supplied limit");
+}

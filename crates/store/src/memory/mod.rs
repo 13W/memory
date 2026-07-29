@@ -113,8 +113,9 @@ pub use consolidation::{
 };
 pub use entry::{
     CreateMemoryEntryError, IllegalMemoryTransition, MemoryEntrySummary, MemoryKind, MemoryState,
-    MemoryTransitionError, NewMemoryEntry, ScopeKind, active_entries_for_scope,
-    canonical_key_owner, create_memory_entry, memory_entry_state, memory_entry_summary,
+    MemoryTransitionError, NewMemoryEntry, RecallCandidate, ScopeKind, active_entries_for_scope,
+    all_memory_entries_with_text, canonical_key_owner, create_memory_entry, memory_entry_state,
+    memory_entry_summary, recall_candidate_by_id, recall_candidates_for_scope,
     transition_memory_entry,
 };
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};

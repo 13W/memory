@@ -1,18 +1,37 @@
-//! The router's pre-generation recall (T14-07, spec 08 §4 step 3: "Input:
-//! window observations + recall of plausibly related existing entries
-//! (candidate conflict set)").
+//! Recall: turning stored `memory_entry` rows into what a caller actually
+//! reads. Two independent consumers, two independent shapes, one module:
 //!
-//! This is deliberately **not** T14-08's scored relevance pipeline —
-//! [`local_rag_store::runner`]'s own module doc already reserves that name
-//! for a later task and keeps [`local_rag_store::ConsolidationWindow`] free
-//! of any such field. Without it, "plausibly related" is approximated the
-//! only honest way available pre-T14-08: every recall-eligible entry in
-//! every scope the window's own observations actually touch (global,
-//! always; each distinct `repo_id`/`worktree_id` seen among the window's
-//! [`WindowObservation`]s) — a real, unscored candidate set, not a fabricated
-//! relevance ranking. [`crate::prompt`] shows this set to the model so it can
-//! target an existing entry by `memory_id` (see [`crate::schema`]'s module
-//! doc for why `memory_id`, never `canonical_key`, is the addressing key).
+//! - **This file** — the router's pre-generation recall (T14-07, spec 08 §4
+//!   step 3: "Input: window observations + recall of plausibly related
+//!   existing entries (candidate conflict set)") and post-generation target
+//!   resolution ([`resolve_target`]). Unscored by design — see below.
+//! - **[`pipeline`]** (T14-08, spec 08 §6's `[FIXED pipeline]`) — the real,
+//!   scored recall pipeline behind the `recall`/hook-injection surface:
+//!   scope union → cardinality guard → lexical (`lexical` submodule) + dense
+//!   (`dense` submodule) legs → fusion (`fusion` submodule) → lifecycle
+//!   recheck → token budget → deterministic order → `format` submodule's
+//!   byte-exact `additionalContext` text.
+//!
+//! # Why the router's own recall ([`candidate_conflict_set`]) stays unscored
+//!
+//! `local_rag_store::memory::runner`'s own module doc reserves the *name* "scored
+//! relevance pipeline" for [`pipeline`] and keeps
+//! [`local_rag_store::ConsolidationWindow`] free of any such field — the
+//! router's use case (find entries a proposed op might conflict with) is
+//! answered correctly by an honest union of touched scopes, and pulling in
+//! the FTS/cosine machinery here would duplicate [`pipeline`] for no gain: a
+//! consolidation window is not a recall request, and the router already
+//! shows the model every relevant entry (bounded, not ranked) rather than a
+//! ranked top-K a small local model would have no reliable way to ask for
+//! "the next one" beyond.
+//!
+//! Every recall-eligible entry in every scope the window's own observations
+//! actually touch (global, always; each distinct `repo_id`/`worktree_id`
+//! seen among the window's [`WindowObservation`]s) — a real, unscored
+//! candidate set, not a fabricated relevance ranking. [`crate::prompt`] shows
+//! this set to the model so it can target an existing entry by `memory_id`
+//! (see [`crate::schema`]'s module doc for why `memory_id`, never
+//! `canonical_key`, is the addressing key).
 //!
 //! [`resolve_target`] is the second, independent use of recall: **after**
 //! generation, re-resolving whatever `target_memory_id` the model echoed back
@@ -22,6 +41,20 @@
 //! optimistic-concurrency check anyway (aborting the whole consolidation
 //! batch, per `runner`'s atomicity guarantee) — re-resolving fresh is
 //! strictly better and avoids burning a whole attempt on a stale echo.
+
+mod dense;
+mod format;
+mod fusion;
+mod lexical;
+pub mod pipeline;
+
+pub use dense::{BruteForceCosine, MemoryDenseBackend, QueryEmbedder, UnavailableEmbedder};
+pub use format::{
+    RECALL_ENTRY_CAP_BYTES, RecallEntry, format_additional_context, prepare_entry_text,
+};
+pub use fusion::{FusedRecallHit, rrf};
+pub use lexical::lexical_leg;
+pub use pipeline::{MAX_RECALL_CANDIDATES, RecallRequest, recall};
 
 use std::collections::BTreeSet;
 

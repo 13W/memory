@@ -138,6 +138,28 @@ boundary), capped `[SPEC 1 KiB/entry]`, and any literal `</memory` sequence insi
 escaped. Provenance (ids, evidence) is available via tools, never inline in the block
 `[FIXED: provenance separate from text]`. Formatting is byte-deterministic for fixture tests.
 
+As-built note (T14-08, `[SPEC]`): `local_rag_memory::recall::format::format_additional_context`
+is a hand-written byte-exact writer, not a `serde` type — nothing in this section shows a JSON
+shape for recall the way 09 §7 does for search, so there is nothing to add to `local_rag_protocol`
+for it. Three encoding details this section states less precisely than the shipped code:
+
+- **Order of the three sub-steps**: sanitize (strip every Unicode control character, `Cc`, except
+  `\n` → one space) → escape the delimiter → cap at `RECALL_ENTRY_CAP_BYTES = 1024`
+  (UTF-8-boundary-safe, mirroring `local_rag_search::snippet::SNIPPET_CAP_BYTES`'s idiom) — run in
+  that order so the cap applies to what is actually emitted, and `len=` (computed last, over the
+  exact bytes the cap produced) is genuinely "a mismatch-proof boundary" rather than a length that
+  could still grow past it.
+- **The escape**: a literal `</memory` sequence becomes `<\/memory` — a backslash before the `/`,
+  the same "insert an unambiguous escape character" idiom `Scanner::redact`'s `[REDACTED]` marker
+  (12 §2) and JSON's own `\/` escaping both use.
+- **`scope=`**: the request's own resolved scope descriptor — `global`, or `repo:<repo_id>` when a
+  repository resolved (this section's own example shows `scope=repo:acme/api`; v2 identities are
+  UUIDs rather than v1's org/repo slugs, so the label carries the real `repo_id`).
+
+`RecallEntry.text` deliberately carries no `memory_id`/evidence/audit fields — this section's own
+"provenance separate from text, available via tools only" `[FIXED]`, enforced at the type level:
+the formatter cannot print what it was never given.
+
 ## 6. CLI `[SPEC surface, commands implied by design]`
 
 ```
