@@ -10,14 +10,49 @@ cargo xtask ci
 ```
 
 This is exactly what CI runs. `xtask` is a thin Rust runner (crate
-`crates/xtask`) that executes the following, failing on the first error:
+`crates/xtask`) that still reports exactly one pass/fail result, but
+internally splits the gate into **16 jobs** and runs the independent ones
+concurrently over a bounded worker pool (size: `available_parallelism()`,
+override with `XTASK_CI_JOBS=<n>`) instead of one at a time. Every job runs to
+completion regardless of its siblings, so one run reports every failure
+instead of stopping at the first — the jobs are:
 
-1. `cargo fmt --all --check`
-2. `cargo clippy --workspace --all-targets -- -D warnings`
-3. `cargo test --workspace`
-4. `cargo doc --workspace --no-deps`
+- All `fmt --check`/`clippy` steps (root workspace, each crate's `--features
+  failpoints` lint, both spike workspace members) are fully independent jobs
+  and run concurrently with everything else.
+- Every `cargo nextest run` step against the **root** workspace — the
+  default-feature `--workspace` run plus each `--features failpoints` crate's
+  run (`local-rag-store`, `-hook`, `-index`, `-projection`, `-search`,
+  `-embed`, `-models`, `-generate`; see "Workspace layout" below for what
+  each seam covers) — is chained into **one** job, `root:test`, run in that
+  order, and every step still runs even if an earlier one fails (so the run
+  still reports every crate's result). Each nextest step is paired with a
+  `cargo test --doc` step for the same scope, since nextest never runs
+  doctests.
+- Likewise, the two spike-workspace `nextest run` steps (`harness`, then
+  `qdrant-edge`) are chained into one job, `spike:test`.
+- `cargo doc --workspace --no-deps` is its own independent job.
 
-After the initial `cargo fetch`, the full check runs **offline**.
+`nextest run` steps against the **same** workspace are chained into one job
+rather than run as separate concurrent jobs for a measured reason: two
+`cargo nextest run` processes started at once against the same workspace
+visibly block on cargo's own build-directory lock (confirmed directly — one
+sits at 0% CPU until the other's build finishes), so running one per crate
+concurrently would silently re-serialize exactly the cost this pipeline most
+needs to shrink (the ~100+ sequential test-binary spawns `cargo test
+--workspace` used to do on its own, per `docs/implementation-plan/PROGRESS.md`
+T14-05's evidence). `clippy`/`fmt`/`doc` do not show this lock behavior, so
+those stay one job each and run fully concurrently. `root:test` and
+`spike:test` — the two jobs no amount of concurrency can shrink further — are
+queued first so a free worker never idles behind a cheap `clippy` job while
+they are still running.
+
+`cargo-nextest` is a required host tool (not a workspace dependency `cargo
+fetch` pulls in): install it once with `cargo install cargo-nextest --locked`.
+`cargo xtask ci` checks for it up front and fails immediately with that
+install command if it is missing, rather than failing confusingly partway
+through. After that one-time install and the initial `cargo fetch`, the full
+check runs **offline**.
 
 ## Search benchmark (`cargo xtask bench`)
 
@@ -85,6 +120,9 @@ exists, not a regression budget.
 - Pinned toolchain: **1.96.1** via `rust-toolchain.toml` (components `rustfmt`,
   `clippy`), installed automatically by `rustup`.
 - Edition **2024**; MSRV **1.96** (`rust-version` in `[workspace.package]`).
+- `cargo-nextest`, required by `cargo xtask ci`'s test jobs (see "Full check"
+  above): `cargo install cargo-nextest --locked`. Not a `rustup` component and
+  not resolved by `cargo fetch` — install it once per machine.
 
 ## Dependency policy
 
