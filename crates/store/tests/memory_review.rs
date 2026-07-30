@@ -12,9 +12,9 @@
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
-    ApproveCandidateOutcome, CandidateRow, ProposedOperation, ReviewError, approve_candidate,
-    candidate_evidence_for, edit_candidate, list_candidates, memory_entry_state,
-    memory_evidence_for, propose_candidate, reject_candidate,
+    ApproveCandidateOutcome, CandidateCountRow, CandidateRow, ProposedOperation, ReviewError,
+    approve_candidate, candidate_evidence_for, edit_candidate, list_candidates, memory_entry_state,
+    memory_evidence_for, pending_candidate_counts, propose_candidate, reject_candidate,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{
@@ -190,7 +190,7 @@ async fn propose_then_list_exposes_state_and_provenance() {
     .await;
 
     let read = db.open_read().expect("read conn");
-    let rows = list_candidates(&read, None).expect("list");
+    let rows = list_candidates(&read, None, i64::MAX, 0).expect("list");
     assert_eq!(rows.len(), 1);
     let row: &CandidateRow = &rows[0];
     assert_eq!(row.candidate_id, "cand-1");
@@ -232,7 +232,8 @@ async fn list_candidates_filters_by_review_state() {
     reject(&db, "cand-b").await.expect("reject");
 
     let read = db.open_read().expect("read conn");
-    let pending = list_candidates(&read, Some(CandidateState::Pending)).expect("list pending");
+    let pending =
+        list_candidates(&read, Some(CandidateState::Pending), i64::MAX, 0).expect("list pending");
     assert_eq!(
         pending
             .iter()
@@ -240,7 +241,8 @@ async fn list_candidates_filters_by_review_state() {
             .collect::<Vec<_>>(),
         vec!["cand-a"],
     );
-    let rejected = list_candidates(&read, Some(CandidateState::Rejected)).expect("list rejected");
+    let rejected =
+        list_candidates(&read, Some(CandidateState::Rejected), i64::MAX, 0).expect("list rejected");
     assert_eq!(
         rejected
             .iter()
@@ -248,7 +250,7 @@ async fn list_candidates_filters_by_review_state() {
             .collect::<Vec<_>>(),
         vec!["cand-b"],
     );
-    let all = list_candidates(&read, None).expect("list all");
+    let all = list_candidates(&read, None, i64::MAX, 0).expect("list all");
     assert_eq!(all.len(), 2);
 }
 
@@ -575,7 +577,7 @@ async fn edit_while_pending_updates_proposal_and_conflicts() {
     .expect("edit");
 
     let read = db.open_read().expect("read conn");
-    let rows = list_candidates(&read, None).expect("list");
+    let rows = list_candidates(&read, None, i64::MAX, 0).expect("list");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].conflicts.as_deref(), Some("[\"conflict-1\"]"));
     let round_tripped: ProposedOperation =
@@ -604,7 +606,7 @@ async fn edit_non_pending_candidate_is_conflicting_edit_with_no_mutation() {
     assert_eq!(result, Err(ReviewError::NotPending));
 
     let read = db.open_read().expect("read conn");
-    let rows = list_candidates(&read, None).expect("list");
+    let rows = list_candidates(&read, None, i64::MAX, 0).expect("list");
     assert_eq!(
         rows[0].review_state,
         CandidateState::Rejected,
@@ -666,5 +668,97 @@ async fn approve_already_rejected_candidate_is_illegal_transition() {
         row_count(&read, "memory_entry"),
         0,
         "no materialization on illegal approve"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T15-04: list_candidates pagination / pending_candidate_counts
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_candidates_limit_and_offset_window_the_ordered_result() {
+    let (_home, db) = open_state();
+    let owner = uuid(180);
+    for (i, seed) in (0u8..4).enumerate() {
+        propose(
+            &db,
+            &format!("cand-{i}"),
+            create_op(&uuid(190 + seed), MemoryKind::Fact, &owner),
+            vec![],
+            vec![],
+            1_000 + i64::from(seed),
+        )
+        .await;
+    }
+
+    let read = db.open_read().expect("read conn");
+    let first_page = list_candidates(&read, None, 2, 0).expect("page 1");
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|r| r.candidate_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cand-0", "cand-1"]
+    );
+    let second_page = list_candidates(&read, None, 2, 2).expect("page 2");
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|r| r.candidate_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cand-2", "cand-3"]
+    );
+    let past_the_end = list_candidates(&read, None, 2, 4).expect("page 3");
+    assert!(past_the_end.is_empty());
+}
+
+#[tokio::test]
+async fn pending_candidate_counts_groups_by_review_state() {
+    let (_home, db) = open_state();
+    let owner = uuid(181);
+    propose(
+        &db,
+        "cand-pending-1",
+        create_op(&uuid(182), MemoryKind::Fact, &owner),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+    propose(
+        &db,
+        "cand-pending-2",
+        create_op(&uuid(183), MemoryKind::Fact, &owner),
+        vec![],
+        vec![],
+        1_100,
+    )
+    .await;
+    propose(
+        &db,
+        "cand-rejected",
+        create_op(&uuid(184), MemoryKind::Fact, &owner),
+        vec![],
+        vec![],
+        1_200,
+    )
+    .await;
+    reject(&db, "cand-rejected").await.expect("reject");
+
+    let read = db.open_read().expect("read conn");
+    let counts = pending_candidate_counts(&read).expect("counts");
+    assert_eq!(
+        counts,
+        vec![
+            CandidateCountRow {
+                state: CandidateState::Pending,
+                count: 2,
+            },
+            CandidateCountRow {
+                state: CandidateState::Rejected,
+                count: 1,
+            },
+        ],
+        "ordered by review_state; empty buckets are omitted"
     );
 }

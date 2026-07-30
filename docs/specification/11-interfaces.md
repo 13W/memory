@@ -159,6 +159,80 @@ v1 name mapping: `forget` → `retract_memory` (audit-preserving; hard delete on
 All tools return the canonical error envelope (02 §6). All mutating tools are idempotent under
 retry via preconditions or idempotency keys.
 
+As-built note (T15-04, `[SPEC]`): the six status/memory-read tools this section's table names —
+`stats`, `health`, `recall`, `list_memory`, `list_memory_candidates`, `inspect_memory_evidence`
+(candidate/memory mutation tools are T15-05's) — are `local_rag::daemon::mcp::memory`, wired the
+same way T15-03's three code-query tools are: `reject_unknown_keys` → typed argument parse →
+domain call against a per-daemon `local_rag::daemon::memory::MemoryContext` (state/cache
+read connections, the `local_rag_memory::recall` embedder/dense-backend seams, `recall_token_
+budget`) → `content::ok`/`content::err`. `MemoryContext` is built once at startup alongside
+`SearchEngine`, from the identical `(state_db, cache_db)` pair — `None` in exactly the same cases
+`SearchEngine` is `None` (`DaemonMode::MigrationOnly`), so `dispatch::route_tools_call`'s existing
+single gate widens to a pair without a new invariant. Six decisions this section states less
+precisely than the shipped code:
+
+- **`MigrationOnly` gets no per-tool exception, including for `health`/`stats`.** Every
+  `tools/call` — the three code-query tools and these six alike — already short-circuits to
+  `isError` + `INCOMPATIBLE_STORE` uniformly before any tool-specific code runs (T15-03's own
+  as-built note above). A store genuinely mid-migration is diagnosable earlier, over a different
+  channel: the handshake `WELCOME`'s own `mode` field (02 §4.2), or the CLI's `local-rag status`
+  (T15-01) — not by adding a second code path that answers `health()` from inside a state this
+  daemon has already decided not to serve tool calls from.
+- **`recall(query?, limit?)` returns structured entries with ids, not only the rendered text
+  block.** `limit?` is only meaningful against a countable list, and 12 §4 item 3 ("provenance
+  separated from text… available via tools only") names exactly this tool as one of the "tools"
+  allowed to carry ids. `local_rag_memory::recall::pipeline::RecallOutcome` grew `scope_label`/
+  `entries: Vec<RecallResultEntry>` (id+kind+state+confidence+text, populated in the same
+  budget-walk loop that already builds the text-only `RecallEntry`) — `additional_context` is
+  unchanged and is never re-rendered for a smaller `limit`; only `entries` is truncated.
+  `RecallResultEntry` deliberately still excludes provenance the untrusted block itself must never
+  carry (evidence, audit); `inspect_memory_evidence`/`list_memory` are the tools for that.
+- **Pagination is `limit`/`offset`, chosen and documented the same way `DEFAULT_SEARCH_LIMIT`/
+  `MAX_SEARCH_LIMIT` were** (11 §2's own T15-03 note: "no `[SPEC]` number exists… picked and
+  documented as chosen, not derived"): `DEFAULT_RECALL_LIMIT = 10`/`MAX_RECALL_LIMIT = 50` (same
+  order as search — `recall` is a top-K relevance result); `DEFAULT_LIST_LIMIT = 20`/
+  `MAX_LIST_LIMIT = 100` for `list_memory`/`list_memory_candidates` (a wider cap — these are
+  exhaustive-pagination review tools, not top-K results). `list_memory_candidates` over-fetches
+  `limit + 1` rows from `local_rag_store::memory::list_candidates` (itself extended with SQL
+  `LIMIT`/`OFFSET`) and slices the extra row to compute `has_more` without a second `COUNT(*)`;
+  `list_memory` unions its (at most three) resolved scopes in memory first — `local_rag_store::
+  memory::list_memory_entries_for_scope` takes no `LIMIT`/`OFFSET` at all, since pagination has to
+  slice the union, never any one scope's rows alone.
+- **`list_memory`'s `state` filter defaults to no exclusion at all** — unlike `recall`'s candidate
+  set and the router's own conflict lookup, both of which exclude terminal states by default. Spec
+  04 §5: terminal states "remain queryable via review tools," and this is that review tool; a
+  caller narrows to one state (including a terminal one) only by naming it. The backing query,
+  `list_memory_entries_for_scope`, is new (T15-04): no group-14 task claimed a general filtered/
+  paginated `memory_entry` listing (only the narrower, terminal-excluding `active_entries_for_
+  scope`, T14-07's router conflict lookup, existed), so this task added it directly rather than
+  file a deviation for a thin, mechanical `SELECT` — the same "small helper logic added while
+  wiring the tool" precedent T15-03's own `normalized_relative_path` already set.
+- **`list_memory_candidates` takes no `RequestRoot`/scope argument at all** — the literal
+  realization of this card's "global-only behavior where applicable": `pending_memory_candidate`
+  has no scope column in the schema (03 §2.5), so a worktree context has nothing to filter by.
+- **`stats()` splits store-wide from scope-specific.** `memory.entries_by_kind_state`/
+  `memory.pending_candidates_by_state` (new `local_rag_store::memory::{memory_entry_counts,
+  pending_candidate_counts}`, `GROUP BY`) are whole-store totals, matching this row's own "counts
+  per pillar" wording as a health figure, not a per-request-scoped one; only the `worktree` block
+  (present iff the request's root resolves — `repo_id`/`worktree_id`/`active_generation_id`/
+  `active_model_space_id`/`projection_status`/`projection_last_error` from `worktree_projection_
+  state`, 04 §2) is scope-specific. `stats()` also closes a gate-09-deferred seam: `write_queues.
+  {state,cache}.{capacity,available}` exposes `StateWriter`/`CacheWriter::{queue_capacity,
+  available_slots}` (02 §5's "queue depth is a metric," `crates/store/src/state/writer.rs:86-99` —
+  already-computed data, only its exposition was deferred to "T15-04/T15-08"). The other 09-gate
+  seam this row's traceability table names, "disk budget across shards," is **not** closed here:
+  unlike queue depth, no artifact/soft-cap number exists anywhere yet — computing one is real new
+  domain work (walking shard directory sizes, inventing the `[SPEC]` cap value), not exposing
+  already-computed state, so it stays deferred (T15-08 or a dedicated task), not silently bundled
+  in.
+- **`health()`** returns `{daemon_mode, daemon_version, store_instance_uuid}` — `daemon_mode` from
+  `DaemonMode::as_str()` (`mode.rs`'s own doc comment already anticipated this exact call site),
+  `daemon_version` from `local_rag_core::VERSION` (the same constant `main.rs` feeds `StartOptions::
+  daemon_version`), `store_instance_uuid` from `local_rag_store::store_instance_uuid`. Reachable
+  only in `DaemonMode::Normal` per the first bullet above, so `daemon_mode` is observed as
+  `"normal"` in practice today — included for the contract's own "daemon/version/store status"
+  completeness, not because MigrationOnly ever reaches it.
+
 ## 3. Hooks
 
 ### 3.1 Ingestion hooks `[FIXED]`

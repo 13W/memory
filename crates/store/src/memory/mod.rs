@@ -94,6 +94,7 @@ mod evidence;
 mod op;
 mod review;
 mod runner;
+mod stats;
 
 pub use audit::{
     Actor, AuditEventRow, NewAuditEvent, find_by_idempotency_key, insert_audit_event,
@@ -112,11 +113,11 @@ pub use consolidation::{
     upsert_processing_cursor,
 };
 pub use entry::{
-    CreateMemoryEntryError, IllegalMemoryTransition, MemoryEntrySummary, MemoryKind, MemoryState,
-    MemoryTransitionError, NewMemoryEntry, RecallCandidate, ScopeKind, active_entries_for_scope,
-    all_memory_entries_with_text, canonical_key_owner, create_memory_entry, memory_entry_state,
-    memory_entry_summary, recall_candidate_by_id, recall_candidates_for_scope,
-    transition_memory_entry,
+    CreateMemoryEntryError, IllegalMemoryTransition, MemoryEntryRow, MemoryEntrySummary,
+    MemoryKind, MemoryState, MemoryTransitionError, NewMemoryEntry, RecallCandidate, ScopeKind,
+    active_entries_for_scope, all_memory_entries_with_text, canonical_key_owner,
+    create_memory_entry, list_memory_entries_for_scope, memory_entry_state, memory_entry_summary,
+    recall_candidate_by_id, recall_candidates_for_scope, transition_memory_entry,
 };
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};
 pub use op::{
@@ -134,6 +135,7 @@ pub use runner::{
     ApplyReport, ConsolidationWindow, GeneratedOp, RunOutcome, RunOutcomeError, RunnerApplyError,
     RunnerError, WindowObservation, commit_apply_run, run_once,
 };
+pub use stats::{CandidateCountRow, MemoryCountRow, memory_entry_counts, pending_candidate_counts};
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the
 /// `memory_entry`/`memory_evidence`/`pending_memory_candidate`/

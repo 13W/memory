@@ -194,7 +194,17 @@ fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
         .collect();
     assert_eq!(
         names,
-        ["search_code", "get_file_context", "project_overview"]
+        [
+            "search_code",
+            "get_file_context",
+            "project_overview",
+            "recall",
+            "list_memory",
+            "list_memory_candidates",
+            "inspect_memory_evidence",
+            "stats",
+            "health",
+        ]
     );
     let _ = stdout;
 

@@ -48,13 +48,18 @@ mod fusion;
 mod lexical;
 pub mod pipeline;
 
-pub use dense::{BruteForceCosine, MemoryDenseBackend, QueryEmbedder, UnavailableEmbedder};
+pub use dense::{
+    BruteForceCosine, DenseLegUnavailable, MemoryDenseBackend, QueryEmbedError, QueryEmbedder,
+    UnavailableEmbedder,
+};
 pub use format::{
     RECALL_ENTRY_CAP_BYTES, RecallEntry, format_additional_context, prepare_entry_text,
 };
 pub use fusion::{FusedRecallHit, rrf};
 pub use lexical::lexical_leg;
-pub use pipeline::{MAX_RECALL_CANDIDATES, RecallRequest, recall};
+pub use pipeline::{
+    MAX_RECALL_CANDIDATES, RecallOutcome, RecallRequest, RecallResultEntry, recall, scopes_for,
+};
 
 use std::collections::BTreeSet;
 

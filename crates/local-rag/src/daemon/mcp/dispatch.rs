@@ -20,6 +20,7 @@ use local_rag_search::SearchEngine;
 
 use super::{content, instructions, jsonrpc, tools};
 use crate::daemon::gitroot;
+use crate::daemon::memory::MemoryContext;
 use crate::daemon::mode::DaemonMode;
 
 /// Everything one `dispatch` call needs. Built fresh per request by
@@ -28,6 +29,7 @@ use crate::daemon::mode::DaemonMode;
 /// `SearchEngine` makes is clock-dependent.
 pub struct DispatchContext<'a> {
     pub engine: Option<&'a SearchEngine>,
+    pub memory: Option<&'a MemoryContext>,
     pub mode: &'a DaemonMode,
     pub request_context: &'a RequestContext,
     pub now_ms: i64,
@@ -98,8 +100,13 @@ async fn route_tools_call(
 ) -> Result<Value, (i64, String)> {
     let call = tools::parse_tool_call(params).map_err(|msg| (jsonrpc::INVALID_PARAMS, msg))?;
 
-    let Some(engine) = ctx.engine else {
-        // MigrationOnly (or, defensively, any other reason the engine isn't
+    // `engine`/`memory` are always `Some` together or `None` together (built
+    // from the same `(state_db, cache_db)` pair in `lifecycle.rs`) — one
+    // combined gate, not two, so this stays the identical single
+    // MigrationOnly short-circuit every tool already shared before T15-04
+    // added a second resource.
+    let (Some(engine), Some(memory)) = (ctx.engine, ctx.memory) else {
+        // MigrationOnly (or, defensively, any other reason neither is
         // built): there is no store to query at all. Still a normal tool
         // result, not a JSON-RPC error — the client asked a well-formed
         // question, the daemon just cannot answer it right now.
@@ -115,6 +122,16 @@ async fn route_tools_call(
         "search_code" => super::code::search_code(engine, root, &call.arguments, ctx.now_ms).await,
         "get_file_context" => super::code::get_file_context(engine, root, &call.arguments).await,
         "project_overview" => super::code::project_overview(engine, root, &call.arguments).await,
+        "recall" => super::memory::recall(memory, root, &call.arguments).await,
+        "list_memory" => super::memory::list_memory(memory, root, &call.arguments).await,
+        "list_memory_candidates" => {
+            super::memory::list_memory_candidates(memory, &call.arguments).await
+        }
+        "inspect_memory_evidence" => {
+            super::memory::inspect_memory_evidence(memory, &call.arguments).await
+        }
+        "stats" => super::memory::stats(memory, root, &call.arguments).await,
+        "health" => super::memory::health(memory, ctx.mode, &call.arguments).await,
         other => return Err((jsonrpc::INVALID_PARAMS, format!("unknown tool: {other}"))),
     };
     result

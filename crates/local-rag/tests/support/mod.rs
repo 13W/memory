@@ -29,14 +29,16 @@ use local_rag_projection::{
     params_for_model_space, shard_dir, switch,
 };
 use local_rag_store::{
-    CacheDb, DEFAULT_MODEL_SPACE_ID, GenerationState, NewContentBlob, NewFileRevision,
-    NewOccurrence, NewParsedUnit, NewlineStyle, RepresentationKey, RepresentationKind,
-    SourceCompression, StateDb, UnitKind, WorktreeRootFacts, allocate_generation,
-    create_repository, create_worktree, derive_content_blob, ensure_store_instance_uuid,
-    insert_content_blob, insert_file_revision, insert_generation_file, insert_occurrence,
-    insert_parsed_unit, insert_projection_state, materialize_fts, observe_repository_path,
-    observe_worktree_path, occurrence_id, register_representation, set_model_space_representation,
-    transition_generation,
+    CacheDb, DEFAULT_MODEL_SPACE_ID, EvidenceKind, GenerationState, MemoryKind, MemoryState,
+    NewContentBlob, NewFileRevision, NewMemoryEntry, NewMemoryEvidence, NewOccurrence,
+    NewParsedUnit, NewlineStyle, ProposedOperation, RepresentationKey, RepresentationKind,
+    ScopeKind, SourceCompression, StateDb, UnitKind, WorktreeRootFacts, allocate_generation,
+    create_memory_entry, create_repository, create_worktree, derive_content_blob,
+    ensure_store_instance_uuid, insert_content_blob, insert_file_revision, insert_generation_file,
+    insert_memory_evidence, insert_occurrence, insert_parsed_unit, insert_projection_state,
+    materialize_fts, observe_repository_path, observe_worktree_path, occurrence_id,
+    propose_candidate, register_representation, set_model_space_representation,
+    transition_generation, transition_memory_entry,
 };
 use local_rag_test_support::TempHome;
 use serde_json::value::RawValue;
@@ -82,6 +84,8 @@ impl VectorSource for AlwaysVectors {
 pub struct SeededWorktree {
     pub repo_path: PathBuf,
     pub facts: WorktreeRootFacts,
+    pub worktree_id: String,
+    pub repo_id: String,
 }
 
 /// Seed `layout`'s `state.sqlite`/`cache.sqlite` with one indexed worktree,
@@ -324,7 +328,12 @@ pub async fn seed_indexed_worktree(home: &TempHome, layout: &StoreLayout) -> See
     cache.close();
     drop(state); // the writer thread is detached; nothing else touches this path before DaemonHandle::start reopens it
 
-    SeededWorktree { repo_path, facts }
+    SeededWorktree {
+        repo_path,
+        facts,
+        worktree_id: worktree_id.to_string(),
+        repo_id: repo_id.to_string(),
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -350,6 +359,150 @@ pub fn git_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------
+// T15-04 memory-tool fixtures: seed `memory_entry`/`pending_memory_
+// candidate` rows directly against an already-open `StateDb`, before or
+// after `DaemonHandle::start` — unlike `seed_indexed_worktree`, memory
+// tools take no lock and need no active generation, so these can run any
+// time the caller already holds a `StateDb` handle (including one borrowed
+// from a running `DaemonHandle`, since `state.writer()` is exactly the same
+// bounded-queue path a real daemon-side write op would use).
+// ---------------------------------------------------------------------
+
+/// Insert one `active` `memory_entry` row directly.
+pub async fn seed_memory_entry(
+    state: &StateDb,
+    memory_id: &str,
+    kind: MemoryKind,
+    scope_kind: ScopeKind,
+    scope_owner_id: &str,
+    text: &str,
+    now_ms: i64,
+) {
+    let (id, owner, text) = (
+        memory_id.to_string(),
+        scope_owner_id.to_string(),
+        text.to_string(),
+    );
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_memory_entry(
+                tx,
+                &NewMemoryEntry {
+                    memory_id: &id,
+                    kind,
+                    text: &text,
+                    canonical_key: None,
+                    scope_kind,
+                    scope_owner_id: &owner,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                now_ms,
+            )
+        })
+        .await
+        .expect("seed memory entry tx (infrastructure)")
+        .expect("seed memory entry (domain)");
+}
+
+/// Transition a previously seeded `memory_entry` — for tests that need a
+/// non-`active` (e.g. terminal) row.
+pub async fn transition_seeded_memory_entry(state: &StateDb, memory_id: &str, to: MemoryState) {
+    let id = memory_id.to_string();
+    state
+        .writer()
+        .transaction(move |tx| transition_memory_entry(tx, &id, to))
+        .await
+        .expect("transition tx (infrastructure)")
+        .expect("transition (domain)");
+}
+
+/// Insert a minimal, standalone `observation_envelope` row (no repo/
+/// worktree, no payload) so evidence-linking tests have a real
+/// `observation_id` to point at — mirrors `crates/store/tests/memory.rs`'s
+/// own `seed_observation` helper (not shared across crates).
+pub async fn seed_observation(state: &StateDb, observation_id: &str) {
+    let oid = observation_id.to_string();
+    state
+        .writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO observation_envelope \
+                   (observation_id, source_event_id, payload_hash, event_type, evidence_kind, \
+                    trust, session_id) \
+                 VALUES (?1, 'evt-1', 'deadbeef', 'Stop', 'user_statement', 'normal', 'sess-1')",
+                [&oid],
+            )
+        })
+        .await
+        .expect("seed observation envelope");
+}
+
+/// Link `observation_id` as `memory_evidence` for `memory_id`.
+pub async fn seed_memory_evidence(state: &StateDb, memory_id: &str, observation_id: &str) {
+    let (mid, oid) = (memory_id.to_string(), observation_id.to_string());
+    state
+        .writer()
+        .transaction(move |tx| {
+            insert_memory_evidence(
+                tx,
+                &NewMemoryEvidence {
+                    memory_id: &mid,
+                    observation_id: &oid,
+                    evidence_kind: EvidenceKind::UserStatement,
+                    session_id: "sess-1",
+                    agent_id: None,
+                    commit_hash: None,
+                },
+            )
+        })
+        .await
+        .expect("seed memory evidence");
+}
+
+/// Insert one `pending` `pending_memory_candidate` row proposing a `create`
+/// of `target_memory_id` — the `target_memory_id` is never itself required
+/// to exist as a `memory_entry` row (candidate review reads
+/// `pending_memory_candidate` directly; nothing here materializes the
+/// proposal).
+pub async fn seed_pending_candidate(
+    state: &StateDb,
+    candidate_id: &str,
+    target_memory_id: &str,
+    scope_owner_id: &str,
+    now_ms: i64,
+) {
+    let (cid, target, owner) = (
+        candidate_id.to_string(),
+        target_memory_id.to_string(),
+        scope_owner_id.to_string(),
+    );
+    state
+        .writer()
+        .transaction(move |tx| {
+            let op = ProposedOperation::Create {
+                memory_id: target,
+                kind: "fact".to_string(),
+                text: "candidate-proposed text".to_string(),
+                canonical_key: None,
+                scope_kind: "worktree".to_string(),
+                scope_owner_id: owner,
+                confidence: 0.5,
+                importance: 0.5,
+                valid_from_tree: None,
+                last_verified_tree: None,
+            };
+            propose_candidate(tx, &cid, &op, &[], &[], now_ms)
+        })
+        .await
+        .expect("propose candidate tx");
 }
 
 // ---------------------------------------------------------------------
@@ -386,6 +539,8 @@ pub fn start_options(layout: StoreLayout) -> StartOptions {
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: 8,
         query_embedder: std::sync::Arc::new(local_rag_search::UnavailableEmbedder),
+        memory_query_embedder: std::sync::Arc::new(local_rag_memory::recall::UnavailableEmbedder),
+        recall_token_budget: 1500,
     }
 }
 

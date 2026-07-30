@@ -53,6 +53,8 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: 8,
         query_embedder: Arc::new(UnavailableEmbedder),
+        memory_query_embedder: Arc::new(local_rag_memory::recall::UnavailableEmbedder),
+        recall_token_budget: 1500,
     }
 }
 

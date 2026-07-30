@@ -18,6 +18,22 @@ use serde_json::{Map, Value};
 pub const DEFAULT_SEARCH_LIMIT: i64 = 10;
 pub const MAX_SEARCH_LIMIT: i64 = 50;
 
+/// `recall`'s own limit (T15-04, `[SPEC]`) — spec 08 §6 fixes the token
+/// budget, not a caller-facing entry-count cap. Same order of magnitude as
+/// `search_code`'s: `recall` is a top-K relevance result too, not an
+/// exhaustive listing.
+pub const DEFAULT_RECALL_LIMIT: i64 = 10;
+pub const MAX_RECALL_LIMIT: i64 = 50;
+
+/// `list_memory`/`list_memory_candidates`'s pagination window (T15-04,
+/// `[SPEC]`) — deliberately a larger cap than `MAX_SEARCH_LIMIT`/
+/// `MAX_RECALL_LIMIT`: these are exhaustive-pagination review tools (spec
+/// 11 §2's "review reads"/"candidate review"), not top-K relevance results,
+/// so a caller paging through everything in a scope needs a wider window
+/// per call.
+pub const DEFAULT_LIST_LIMIT: i64 = 20;
+pub const MAX_LIST_LIMIT: i64 = 100;
+
 /// The full `tools/list` result.
 pub fn catalog() -> Value {
     serde_json::json!({
@@ -86,6 +102,144 @@ pub fn catalog() -> Value {
                     recursive file and unit counts, likely entry-point files, and the most \
                     frequently imported module specifiers, all derived from the active index \
                     generation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "recall",
+                "description": "Explicit durable-memory recall: the same scored pipeline the \
+                    session-start hook uses. An empty/absent query is legal and returns the \
+                    scope's most recent eligible memories. Returns both the rendered \
+                    additionalContext text block and structured entries with ids for follow-up \
+                    tool calls (inspect_memory_evidence, edit_memory).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Free-text relevance query. Omit or leave empty for \
+                                a termless recall (most recent eligible memories)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_RECALL_LIMIT,
+                            "default": DEFAULT_RECALL_LIMIT,
+                            "description": "Maximum number of structured entries to return \
+                                (does not truncate the additionalContext text block)."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "list_memory",
+                "description": "Review durable memory entries in scope (global, repository, \
+                    and — when a worktree resolves — worktree), including terminal states \
+                    (superseded/retracted/resolved/rejected), unlike recall which excludes them.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "fact", "decision", "convention", "procedure", "task",
+                                "question", "hypothesis"
+                            ],
+                            "description": "Keep only entries of this kind."
+                        },
+                        "state": {
+                            "type": "string",
+                            "enum": [
+                                "active", "resolved", "retracted", "confirmed", "rejected",
+                                "superseded"
+                            ],
+                            "description": "Keep only entries in this state. Omit to see every \
+                                state, including terminal ones."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["global", "repository", "worktree"],
+                            "description": "Restrict to one resolved scope instead of the \
+                                default global ∪ repository ∪ worktree union."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_LIST_LIMIT,
+                            "default": DEFAULT_LIST_LIMIT
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 0
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "list_memory_candidates",
+                "description": "Review pending/approved/rejected/expired memory candidates \
+                    proposed by consolidation. Candidates have no scope (global to the store) — \
+                    the request's worktree context is not consulted.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "state": {
+                            "type": "string",
+                            "enum": ["pending", "approved", "rejected", "expired"],
+                            "description": "Keep only candidates in this review state. Omit to \
+                                see every state."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_LIST_LIMIT,
+                            "default": DEFAULT_LIST_LIMIT
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 0
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "inspect_memory_evidence",
+                "description": "The observation ids cited as evidence for one memory entry. An \
+                    unknown memory_id returns an empty list, not an error.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    },
+                    "required": ["memory_id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "stats",
+                "description": "Store-wide counts of memory entries (by kind/state) and pending \
+                    candidates (by review state), plus write-queue backpressure and, when the \
+                    request's worktree resolves, its projection status.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "health",
+                "description": "Daemon mode, version, and store instance identity.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -160,7 +314,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_advertises_all_three_tools_with_the_spec_fixed_names() {
+    fn catalog_advertises_all_nine_v0_tools_with_the_spec_fixed_names() {
         let catalog = catalog();
         let names: Vec<&str> = catalog["tools"]
             .as_array()
@@ -170,7 +324,17 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["search_code", "get_file_context", "project_overview"]
+            [
+                "search_code",
+                "get_file_context",
+                "project_overview",
+                "recall",
+                "list_memory",
+                "list_memory_candidates",
+                "inspect_memory_evidence",
+                "stats",
+                "health",
+            ]
         );
     }
 

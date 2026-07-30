@@ -70,7 +70,7 @@ async fn a_notification_produces_no_response_line() {
 }
 
 #[tokio::test]
-async fn tools_list_advertises_the_three_code_query_tools() {
+async fn tools_list_advertises_all_nine_v0_tools() {
     let (_home, layout) = open_layout();
     let socket_path = layout.socket_path();
     let handle = start(&layout).await;
@@ -90,7 +90,17 @@ async fn tools_list_advertises_the_three_code_query_tools() {
         .collect();
     assert_eq!(
         names,
-        ["search_code", "get_file_context", "project_overview"]
+        [
+            "search_code",
+            "get_file_context",
+            "project_overview",
+            "recall",
+            "list_memory",
+            "list_memory_candidates",
+            "inspect_memory_evidence",
+            "stats",
+            "health",
+        ]
     );
     handle.shutdown().await;
 }
@@ -160,6 +170,14 @@ async fn tools_call_argument_errors_get_invalid_params() {
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"x","limit":0}}}"#,
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"x","mode":"graph"}}}"#,
             r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"x","bogus":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"inspect_memory_evidence","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"recall","arguments":{"limit":0}}}"#,
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_memory","arguments":{"kind":"bogus"}}}"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_memory","arguments":{"state":"bogus"}}}"#,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"list_memory_candidates","arguments":{"state":"bogus"}}}"#,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"list_memory","arguments":{"offset":-1}}}"#,
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"stats","arguments":{"bogus":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"health","arguments":{"bogus":true}}}"#,
         ];
         cases
             .iter()
@@ -234,22 +252,35 @@ async fn migration_only_serves_the_handshake_but_refuses_tool_calls() {
         }
     ));
 
-    let (initialize_ok, tools_list_ok, call_body) = tokio::task::spawn_blocking(move || {
-        let mut client = Client::connect(&socket_path);
-        let initialize = client.call_and_read(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, None);
-        let tools_list = client.call_and_read(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, None);
-        let call = client.call_and_read(
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"project_overview","arguments":{}}}"#,
-            None,
-        );
-        (
-            initialize["result"]["serverInfo"]["name"] == "local-rag",
-            tools_list["result"]["tools"].is_array(),
-            call,
-        )
-    })
-    .await
-    .expect("blocking task");
+    let (initialize_ok, tools_list_ok, call_body, health_body) =
+        tokio::task::spawn_blocking(move || {
+            let mut client = Client::connect(&socket_path);
+            let initialize =
+                client.call_and_read(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, None);
+            let tools_list =
+                client.call_and_read(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, None);
+            let call = client.call_and_read(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"project_overview","arguments":{}}}"#,
+                None,
+            );
+            // A T15-04 tool must be refused identically -- no per-tool
+            // exception to the MigrationOnly gate, including for
+            // "health"/"stats" (see `mcp::memory::health`'s own doc comment
+            // for why that is not a gap: migration status is diagnosable
+            // earlier, over the handshake/CLI channels).
+            let health = client.call_and_read(
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"health","arguments":{}}}"#,
+                None,
+            );
+            (
+                initialize["result"]["serverInfo"]["name"] == "local-rag",
+                tools_list["result"]["tools"].is_array(),
+                call,
+                health,
+            )
+        })
+        .await
+        .expect("blocking task");
 
     assert!(initialize_ok, "initialize must work even in MigrationOnly");
     assert!(tools_list_ok, "tools/list must work even in MigrationOnly");
@@ -261,6 +292,15 @@ async fn migration_only_serves_the_handshake_but_refuses_tool_calls() {
     assert!(
         content_text.contains("\"code\":\"INCOMPATIBLE_STORE\""),
         "{content_text}"
+    );
+
+    let health_text = health_body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content text");
+    assert_eq!(health_body["result"]["isError"], Value::Bool(true));
+    assert!(
+        health_text.contains("\"code\":\"INCOMPATIBLE_STORE\""),
+        "{health_text}"
     );
 
     handle.shutdown().await;
