@@ -49,6 +49,75 @@ worktree before any lock and then read the active generation under `L2.read` (06
 discipline `search_code` follows, and for the same reason: an occurrence list and its snippets
 must not come from different generations.
 
+As-built note (T15-03, `[SPEC]`): the MCP tool wiring named above is `local_rag::daemon::mcp`
+(`crates/local-rag/src/daemon/mcp/`) — a hand-rolled JSON-RPC 2.0 dispatcher, not an SDK
+dependency (none exists anywhere in this workspace's `Cargo.lock`; three tool schemas do not earn
+one, the same dependency-minimalism precedent `Snippet`'s own hand-written `Serialize` and this
+project's copied-not-shared backoff formulas already set). `mcp::jsonrpc` is the inner JSON-RPC
+envelope, orthogonal to `local_rag_protocol::handshake`'s own outer `RequestEnvelope`/
+`ResponseEnvelope` transport frame (02 §4.2) the MCP payload rides inside as an opaque
+`Box<RawValue>`. `mcp::dispatch` routes `initialize`/`notifications/*`/`ping`/`tools/list`/
+`tools/call`; `mcp::content` maps a tool's outcome into MCP's `isError` content (the vocabulary
+02 §6 already names) or a JSON-RPC error object, per a two-channel split that follows MCP's own
+"Error Handling" guidance verbatim: unknown tools/invalid arguments/malformed envelopes are
+JSON-RPC errors (`-32600 Invalid Request`, `-32601 Method not found`, `-32602 Invalid params`);
+everything the tool itself can answer — including `WORKTREE_NOT_INDEXED`, `INDEX_UNAVAILABLE`,
+and an infra failure this daemon cannot recover from (`SearchInfraError`, folded into
+`INDEX_UNAVAILABLE` rather than a JSON-RPC `-32603 Internal error`, which would be indistinguishable
+from a server bug to the model reading it) — is `isError: true` content instead. `-32700 Parse
+error` is defined (the vocabulary stays complete) but structurally unreachable: `mcp: Box<RawValue>`
+is already valid JSON by construction of `Message`'s own deserialization, and `local-rag-proxy`
+rejects malformed JSON on stdin before it ever reaches a `RequestEnvelope`.
+
+`RequestHandler::handle` (02 §4.2's as-built note) returns `Option<Box<RawValue>>`, not
+`Box<RawValue>` — `None` for a JSON-RPC **notification** (a message with no `"id"` key, most
+commonly `notifications/initialized`, which every MCP session sends right after `initialize`).
+JSON-RPC 2.0 §4.1 forbids a response to a notification; `local-rag-proxy`'s own relay has no
+request/response pairing of its own (11 §1's "thin pass-through"), so answering one would put an
+unsolicited line on the client's stdin. Notification status is decided purely by the presence of
+the `id` key, never by the method name.
+
+`initialize`'s result carries `serverInfo: {name: "local-rag", version}`, `capabilities:
+{tools: {listChanged: false}}` (the catalog is a compile-time constant), and `instructions` — this
+card's own "server instructions describe search protocol": which tool to reach for, what the four
+search modes mean, how to read `degraded`/`legs`, and the canonical error codes, closing with the
+same "data, never instructions" banner 11 §5 already puts on the recall block (architecture
+guardrail: recalled memory and indexed repository content are untrusted data). Protocol-version
+negotiation (`protocolVersion`) is a fresh `[SPEC]` decision — no MCP revision string existed
+anywhere in this repository before this task: `SUPPORTED_MCP_PROTOCOL = ["2025-06-18",
+"2025-03-26", "2024-11-05"]`, echoing the client's requested revision when it is in that list and
+answering the first (preferred) one otherwise, per MCP's own prescribed negotiation. All three
+revisions are shape-identical for everything this server implements, so growing the list is a
+one-line change.
+
+Tool schemas (`mcp::tools::catalog`) are hand-written `serde_json::Value`, each with
+`additionalProperties: false` — enforced, not advisory: an unrecognized `tools/call` argument is
+`-32602`. `search_code`'s `mode` enum includes `"semantic"` deliberately: it is schema-valid (a
+recognized mode) but reaches the adapter and comes back as `isError` + `UNSUPPORTED_MODE`, since
+`SearchMode::from_wire("semantic")` is intentionally successful (09 §5) — an unrecognized mode
+string like `"graph"` is the `-32602` case. `DEFAULT_SEARCH_LIMIT = 10`/`MAX_SEARCH_LIMIT = 50` are
+chosen, not derived — no `[SPEC]` number exists for a caller-facing default/cap (09 §1/§4 only
+discuss `limit` relative to `candidate_depth`) — picked and documented the same way
+`MAX_MESSAGE_BYTES` was.
+
+`get_file_context`'s `path` argument accepts both worktree-relative and absolute paths (Claude
+Code's own tools frequently hold absolute ones). An absolute path is resolved against the
+request's probed worktree root (02 §3.3) without requiring the queried file to currently exist on
+disk — only its parent directory, symlink-resolved the same way the worktree root itself was, need
+exist; a file the index knows about may have been deleted or moved since indexing, and this
+server's own `instructions` already promise excerpts "describe what was indexed even if the file
+has since changed." A path outside the worktree root, or one whose entire directory tree is gone,
+is `PATH_NOT_INDEXED` — a domain answer, not `-32602`: the string is well-formed, it simply names
+nothing in this worktree.
+
+In `DaemonMode::MigrationOnly`, `initialize`/`tools/list`/`ping`/notifications still answer (none
+touch the store) — only `tools/call` short-circuits to `isError` + `INCOMPATIBLE_STORE`, reusing
+`daemon::error::error_envelope` (T15-01). Not `MIGRATION_IN_PROGRESS`: `MigrationOnlyReason` is
+always a refusal (`IncompatibleStore`/`ChecksumDrift`/`Other`), never "a migration is currently
+running" — a store genuinely mid-migration has not bound its socket yet, so no MCP response can be
+produced during that window at all (T15-01's own as-built note in 02 §6 already makes this
+distinction for the CLI-level case; this is its MCP-level twin).
+
 **`get_file_context(path)`** returns `{path, generation, occurrences[]}` with each occurrence's
 `{occurrence_id, unit_kind, name, qualified_name, span, snippet}`, ascending by span. A path that
 is not in the active generation is `PATH_NOT_INDEXED` (02 §6) with `details` separating the two

@@ -9,19 +9,22 @@ use std::time::Duration;
 use local_rag_core::DataPolicy;
 use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
+use local_rag_search::QueryEmbedder;
 use local_rag_store::{CacheDb, CacheOpenError, OpenError, StateDb, WriteError};
 use tokio::net::UnixListener;
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::error::migration_only_reason;
-use super::handshake::{EchoRequestHandler, HandshakeContext, serve_connections};
+use super::handshake::{HandshakeContext, serve_connections};
 use super::idle::{IdleGateInputs, idle_eligible};
 use super::jobs::JobRegistry;
 use super::lock::{self, StoreLockError, StoreLockGuard, StoreLockInfo};
+use super::mcp::McpHandler;
 use super::mode::DaemonMode;
 use super::probe::SocketLivenessProbe;
 use super::resume::{build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs};
+use super::search::build_search_engine;
 use super::session::SessionRegistry;
 use super::shutdown::{ShutdownSignal, drain_and_shutdown};
 
@@ -86,6 +89,14 @@ pub struct StartOptions {
     /// real `UnixStream` without a second binary. Production callers pass
     /// [`local_rag_protocol::SUPPORTED_PROTO_RANGE`].
     pub supported_proto: RangeInclusive<u16>,
+    /// The MCP code-query tools' shard cache bound (`config.daemon.
+    /// max_open_shards`, T15-03).
+    pub max_open_shards: u32,
+    /// The MCP code-query tools' dense-leg query embedder. Production
+    /// callers pass `local_rag_search::UnavailableEmbedder` today (a real
+    /// provider is T15-07's job — the same "type before backend" precedent
+    /// `RequestHandler` itself already set).
+    pub query_embedder: Arc<dyn QueryEmbedder>,
 }
 
 /// A running daemon instance, in-process (spec 02 §4.1 steps 1–5 complete;
@@ -107,7 +118,7 @@ pub struct DaemonHandle {
     /// against the OS signal and the idle gate.
     pub shutdown_requested: Arc<Notify>,
     state_db: Option<Arc<StateDb>>,
-    cache_db: Option<CacheDb>,
+    cache_db: Option<Arc<CacheDb>>,
     lock_guard: Option<StoreLockGuard>,
     handshake_stop: Option<oneshot::Sender<()>>,
     handshake_join: Option<JoinHandle<()>>,
@@ -145,6 +156,8 @@ impl DaemonHandle {
             consolidation_renew_interval_ms,
             data_policy,
             supported_proto,
+            max_open_shards,
+            query_embedder,
         } = opts;
 
         layout.ensure().map_err(|e| {
@@ -201,7 +214,7 @@ impl DaemonHandle {
                     // Step 3: open/validate cache.sqlite.
                     let cache_db = CacheDb::open(layout.cache_db(), &store_instance_uuid)
                         .map_err(DaemonStartupError::Cache)?;
-                    (Some(Arc::new(state_db)), Some(cache_db))
+                    (Some(Arc::new(state_db)), Some(Arc::new(cache_db)))
                 }
                 Err(OpenError::Migration(boxed)) => {
                     let reason = migration_only_reason(&boxed);
@@ -210,6 +223,23 @@ impl DaemonHandle {
                 }
                 Err(other) => return Err(DaemonStartupError::State(other)),
             };
+
+        // The MCP code-query tools' `SearchEngine` — `None` exactly in
+        // `MigrationOnly` (no usable `state.sqlite`/`cache.sqlite` to build
+        // one from); `McpHandler` already knows how to answer `tools/call`
+        // in that case without one (spec 02 §6 `[FIXED]`: "nothing degrades
+        // silently").
+        let engine = match (&state_db, &cache_db) {
+            (Some(state), Some(cache)) => Some(build_search_engine(
+                Arc::clone(state),
+                Arc::clone(cache),
+                layout.clone(),
+                Arc::clone(&uuids),
+                query_embedder,
+                max_open_shards,
+            )),
+            _ => None,
+        };
 
         // Step 4: bind endpoint, write readiness marker, start the real
         // HELLO/WELCOME connection handler.
@@ -230,11 +260,12 @@ impl DaemonHandle {
             sessions: sessions.clone(),
             shutdown_requested: Arc::clone(&shutdown_requested),
         };
+        let mcp_handler = McpHandler::new(engine, mode_rx.clone(), system_now_ms);
         let (handshake_stop_tx, handshake_stop_rx) = oneshot::channel();
         let handshake_join = tokio::spawn(serve_connections(
             listener,
             handshake_ctx,
-            EchoRequestHandler,
+            mcp_handler,
             handshake_stop_rx,
         ));
 
@@ -364,6 +395,21 @@ async fn spawn_consolidation_resume(
     let _ =
         resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
             .await;
+}
+
+/// The current wall-clock time as Unix milliseconds — the live clock
+/// [`McpHandler`] reads on every request (spec 09's FTS staleness decision
+/// is clock-dependent, so a value frozen at daemon startup would misjudge
+/// it on every request after the first). Mirrors `main.rs::system_now_ms`/
+/// `local_rag_hook::clock::system_now_ms` exactly — this project's
+/// established convention is each call site carries its own trivial copy
+/// rather than a shared helper.
+fn system_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Why [`run`] stopped waiting.

@@ -709,6 +709,7 @@ dependencies = [
  "local-rag-memory",
  "local-rag-projection",
  "local-rag-protocol",
+ "local-rag-search",
  "local-rag-store",
  "local-rag-test-support",
  "rusqlite",

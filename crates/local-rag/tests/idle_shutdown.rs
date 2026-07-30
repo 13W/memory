@@ -12,6 +12,7 @@ use local_rag_core::DataPolicy;
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
+use local_rag_search::UnavailableEmbedder;
 use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
 use local_rag_test_support::TempHome;
 
@@ -51,6 +52,8 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         consolidation_renew_interval_ms: LEASE_RENEW_INTERVAL_MS,
         data_policy: DataPolicy::LocalOnly,
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
+        max_open_shards: 8,
+        query_embedder: Arc::new(UnavailableEmbedder),
     }
 }
 
