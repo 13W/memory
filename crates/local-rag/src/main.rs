@@ -10,6 +10,7 @@ use std::sync::Arc;
 use local_rag::daemon::{DaemonStartupError, ShutdownReason, StartOptions, StoreLockError};
 use local_rag_core::identity::SystemUuidV7;
 use local_rag_core::paths::{StoreLayout, SystemEnv, config_dir, data_dir};
+use local_rag_memory::recall::UnavailableEmbedder as UnavailableMemoryEmbedder;
 use local_rag_protocol::ErrorEnvelope;
 use local_rag_search::UnavailableEmbedder;
 use local_rag_store::{DEFAULT_WRITE_QUEUE_CAPACITY, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
@@ -89,6 +90,11 @@ async fn serve() -> ExitCode {
         // `search_code` correctly degrades to `lexical_only` with an
         // explicit reason instead of the dense leg silently never running.
         query_embedder: Arc::new(UnavailableEmbedder),
+        // Same precedent as `query_embedder` above, for the `recall` MCP
+        // tool's dense leg (T15-04): degrades visibly (`dense_degraded:
+        // Some(EmbedFailed(..))`) until T15-07 wires a real provider.
+        memory_query_embedder: Arc::new(UnavailableMemoryEmbedder),
+        recall_token_budget: config.memory.recall_token_budget,
     };
     let idle_shutdown_secs = config.daemon.idle_shutdown_secs;
 

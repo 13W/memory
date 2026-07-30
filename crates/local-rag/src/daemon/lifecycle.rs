@@ -21,6 +21,7 @@ use super::idle::{IdleGateInputs, idle_eligible};
 use super::jobs::JobRegistry;
 use super::lock::{self, StoreLockError, StoreLockGuard, StoreLockInfo};
 use super::mcp::McpHandler;
+use super::memory::build_memory_context;
 use super::mode::DaemonMode;
 use super::probe::SocketLivenessProbe;
 use super::resume::{build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs};
@@ -97,6 +98,17 @@ pub struct StartOptions {
     /// provider is T15-07's job — the same "type before backend" precedent
     /// `RequestHandler` itself already set).
     pub query_embedder: Arc<dyn QueryEmbedder>,
+    /// The MCP `recall` tool's dense-leg query embedder (T15-04) — a
+    /// **different** trait from `query_embedder` above (`local_rag_memory::
+    /// recall::QueryEmbedder`, not `local_rag_search::QueryEmbedder`: the
+    /// two seams embed under different `RepresentationKind`s, `memory` vs
+    /// `code_raw`). Production callers pass `local_rag_memory::recall::
+    /// UnavailableEmbedder` today, the same "type before backend, T15-07's
+    /// job" precedent as `query_embedder`.
+    pub memory_query_embedder: Arc<dyn local_rag_memory::recall::QueryEmbedder>,
+    /// `recall`'s token budget (`config.memory.recall_token_budget`, spec 08
+    /// §6 `[SPEC default 1500 tokens, config]`).
+    pub recall_token_budget: u32,
 }
 
 /// A running daemon instance, in-process (spec 02 §4.1 steps 1–5 complete;
@@ -158,6 +170,8 @@ impl DaemonHandle {
             supported_proto,
             max_open_shards,
             query_embedder,
+            memory_query_embedder,
+            recall_token_budget,
         } = opts;
 
         layout.ensure().map_err(|e| {
@@ -224,21 +238,31 @@ impl DaemonHandle {
                 Err(other) => return Err(DaemonStartupError::State(other)),
             };
 
-        // The MCP code-query tools' `SearchEngine` — `None` exactly in
+        // The MCP code-query tools' `SearchEngine` and the MCP status/
+        // memory-read tools' `MemoryContext` — both `None` exactly in
         // `MigrationOnly` (no usable `state.sqlite`/`cache.sqlite` to build
-        // one from); `McpHandler` already knows how to answer `tools/call`
-        // in that case without one (spec 02 §6 `[FIXED]`: "nothing degrades
-        // silently").
-        let engine = match (&state_db, &cache_db) {
-            (Some(state), Some(cache)) => Some(build_search_engine(
-                Arc::clone(state),
-                Arc::clone(cache),
-                layout.clone(),
-                Arc::clone(&uuids),
-                query_embedder,
-                max_open_shards,
-            )),
-            _ => None,
+        // either from, built from the same `(state_db, cache_db)` pair so
+        // the two `Option`s can never disagree); `McpHandler` already knows
+        // how to answer `tools/call` in that case without either (spec 02
+        // §6 `[FIXED]`: "nothing degrades silently").
+        let (engine, memory_ctx) = match (&state_db, &cache_db) {
+            (Some(state), Some(cache)) => (
+                Some(build_search_engine(
+                    Arc::clone(state),
+                    Arc::clone(cache),
+                    layout.clone(),
+                    Arc::clone(&uuids),
+                    query_embedder,
+                    max_open_shards,
+                )),
+                Some(build_memory_context(
+                    Arc::clone(state),
+                    Arc::clone(cache),
+                    memory_query_embedder,
+                    recall_token_budget,
+                )),
+            ),
+            _ => (None, None),
         };
 
         // Step 4: bind endpoint, write readiness marker, start the real
@@ -260,7 +284,7 @@ impl DaemonHandle {
             sessions: sessions.clone(),
             shutdown_requested: Arc::clone(&shutdown_requested),
         };
-        let mcp_handler = McpHandler::new(engine, mode_rx.clone(), system_now_ms);
+        let mcp_handler = McpHandler::new(engine, memory_ctx, mode_rx.clone(), system_now_ms);
         let (handshake_stop_tx, handshake_stop_rx) = oneshot::channel();
         let handshake_join = tokio::spawn(serve_connections(
             listener,

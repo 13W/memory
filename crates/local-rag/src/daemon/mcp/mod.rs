@@ -5,15 +5,17 @@
 //! [`jsonrpc`] is the inner JSON-RPC 2.0 envelope; [`dispatch`] routes
 //! methods; [`content`] maps domain/infra outcomes into MCP `isError`
 //! content; [`tools`] is the tool catalog and argument parsing; [`code`] is
-//! the three tool adapters over [`local_rag_search::SearchEngine`];
-//! [`instructions`] is `initialize`'s server identity/instructions/protocol
-//! negotiation.
+//! the three code-query tool adapters over [`local_rag_search::
+//! SearchEngine`]; [`memory`] is the six status/memory-read tool adapters
+//! over [`crate::daemon::memory::MemoryContext`] (T15-04); [`instructions`]
+//! is `initialize`'s server identity/instructions/protocol negotiation.
 
 mod code;
 mod content;
 mod dispatch;
 mod instructions;
 mod jsonrpc;
+mod memory;
 mod tools;
 
 use std::sync::Arc;
@@ -24,21 +26,31 @@ use serde_json::value::RawValue;
 use tokio::sync::watch;
 
 use super::handshake::RequestHandler;
+use super::memory::MemoryContext;
 use super::mode::DaemonMode;
 
 pub use instructions::{
     PREFERRED_MCP_PROTOCOL, SERVER_INSTRUCTIONS, SERVER_NAME, SUPPORTED_MCP_PROTOCOL,
 };
-pub use tools::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT};
+pub use tools::{
+    DEFAULT_LIST_LIMIT, DEFAULT_RECALL_LIMIT, DEFAULT_SEARCH_LIMIT, MAX_LIST_LIMIT,
+    MAX_RECALL_LIMIT, MAX_SEARCH_LIMIT,
+};
 
 /// The real `RequestHandler`: parses and dispatches MCP JSON-RPC, calling
-/// [`SearchEngine`] for `search_code`/`get_file_context`/`project_overview`.
+/// [`SearchEngine`] for `search_code`/`get_file_context`/`project_overview`
+/// and [`MemoryContext`] for `stats`/`health`/`recall`/`list_memory`/
+/// `list_memory_candidates`/`inspect_memory_evidence`.
 ///
-/// `engine: None` exactly when the daemon is in [`DaemonMode::
-/// MigrationOnly`] (no usable `state.sqlite`/`cache.sqlite` to build one
-/// from) — `initialize`/`tools/list`/`ping`/notifications still work in that
-/// mode (they touch no store); only `tools/call` short-circuits to
-/// `isError` + `INCOMPATIBLE_STORE` (see `dispatch::route_tools_call`).
+/// `engine`/`memory`: both `None` exactly when the daemon is in
+/// [`DaemonMode::MigrationOnly`] (no usable `state.sqlite`/`cache.sqlite` to
+/// build either from — they are constructed together, from the same
+/// `(state_db, cache_db)` pair, so the two `Option`s can never disagree) —
+/// `initialize`/`tools/list`/`ping`/notifications still work in that mode
+/// (they touch no store); only `tools/call` short-circuits to `isError` +
+/// `INCOMPATIBLE_STORE` (see `dispatch::route_tools_call`), uniformly for
+/// every tool including `health`/`stats` — see `mcp::memory::health`'s own
+/// doc comment for why that is not a gap.
 ///
 /// Per-connection handling stays sequential — no per-call `tokio::spawn` —
 /// the minimal delta on T15-02's transport: one proxy process serves one
@@ -49,6 +61,7 @@ pub use tools::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT};
 #[derive(Clone)]
 pub struct McpHandler {
     engine: Option<Arc<SearchEngine>>,
+    memory: Option<Arc<MemoryContext>>,
     mode: watch::Receiver<DaemonMode>,
     /// A live clock read, not a value frozen at construction — the FTS
     /// staleness decision `SearchEngine` makes on every call is
@@ -60,10 +73,16 @@ pub struct McpHandler {
 impl McpHandler {
     pub fn new(
         engine: Option<Arc<SearchEngine>>,
+        memory: Option<Arc<MemoryContext>>,
         mode: watch::Receiver<DaemonMode>,
         now: fn() -> i64,
     ) -> Self {
-        McpHandler { engine, mode, now }
+        McpHandler {
+            engine,
+            memory,
+            mode,
+            now,
+        }
     }
 }
 
@@ -72,6 +91,7 @@ impl RequestHandler for McpHandler {
         let mode = self.mode.borrow().clone();
         let dispatch_ctx = dispatch::DispatchContext {
             engine: self.engine.as_deref(),
+            memory: self.memory.as_deref(),
             mode: &mode,
             request_context: &ctx,
             now_ms: (self.now)(),

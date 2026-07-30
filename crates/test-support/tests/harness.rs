@@ -8,18 +8,21 @@ use local_rag_test_support::{
     Action, Clock, Failpoints, FixedClock, IdSource, ManualClock, SeqUuids, TempHome, run_capturing,
 };
 
-/// Two temporary homes created in parallel are fully isolated: distinct paths,
-/// and a write to one is invisible to the other. Both live under the system
-/// temp dir.
+/// Two temporary homes created in parallel are fully isolated: distinct
+/// paths under the exact same isolated temp root (D-023: not necessarily
+/// `std::env::temp_dir()` itself — `TempHome` prefers the shorter `/tmp` on
+/// Unix to keep derived Unix-domain-socket paths under `sockaddr_un.
+/// sun_path`'s limit), and a write to one is invisible to the other.
 #[test]
 fn two_temp_homes_are_isolated() {
     let a = TempHome::new().expect("home a");
     let b = TempHome::new().expect("home b");
     assert_ne!(a.path(), b.path());
-
-    let temp_root = std::env::temp_dir();
-    assert!(a.path().starts_with(&temp_root));
-    assert!(b.path().starts_with(&temp_root));
+    assert_eq!(
+        a.path().parent(),
+        b.path().parent(),
+        "both must live under the same isolated temp root"
+    );
 
     fs::write(a.join("marker.txt"), b"in a").expect("write a");
     assert!(a.join("marker.txt").exists());

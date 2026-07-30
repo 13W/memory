@@ -17,12 +17,13 @@ use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
     Actor, CandidateState, CandidateTransitionError, CreateMemoryEntryError, GLOBAL_SCOPE_OWNER_ID,
-    IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition, MemoryKind,
-    MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate, NewConsolidationRun,
-    NewMemoryEntry, NewMemoryEvidence, RunState, RunTransitionError, ScopeKind,
-    active_entries_for_scope, candidate_state, canonical_key_owner, consolidation_run_state,
-    create_candidate, create_consolidation_run, create_memory_entry, insert_audit_event,
-    insert_candidate_evidence, insert_memory_evidence, memory_entry_state, memory_entry_summary,
+    IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition, MemoryCountRow,
+    MemoryKind, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
+    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunState, RunTransitionError,
+    ScopeKind, active_entries_for_scope, candidate_state, canonical_key_owner,
+    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
+    insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
+    list_memory_entries_for_scope, memory_entry_counts, memory_entry_state, memory_entry_summary,
     memory_evidence_for, processing_cursor, read_audit_events_for_entity,
     recall_candidates_for_scope, transition_candidate, transition_memory_entry, transition_run,
     upsert_processing_cursor,
@@ -1472,4 +1473,252 @@ async fn canonical_key_owner_is_none_when_unclaimed_or_in_a_different_scope() {
         None,
         "the same key text in a different scope is a different slot"
     );
+}
+
+// ---------------------------------------------------------------------------
+// T15-04: list_memory_entries_for_scope / memory_entry_counts
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_memory_entries_for_scope_includes_terminal_states_and_isolates_by_scope() {
+    let (_home, db) = open_state();
+    let owner = uuid(166);
+    let other_owner = uuid(167);
+
+    let active_id = uuid(168);
+    create_memory(
+        &db,
+        &active_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create active");
+
+    let retracted_id = uuid(169);
+    create_memory(
+        &db,
+        &retracted_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create to retract");
+    transition_entry(&db, &retracted_id, MemoryState::Retracted)
+        .await
+        .expect("retract");
+
+    let other_scope_id = uuid(170);
+    create_memory(
+        &db,
+        &other_scope_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &other_owner,
+        None,
+    )
+    .await
+    .expect("create in a different scope");
+
+    let read = db.open_read().expect("read conn");
+    let found = list_memory_entries_for_scope(&read, ScopeKind::Worktree, &owner, None, None)
+        .expect("query");
+    // Unlike active_entries_for_scope/recall_candidates_for_scope, a
+    // review-tool listing must still surface the retracted entry (spec 04
+    // §5: "remain queryable via review tools") -- and never a different
+    // scope's rows.
+    assert_eq!(
+        found
+            .iter()
+            .map(|e| e.memory_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![active_id.as_str(), retracted_id.as_str()],
+        "both entries in this scope are listed, ordered by created_at then memory_id"
+    );
+    assert_eq!(found[1].state, MemoryState::Retracted);
+}
+
+#[tokio::test]
+async fn list_memory_entries_for_scope_filters_by_kind_and_state() {
+    let (_home, db) = open_state();
+    let owner = uuid(171);
+
+    let fact_id = uuid(172);
+    create_memory(
+        &db,
+        &fact_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create fact");
+
+    let task_id = uuid(173);
+    create_memory(
+        &db,
+        &task_id,
+        MemoryKind::Task,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create task");
+    transition_entry(&db, &task_id, MemoryState::Resolved)
+        .await
+        .expect("resolve");
+
+    let read = db.open_read().expect("read conn");
+
+    let by_kind = list_memory_entries_for_scope(
+        &read,
+        ScopeKind::Worktree,
+        &owner,
+        Some(MemoryKind::Fact),
+        None,
+    )
+    .expect("query");
+    assert_eq!(
+        by_kind
+            .iter()
+            .map(|e| e.memory_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![fact_id.as_str()]
+    );
+
+    let by_state = list_memory_entries_for_scope(
+        &read,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+        Some(MemoryState::Resolved),
+    )
+    .expect("query");
+    assert_eq!(
+        by_state
+            .iter()
+            .map(|e| e.memory_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![task_id.as_str()]
+    );
+
+    let unfiltered = list_memory_entries_for_scope(&read, ScopeKind::Worktree, &owner, None, None)
+        .expect("query");
+    assert_eq!(unfiltered.len(), 2, "no filter returns both");
+}
+
+#[tokio::test]
+async fn list_memory_entries_for_scope_carries_the_full_row_shape() {
+    let (_home, db) = open_state();
+    let owner = uuid(174);
+    let id = uuid(175);
+    create_memory(
+        &db,
+        &id,
+        MemoryKind::Decision,
+        ScopeKind::Worktree,
+        &owner,
+        Some("storage-backend"),
+    )
+    .await
+    .expect("create keyed");
+
+    let read = db.open_read().expect("read conn");
+    let found = list_memory_entries_for_scope(&read, ScopeKind::Worktree, &owner, None, None)
+        .expect("query");
+    assert_eq!(found.len(), 1);
+    let row = &found[0];
+    assert_eq!(row.memory_id, id);
+    assert_eq!(row.kind, MemoryKind::Decision);
+    assert_eq!(row.state, MemoryState::Active);
+    assert_eq!(row.text, "some durable text");
+    assert_eq!(row.canonical_key.as_deref(), Some("storage-backend"));
+    assert_eq!(row.scope_kind, ScopeKind::Worktree);
+    assert_eq!(row.scope_owner_id, owner);
+    assert_eq!(row.confidence, 0.5);
+    assert_eq!(row.importance, 0.5);
+    assert_eq!(row.valid_from_tree, None);
+    assert_eq!(row.last_verified_tree, None);
+    assert_eq!(row.supersedes_id, None);
+    assert_eq!(row.entry_version, 1);
+    assert_eq!(row.created_at, 1000);
+    assert_eq!(row.updated_at, 1000);
+}
+
+#[tokio::test]
+async fn memory_entry_counts_groups_by_kind_and_state_store_wide() {
+    let (_home, db) = open_state();
+    let owner = uuid(176);
+    let other_owner = uuid(177);
+
+    // Two active facts (possibly different scopes -- counts are store-wide,
+    // not scope-filtered).
+    create_memory(
+        &db,
+        &uuid(178),
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create fact 1");
+    create_memory(
+        &db,
+        &uuid(179),
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &other_owner,
+        None,
+    )
+    .await
+    .expect("create fact 2");
+
+    // One resolved task.
+    let task_id = uuid(180);
+    create_memory(
+        &db,
+        &task_id,
+        MemoryKind::Task,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create task");
+    transition_entry(&db, &task_id, MemoryState::Resolved)
+        .await
+        .expect("resolve");
+
+    let read = db.open_read().expect("read conn");
+    let counts = memory_entry_counts(&read).expect("counts");
+    assert_eq!(
+        counts,
+        vec![
+            MemoryCountRow {
+                kind: MemoryKind::Fact,
+                state: MemoryState::Active,
+                count: 2,
+            },
+            MemoryCountRow {
+                kind: MemoryKind::Task,
+                state: MemoryState::Resolved,
+                count: 1,
+            },
+        ],
+        "ordered by (kind, state); empty buckets are omitted, not zero-filled"
+    );
+}
+
+#[tokio::test]
+async fn memory_entry_counts_is_empty_for_an_empty_store() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+    assert_eq!(memory_entry_counts(&read).expect("counts"), Vec::new());
 }

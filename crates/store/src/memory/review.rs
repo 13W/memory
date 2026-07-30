@@ -558,19 +558,25 @@ pub fn observation_evidence_source(
 /// — with no numeric version on this table, `review_state`/`created_at` are
 /// its own staleness signal; pair with
 /// [`candidate_evidence_for`](super::candidate::candidate_evidence_for) for
-/// provenance).
+/// provenance). `limit`/`offset` are a plain SQL window (T15-04's
+/// `list_memory_candidates` MCP tool) — a caller wanting to detect "more
+/// rows exist" over-fetches by one and slices the extra row off itself; this
+/// primitive stays an honest "N rows starting at K", not a paginator.
 pub fn list_candidates(
     conn: &Connection,
     review_state_filter: Option<CandidateState>,
+    limit: i64,
+    offset: i64,
 ) -> rusqlite::Result<Vec<CandidateRow>> {
     let mut stmt = conn.prepare(
         "SELECT candidate_id, proposed_operation, conflicts, review_state, created_at \
          FROM pending_memory_candidate \
          WHERE ?1 IS NULL OR review_state = ?1 \
-         ORDER BY created_at, candidate_id",
+         ORDER BY created_at, candidate_id \
+         LIMIT ?2 OFFSET ?3",
     )?;
     let filter = review_state_filter.map(CandidateState::as_str);
-    let rows = stmt.query_map(params![filter], |r| {
+    let rows = stmt.query_map(params![filter, limit, offset], |r| {
         let raw: String = r.get(3)?;
         let review_state = CandidateState::from_db(&raw).ok_or_else(|| {
             Error::FromSqlConversionFailure(

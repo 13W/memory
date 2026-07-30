@@ -668,6 +668,119 @@ pub fn canonical_key_owner(
     .optional()
 }
 
+/// One full `memory_entry` row (spec 03 §2.5) — every column, unlike
+/// [`MemoryEntrySummary`]'s narrower conflict-lookup shape. Built for
+/// `list_memory` (11 §2, T15-04): a reviewer needs `confidence`/`importance`/
+/// timestamps/`supersedes_id`, none of which any existing caller (the
+/// router's conflict lookup, the recall pipeline) reads — the same reasoning
+/// [`RecallCandidate`] already gives for not reusing `MemoryEntrySummary`
+/// either, generalized to the review tool's own full-row need.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryEntryRow {
+    pub memory_id: String,
+    pub kind: MemoryKind,
+    pub state: MemoryState,
+    pub text: String,
+    pub canonical_key: Option<String>,
+    pub scope_kind: ScopeKind,
+    pub scope_owner_id: String,
+    pub confidence: f64,
+    pub importance: f64,
+    pub valid_from_tree: Option<String>,
+    pub last_verified_tree: Option<String>,
+    pub supersedes_id: Option<String>,
+    pub entry_version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+const FULL_ROW_COLUMNS: &str = "memory_id, kind, state, text, canonical_key, scope_kind, \
+     scope_owner_id, confidence, importance, valid_from_tree, last_verified_tree, \
+     supersedes_id, entry_version, created_at, updated_at";
+
+fn read_full_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntryRow> {
+    let raw_kind: String = r.get(1)?;
+    let kind = MemoryKind::from_db(&raw_kind).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            1,
+            Type::Text,
+            format!("invalid memory_entry.kind {raw_kind:?}").into(),
+        )
+    })?;
+    let raw_state: String = r.get(2)?;
+    let state = MemoryState::from_db(&raw_state).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            format!("invalid memory_entry.state {raw_state:?}").into(),
+        )
+    })?;
+    let raw_scope_kind: String = r.get(5)?;
+    let scope_kind = ScopeKind::from_db(&raw_scope_kind).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            5,
+            Type::Text,
+            format!("invalid memory_entry.scope_kind {raw_scope_kind:?}").into(),
+        )
+    })?;
+    Ok(MemoryEntryRow {
+        memory_id: r.get(0)?,
+        kind,
+        state,
+        text: r.get(3)?,
+        canonical_key: r.get(4)?,
+        scope_kind,
+        scope_owner_id: r.get(6)?,
+        confidence: r.get(7)?,
+        importance: r.get(8)?,
+        valid_from_tree: r.get(9)?,
+        last_verified_tree: r.get(10)?,
+        supersedes_id: r.get(11)?,
+        entry_version: r.get(12)?,
+        created_at: r.get(13)?,
+        updated_at: r.get(14)?,
+    })
+}
+
+/// Every `memory_entry` row in `(scope_kind, scope_owner_id)`, **including
+/// terminal states** — unlike [`active_entries_for_scope`]/
+/// [`recall_candidates_for_scope`], which both exclude them for recall
+/// purposes. Spec 04 §5: terminal states "remain queryable via review
+/// tools," and `list_memory` (spec 11 §2, T15-04) is exactly that review
+/// tool. `kind_filter`/`state_filter` are both optional narrowing, the same
+/// `?N IS NULL OR ...` idiom [`active_entries_for_scope`] already uses for
+/// `canonical_key_filter`. No `LIMIT`/`OFFSET` here: a caller unions
+/// multiple scopes (global ∪ repository ∪ worktree) in Rust first — the same
+/// per-scope-then-union pattern `local_rag_memory::recall::pipeline` already
+/// follows — so pagination has to slice the union, not any one scope's rows.
+pub fn list_memory_entries_for_scope(
+    conn: &Connection,
+    scope_kind: ScopeKind,
+    scope_owner_id: &str,
+    kind_filter: Option<MemoryKind>,
+    state_filter: Option<MemoryState>,
+) -> rusqlite::Result<Vec<MemoryEntryRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {FULL_ROW_COLUMNS} FROM memory_entry \
+         WHERE scope_kind = ?1 AND scope_owner_id = ?2 \
+           AND (?3 IS NULL OR kind = ?3) \
+           AND (?4 IS NULL OR state = ?4) \
+         ORDER BY created_at, memory_id"
+    ))?;
+    let rows = stmt
+        .query_map(
+            params![
+                scope_kind.as_str(),
+                scope_owner_id,
+                kind_filter.map(MemoryKind::as_str),
+                state_filter.map(MemoryState::as_str),
+            ],
+            read_full_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

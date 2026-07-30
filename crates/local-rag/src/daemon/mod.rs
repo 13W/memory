@@ -12,10 +12,12 @@
 //! migration failure into both. [`gitroot`] git-probes an MCP request's
 //! `worktree_root` path into the registry's `RequestRoot` (spec 02 §3.3,
 //! T15-03). [`search`] builds the `local_rag_search::SearchEngine` the MCP
-//! code-query tools call. [`mcp`] is the real MCP JSON-RPC dispatcher (spec
-//! 11 §2, T15-03) — the `RequestHandler` `lifecycle` wires in place of
-//! T15-02's `EchoRequestHandler`. [`lifecycle`] composes all of the above
-//! into the five startup steps and the shutdown sequence ([`shutdown`]) —
+//! code-query tools call; [`memory`] builds the analogous [`MemoryContext`]
+//! the MCP status/memory-read tools call (spec 11 §2, T15-04). [`mcp`] is
+//! the real MCP JSON-RPC dispatcher (spec 11 §2, T15-03/T15-04) — the
+//! `RequestHandler` `lifecycle` wires in place of T15-02's
+//! `EchoRequestHandler`. [`lifecycle`] composes all of the above into the
+//! five startup steps and the shutdown sequence ([`shutdown`]) —
 //! [`lifecycle::run`] is what `main.rs`'s `serve` command drives.
 
 pub mod error;
@@ -26,6 +28,7 @@ pub mod jobs;
 pub mod lifecycle;
 pub mod lock;
 pub mod mcp;
+pub mod memory;
 pub mod mode;
 pub mod probe;
 pub mod resume;
@@ -43,6 +46,7 @@ pub use lifecycle::{
 };
 pub use lock::{StoreLockError, StoreLockGuard, StoreLockInfo, acquire};
 pub use mcp::McpHandler;
+pub use memory::{MemoryContext, build_memory_context};
 pub use mode::{DaemonMode, MigrationOnlyReason};
 #[cfg(unix)]
 pub use probe::SocketLivenessProbe;

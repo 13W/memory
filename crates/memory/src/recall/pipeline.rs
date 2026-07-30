@@ -63,9 +63,10 @@ use std::collections::HashMap;
 
 use local_rag_store::rusqlite::{self, Connection};
 use local_rag_store::{
-    GLOBAL_SCOPE_OWNER_ID, RecallCandidate, RepresentationKind, RequestRoot, Resolution, ScopeKind,
-    default_model_space_id, model_space_required_representation_ids, projection_state,
-    recall_candidate_by_id, recall_candidates_for_scope, representation_key, resolve,
+    GLOBAL_SCOPE_OWNER_ID, MemoryKind, MemoryState, RecallCandidate, RepresentationKind,
+    RequestRoot, Resolution, ScopeKind, default_model_space_id,
+    model_space_required_representation_ids, projection_state, recall_candidate_by_id,
+    recall_candidates_for_scope, representation_key, resolve,
 };
 
 use super::dense::{DenseLegUnavailable, MemoryDenseBackend, QueryEmbedder, dense_leg};
@@ -101,6 +102,22 @@ pub struct RecallRequest<'a> {
     pub query: &'a str,
 }
 
+/// One chosen recall entry with its `memory_id` attached — T15-04's MCP
+/// `recall()` tool surface. Unlike [`RecallEntry`] (`format.rs`), which
+/// deliberately omits `memory_id` because it is printed into the untrusted
+/// `additionalContext` text block (spec 12 §4), this type is never printed
+/// there — it exists only for MCP callers, per 12 §4 item 3: "provenance
+/// separated from text ... available via tools only." `recall()` is one of
+/// those tools.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallResultEntry {
+    pub memory_id: String,
+    pub kind: MemoryKind,
+    pub state: MemoryState,
+    pub confidence: f64,
+    pub text: String,
+}
+
 /// Everything one `recall()` call observed, beyond the wire text itself —
 /// for daemon-side logging/diagnostics, never printed into
 /// `additionalContext` (spec 12 §4: provenance/diagnostics stay out of the
@@ -110,6 +127,17 @@ pub struct RecallOutcome {
     /// The exact `additionalContext` bytes (spec 11 §5) — `""` for an empty
     /// result.
     pub additional_context: String,
+    /// The scope descriptor also embedded in `additional_context`'s own
+    /// header (`global` or `repo:<repo_id>`) — surfaced as its own field so
+    /// an MCP caller does not have to parse it back out of the text block.
+    pub scope_label: String,
+    /// The same entries `additional_context` renders, with `memory_id`
+    /// attached (T15-04, `[SPEC]`: `recall(query?, limit?)`'s own `limit?`
+    /// param is only meaningful against a countable list). Ordered
+    /// identically to the text block; a caller wanting fewer entries slices
+    /// this list — `additional_context` itself is never re-rendered for a
+    /// smaller `limit`.
+    pub entries: Vec<RecallResultEntry>,
     /// How many candidates were actually scored, after the guard.
     pub candidate_count: usize,
     /// Whether [`MAX_RECALL_CANDIDATES`] truncated the candidate set.
@@ -154,6 +182,8 @@ pub fn recall(
     if candidates.is_empty() {
         return Ok(RecallOutcome {
             additional_context: String::new(),
+            scope_label,
+            entries: Vec::new(),
             candidate_count: 0,
             truncated: false,
             dense_degraded: None,
@@ -226,6 +256,7 @@ pub fn recall(
     //    order: a stale (now-terminal) entry is skipped; the first entry
     //    that would overflow the budget stops the walk (a ranked prefix).
     let mut chosen: Vec<RecallEntry> = Vec::new();
+    let mut entries: Vec<RecallResultEntry> = Vec::new();
     let mut used_tokens: u32 = 0;
     for candidate in ordered {
         let Some(fresh) = recall_candidate_by_id(state_read, &candidate.memory_id)? else {
@@ -240,6 +271,13 @@ pub fn recall(
             break;
         }
         used_tokens += cost;
+        entries.push(RecallResultEntry {
+            memory_id: fresh.memory_id.clone(),
+            kind: fresh.kind,
+            state: fresh.state,
+            confidence: fresh.confidence,
+            text: fresh.text.clone(),
+        });
         chosen.push(RecallEntry {
             kind: fresh.kind,
             state: fresh.state,
@@ -248,8 +286,11 @@ pub fn recall(
         });
     }
 
+    let additional_context = format_additional_context(&scope_label, &chosen);
     Ok(RecallOutcome {
-        additional_context: format_additional_context(&scope_label, &chosen),
+        additional_context,
+        scope_label,
+        entries,
         candidate_count,
         truncated,
         dense_degraded,
@@ -262,7 +303,12 @@ pub fn recall(
 /// `repo_id`/`worktree_id` recall can safely scope to, and spec 02 §6's own
 /// table already establishes the principle this generalizes: "Worktree
 /// unknown / never indexed | … memory tools work in repo/global scope".
-fn scopes_for(resolution: &Resolution) -> (String, Vec<(ScopeKind, String)>) {
+///
+/// `pub` (T15-04): `list_memory`/`stats` (`local_rag::daemon::mcp::memory`)
+/// need the identical scope-union logic — reusing this instead of
+/// re-deriving it in the daemon crate keeps the "memory tools degrade to
+/// global scope" rule defined in exactly one place.
+pub fn scopes_for(resolution: &Resolution) -> (String, Vec<(ScopeKind, String)>) {
     match resolution {
         Resolution::Resolved {
             repo_id,
@@ -587,5 +633,110 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abcd"), 1);
         assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[tokio::test]
+    async fn recall_entries_carry_memory_id_in_the_same_order_as_additional_context() {
+        let (_home, state, cache) = open_both();
+        let older_id = uuid(40);
+        seed_memory(
+            &state,
+            &older_id,
+            MemoryKind::Fact,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "older fact",
+            0.5,
+            1_000,
+        )
+        .await;
+        let newer_id = uuid(41);
+        seed_memory(
+            &state,
+            &newer_id,
+            MemoryKind::Fact,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "newer fact",
+            0.5,
+            2_000,
+        )
+        .await;
+
+        let state_read = state.open_read().expect("state read");
+        let cache_read = cache.open_read().expect("cache read");
+        let request = global_only_request("");
+        let outcome = recall(
+            &state_read,
+            &cache_read,
+            &UnavailableEmbedder,
+            &BruteForceCosine,
+            &request,
+            1500,
+        )
+        .expect("recall");
+
+        assert_eq!(
+            outcome
+                .entries
+                .iter()
+                .map(|e| e.memory_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![newer_id.as_str(), older_id.as_str()],
+            "entries mirror additional_context's own recency order"
+        );
+        assert_eq!(outcome.entries[0].text, "newer fact");
+        assert_eq!(outcome.entries[0].kind, MemoryKind::Fact);
+        assert_eq!(outcome.entries[0].state, MemoryState::Active);
+        assert_eq!(outcome.entries[0].confidence, 0.5);
+    }
+
+    #[tokio::test]
+    async fn recall_scope_label_reflects_global_only_resolution() {
+        let (_home, state, cache) = open_both();
+        let state_read = state.open_read().expect("state read");
+        let cache_read = cache.open_read().expect("cache read");
+        let request = global_only_request("anything");
+        let outcome = recall(
+            &state_read,
+            &cache_read,
+            &UnavailableEmbedder,
+            &BruteForceCosine,
+            &request,
+            1500,
+        )
+        .expect("recall");
+        assert_eq!(outcome.scope_label, "global");
+    }
+
+    #[tokio::test]
+    async fn recall_entries_is_empty_when_candidates_exist_but_none_fit_the_budget() {
+        let (_home, state, cache) = open_both();
+        seed_memory(
+            &state,
+            &uuid(42),
+            MemoryKind::Fact,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "some fact",
+            0.5,
+            1_000,
+        )
+        .await;
+
+        let state_read = state.open_read().expect("state read");
+        let cache_read = cache.open_read().expect("cache read");
+        let request = global_only_request("fact");
+        let outcome = recall(
+            &state_read,
+            &cache_read,
+            &UnavailableEmbedder,
+            &BruteForceCosine,
+            &request,
+            0,
+        )
+        .expect("recall");
+        assert_eq!(outcome.additional_context, "");
+        assert!(outcome.entries.is_empty());
     }
 }
