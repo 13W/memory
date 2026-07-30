@@ -233,6 +233,76 @@ precisely than the shipped code:
   `"normal"` in practice today — included for the contract's own "daemon/version/store status"
   completeness, not because MigrationOnly ever reaches it.
 
+As-built note (T15-05, `[SPEC]`): the eight memory-write/candidate-review tools this section's
+table names — `remember`, `approve_memory_candidate`, `reject_memory_candidate`,
+`edit_memory_candidate`, `edit_memory`, `retract_memory`, `merge_memories`, `give_feedback` — are
+`local_rag::daemon::mcp::memory_write`, a sibling of T15-04's `mcp::memory` (kept separate so that
+file's own "every tool here is read-only" doc claim stays true). Every group-14 store primitive
+(`op::apply_*`, `review::{approve,reject,edit}_candidate`) already existed, gate-passed; this task
+is pure wiring plus five decisions the spec's own terseness left open:
+
+- **`remember` always writes `actor=Actor::User`**, regardless of `confirmed_by_user`. The
+  shipped `op.rs` doc comment on the model-claim-only-provenance backstop (T14-02, unchanged by
+  this task) already says `actor == User` is exempt "by construction" because "spec 08 §5's
+  `remember`/candidate-approval path already carries user-equivalent trust… a human already
+  vouched for it" — a forward-looking note this task completes rather than reinterprets. Reading
+  08 §5's "else actor='router'-equivalent trust" as literal `Actor::Router` would make the
+  backstop sometimes reachable from an explicit human/agent tool call, defeating its own purpose
+  (guarding the *autonomous* consolidation router, not a deliberate `remember()` invocation).
+  `confirmed_by_user` instead scales confidence (`Signal::High.confidence()` when `true`,
+  `Signal::Medium.confidence()` when `false` — `crates/memory/src/schema.rs`'s existing
+  "chosen, not derived" constants, same numbers the router itself uses). `remember` attaches no
+  evidence at all (`evidence: &[]`): its own spec-fixed argument list has no `observation_id` to
+  cite, and synthesizing one would fabricate provenance that does not exist. `importance?` is a
+  qualitative `Signal` string (`low|medium|high`, default `medium`) — a fresh, unverified
+  assertion with nothing to round-trip against, the same class the router itself must express
+  qualitatively (T14-07) — unlike `edit_memory`'s `patch.importance`, a raw `f64` edit of an
+  already-materialized value the caller just read via `list_memory`.
+- **`remember` carries an idempotency key** (`mcp-remember:<session_id>:<request_id>`, never on
+  the wire), despite `CreateMemoryOp.idempotency_key`'s original doc comment naming `remember` as
+  the `None` example — that comment predates `remember`'s own design and is updated by this task,
+  not contradicted: `remember` has no `expected_version` and an optional `canonical_key`, so
+  without a key a bare retry (no `canonical_key` given) would silently create a second entry,
+  conflicting with this section's own "All mutating tools are idempotent under retry."
+- **`remember`'s default scope**: `repository` when the request's worktree resolves, else
+  `global` — a durable memory is normally "about this project," not the transient worktree
+  checkout. An explicit `scope: "repository"`/`"worktree"` while unresolved is
+  `WORKTREE_NOT_INDEXED` (the caller asked for a scope this request cannot supply), never
+  silently downgraded.
+- **`give_feedback` never calls the op engine** — it is the MCP-callable equivalent of a hook's
+  spool append, purely an `observation_envelope` insert (`local_rag_store::observation::
+  insert_envelope`, widened from `pub(crate)` to `pub` — it had no spool-specific coupling to
+  begin with, so widening it was direct reuse, not a new wrapper around `import_batch`'s
+  cursor-advancing machinery, which does not apply to a single daemon-internal write). Durable
+  memory consequences, if any, arrive later via the normal consolidation pass over this new
+  observation, exactly as this section's own text says ("daemon-internal writes" are exempt from
+  the spool-only constraint, not from the router pipeline). Field choices: `source_event_id =
+  dedup_key = "mcp:<session_id>:<request_id>"` (this section's own literal source-identity
+  format) — a retried identical JSON-RPC call reproduces the same key, and `insert_envelope`'s
+  existing `ON CONFLICT(dedup_key) DO NOTHING` reports it back as already-recorded (an idempotent
+  success, never an error) rather than inserting a duplicate row; `payload_hash =
+  sha256_hex(text)` (the same idiom `import.rs` already uses for real spool-imported payloads,
+  not the domain-separated BLAKE3 family spec 03 §1.2 reserves for durable UNIQUE/FK identity);
+  `event_type = "McpFeedback"` (the column carries no CHECK constraint, and the one place that
+  pattern-matches on `event_type` strings — `spool.rs`'s frame decoder — is unreachable from this
+  direct-insert path); `evidence_kind = user_statement`, `trust = normal`.
+- **The JSON-RPC request `id`** now threads into `route_tools_call` as an explicit parameter
+  (`crates/local-rag/src/daemon/mcp/dispatch.rs`), not a `DispatchContext` field — the id is
+  parsed inside `dispatch()` itself, after `DispatchContext` is already built in `McpHandler::
+  handle`, so a field would need parsing twice. `request_id_string` stringifies whichever
+  JSON-RPC id shape (string/number/null) the caller sent for the `mcp:<session_id>:<request_id>`
+  identity both `remember` and `give_feedback` use.
+
+Thirteen new `ErrorCode` variants (`crates/protocol/src/error.rs`) map the full `MemoryOpError`/
+`ReviewError` vocabulary one-to-one — no shared "generic" code, the same precedent the nine
+existing codes already set (`WorktreeNotIndexed`/`PathNotIndexed`/`IndexUnavailable` stay three
+distinct "not found"-shaped codes rather than collapsing into one). `ReviewError::Materialization`
+unwraps to the identical `MemoryOpError` code a direct `edit_memory`/`remember` call would show
+for the same underlying condition, rather than a separate "materialization failed" code. All
+`retryable: false` — every one of these is a deterministic same-request-same-state refusal;
+retry-safety for this tool set comes from `expected_version`/idempotency keys/candidate
+`review_state`, not from the envelope's own `retryable` flag.
+
 ## 3. Hooks
 
 ### 3.1 Ingestion hooks `[FIXED]`

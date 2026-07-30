@@ -70,7 +70,7 @@ async fn a_notification_produces_no_response_line() {
 }
 
 #[tokio::test]
-async fn tools_list_advertises_all_nine_v0_tools() {
+async fn tools_list_advertises_all_seventeen_v0_tools() {
     let (_home, layout) = open_layout();
     let socket_path = layout.socket_path();
     let handle = start(&layout).await;
@@ -100,8 +100,21 @@ async fn tools_list_advertises_all_nine_v0_tools() {
             "inspect_memory_evidence",
             "stats",
             "health",
+            "remember",
+            "approve_memory_candidate",
+            "reject_memory_candidate",
+            "edit_memory_candidate",
+            "edit_memory",
+            "retract_memory",
+            "merge_memories",
+            "give_feedback",
         ]
     );
+    // v1 name mapping (spec 11 §2): forget -> retract_memory,
+    // consolidate(src,tgt) -> merge_memories -- neither v1 name is ever
+    // exposed as its own tool (this task card's own test bullet).
+    assert!(!names.contains(&"forget"), "{names:?}");
+    assert!(!names.contains(&"consolidate"), "{names:?}");
     handle.shutdown().await;
 }
 
@@ -178,6 +191,19 @@ async fn tools_call_argument_errors_get_invalid_params() {
             r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"list_memory","arguments":{"offset":-1}}}"#,
             r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"stats","arguments":{"bogus":true}}}"#,
             r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"health","arguments":{"bogus":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"remember","arguments":{"text":"x"}}}"#,
+            r#"{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"remember","arguments":{"text":"x","kind":"bogus"}}}"#,
+            r#"{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"remember","arguments":{"text":"","kind":"fact"}}}"#,
+            r#"{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"approve_memory_candidate","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"reject_memory_candidate","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"edit_memory_candidate","arguments":{"id":"c-1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"edit_memory_candidate","arguments":{"id":"c-1","patch":{"bogus":true}}}}"#,
+            r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"edit_memory","arguments":{"id":"m-1","patch":{"text":"x"}}}}"#,
+            r#"{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"edit_memory","arguments":{"id":"m-1","expected_version":1,"patch":{}}}}"#,
+            r#"{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"retract_memory","arguments":{"id":"m-1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"merge_memories","arguments":{"ids":[{"memory_id":"m-1","expected_version":1}],"survivor_id":"m-1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"merge_memories","arguments":{"ids":[{"memory_id":"m-1","expected_version":1},{"memory_id":"m-2","expected_version":1}],"survivor_id":"m-3"}}}"#,
+            r#"{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"give_feedback","arguments":{}}}"#,
         ];
         cases
             .iter()

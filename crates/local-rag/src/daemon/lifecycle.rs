@@ -260,6 +260,7 @@ impl DaemonHandle {
                     Arc::clone(cache),
                     memory_query_embedder,
                     recall_token_budget,
+                    Arc::clone(&uuids),
                 )),
             ),
             _ => (None, None),

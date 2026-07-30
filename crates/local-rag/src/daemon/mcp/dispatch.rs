@@ -81,7 +81,7 @@ pub async fn dispatch(text: &str, ctx: &DispatchContext<'_>) -> Option<String> {
             Ok(()) => encode_success(id, tools::catalog()),
             Err(msg) => encode_error(id, jsonrpc::INVALID_PARAMS, &msg),
         },
-        "tools/call" => match route_tools_call(ctx, request.params).await {
+        "tools/call" => match route_tools_call(ctx, &id, request.params).await {
             Ok(result) => encode_success(id, result),
             Err((code, msg)) => encode_error(id, code, &msg),
         },
@@ -96,6 +96,7 @@ pub async fn dispatch(text: &str, ctx: &DispatchContext<'_>) -> Option<String> {
 
 async fn route_tools_call(
     ctx: &DispatchContext<'_>,
+    id: &Value,
     params: Option<Value>,
 ) -> Result<Value, (i64, String)> {
     let call = tools::parse_tool_call(params).map_err(|msg| (jsonrpc::INVALID_PARAMS, msg))?;
@@ -132,6 +133,46 @@ async fn route_tools_call(
         }
         "stats" => super::memory::stats(memory, root, &call.arguments).await,
         "health" => super::memory::health(memory, ctx.mode, &call.arguments).await,
+        "remember" => {
+            super::memory_write::remember(
+                memory,
+                root,
+                &call.arguments,
+                &ctx.request_context.session_id,
+                id,
+                ctx.now_ms,
+            )
+            .await
+        }
+        "approve_memory_candidate" => {
+            super::memory_write::approve_memory_candidate(memory, &call.arguments, ctx.now_ms).await
+        }
+        "reject_memory_candidate" => {
+            super::memory_write::reject_memory_candidate(memory, &call.arguments).await
+        }
+        "edit_memory_candidate" => {
+            super::memory_write::edit_memory_candidate(memory, &call.arguments).await
+        }
+        "edit_memory" => {
+            super::memory_write::edit_memory(memory, &call.arguments, ctx.now_ms).await
+        }
+        "retract_memory" => {
+            super::memory_write::retract_memory(memory, &call.arguments, ctx.now_ms).await
+        }
+        "merge_memories" => {
+            super::memory_write::merge_memories(memory, &call.arguments, ctx.now_ms).await
+        }
+        "give_feedback" => {
+            super::memory_write::give_feedback(
+                memory,
+                root,
+                &call.arguments,
+                &ctx.request_context.session_id,
+                id,
+                ctx.now_ms,
+            )
+            .await
+        }
         other => return Err((jsonrpc::INVALID_PARAMS, format!("unknown tool: {other}"))),
     };
     result

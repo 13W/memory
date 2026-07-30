@@ -224,7 +224,16 @@ pub struct NewObservationEnvelope<'a> {
 /// `dedup_key` (best-effort events) can never trigger this conflict; the
 /// bounded-window dedup check for those is a separate read
 /// ([`recent_same_source_event_exists`]) the caller runs *before* calling this.
-pub(crate) fn insert_envelope(
+///
+/// `pub` (T15-05, widened from `pub(crate)`): [`import`]'s `import_batch` is
+/// not the only legitimate caller — it is shaped for the spool decoder
+/// (cursor advance, batch of `DecodedObservation`), machinery a single
+/// daemon-internal write (the MCP `give_feedback` tool, spec 11 §2: "writes
+/// an observation envelope directly... spool-only constraint applies to
+/// hooks, not to daemon-internal writes") has no use for. This primitive
+/// itself has no spool coupling at all, so widening it is the direct reuse,
+/// not a new wrapper.
+pub fn insert_envelope(
     tx: &Transaction<'_>,
     row: &NewObservationEnvelope<'_>,
 ) -> rusqlite::Result<Option<i64>> {

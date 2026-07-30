@@ -155,8 +155,15 @@ pub struct CreateMemoryOp<'a> {
     pub last_verified_tree: Option<&'a str>,
     pub evidence: &'a [EvidenceInput<'a>],
     pub actor: Actor,
-    /// `Some` for a router-originated op (spec 08 §3); `None` for a direct
-    /// tool call (e.g. `remember`, 08 §5), which has no retry to recognize.
+    /// `Some` for a router-originated op (spec 08 §3), or for the MCP
+    /// `remember` tool (T15-05, `[SPEC]`): `remember` has no
+    /// `expected_version` to fall back on and an optional `canonical_key`,
+    /// so without an idempotency key a bare retry (no `canonical_key`
+    /// given) would create a second entry — `remember` builds one from the
+    /// request's own identity (`mcp-remember:<session_id>:<request_id>`,
+    /// mirroring `give_feedback`'s `mcp:<session_id>:<request_id>` source
+    /// identity, 11 §2), never exposed on the wire. `None` for any other
+    /// direct tool call with no retry to recognize.
     pub idempotency_key: Option<&'a str>,
 }
 

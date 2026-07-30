@@ -245,6 +245,223 @@ pub fn catalog() -> Value {
                     "properties": {},
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "remember",
+                "description": "Create a new durable memory entry directly (not via candidate \
+                    review). Defaults to repository scope when the request's worktree resolves, \
+                    else global.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "fact", "decision", "convention", "procedure", "task",
+                                "question", "hypothesis"
+                            ]
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["global", "repository", "worktree"],
+                            "description": "Restrict to one scope instead of the default \
+                                (repository when the worktree resolves, else global)."
+                        },
+                        "canonical_key": {
+                            "type": "string",
+                            "description": "Unique within (scope_kind, scope_owner_id); a \
+                                conflict is CANONICAL_KEY_CONFLICT."
+                        },
+                        "importance": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                            "default": "medium"
+                        },
+                        "confirmed_by_user": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Whether a human explicitly confirmed this text. \
+                                Raises the entry's confidence; does not change who is recorded \
+                                as the acting actor (always the caller)."
+                        }
+                    },
+                    "required": ["text", "kind"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "approve_memory_candidate",
+                "description": "Approve a pending memory candidate, materializing its proposed \
+                    operation through the same transactional path a direct write would use.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "reject_memory_candidate",
+                "description": "Reject a pending memory candidate. Never materializes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "edit_memory_candidate",
+                "description": "Edit a pending memory candidate's proposed operation and/or \
+                    conflict list. Legal only while the candidate is still pending (candidates \
+                    have no version to check instead).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "patch": {
+                            "type": "object",
+                            "properties": {
+                                "proposed_operation": {
+                                    "type": "object",
+                                    "description": "Full replacement for the candidate's \
+                                        proposed_operation: a tagged object {\"op\": \
+                                        \"create\"|\"reinforce\"|\"resolve\"|\"retract\"|\
+                                        \"supersede\", ...op-specific fields}."
+                                },
+                                "conflicts": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["id", "patch"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "edit_memory",
+                "description": "Edit an existing memory entry's text and/or importance. \
+                    Rejects editing a terminal-state entry.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "expected_version": {
+                            "type": "integer",
+                            "description": "Optimistic-concurrency precondition; a mismatch is \
+                                OPTIMISTIC_CONFLICT."
+                        },
+                        "patch": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "importance": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["id", "expected_version", "patch"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "retract_memory",
+                "description": "Retract a memory entry (v1 'forget'): audit-preserving \
+                    withdrawal, not a delete. Illegal for kinds without a retracted state (e.g. \
+                    hypothesis).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "expected_version": {
+                            "type": "integer",
+                            "description": "Optimistic-concurrency precondition; a mismatch is \
+                                OPTIMISTIC_CONFLICT."
+                        }
+                    },
+                    "required": ["id", "expected_version"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "merge_memories",
+                "description": "Merge two or more memory entries (v1 'consolidate'): the \
+                    survivor absorbs the losers' evidence; losers become superseded, pointing at \
+                    the survivor.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "ids": {
+                            "type": "array",
+                            "minItems": 2,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "memory_id": {"type": "string", "minLength": 1},
+                                    "expected_version": {"type": "integer"}
+                                },
+                                "required": ["memory_id", "expected_version"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "survivor_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Must be one of ids[].memory_id; that entry survives, \
+                                the rest become superseded losers."
+                        }
+                    },
+                    "required": ["ids", "survivor_id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "give_feedback",
+                "description": "Record free-text feedback as a durable observation, directly \
+                    (not through the spool) — the daemon-internal equivalent of a hook's ingest \
+                    append. Feeds the next consolidation pass; does not itself mutate any memory \
+                    entry.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -314,7 +531,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_advertises_all_nine_v0_tools_with_the_spec_fixed_names() {
+    fn catalog_advertises_all_seventeen_v0_tools_with_the_spec_fixed_names() {
         let catalog = catalog();
         let names: Vec<&str> = catalog["tools"]
             .as_array()
@@ -334,8 +551,33 @@ mod tests {
                 "inspect_memory_evidence",
                 "stats",
                 "health",
+                "remember",
+                "approve_memory_candidate",
+                "reject_memory_candidate",
+                "edit_memory_candidate",
+                "edit_memory",
+                "retract_memory",
+                "merge_memories",
+                "give_feedback",
             ]
         );
+    }
+
+    #[test]
+    fn catalog_never_exposes_the_v1_forget_or_consolidate_names() {
+        // v1 name mapping (spec 11 §2): forget -> retract_memory,
+        // consolidate(src,tgt) -> merge_memories. Neither v1 name is ever a
+        // tool name -- this task card's own "v1 forget/consolidate names
+        // not exposed as destructive behavior" bullet.
+        let catalog = catalog();
+        let names: Vec<&str> = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"forget"), "{names:?}");
+        assert!(!names.contains(&"consolidate"), "{names:?}");
     }
 
     #[test]

@@ -412,6 +412,51 @@ pub async fn seed_memory_entry(
         .expect("seed memory entry (domain)");
 }
 
+/// Like [`seed_memory_entry`], but with a real `canonical_key` — for tests
+/// that need a `CANONICAL_KEY_CONFLICT` fixture (T15-05).
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_memory_entry_with_canonical_key(
+    state: &StateDb,
+    memory_id: &str,
+    kind: MemoryKind,
+    scope_kind: ScopeKind,
+    scope_owner_id: &str,
+    text: &str,
+    canonical_key: &str,
+    now_ms: i64,
+) {
+    let (id, owner, text, key) = (
+        memory_id.to_string(),
+        scope_owner_id.to_string(),
+        text.to_string(),
+        canonical_key.to_string(),
+    );
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_memory_entry(
+                tx,
+                &NewMemoryEntry {
+                    memory_id: &id,
+                    kind,
+                    text: &text,
+                    canonical_key: Some(&key),
+                    scope_kind,
+                    scope_owner_id: &owner,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                now_ms,
+            )
+        })
+        .await
+        .expect("seed memory entry tx (infrastructure)")
+        .expect("seed memory entry (domain)");
+}
+
 /// Transition a previously seeded `memory_entry` — for tests that need a
 /// non-`active` (e.g. terminal) row.
 pub async fn transition_seeded_memory_entry(state: &StateDb, memory_id: &str, to: MemoryState) {

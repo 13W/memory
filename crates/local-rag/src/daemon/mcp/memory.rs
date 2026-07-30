@@ -32,11 +32,11 @@ use super::tools::{
 /// this request") — never a JSON-RPC `-32603`, mirroring `code.rs`'s
 /// `infra_err` precedent for `SearchInfraError`, generalized to any
 /// `Display` error these plain SQL reads can produce.
-fn infra_err(e: impl std::fmt::Display) -> CallToolResult {
+pub(super) fn infra_err(e: impl std::fmt::Display) -> CallToolResult {
     content::err(&ErrorEnvelope::index_unavailable(e.to_string()))
 }
 
-fn optional_enum<T: Copy>(
+pub(super) fn optional_enum<T: Copy>(
     args: &Map<String, Value>,
     key: &str,
     parse: impl Fn(&str) -> Option<T>,

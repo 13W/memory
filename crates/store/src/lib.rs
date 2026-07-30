@@ -440,9 +440,9 @@ pub use memory::{
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{
-    EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, PayloadSweepError,
-    PayloadSweepReport, TrustLevel, import_batch, import_session_tail, known_spool_sessions,
-    run_payload_ttl_sweep,
+    EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, NewObservationEnvelope,
+    PayloadSweepError, PayloadSweepReport, TrustLevel, import_batch, import_session_tail,
+    insert_envelope, known_spool_sessions, run_payload_ttl_sweep,
 };
 pub use registry::{
     AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
