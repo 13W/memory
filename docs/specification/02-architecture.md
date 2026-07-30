@@ -183,6 +183,19 @@ disambiguate two linked worktrees of one repository (that needs an explicit work
 `local-rag-store` carries no git/network dependency (architecture guardrail until T10); the
 resolver is a pure registry lookup over those facts.
 
+As-built note (T15-02, `[SPEC]`): the wire form of this context is
+`local_rag_protocol::handshake::RequestContext { session_id, worktree_root: Option<String>,
+repo_hint: Option<String> }` — `Serialize + Deserialize`, embedded verbatim in every
+`RequestEnvelope` the proxy sends (§4.2). `local-rag-proxy` resolves it exactly once at launch
+(`handshake::resolve_session_params`: `session_id` from `$LOCAL_RAG_SESSION_ID` if set and
+non-empty, else a fresh UUIDv7; `worktree_root` from `current_dir()`) and clones the same value
+into every relayed call for the connection's lifetime — one proxy process serves one session, so
+there is nothing per-request to vary it by. `repo_hint` is always `None` from the MCP proxy in v0
+(no v0 tool fills it; the field exists for the wire shape and a future T15-07 CLI caller). The
+`$LOCAL_RAG_SESSION_ID` env-var source is a deliberately provisional default: the real npm/plugin
+launch contract that would set it does not exist yet in this repository (packaging is a later
+group).
+
 ## 4. Daemon lifecycle `[FIXED, mechanics [SPEC]]`
 
 ### 4.1 Startup
@@ -250,6 +263,103 @@ daemon → WELCOME {proto: 1, daemon_version, store_instance_uuid, capabilities[
   `SHUTDOWN_REQUEST`; old daemon finishes in-flight jobs, releases, exits; new daemon starts
   `[SPEC]`. If the old daemon does not exit within 30 s the proxy reports the conflict instead
   of force-killing.
+
+As-built note (T15-02, `[SPEC]`): the concrete wire types live in `local_rag_protocol::handshake`
+— `Hello`, `Welcome { proto, daemon_version, store_instance_uuid, capabilities[],
+mcp_passthrough_version, spool_max_format_version, mode }`, `Incompatible { min_proto, max_proto,
+daemon_version }`, `ShutdownRequest { requested_by_proxy_version, reason }`, `RequestContext`
+(§3.3), `RequestEnvelope { context, mcp: Box<RawValue> }`, `ResponseEnvelope { mcp: Box<RawValue>
+}`, unified under one `Message` enum. Framing is **NDJSON** (one `Message` per `\n`-terminated
+line) for both the handshake and the MCP-passthrough phase alike: a UDS/pipe is a reliable
+ordered byte stream (its only failure mode is EOF, unlike `local_rag_core::spool`'s durable
+on-disk format, which needs CRC/magic against physical corruption), and JSON's own string-escaping
+guarantees a raw `\n` never appears inside a line, so splitting on it is safe even for the opaque
+passthrough payload. `mcp` is `Box<serde_json::value::RawValue>`, not `Value` — the proxy never
+parses or rebuilds MCP JSON-RPC content (preserves big-integer `id` precision, field order, and
+avoids a reparse allocation on relay), the literal "thin pass-through" of 11 §1.
+`Message`'s `#[serde(tag = "type", content = "data")]` (adjacent tagging), not the default
+internal tagging: internally-tagged enums cannot deserialize a variant holding a `RawValue` field
+(`serde` buffers into a generic `Content` type first, which errors on `RawValue`'s
+`deserialize_any`-only impl — reproduced directly), while adjacent (and external) tagging both
+work, since neither needs that buffering step. Constants: `PROTO_VERSION = 1`,
+`SUPPORTED_PROTO_RANGE = 1..=1`, `MCP_PASSTHROUGH_VERSION = 1`, `MAX_MESSAGE_BYTES = 8 MiB` — all
+`[SPEC]`, picked and documented as chosen (not derived), the same precedent
+`LIVENESS_PROBE_TIMEOUT_MS` set. `spool_max_format_version` reuses the existing
+`local_rag_core::spool::FORMAT_VERSION` rather than a second constant (11 §4's as-built note).
+
+`INCOMPATIBLE` is triggered **only** by a `proto` range mismatch
+(`local_rag_protocol::negotiate_proto`) — `mcp_passthrough_version`/`spool_max_format_version` in
+`WELCOME` are informational, not an accept/reject condition; the card's literal
+`INCOMPATIBLE{min_proto, max_proto, daemon_version}` carries no third reason. A daemon-version
+mismatch with a **compatible** `proto` does not produce `INCOMPATIBLE` at all — it is the upgrade
+case below.
+
+Daemon side (`local_rag::daemon::handshake`, replacing T15-01's provisional
+`handshake_stub`): `HandshakeContext { instance_uuid, daemon_version, supported_proto, mode,
+sessions: SessionRegistry, shutdown_requested: Arc<Notify> }`; `RequestHandler` — a native
+`async fn`-in-trait (stable since Rust 1.75, no `async-trait`) implemented by `EchoRequestHandler`,
+T15-02's own transport-proving stub (echoes `{context, received}`; real MCP dispatch is T15-03's
+"type before backend" seam, the same precedent `ProjectionStore`/`Generator` already set);
+`serve_connections` spawns one long-lived task per accepted connection (unlike the stub's
+single-write-and-close). Per connection: read HELLO → `negotiate_proto` → WELCOME/INCOMPATIBLE
+(closing on INCOMPATIBLE) → on WELCOME, register `SessionRegistry::register` (T15-01 built this
+registry anticipating exactly this call site) and hold the guard for the connection's lifetime →
+loop reading `Request`→`handler.handle`→`Response`, and `ShutdownRequest` → 
+`shutdown_requested.notify_one()`. A `ShutdownRequest` does **not** close the connection — it keeps
+looping. The daemon's own `main.rs::run_serve` builds its `tokio::runtime::Runtime` as a local
+variable that is dropped only after `DaemonHandle::shutdown()`'s full drain (checkpoint, cache
+close, lock release) has already completed; dropping a `Runtime` forcibly drops every still-running
+task, including this connection's — closing the socket only *after* the drain finishes is what
+lets the requesting proxy's `wait_for_close` observe EOF exactly when it is safe to reconnect, not
+before.
+
+Proxy side (`local-rag-proxy::{connect,handshake,relay}`): `connect::connect_or_spawn` tries one
+connect, and only on failure spawns the daemon binary **once** (not once per retry — a slow
+startup should not race a flood of redundant sibling spawns) via `std::process::Command` with
+`process_group(0)` (unix — a signal to the proxy's own group, e.g. terminal Ctrl-C, never reaches
+the daemon) and `Stdio::null()` on all three standard streams (otherwise the daemon would inherit
+the very stdio channel the proxy uses to speak MCP), then retries with backoff. The backoff formula
+is `local-rag-proxy`'s own copy of `crates/embed/src/pool.rs::RetryPolicy`'s *shape* (250 ms base,
+doubling, 4 s cap — that module's own doc already cites this section as the numbers' source), not
+an import (`local-rag-embed` pulls in `local-rag-store`, and this proxy must hold no project
+state). The 20 s figure is a `tokio::time::timeout` racing the *entire* retry loop, not a
+per-attempt running-total check, so the cutoff lands at exactly 20 000 ms regardless of where the
+next scheduled delay would have landed (verified with a paused clock: 250/500/1000/2000/4000/4000…
+ms, cut off at the 20 s boundary). The daemon binary is located next to the running proxy binary
+via `current_exe()`'s parent directory (spec 13 §1: all product binaries ship side by side).
+
+The upgrade flow (13 §4) is driven by `handshake::establish_session`'s retry loop, bounded by
+`MAX_UPGRADE_ROUNDS = 2` (a defensive cap against a persistently flapping daemon — not a number
+this section names): on a compatible `WELCOME` whose `daemon_version` differs from this proxy's
+own `local_rag_core::VERSION`, the proxy sends `SHUTDOWN_REQUEST` on the same connection, then
+`wait_for_close` (a plain `tokio::time::timeout`, the 30 s of this section) for EOF, then calls
+`connect_or_spawn` again — with the old daemon's lock now released, this spawns the current
+(now-matching) binary. Exceeding the round budget is `ProxyError::UpgradeLoopExceeded`; a
+`wait_for_close` timeout is `ProxyError::UpgradeTimedOut` — both are proxy-local diagnostics (see
+below), not synthesized MCP responses.
+
+This task deliberately does **not** synthesize an MCP JSON-RPC initialization error on a
+handshake/upgrade failure: doing so would require parsing the client's own incoming `initialize`
+request for its `id` first (so the error can be correlated), which needs MCP tool-schema awareness
+this task does not have — that is T15-03's domain (11 §2's "isError mapping"). `local-rag-proxy`
+instead writes a `ProxyError`'s `Display` text to stderr and exits non-zero; nothing degrades
+silently (§6's own invariant), but the *shape* on stdout described by this section's prose (an MCP
+initialization error naming both versions) is not yet produced. This boundary is deliberate, not
+an oversight, and is owned by T15-03 rather than tracked as a separate deviation, the same
+established pattern this project already used for T15-06 (continuing consolidation trigger,
+flagged by T14-06's as-built note) and T15-07 (real `code_raw`/`memory` required registration,
+flagged at D-013's closure).
+
+An implementation-level finding worth recording here since it is easy to reintroduce: this proxy's
+stdin is read via `tokio::io::stdin()`, which is backed by a dedicated OS thread doing a genuine
+blocking `read()` — there is no async stdin on unix. When the relay loop returns because the
+shutdown signal fired rather than because stdin reached EOF, that thread is left blocked in the
+syscall forever; `tokio::runtime::Runtime::drop` blocks its caller until every outstanding
+`spawn_blocking` task completes, so simply letting the runtime drop at the end of `main` hangs the
+whole process indefinitely in exactly that scenario (reproduced directly with a minimal repro
+while building this task, and by the real `local-rag-proxy` binary under a real SIGTERM). Fixed by
+calling `std::process::exit` explicitly instead of returning from `main`, bypassing `Runtime::drop`
+— nothing past that point needs `Drop`-based cleanup.
 
 ### 4.3 Shutdown
 

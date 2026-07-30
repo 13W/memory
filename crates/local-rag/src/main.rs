@@ -81,12 +81,14 @@ async fn serve() -> ExitCode {
         consolidation_lease_ms: LEASE_DURATION_MS,
         consolidation_renew_interval_ms: LEASE_RENEW_INTERVAL_MS,
         data_policy: config.models.data_policy,
+        supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
     };
     let idle_shutdown_secs = config.daemon.idle_shutdown_secs;
 
     match local_rag::daemon::run(opts, idle_shutdown_secs, IDLE_POLL_INTERVAL).await {
         Ok(ShutdownReason::Signal) => ExitCode::SUCCESS,
         Ok(ShutdownReason::Idle) => ExitCode::SUCCESS,
+        Ok(ShutdownReason::UpgradeRequested) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{BIN}: {}", startup_error_message(&e));
             ExitCode::FAILURE

@@ -12,13 +12,18 @@ local-rag-core = { path = "../core" }
 # derives here implement a spec'd shape rather than inventing a wire format —
 # and they make "repeated output is byte-stable" a real byte comparison instead
 # of a proxy for it. Already approved and already in `Cargo.lock` (used by
-# `core`/`store`/`index`/`models`), so this adds zero packages. Transport,
-# handshake and the MCP framing around these types stay group 15.
+# `core`/`store`/`index`/`models`), so this adds zero packages.
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
-# Byte-stability and shape assertions render the derived `Serialize` to JSON.
-serde_json = "1"
+# T15-02: the proxy <-> daemon wire protocol itself (`handshake` module) —
+# promoted from dev-only (T12-03 used it only to assert byte-stable JSON
+# shape) to a real dependency, since both sides of the handshake now actually
+# send and parse this crate's types over a live connection. `raw_value`:
+# `Box<RawValue>` carries the opaque MCP JSON-RPC payload byte-exact through
+# `RequestEnvelope`/`ResponseEnvelope` without this crate ever parsing MCP
+# semantics — see `handshake.rs`'s own module doc for why plain
+# `serde_json::Value` would not do. Already approved, already resolved
+# throughout the workspace — this adds a feature flag, not a new package.
+serde_json = { version = "1", features = ["raw_value"] }
 
 [lints]
 workspace = true

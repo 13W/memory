@@ -8,6 +8,19 @@ envelope `{session_id, worktree_root}` to every call. Indexing is fully isolated
 path `[FIXED — v1 contract]`: no tool call ever performs synchronous indexing work beyond
 waiting on `L2.read`.
 
+As-built note (T15-02, `[FIXED]`): `local-rag-proxy` implements this pass-through as a
+`tokio::select!` loop (`relay::relay`) over four sources: stdin (raw MCP JSON-RPC lines, wrapped
+in `Message::Request{context, mcp}` before being sent to the daemon), the UDS connection
+(`Message::Response` unwrapped back to a raw line on stdout), and this proxy's own SIGTERM/CTRL-C
+listener. `context` is resolved once at launch and cloned unchanged into every relayed request —
+proven by a duplex-based unit test asserting two requests with different MCP content still carry
+byte-identical context, and by a real two-binary subprocess test asserting the same end to end.
+"Proxy holds no project state" is structural, not a discipline: `local-rag-proxy/Cargo.toml`
+depends on neither `local-rag-store` nor `-embed`/`-index`/`-projection` at all — there is no type
+in this crate's dependency graph through which state could accumulate across sessions even by
+accident. See 02 §4.2's as-built note for the handshake mechanics, the wire types, and the
+detached-spawn/backoff/upgrade details this pass-through sits on top of.
+
 ## 2. MCP tool surface
 
 Status: **v0** ships in MVP; **v0.x** additive after MVP; **post-v0** benchmark/spike-gated.
@@ -117,6 +130,15 @@ supports, without attempting to parse any frame (a newer container format may ha
 the frame layout itself, so nothing past the header can be trusted). The actual proxy↔daemon
 handshake wiring — advertising the daemon's max supported spool `format_version` over the wire —
 remains a later task; this fixes only the primitive it will rely on.
+
+As-built note (T15-02, `[SPEC]`): the handshake wiring named above is now in place —
+`Welcome.spool_max_format_version` carries `local_rag_core::spool::FORMAT_VERSION` directly (no
+second constant), sent on every successful handshake. Nothing on the proxy side reads it yet: a
+mismatch between a newer hook binary's spool writes and the running daemon's supported format is
+still only reportable by the daemon (`HeaderError::UnsupportedFormatVersion` above) at import
+time, not by the proxy at connect time — a proxy-side comparison and a reported diagnostic path
+for it remain later work, tracked wherever `local-rag-hook`'s own version relationship to a
+running daemon is next addressed.
 
 ## 5. `additionalContext` format `[SPEC, deterministic per v1 contract]`
 

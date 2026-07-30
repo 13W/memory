@@ -39,7 +39,10 @@ tokio = { version = "1", default-features = false, features = [
 # daemon_version, started_at}") and the store-liveness-probe greeting line.
 # Already resolved via local-rag-core/local-rag-store — 0 new external sources.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value`: `daemon::handshake` passes the opaque MCP JSON-RPC payload
+# through as `Box<RawValue>` (see `local-rag-protocol`'s `handshake` module
+# doc for why plain `serde_json::Value` would not do) — T15-02.
+serde_json = { version = "1", features = ["raw_value"] }
 # `rusqlite::Error` appears in this crate's own error types (the resume
 # drivers surface a stale-run-set read failure directly). Same
 # version/features as `local-rag-store` — 0 new external sources, only a
