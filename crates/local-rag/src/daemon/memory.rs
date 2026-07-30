@@ -6,22 +6,29 @@
 
 use std::sync::Arc;
 
+use local_rag_core::identity::UuidSource;
 use local_rag_memory::recall::{BruteForceCosine, MemoryDenseBackend, QueryEmbedder};
 use local_rag_store::{CacheDb, StateDb};
 
-/// Everything a T15-04 MCP tool adapter needs to read `state.sqlite`/
-/// `cache.sqlite` directly — unlike [`super::search::build_search_engine`]'s
-/// `SearchEngine`, there is no shard manager or worktree lock here: memory
-/// recall holds no lock across its pipeline (spec 08 §6's own as-built note),
-/// and the review-tool reads (`list_memory`, `list_memory_candidates`,
-/// `inspect_memory_evidence`, `stats`, `health`) are plain, single-connection
-/// SQL.
+/// Everything a T15-04/T15-05 MCP tool adapter needs to read
+/// `state.sqlite`/`cache.sqlite` directly — unlike
+/// [`super::search::build_search_engine`]'s `SearchEngine`, there is no
+/// shard manager or worktree lock here: memory recall holds no lock across
+/// its pipeline (spec 08 §6's own as-built note), and the review-tool reads
+/// (`list_memory`, `list_memory_candidates`, `inspect_memory_evidence`,
+/// `stats`, `health`) are plain, single-connection SQL. `uuids` (T15-05)
+/// mints fresh ids the daemon itself is responsible for: `remember`'s
+/// `memory_id` and `give_feedback`'s `observation_id` — unlike the router
+/// or a candidate proposer, which already mint their own ids before calling
+/// into the store, the MCP layer *is* the caller here, so nothing upstream
+/// supplies one.
 pub struct MemoryContext {
     pub state: Arc<StateDb>,
     pub cache: Arc<CacheDb>,
     pub embedder: Arc<dyn QueryEmbedder>,
     pub dense_backend: Arc<dyn MemoryDenseBackend>,
     pub recall_token_budget: u32,
+    pub uuids: Arc<dyn UuidSource + Send + Sync>,
 }
 
 /// Build the [`MemoryContext`] the MCP memory tools call.
@@ -41,6 +48,7 @@ pub fn build_memory_context(
     cache: Arc<CacheDb>,
     embedder: Arc<dyn QueryEmbedder>,
     recall_token_budget: u32,
+    uuids: Arc<dyn UuidSource + Send + Sync>,
 ) -> Arc<MemoryContext> {
     Arc::new(MemoryContext {
         state,
@@ -48,5 +56,6 @@ pub fn build_memory_context(
         embedder,
         dense_backend: Arc::new(BruteForceCosine),
         recall_token_budget,
+        uuids,
     })
 }

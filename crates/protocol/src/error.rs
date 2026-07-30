@@ -71,6 +71,48 @@ pub enum ErrorCode {
     /// a migration checksum drift, or rewritten migration history (spec 02
     /// §6, 13 §3). `details` disambiguates which.
     IncompatibleStore,
+    /// A memory-write tool named a `memory_id` with no `memory_entry` row
+    /// (spec 08 §3).
+    UnknownMemory,
+    /// `expected_version` did not match the entry's current `entry_version`
+    /// (spec 08 §3's optimistic-concurrency precondition). `details` names
+    /// both values.
+    OptimisticConflict,
+    /// `create`'s (or `supersede`'s new-entry) `canonical_key` already
+    /// exists in the same scope (spec 08 §3).
+    CanonicalKeyConflict,
+    /// `scope_kind='global'` with a `scope_owner_id` other than the fixed
+    /// singleton (spec 03 §2.5).
+    InvalidGlobalScopeOwner,
+    /// The entry's kind-specific state machine forbids the requested
+    /// transition (spec 04 §5). `details` names the kind/from/to.
+    IllegalMemoryTransition,
+    /// `edit_memory` targets an entry whose current state is terminal (spec
+    /// 08 §3's as-built `edit` guard).
+    EntryTerminal,
+    /// `merge_memories`: a loser's `(scope_kind, scope_owner_id)` differs
+    /// from the survivor's (spec 08 §3).
+    IncompatibleScope,
+    /// `merge_memories` was called with no losers (spec 08 §3: "losers must
+    /// be non-empty").
+    EmptyMergeSet,
+    /// The model-claims-are-never-auto-promoted-to-facts backstop refused a
+    /// router-actor `create`/`supersede` of a promotion kind backed only by
+    /// `model_claim` evidence (spec 12 §4).
+    ModelClaimOnlyProvenance,
+    /// A candidate-review tool named a `candidate_id` with no
+    /// `pending_memory_candidate` row (spec 04 §6).
+    UnknownCandidate,
+    /// The candidate review-state machine forbids the requested transition
+    /// (spec 04 §6). `details` names the from/to.
+    IllegalCandidateTransition,
+    /// `edit_memory_candidate` targets a candidate whose `review_state` is
+    /// no longer `pending` (spec 04 §6 — candidates have no version to check
+    /// instead).
+    CandidateNotPending,
+    /// A candidate's `proposed_operation` failed to parse, or named a
+    /// `kind`/`scope_kind` outside the CHECK domain (spec 04 §6).
+    InvalidProposedOperation,
 }
 
 impl ErrorCode {
@@ -86,6 +128,19 @@ impl ErrorCode {
             ErrorCode::MigrationInProgress => "MIGRATION_IN_PROGRESS",
             ErrorCode::StoreLocked => "STORE_LOCKED",
             ErrorCode::IncompatibleStore => "INCOMPATIBLE_STORE",
+            ErrorCode::UnknownMemory => "UNKNOWN_MEMORY",
+            ErrorCode::OptimisticConflict => "OPTIMISTIC_CONFLICT",
+            ErrorCode::CanonicalKeyConflict => "CANONICAL_KEY_CONFLICT",
+            ErrorCode::InvalidGlobalScopeOwner => "INVALID_GLOBAL_SCOPE_OWNER",
+            ErrorCode::IllegalMemoryTransition => "ILLEGAL_MEMORY_TRANSITION",
+            ErrorCode::EntryTerminal => "ENTRY_TERMINAL",
+            ErrorCode::IncompatibleScope => "INCOMPATIBLE_SCOPE",
+            ErrorCode::EmptyMergeSet => "EMPTY_MERGE_SET",
+            ErrorCode::ModelClaimOnlyProvenance => "MODEL_CLAIM_ONLY_PROVENANCE",
+            ErrorCode::UnknownCandidate => "UNKNOWN_CANDIDATE",
+            ErrorCode::IllegalCandidateTransition => "ILLEGAL_CANDIDATE_TRANSITION",
+            ErrorCode::CandidateNotPending => "CANDIDATE_NOT_PENDING",
+            ErrorCode::InvalidProposedOperation => "INVALID_PROPOSED_OPERATION",
         }
     }
 }
@@ -220,6 +275,156 @@ impl ErrorEnvelope {
         ErrorEnvelope {
             code: ErrorCode::IncompatibleStore,
             message: "the store's schema is not usable by this binary".to_string(),
+            retryable: false,
+            details: Some(details.into()),
+        }
+    }
+
+    /// No `memory_entry` row with this id (spec 08 §3). Not retryable: the
+    /// same id names nothing until a separate `create` succeeds.
+    pub fn unknown_memory() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::UnknownMemory,
+            message: "no memory entry with this id".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// `expected_version` did not match the entry's current `entry_version`
+    /// (spec 08 §3). Not retryable *as-is*: the caller must re-read the
+    /// current version before retrying, not simply resend the same request.
+    pub fn optimistic_conflict(expected: i64, actual: i64) -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::OptimisticConflict,
+            message: "expected_version does not match the entry's current version".to_string(),
+            retryable: false,
+            details: Some(format!("expected entry_version {expected}, found {actual}")),
+        }
+    }
+
+    /// `canonical_key` already exists in this scope (spec 08 §3). Not
+    /// retryable: the same key in the same scope conflicts identically.
+    pub fn canonical_key_conflict() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::CanonicalKeyConflict,
+            message: "canonical_key already exists in this scope".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// `scope_kind='global'` with a `scope_owner_id` other than the fixed
+    /// singleton (spec 03 §2.5). Not retryable: a caller-shape error.
+    pub fn invalid_global_scope_owner() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::InvalidGlobalScopeOwner,
+            message: "global scope requires the fixed singleton scope_owner_id".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// The entry's kind-specific state machine forbids the requested
+    /// transition (spec 04 §5). Not retryable: the same transition is
+    /// illegal for this kind regardless of when it is retried.
+    pub fn illegal_memory_transition(details: impl Into<String>) -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::IllegalMemoryTransition,
+            message: "this transition is illegal for the entry's kind".to_string(),
+            retryable: false,
+            details: Some(details.into()),
+        }
+    }
+
+    /// `edit_memory` targets an entry whose current state is terminal (spec
+    /// 08 §3's as-built `edit` guard). Not retryable: a terminal state never
+    /// becomes editable again.
+    pub fn entry_terminal() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::EntryTerminal,
+            message: "the entry's current state is terminal".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// `merge_memories`: a loser's scope differs from the survivor's (spec
+    /// 08 §3). Not retryable: the same scope mismatch persists.
+    pub fn incompatible_scope() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::IncompatibleScope,
+            message: "every merged entry must share the survivor's scope".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// `merge_memories` was called with no losers (spec 08 §3). Not
+    /// retryable: a caller-shape error.
+    pub fn empty_merge_set() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::EmptyMergeSet,
+            message: "merge requires at least one loser".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// The model-claims-never-auto-promoted-to-facts backstop refused a
+    /// router-actor `create`/`supersede` backed only by `model_claim`
+    /// evidence (spec 12 §4). Not retryable: only new, non-model-claim
+    /// evidence changes this outcome.
+    pub fn model_claim_only_provenance() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::ModelClaimOnlyProvenance,
+            message: "model-claim-only evidence cannot promote to this kind".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// No `pending_memory_candidate` row with this id (spec 04 §6). Not
+    /// retryable.
+    pub fn unknown_candidate() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::UnknownCandidate,
+            message: "no candidate with this id".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// The candidate review-state machine forbids the requested transition
+    /// (spec 04 §6). Not retryable.
+    pub fn illegal_candidate_transition(details: impl Into<String>) -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::IllegalCandidateTransition,
+            message: "this candidate review-state transition is illegal".to_string(),
+            retryable: false,
+            details: Some(details.into()),
+        }
+    }
+
+    /// `edit_memory_candidate` targets a candidate whose `review_state` is
+    /// no longer `pending` (spec 04 §6). Not retryable: pending never
+    /// returns once left.
+    pub fn candidate_not_pending() -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::CandidateNotPending,
+            message: "the candidate is no longer pending".to_string(),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// A candidate's `proposed_operation` failed to parse, or named a
+    /// `kind`/`scope_kind` outside the CHECK domain (spec 04 §6). Not
+    /// retryable: the stored payload does not change on retry.
+    pub fn invalid_proposed_operation(details: impl Into<String>) -> Self {
+        ErrorEnvelope {
+            code: ErrorCode::InvalidProposedOperation,
+            message: "proposed_operation failed to parse".to_string(),
             retryable: false,
             details: Some(details.into()),
         }
@@ -395,5 +600,107 @@ mod tests {
             serde_json::to_string(&a).unwrap(),
             serde_json::to_string(&b).unwrap()
         );
+    }
+
+    #[test]
+    fn memory_write_error_code_strings_match_t15_05() {
+        assert_eq!(ErrorCode::UnknownMemory.as_str(), "UNKNOWN_MEMORY");
+        assert_eq!(
+            ErrorCode::OptimisticConflict.as_str(),
+            "OPTIMISTIC_CONFLICT"
+        );
+        assert_eq!(
+            ErrorCode::CanonicalKeyConflict.as_str(),
+            "CANONICAL_KEY_CONFLICT"
+        );
+        assert_eq!(
+            ErrorCode::InvalidGlobalScopeOwner.as_str(),
+            "INVALID_GLOBAL_SCOPE_OWNER"
+        );
+        assert_eq!(
+            ErrorCode::IllegalMemoryTransition.as_str(),
+            "ILLEGAL_MEMORY_TRANSITION"
+        );
+        assert_eq!(ErrorCode::EntryTerminal.as_str(), "ENTRY_TERMINAL");
+        assert_eq!(ErrorCode::IncompatibleScope.as_str(), "INCOMPATIBLE_SCOPE");
+        assert_eq!(ErrorCode::EmptyMergeSet.as_str(), "EMPTY_MERGE_SET");
+        assert_eq!(
+            ErrorCode::ModelClaimOnlyProvenance.as_str(),
+            "MODEL_CLAIM_ONLY_PROVENANCE"
+        );
+        assert_eq!(ErrorCode::UnknownCandidate.as_str(), "UNKNOWN_CANDIDATE");
+        assert_eq!(
+            ErrorCode::IllegalCandidateTransition.as_str(),
+            "ILLEGAL_CANDIDATE_TRANSITION"
+        );
+        assert_eq!(
+            ErrorCode::CandidateNotPending.as_str(),
+            "CANDIDATE_NOT_PENDING"
+        );
+        assert_eq!(
+            ErrorCode::InvalidProposedOperation.as_str(),
+            "INVALID_PROPOSED_OPERATION"
+        );
+    }
+
+    #[test]
+    fn memory_write_error_constructors_are_never_retryable() {
+        assert!(!ErrorEnvelope::unknown_memory().retryable);
+        assert!(!ErrorEnvelope::optimistic_conflict(1, 2).retryable);
+        assert!(!ErrorEnvelope::canonical_key_conflict().retryable);
+        assert!(!ErrorEnvelope::invalid_global_scope_owner().retryable);
+        assert!(!ErrorEnvelope::illegal_memory_transition("x").retryable);
+        assert!(!ErrorEnvelope::entry_terminal().retryable);
+        assert!(!ErrorEnvelope::incompatible_scope().retryable);
+        assert!(!ErrorEnvelope::empty_merge_set().retryable);
+        assert!(!ErrorEnvelope::model_claim_only_provenance().retryable);
+        assert!(!ErrorEnvelope::unknown_candidate().retryable);
+        assert!(!ErrorEnvelope::illegal_candidate_transition("x").retryable);
+        assert!(!ErrorEnvelope::candidate_not_pending().retryable);
+        assert!(!ErrorEnvelope::invalid_proposed_operation("x").retryable);
+    }
+
+    #[test]
+    fn optimistic_conflict_names_both_versions_in_details() {
+        let env = ErrorEnvelope::optimistic_conflict(3, 5);
+        assert_eq!(env.code, ErrorCode::OptimisticConflict);
+        let details = env.details.expect("details");
+        assert!(details.contains('3'), "{details}");
+        assert!(details.contains('5'), "{details}");
+    }
+
+    #[test]
+    fn illegal_memory_transition_carries_the_caller_supplied_details() {
+        let env = ErrorEnvelope::illegal_memory_transition("(hypothesis) active -> retracted");
+        assert_eq!(env.code, ErrorCode::IllegalMemoryTransition);
+        assert_eq!(
+            env.details.as_deref(),
+            Some("(hypothesis) active -> retracted")
+        );
+    }
+
+    #[test]
+    fn invalid_proposed_operation_carries_the_parse_error_string() {
+        let env = ErrorEnvelope::invalid_proposed_operation("missing field `kind`");
+        assert_eq!(env.code, ErrorCode::InvalidProposedOperation);
+        assert_eq!(env.details.as_deref(), Some("missing field `kind`"));
+    }
+
+    #[test]
+    fn no_details_variants_omit_details_from_the_wire() {
+        for env in [
+            ErrorEnvelope::unknown_memory(),
+            ErrorEnvelope::canonical_key_conflict(),
+            ErrorEnvelope::invalid_global_scope_owner(),
+            ErrorEnvelope::entry_terminal(),
+            ErrorEnvelope::incompatible_scope(),
+            ErrorEnvelope::empty_merge_set(),
+            ErrorEnvelope::model_claim_only_provenance(),
+            ErrorEnvelope::unknown_candidate(),
+            ErrorEnvelope::candidate_not_pending(),
+        ] {
+            assert_eq!(env.details, None);
+            assert!(!serde_json::to_string(&env).unwrap().contains("details"));
+        }
     }
 }

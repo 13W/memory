@@ -204,6 +204,14 @@ fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
             "inspect_memory_evidence",
             "stats",
             "health",
+            "remember",
+            "approve_memory_candidate",
+            "reject_memory_candidate",
+            "edit_memory_candidate",
+            "edit_memory",
+            "retract_memory",
+            "merge_memories",
+            "give_feedback",
         ]
     );
     let _ = stdout;

@@ -7,8 +7,10 @@
 //! content; [`tools`] is the tool catalog and argument parsing; [`code`] is
 //! the three code-query tool adapters over [`local_rag_search::
 //! SearchEngine`]; [`memory`] is the six status/memory-read tool adapters
-//! over [`crate::daemon::memory::MemoryContext`] (T15-04); [`instructions`]
-//! is `initialize`'s server identity/instructions/protocol negotiation.
+//! over [`crate::daemon::memory::MemoryContext`] (T15-04); [`memory_write`]
+//! is the eight memory-write/candidate-review tool adapters over the same
+//! context (T15-05); [`instructions`] is `initialize`'s server
+//! identity/instructions/protocol negotiation.
 
 mod code;
 mod content;
@@ -16,6 +18,7 @@ mod dispatch;
 mod instructions;
 mod jsonrpc;
 mod memory;
+mod memory_write;
 mod tools;
 
 use std::sync::Arc;
