@@ -1,14 +1,15 @@
 //! Tracked background jobs (spec 02 §4.3 idle-shutdown gate: "no running
 //! index/consolidation/GC jobs") — T15-01.
 //!
-//! T15-01's own scope is narrow (see [`super::resume`]): only the two
-//! startup catch-up passes spec 02 §4.1 step 5 names run today, so only
-//! [`JobKind::SpoolImport`]/[`JobKind::ConsolidationResume`] exist. The
-//! registry itself is generic over `JobKind` — a later group-15 card wiring
-//! a continuous reconcile/backfill/GC trigger adds its own variant and
-//! tracks it through this same registry rather than inventing a second one
-//! (`#[non_exhaustive]` keeps that open without a breaking change, the same
-//! pattern `local_rag_protocol::ErrorCode` already uses).
+//! T15-01's own scope was narrow (see [`super::resume`]): only the two
+//! startup catch-up passes spec 02 §4.1 step 5 names ran at first, so only
+//! [`JobKind::SpoolImport`]/[`JobKind::ConsolidationResume`] existed. D-024
+//! then wired the continuous consolidation-trigger worker (spec 07 §6:
+//! checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`),
+//! adding [`JobKind::ConsolidationTrigger`] rather than inventing a second
+//! registry (`#[non_exhaustive]` keeps this open without a breaking change,
+//! the same pattern `local_rag_protocol::ErrorCode` already uses) — a future
+//! reconcile/backfill/GC trigger follows the identical path.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,10 +19,19 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum JobKind {
-    /// A startup spool-import catch-up pass (spec 02 §4.1 step 5; 07 §6).
+    /// A startup spool-import catch-up pass (spec 02 §4.1 step 5; 07 §6) —
+    /// also reused per-tick by the continuous consolidation-trigger worker
+    /// (D-024): the same operation (`import_session_tail`), just repeated.
     SpoolImport,
-    /// A startup consolidation crash-resume pass (spec 02 §4.1 step 5; 08 §4).
+    /// A startup consolidation crash-resume pass (spec 02 §4.1 step 5; 08 §4)
+    /// — also reused per-tick by the continuous consolidation-trigger worker
+    /// (D-024) for its own stale-run recovery sweep.
     ConsolidationResume,
+    /// The continuous consolidation-trigger worker (D-024, spec 07 §6)
+    /// opening a fresh consolidation window — distinct from
+    /// [`JobKind::ConsolidationResume`], which only recovers crashed/expired
+    /// runs.
+    ConsolidationTrigger,
 }
 
 #[derive(Debug, Default)]

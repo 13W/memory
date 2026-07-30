@@ -433,10 +433,11 @@ pub use memory::{
     edit_candidate, find_by_idempotency_key, insert_audit_event, insert_candidate_evidence,
     insert_memory_evidence, lease_expired, list_candidates, list_memory_entries_for_scope,
     memory_entry_counts, memory_entry_state, memory_entry_summary, memory_evidence_for,
-    observation_evidence_source, open_next_run, pending_candidate_ages, pending_candidate_counts,
-    processing_cursor, propose_candidate, read_audit_events_for_entity, recall_candidate_by_id,
-    recall_candidates_for_scope, reject_candidate, renew_lease, retry_run, run_once, stale_runs,
-    transition_candidate, transition_memory_entry, transition_run, upsert_processing_cursor,
+    observation_evidence_source, open_next_run, pending_backlog, pending_candidate_ages,
+    pending_candidate_counts, processing_cursor, propose_candidate, read_audit_events_for_entity,
+    recall_candidate_by_id, recall_candidates_for_scope, reject_candidate, renew_lease, retry_run,
+    run_once, stale_runs, transition_candidate, transition_memory_entry, transition_run,
+    upsert_processing_cursor,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{

@@ -329,6 +329,25 @@ sequence shared by every session's envelopes.
 - Import is idempotent under daemon kill at any point: cursor advances only in the same tx as
   the envelopes; re-reading a segment re-skips imported frames via dedup + offset.
 
+As-built note (D-024, `[SPEC]`): "a background worker owns all of it" split across two tasks —
+T15-01 shipped only the startup catch-up quarter (`local_rag::daemon::resume`, one-shot at
+`DaemonHandle::start`); the continuous three-quarters (checkpoint on `Stop`, queue-size
+threshold, best-effort `SessionEnd`) is `local_rag::daemon::consolidation_trigger`, a
+`tokio::time::interval`-driven loop ticking every `[SPEC 15s]`
+(`main.rs::CONSOLIDATION_POLL_INTERVAL`), spawned alongside the two startup passes and cancelled
+via signal-then-await at shutdown (see `docs/specification/02-architecture.md` §4.3's own as-built
+note for the full wiring). "Queue size threshold" is `config.memory.consolidation_queue_threshold
+= 50` against `local_rag_store::pending_backlog` (envelopes past the session's processing
+cursor); deliberately 2.5× the companion `consolidation_batch_size = 20`
+(`docs/specification/08-memory.md` §4's own as-built note) — a threshold at or below the batch
+size would open a fresh run on nearly every tick that has *any* backlog at all, defeating the
+point of reserving this path for genuine off-checkpoint buildup rather than eager per-tick
+triggering against a 120s-leased, non-instant local-LLM call. A known, accepted gap: at daemon
+boot this worker's first tick races T15-01's own startup spool-import pass for the same session's
+tail, so a `Stop` arriving exactly at startup can be missed by the checkpoint path specifically
+(caught later by the queue-threshold path instead) — see
+`crates/local-rag/src/daemon/consolidation_trigger.rs`'s own module doc for the full reasoning.
+
 As-built note (T13-05, `[SPEC]`): the session directory GC sweep is
 `local_rag_store::housekeeping::run_spool_session_sweep`, the fourth sweep in
 `crates/store/src/housekeeping.rs` alongside the three shard sweeps (D-004/D-007/D-011) — the

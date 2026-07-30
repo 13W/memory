@@ -16,10 +16,14 @@
 //! the MCP status/memory-read tools call (spec 11 §2, T15-04). [`mcp`] is
 //! the real MCP JSON-RPC dispatcher (spec 11 §2, T15-03/T15-04) — the
 //! `RequestHandler` `lifecycle` wires in place of T15-02's
-//! `EchoRequestHandler`. [`lifecycle`] composes all of the above into the
-//! five startup steps and the shutdown sequence ([`shutdown`]) —
-//! [`lifecycle::run`] is what `main.rs`'s `serve` command drives.
+//! `EchoRequestHandler`. [`consolidation_trigger`] is the continuous
+//! consolidation-trigger background worker (spec 07 §6, D-024) —
+//! [`resume`]'s missing continuous quarter. [`lifecycle`] composes all of
+//! the above into the five startup steps and the shutdown sequence
+//! ([`shutdown`]) — [`lifecycle::run`] is what `main.rs`'s `serve` command
+//! drives.
 
+pub mod consolidation_trigger;
 pub mod error;
 pub mod gitroot;
 pub mod handshake;
@@ -36,6 +40,10 @@ pub mod search;
 pub mod session;
 pub mod shutdown;
 
+pub use consolidation_trigger::{
+    ConsolidationTriggerParams, SessionTickOutcome, consolidation_trigger_tick,
+    run_consolidation_trigger,
+};
 pub use error::{error_envelope, migration_only_reason};
 pub use gitroot::{case_sensitivity, probe as probe_worktree_root, request_root};
 pub use handshake::{EchoRequestHandler, HandshakeContext, RequestHandler, serve_connections};

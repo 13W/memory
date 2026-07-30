@@ -56,6 +56,9 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         query_embedder: Arc::new(UnavailableEmbedder),
         memory_query_embedder: Arc::new(local_rag_memory::recall::UnavailableEmbedder),
         recall_token_budget: 1500,
+        consolidation_batch_size: 20,
+        consolidation_queue_threshold: 50,
+        consolidation_poll_interval: Duration::from_millis(50),
     }
 }
 

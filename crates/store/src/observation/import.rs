@@ -76,6 +76,11 @@ pub struct ImportBatchReport {
     pub exact_duplicates: u32,
     /// Best-effort events skipped by the bounded dedup window.
     pub window_duplicates: u32,
+    /// A newly-imported (not deduplicated-away) `Stop` row was in this batch
+    /// (spec 07 §6's "checkpoint on Stop" trigger, D-024).
+    pub saw_stop: bool,
+    /// As `saw_stop`, for `SessionEnd` (spec 07 §6's best-effort trigger).
+    pub saw_session_end: bool,
 }
 
 /// Import `observations` (already decoded, in order) for `session_id` in one
@@ -181,6 +186,11 @@ pub fn import_batch(
             insert_payload(tx, observation_id, text.as_bytes(), expires_at)?;
         }
         report.imported += 1;
+        match payload.event_type.as_str() {
+            "Stop" => report.saw_stop = true,
+            "SessionEnd" => report.saw_session_end = true,
+            _ => {}
+        }
     }
 
     upsert_cursor(

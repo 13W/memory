@@ -95,6 +95,9 @@ async fn serve() -> ExitCode {
         // Some(EmbedFailed(..))`) until T15-07 wires a real provider.
         memory_query_embedder: Arc::new(UnavailableMemoryEmbedder),
         recall_token_budget: config.memory.recall_token_budget,
+        consolidation_batch_size: config.memory.consolidation_batch_size,
+        consolidation_queue_threshold: config.memory.consolidation_queue_threshold,
+        consolidation_poll_interval: CONSOLIDATION_POLL_INTERVAL,
     };
     let idle_shutdown_secs = config.daemon.idle_shutdown_secs;
 
@@ -110,6 +113,10 @@ async fn serve() -> ExitCode {
 }
 
 const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often the continuous consolidation-trigger worker ticks (D-024). No
+/// `[SPEC]` number exists for it — the same bucket `IDLE_POLL_INTERVAL`
+/// above occupies.
+const CONSOLIDATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The current wall-clock time as Unix milliseconds (production seam).
 ///
