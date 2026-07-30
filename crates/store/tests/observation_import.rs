@@ -626,3 +626,217 @@ async fn import_stores_redaction_version_and_null_for_envelope_only() {
         "an envelope-only event's payload was never scanned"
     );
 }
+
+// ---------------------------------------------------------------------------
+// D-024: ImportBatchReport::{saw_stop, saw_session_end}
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn import_batch_flags_saw_stop_when_newly_imported() {
+    let (_home, _layout, db) = open_state();
+    let payload = fixture(
+        "Stop",
+        "st:sess-1:1",
+        Some("stop-1"),
+        "sess-1",
+        1_000,
+        vec![],
+        None,
+    );
+    let decoded = DecodedObservation {
+        payload,
+        classification: DedupClass::Stable {
+            dedup_key: "stop-1".to_string(),
+        },
+        frame_offset: 0,
+        frame_len: 0,
+    };
+    let ids = vec!["obs-1".to_string()];
+    let request_root = RequestRoot::default();
+
+    let report = db
+        .writer()
+        .transaction(move |tx| {
+            import_batch(
+                tx,
+                "sess-1",
+                std::slice::from_ref(&decoded),
+                &ids,
+                &request_root,
+                5_000,
+                72,
+                1,
+                100,
+            )
+        })
+        .await
+        .expect("import_batch commits");
+
+    assert_eq!(report.imported, 1);
+    assert!(report.saw_stop, "a newly-imported Stop row sets saw_stop");
+    assert!(!report.saw_session_end);
+}
+
+#[tokio::test]
+async fn import_batch_does_not_flag_saw_stop_for_a_deduplicated_redelivered_stop() {
+    let (_home, _layout, db) = open_state();
+    let payload = fixture(
+        "Stop",
+        "st:sess-1:1",
+        Some("stop-1"),
+        "sess-1",
+        1_000,
+        vec![],
+        None,
+    );
+    let decoded = DecodedObservation {
+        payload,
+        classification: DedupClass::Stable {
+            dedup_key: "stop-1".to_string(),
+        },
+        frame_offset: 0,
+        frame_len: 0,
+    };
+    let ids = vec!["obs-1".to_string()];
+    let request_root = RequestRoot::default();
+
+    // First delivery: genuinely imported.
+    {
+        let decoded = decoded.clone();
+        let ids = ids.clone();
+        let request_root = request_root.clone();
+        db.writer()
+            .transaction(move |tx| {
+                import_batch(
+                    tx,
+                    "sess-1",
+                    std::slice::from_ref(&decoded),
+                    &ids,
+                    &request_root,
+                    5_000,
+                    72,
+                    1,
+                    100,
+                )
+            })
+            .await
+            .expect("first import commits");
+    }
+
+    // Second delivery of the very same dedup_key: exact-duplicate skip.
+    let ids2 = vec!["obs-2".to_string()];
+    let report = db
+        .writer()
+        .transaction(move |tx| {
+            import_batch(
+                tx,
+                "sess-1",
+                std::slice::from_ref(&decoded),
+                &ids2,
+                &request_root,
+                5_000,
+                72,
+                2,
+                200,
+            )
+        })
+        .await
+        .expect("second import commits");
+
+    assert_eq!(report.imported, 0);
+    assert_eq!(report.exact_duplicates, 1);
+    assert!(
+        !report.saw_stop,
+        "a deduplicated-away redelivery must not trigger a fresh checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn import_batch_flags_saw_session_end_independently() {
+    let (_home, _layout, db) = open_state();
+    let payload = fixture(
+        "SessionEnd",
+        "se:sess-1:1",
+        Some("end-1"),
+        "sess-1",
+        1_000,
+        vec![],
+        None,
+    );
+    let decoded = DecodedObservation {
+        payload,
+        classification: DedupClass::Stable {
+            dedup_key: "end-1".to_string(),
+        },
+        frame_offset: 0,
+        frame_len: 0,
+    };
+    let ids = vec!["obs-1".to_string()];
+    let request_root = RequestRoot::default();
+
+    let report = db
+        .writer()
+        .transaction(move |tx| {
+            import_batch(
+                tx,
+                "sess-1",
+                std::slice::from_ref(&decoded),
+                &ids,
+                &request_root,
+                5_000,
+                72,
+                1,
+                100,
+            )
+        })
+        .await
+        .expect("import_batch commits");
+
+    assert!(report.saw_session_end);
+    assert!(!report.saw_stop);
+}
+
+#[tokio::test]
+async fn import_batch_flags_neither_for_an_ordinary_batch() {
+    let (_home, _layout, db) = open_state();
+    let payload = fixture(
+        "PreToolUse",
+        "pt:sess-1:1",
+        Some("pt-1"),
+        "sess-1",
+        1_000,
+        vec![],
+        None,
+    );
+    let decoded = DecodedObservation {
+        payload,
+        classification: DedupClass::Stable {
+            dedup_key: "pt-1".to_string(),
+        },
+        frame_offset: 0,
+        frame_len: 0,
+    };
+    let ids = vec!["obs-1".to_string()];
+    let request_root = RequestRoot::default();
+
+    let report = db
+        .writer()
+        .transaction(move |tx| {
+            import_batch(
+                tx,
+                "sess-1",
+                std::slice::from_ref(&decoded),
+                &ids,
+                &request_root,
+                5_000,
+                72,
+                1,
+                100,
+            )
+        })
+        .await
+        .expect("import_batch commits");
+
+    assert!(!report.saw_stop);
+    assert!(!report.saw_session_end);
+}

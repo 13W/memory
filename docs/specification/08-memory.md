@@ -190,7 +190,13 @@ the shipped code:
 - **No default batch size is specified anywhere normative** in this section, 03 §2.5, or 04 §4 —
   unlike the lease/renewal numbers, which are explicitly `[SPEC]`-tagged. `open_next_run` therefore
   takes `batch` as a required caller parameter rather than inventing a crate constant; picking an
-  actual default is deferred to whichever task wires the daemon-level trigger (T15-06).
+  actual default was deferred to whichever task wires the daemon-level trigger.
+
+As-built note (D-024, `[SPEC]`): the default is `config.memory.consolidation_batch_size = 20`
+(`crates/core/src/config::MemoryConfig`, the same "spec names the value's existence without a TOML
+layout" home as `recall_token_budget`). Chosen deliberately smaller than the companion
+`consolidation_queue_threshold = 50` — see `docs/specification/07-observations-spool.md` §6's own
+as-built note for why the relative sizing matters, not just the absolute numbers.
 
 `idempotency_key = H(memory_op, run_id, op_index)` is realized as
 `format!("consolidation:{run_id}:{op_index}:{op_kind}")` — a plain deterministic string, mirroring

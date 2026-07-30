@@ -109,7 +109,7 @@ pub use consolidation::{
     IllegalRunTransition, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, NewConsolidationRun,
     RenewError, RunState, RunTransitionError, RunWindow, SnapshotOutcome, StaleRun, acquire_lease,
     consolidation_run_state, create_consolidation_run, lease_expired, open_next_run,
-    processing_cursor, renew_lease, retry_run, stale_runs, transition_run,
+    pending_backlog, processing_cursor, renew_lease, retry_run, stale_runs, transition_run,
     upsert_processing_cursor,
 };
 pub use entry::{

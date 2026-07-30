@@ -419,17 +419,40 @@ future per-connection HELLO handler; T15-01's own tests register directly), a `J
 tracking the startup resume passes below, and
 `local_rag_store::store_has_pending_spool_bytes`. `idle_eligible` is a pure `&&` of all three —
 a single non-idle input refuses regardless of the other two, per this section's own "**all**".
-This task's own scope covers only the two *startup* resume jobs (07 §6, 08 §4) — continuous
-consolidation triggering (checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`) is
-T15-06's, per T14-06's own as-built note; no reconcile-watcher or periodic-GC scheduling exists yet
-either (no card names an owner narrower than "group 15" for either).
+This task's own scope covered only the two *startup* resume jobs (07 §6, 08 §4); no
+reconcile-watcher or periodic-GC scheduling exists yet either (no card names an owner narrower
+than "group 15" for either).
 
-As-built note (T15-01, `[SPEC]`): the four shutdown steps are, in order: (1) stop accepting — signal
-the socket's accept loop to return, then best-effort unlink `run/daemon.sock`; (2) cancel at the
-next safe point — T15-01's own only background work is the two startup resume passes, and the
-caller already `.await`s their completion before proceeding, which *is* "let the current job finish,
-refuse new ones" here (a `StateWriter`/`CacheWriter` job's only unit of work is already one SQL
-transaction — there is no smaller safe point); (3) flush WAL checkpoint — `TRUNCATE` on both
+As-built note (D-024, `[SPEC]`): continuous consolidation triggering (checkpoint on `Stop`,
+queue-size threshold, best-effort `SessionEnd`) — the quarter this section's own text names but
+T15-01 left to a later task, and which T15-06's own card never actually carried — is
+`local_rag::daemon::consolidation_trigger::run_consolidation_trigger`, a `tokio::time::interval`-driven
+loop (`config.memory.consolidation_poll_interval`-adjacent constant, `[SPEC]` 15s default, see
+`main.rs::CONSOLIDATION_POLL_INTERVAL`) spawned alongside the two startup passes in
+`DaemonHandle::start` (guarded identically: never in `MigrationOnly`). Each tick: T15-01's own
+`resume_stale_consolidation_runs` verbatim (crash recovery first, so a same-tick fresh checkpoint
+is never blocked by a leftover non-`applied` row), then per known spool session,
+`import_session_tail` followed by `open_next_run`+`run_once` whenever that import just saw a
+`Stop`/`SessionEnd` row or `local_rag_store::pending_backlog` has crossed
+`config.memory.consolidation_queue_threshold`. Unlike the two startup passes (blind-awaited to
+natural completion), this worker never completes on its own — `DaemonHandle` cancels it via a
+dedicated `(oneshot::Sender<()>, JoinHandle<()>)` pair, signalled then awaited in `shutdown`,
+mirroring `handshake_stop`/`handshake_join`'s existing shape rather than `resume_handles`'s. Its
+own `JobGuard` (`JobKind::ConsolidationTrigger`) is held only for one tick's active work, dropped
+before the next tick's wait, so a live-but-idle worker never blocks idle-shutdown. A known,
+accepted gap: at daemon boot the worker's first tick races T15-01's own startup spool-import pass
+for the same session's tail — whichever import call wins observes the checkpoint flag, so a
+`Stop` arriving exactly at startup can be missed by the checkpoint path and only picked up once
+the queue-size threshold is later crossed; see `consolidation_trigger.rs`'s own module doc.
+
+As-built note (T15-01, `[SPEC]`; updated D-024): the four shutdown steps are, in order: (1) stop
+accepting — signal the socket's accept loop to return, then best-effort unlink `run/daemon.sock`;
+(2) cancel at the next safe point — the two startup resume passes are blind-awaited to natural
+completion, which *is* "let the current job finish, refuse new ones" for them (a `StateWriter`/
+`CacheWriter` job's only unit of work is already one SQL transaction — there is no smaller safe
+point); the continuous consolidation-trigger worker (D-024) is signalled to stop and then awaited
+immediately after, since — unlike the two passes — it never completes on its own; (3) flush WAL
+checkpoint — `TRUNCATE` on both
 `state.sqlite` and `cache.sqlite` (03 §4's own as-built note), then `CacheDb::close` (D-009's
 blocking, join-the-writer-thread variant — exactly the "process going away" case it was built for);
 `state.sqlite`'s own writer thread stays detached, safe by construction once step 2 already

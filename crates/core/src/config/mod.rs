@@ -248,12 +248,26 @@ pub struct SpoolConfig {
 pub struct MemoryConfig {
     /// Recall's `additionalContext` token budget (spec 08 §6, 11 §5).
     pub recall_token_budget: u32,
+    /// The continuous consolidation-trigger worker's window size
+    /// (`open_next_run`'s `batch`, D-024, spec 08 §4) — no default is
+    /// specified anywhere normative, so this is a `[SPEC]`-chosen value, not
+    /// derived.
+    pub consolidation_batch_size: i64,
+    /// The backlog size that alone opens a fresh consolidation window, even
+    /// with no `Stop`/`SessionEnd` checkpoint (D-024, spec 07 §6's
+    /// "queue size threshold" trigger). Deliberately larger than
+    /// `consolidation_batch_size` — see D-024's evidence for why a threshold
+    /// at or below the batch size would make this path fire on nearly every
+    /// tick instead of reserving it for genuine off-checkpoint buildup.
+    pub consolidation_queue_threshold: i64,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         MemoryConfig {
             recall_token_budget: 1500,
+            consolidation_batch_size: 20,
+            consolidation_queue_threshold: 50,
         }
     }
 }
@@ -486,6 +500,8 @@ deny_tools = []
 
 [memory]
 recall_token_budget = 1500
+consolidation_batch_size = 20
+consolidation_queue_threshold = 50
 ";
 
     const ALL_POLICIES: [DataPolicy; 4] = [
@@ -664,5 +680,30 @@ recall_token_budget = 1500
         // Every other section still defaults.
         assert_eq!(cfg.daemon, DaemonConfig::default());
         assert_eq!(cfg.spool, SpoolConfig::default());
+    }
+
+    // ---- `[memory]` consolidation-trigger fields (D-024) --------------------
+
+    #[test]
+    fn memory_config_defaults_consolidation_batch_and_threshold() {
+        let defaults = MemoryConfig::default();
+        assert_eq!(defaults.consolidation_batch_size, 20);
+        assert_eq!(defaults.consolidation_queue_threshold, 50);
+        assert!(
+            defaults.consolidation_queue_threshold > defaults.consolidation_batch_size,
+            "the threshold must stay above the batch size, or it would fire on nearly every tick"
+        );
+    }
+
+    #[test]
+    fn memory_section_round_trips_custom_consolidation_values() {
+        let cfg = Config::parse_toml(
+            "[memory]\nconsolidation_batch_size = 5\nconsolidation_queue_threshold = 30\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.memory.consolidation_batch_size, 5);
+        assert_eq!(cfg.memory.consolidation_queue_threshold, 30);
+        // A partial `[memory]` section still defaults the untouched key.
+        assert_eq!(cfg.memory.recall_token_budget, 1500);
     }
 }

@@ -233,6 +233,16 @@ pub fn processing_cursor(conn: &Connection, session_id: &str) -> rusqlite::Resul
     .optional()
 }
 
+/// How many envelopes are past `session_id`'s processing cursor, not yet
+/// swept into any consolidation window (spec 07 §6's "queue size threshold"
+/// trigger, D-024). `0` for an unknown session or a cursor already caught up
+/// to `max_received_seq` — never negative.
+pub fn pending_backlog(conn: &Connection, session_id: &str) -> rusqlite::Result<i64> {
+    let cursor = processing_cursor(conn, session_id)?.unwrap_or(0);
+    let max_seq = crate::observation::max_received_seq(conn, session_id)?.unwrap_or(cursor);
+    Ok((max_seq - cursor).max(0))
+}
+
 /// Upsert the `session_id`'s consolidation cursor, mirroring
 /// [`observation`](crate::observation)'s `spool_import_cursor` upsert idiom.
 pub fn upsert_processing_cursor(
@@ -958,5 +968,57 @@ mod tests {
             .expect("run-expired present");
         assert_eq!(expired.from_received_seq, 1);
         assert_eq!(expired.to_received_seq, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // D-024: pending_backlog
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_backlog_is_zero_for_an_unknown_session() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE processing_cursor (session_id TEXT, last_consolidated_received_seq INTEGER);\n\
+             CREATE TABLE observation_envelope (session_id TEXT, received_seq INTEGER);",
+        )
+        .expect("seed empty tables");
+        assert_eq!(pending_backlog(&conn, "nobody").expect("read"), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_backlog_counts_envelopes_past_the_cursor() {
+        let (_home, db) = open_state();
+        seed_envelopes(&db, "sess-1", 5).await;
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            pending_backlog(&read, "sess-1").expect("backlog"),
+            5,
+            "no cursor yet: every envelope is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_backlog_shrinks_after_the_cursor_advances() {
+        let (_home, db) = open_state();
+        seed_envelopes(&db, "sess-1", 5).await;
+        db.writer()
+            .transaction(|tx| upsert_processing_cursor(tx, "sess-1", 3))
+            .await
+            .expect("advance cursor");
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(pending_backlog(&read, "sess-1").expect("backlog"), 2);
+
+        db.writer()
+            .transaction(|tx| upsert_processing_cursor(tx, "sess-1", 5))
+            .await
+            .expect("catch up cursor");
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            pending_backlog(&read, "sess-1").expect("backlog"),
+            0,
+            "cursor caught up to max_received_seq"
+        );
     }
 }

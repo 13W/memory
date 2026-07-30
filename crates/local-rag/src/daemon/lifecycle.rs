@@ -109,6 +109,18 @@ pub struct StartOptions {
     /// `recall`'s token budget (`config.memory.recall_token_budget`, spec 08
     /// §6 `[SPEC default 1500 tokens, config]`).
     pub recall_token_budget: u32,
+    /// The continuous consolidation-trigger worker's window size
+    /// (`config.memory.consolidation_batch_size`, D-024, spec 08 §4).
+    pub consolidation_batch_size: i64,
+    /// The continuous consolidation-trigger worker's backlog threshold
+    /// (`config.memory.consolidation_queue_threshold`, D-024, spec 07 §6).
+    pub consolidation_queue_threshold: i64,
+    /// How often the continuous consolidation-trigger worker ticks (D-024).
+    /// No `[SPEC]` number exists for it (the same bucket
+    /// `wait_for_shutdown_trigger`'s own `poll_interval` occupies) — a plain
+    /// parameter, not a config field, so lifecycle-level tests can drive it
+    /// directly.
+    pub consolidation_poll_interval: Duration,
 }
 
 /// A running daemon instance, in-process (spec 02 §4.1 steps 1–5 complete;
@@ -135,11 +147,18 @@ pub struct DaemonHandle {
     handshake_stop: Option<oneshot::Sender<()>>,
     handshake_join: Option<JoinHandle<()>>,
     /// The two startup catch-up passes (spec 02 §4.1 step 5), spawned
-    /// non-blocking relative to readiness. `run`/`shutdown` await these to
-    /// completion before draining — spec 02 §4.3's "cancel reconciles at the
-    /// next safe point" applied to the only background work this task's own
-    /// scope has (see `shutdown::drain_and_shutdown`'s doc).
+    /// non-blocking relative to readiness. Both terminate on their own, so
+    /// `shutdown` blind-awaits these to completion before draining — spec 02
+    /// §4.3's "cancel reconciles at the next safe point" applied to the only
+    /// background work T15-01's own scope had.
     resume_handles: Vec<JoinHandle<()>>,
+    /// The continuous consolidation-trigger worker (D-024, spec 07 §6) —
+    /// unlike `resume_handles` above, this is a `loop { tick }` that never
+    /// completes on its own, so `shutdown` signals it via this sender
+    /// (rather than blind-awaiting its `JoinHandle`), mirroring
+    /// `handshake_stop`/`handshake_join`.
+    consolidation_trigger_stop: Option<oneshot::Sender<()>>,
+    consolidation_trigger_join: Option<JoinHandle<()>>,
 }
 
 impl DaemonHandle {
@@ -172,6 +191,9 @@ impl DaemonHandle {
             query_embedder,
             memory_query_embedder,
             recall_token_budget,
+            consolidation_batch_size,
+            consolidation_queue_threshold,
+            consolidation_poll_interval,
         } = opts;
 
         layout.ensure().map_err(|e| {
@@ -319,6 +341,33 @@ impl DaemonHandle {
             )));
         }
 
+        // D-024: the continuous consolidation-trigger worker (spec 07 §6) —
+        // same `state_db`-present guard as the two resume passes above (no
+        // usable `state.sqlite` in `MigrationOnly`), but its own
+        // signal-then-await cancellation pair (see `DaemonHandle::shutdown`),
+        // not `resume_handles` — this loop never completes on its own.
+        let (consolidation_trigger_stop, consolidation_trigger_join) = match state_db.as_ref() {
+            Some(db) => {
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let join = tokio::spawn(spawn_consolidation_trigger(
+                    Arc::clone(db),
+                    layout.clone(),
+                    Arc::clone(&uuids),
+                    jobs.clone(),
+                    consolidation_lease_ms,
+                    consolidation_renew_interval_ms,
+                    consolidation_batch_size,
+                    consolidation_queue_threshold,
+                    payload_ttl_hours,
+                    consolidation_poll_interval,
+                    data_policy,
+                    stop_rx,
+                ));
+                (Some(stop_tx), Some(join))
+            }
+            None => (None, None),
+        };
+
         Ok(DaemonHandle {
             socket_path: layout.socket_path(),
             layout,
@@ -333,6 +382,8 @@ impl DaemonHandle {
             handshake_stop: Some(handshake_stop_tx),
             handshake_join: Some(handshake_join),
             resume_handles,
+            consolidation_trigger_stop,
+            consolidation_trigger_join,
         })
     }
 
@@ -360,12 +411,19 @@ impl DaemonHandle {
     }
 
     /// Drain and release the store (spec 02 §4.3): await the startup resume
-    /// passes to their natural completion (the only "safe point" this task's
-    /// own background work has — see `shutdown::drain_and_shutdown`'s doc),
-    /// then checkpoint, close the cache, and release the lock.
+    /// passes to their natural completion, signal-then-await the continuous
+    /// consolidation-trigger worker (D-024 — unlike the resume passes, it
+    /// never completes on its own), then checkpoint, close the cache, and
+    /// release the lock.
     pub async fn shutdown(mut self) {
         for handle in self.resume_handles.drain(..) {
             let _ = handle.await;
+        }
+        if let Some(stop) = self.consolidation_trigger_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.consolidation_trigger_join.take() {
+            let _ = join.await;
         }
         if let Some(handshake_join) = self.handshake_join.take() {
             // `handshake_join` is only the *accept loop* — aborting it stops
@@ -420,6 +478,66 @@ async fn spawn_consolidation_resume(
     let _ =
         resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
             .await;
+}
+
+/// D-024: the continuous consolidation-trigger worker (spec 07 §6).
+///
+/// Unlike [`spawn_consolidation_resume`]'s `generate` above — which borrows
+/// `db`/`pool`/`uuids` from this function's own stack frame and is used
+/// entirely within it — this worker is `tokio::spawn`ed independently and so
+/// needs a `'static` `generate`. A `move` closure that captured `db`/`pool`/
+/// `uuids` directly would make each call's returned future borrow from the
+/// closure's own fields, which `Fn`'s signature cannot allow to escape
+/// (`Fut` is one fixed associated type, not tied to a per-call borrow).
+/// Instead, the outer closure holds `Arc` clones and hands each call a fresh
+/// clone to own inside its own `async move` block — the returned future then
+/// owns its data instead of borrowing the closure's.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_consolidation_trigger(
+    db: Arc<StateDb>,
+    layout: StoreLayout,
+    uuids: Arc<dyn UuidSource + Send + Sync>,
+    jobs: JobRegistry,
+    lease_ms: i64,
+    renew_interval_ms: i64,
+    batch_size: i64,
+    queue_threshold: i64,
+    payload_ttl_hours: u64,
+    poll_interval: Duration,
+    data_policy: DataPolicy,
+    stop: oneshot::Receiver<()>,
+) {
+    let pool = Arc::new(build_best_effort_pool(&layout));
+    let generate = {
+        let db = Arc::clone(&db);
+        let uuids = Arc::clone(&uuids);
+        move |window| {
+            let db = Arc::clone(&db);
+            let pool = Arc::clone(&pool);
+            let uuids = Arc::clone(&uuids);
+            async move {
+                local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window).await
+            }
+        }
+    };
+    let params = super::consolidation_trigger::ConsolidationTriggerParams {
+        lease_ms,
+        renew_interval_ms,
+        batch_size,
+        queue_threshold,
+        payload_ttl_hours,
+    };
+    super::consolidation_trigger::run_consolidation_trigger(
+        db,
+        layout,
+        uuids,
+        jobs,
+        params,
+        poll_interval,
+        generate,
+        stop,
+    )
+    .await;
 }
 
 /// The current wall-clock time as Unix milliseconds — the live clock
