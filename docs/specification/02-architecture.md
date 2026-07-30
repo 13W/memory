@@ -196,6 +196,50 @@ there is nothing per-request to vary it by. `repo_hint` is always `None` from th
 launch contract that would set it does not exist yet in this repository (packaging is a later
 group).
 
+As-built note (T15-03, `[SPEC]`): the git probe §3.3's own T02-04 note named as "the daemon's job"
+is `local_rag::daemon::gitroot` (`crates/local-rag/src/daemon/gitroot.rs`). `request_root` is
+total — it never errors — built by shelling out to `git` (the same precedent
+`crates/xtask/src/bench/run.rs`'s own `git rev-parse --short HEAD` already sets; no `git2`
+dependency) rather than reimplementing git's own repository-layout rules:
+
+- **Command**: `git -C <path> rev-parse --path-format=absolute --show-toplevel --git-dir
+  --git-common-dir` (git ≥ 2.31), falling back to `--absolute-git-dir` + `--git-common-dir` for
+  older git. Any failure (not a git repository, `git` missing, non-zero exit) is `WorktreeKind::
+  NonGit`, not a hard error — a probe failure only becomes `worktree_root: None` if the path
+  itself cannot be canonicalized at all (does not exist, inaccessible).
+- **`WorktreeKind` discriminator**: `Main` iff the canonicalized `--git-dir` equals the
+  canonicalized `--git-common-dir`; otherwise `Linked` (`git worktree add` gives a linked tree a
+  `--git-dir` of `<common>/worktrees/<name>` while `--git-common-dir` stays `<common>`) — the
+  exact discriminator, not a heuristic, and unit-testable without a real git repository since the
+  comparison is pure string equality on already-git-reported paths.
+- **Toplevel snapping**: the probed path is snapped to `--show-toplevel`, not used as given —
+  `RequestContext.worktree_root` is the proxy's launch `current_dir()`, often a package
+  subdirectory rather than the repository root, and `local_rag_store::registry::resolve`'s only
+  automatic path matches the *recorded worktree root* exactly.
+- **`remote_fingerprint`**: `git config --get remote.origin.url` (absent key is normal, not a
+  failure — `None`, not an error) through the already-existing
+  `local_rag_core::identity::remote::fingerprint`.
+- **`common_dir_fingerprint`**: reuses `local_rag_core::identity::domain::path_fingerprint` on the
+  canonicalized common/admin dir — consistent with `path_fingerprint`'s own documented shape
+  (`H(path_fingerprint, canonical_path)`, and the common dir is itself a canonical path), not a
+  new hash-schema variant for a field this module's own doc already marks "advisory only... never
+  stored or queried."
+- **Case sensitivity**: `daemon::gitroot::case_sensitivity()` returns the platform default
+  (insensitive on macOS/Windows, sensitive elsewhere) — no live filesystem probe (would touch the
+  caller's worktree on every request); `pub` specifically so T15-07's indexer calls the same
+  function rather than risking a divergent fold.
+- **No cache**: the probe runs fresh on every request. `git` shells out are a few milliseconds on
+  a warm page cache, MCP tool calls are user-turn-driven (not a hot loop), and a path-keyed cache
+  would itself be exactly the ambient per-request state the "no process-global current
+  project/worktree/branch" guardrail forbids.
+
+`get_file_context`'s absolute-path handling resolves its input's *parent directory* through the
+same real `canonicalize_absolute` the worktree root itself used (so symlinked ancestors — macOS's
+`/tmp` → `/private/tmp`, `/var` → `/private/var` are the everyday case — compare correctly)
+without ever requiring the queried *file* to still exist, falling back to pure string
+normalization only if the parent itself is also gone (11 §2's as-built note has the full
+reasoning).
+
 ## 4. Daemon lifecycle `[FIXED, mechanics [SPEC]]`
 
 ### 4.1 Startup
@@ -603,3 +647,23 @@ names an owner whose lock record has `ready: false` (still starting, most common
 migrating, see §4.1's as-built note above), naming the code for a human or launcher-script reading
 stderr, not for a wire response. Group 15 (T15-02+) still owns wiring these into the real MCP/proxy
 transport.
+
+As-built note (T15-03, `[SPEC]`): the real MCP wiring named above (`local_rag::daemon::mcp`, 11
+§2) confirms the previous note's own prediction rather than contradicting it — a `DaemonMode::
+MigrationOnly` `tools/call` answers `INCOMPATIBLE_STORE`, never `MIGRATION_IN_PROGRESS`, for
+exactly the reason already given: `MigrationOnlyReason` is *always* a refusal
+(`IncompatibleStore`/`ChecksumDrift`/`Other`), never "currently migrating" — a store genuinely
+mid-migration has no bound socket to answer *any* MCP request on. `initialize`/`tools/list`/
+`ping`/notifications still work in `MigrationOnly` (they touch no store) so a connected client can
+at least receive this diagnosable error, per this section's own `[FIXED]`: "nothing degrades
+silently."
+
+Also new: `SearchInfraError` (`local_rag_search::pipeline`, T12-04) — real infrastructure failures
+(`state.sqlite`/`cache.sqlite` would not open, a corrupt `worktree_id`, a missing generation row),
+distinct from this section's own domain taxonomy. It maps to `ErrorCode::IndexUnavailable`
+(`retryable = false`, `details` carrying the error's own `Display` text) rather than a new
+taxonomy row: the condition is exactly "the index cannot serve this request", which
+`INDEX_UNAVAILABLE` already names, and it is surfaced as `isError` content (11 §2's own
+two-channel split), never a bare JSON-RPC `-32603 Internal error` — that code is indistinguishable
+from a server bug to the model reading it, where `isError` content lets the model see and react to
+the specific taxonomy code.

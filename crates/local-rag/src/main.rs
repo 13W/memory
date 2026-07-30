@@ -11,6 +11,7 @@ use local_rag::daemon::{DaemonStartupError, ShutdownReason, StartOptions, StoreL
 use local_rag_core::identity::SystemUuidV7;
 use local_rag_core::paths::{StoreLayout, SystemEnv, config_dir, data_dir};
 use local_rag_protocol::ErrorEnvelope;
+use local_rag_search::UnavailableEmbedder;
 use local_rag_store::{DEFAULT_WRITE_QUEUE_CAPACITY, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
 
 const BIN: &str = "local-rag";
@@ -82,6 +83,12 @@ async fn serve() -> ExitCode {
         consolidation_renew_interval_ms: LEASE_RENEW_INTERVAL_MS,
         data_policy: config.models.data_policy,
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
+        max_open_shards: config.daemon.max_open_shards,
+        // The real provider is T15-07's job (it adds `local-rag-models`'
+        // ONNX weights and `init --download-models`); until then, MCP
+        // `search_code` correctly degrades to `lexical_only` with an
+        // explicit reason instead of the dense leg silently never running.
+        query_embedder: Arc::new(UnavailableEmbedder),
     };
     let idle_shutdown_secs = config.daemon.idle_shutdown_secs;
 

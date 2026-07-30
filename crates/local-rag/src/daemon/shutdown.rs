@@ -51,8 +51,8 @@ impl ShutdownSignal {
 
 /// Drain and release the store (spec 02 §4.3's four ordered steps).
 ///
-/// 1. **Stop accepting**: signal the handshake-stub accept loop to return,
-///    then best-effort unlink the socket file. Not required for correctness
+/// 1. **Stop accepting**: signal the accept loop to return, then
+///    best-effort unlink the socket file. Not required for correctness
 ///    (the next `acquire`'s success path already reclaims an orphaned socket
 ///    unconditionally, spec 02 §4.4), but an orderly shutdown leaving nothing
 ///    behind is strictly better than relying on that recovery path every
@@ -68,18 +68,43 @@ impl ShutdownSignal {
 /// 3. **Flush WAL checkpoint**: `TRUNCATE` on both databases (spec 03 §3;
 ///    03 §4's own as-built note adopting the same policy for `cache.sqlite`),
 ///    then [`CacheDb::close`] (the blocking, D-009-safe variant — exactly the
-///    "process going away" case its own doc anticipates). `state.sqlite`'s
-///    writer thread stays detached (`StateDb`'s own doc: safe by
-///    construction once nothing is mid-transaction, which step 2 already
-///    guarantees).
+///    "process going away" case its own doc anticipates) *when this is
+///    provably the last reference* — see below for why it sometimes is not,
+///    and why that is still safe. `state.sqlite`'s writer thread stays
+///    detached (`StateDb`'s own doc: safe by construction once nothing is
+///    mid-transaction, which step 2 already guarantees).
 /// 4. **Release lock**: [`StoreLockGuard::release`].
 ///
 /// Every step is best-effort past the first failure — a checkpoint error, for
 /// instance, must not skip releasing the lock afterward.
+///
+/// # Why `cache_db` is `Arc<CacheDb>`, and why `Arc::into_inner` can fail here
+///
+/// T15-03's `SearchEngine` needs `Arc<CacheDb>` to serve MCP queries, so
+/// `DaemonHandle` now shares one clone with it. By the time this function
+/// runs, `DaemonHandle::shutdown` has already aborted the accept loop
+/// (`handshake_join`, dropping *its* clone) — but a connection already
+/// mid-session when the trigger fired is deliberately never aborted
+/// (`daemon::handshake`'s own doc: it must stay open until this very drain
+/// finishes, so the requesting proxy observes EOF only after the drain is
+/// real). That connection's task holds its own clone until it is reclaimed
+/// by `main.rs::run_serve`'s `Runtime` drop, strictly *after* this function
+/// returns. So `Arc::into_inner` can genuinely fail here — not a bug, a live
+/// session racing shutdown. When it does, the checkpoint above has already
+/// run (it only needs `&Arc<CacheDb>`), and this function simply does not
+/// call `.close()` — the value drops later, when that session's task is
+/// reclaimed. That bare drop is exactly what D-009 flagged as unsafe in
+/// general, but not here: D-009's actual hazard is a *second* `CacheDb`
+/// immediately reopening the same `cache.sqlite` path before the first's
+/// writer thread finishes closing — and nothing reopens this store's path
+/// before the `Runtime` drop reclaims every remaining clone (the upgrade
+/// flow's own proxy-side `wait_for_close` only spawns a replacement daemon
+/// *after* observing EOF, which cannot happen before that drop; a plain
+/// SIGTERM/idle exit spawns nothing at all).
 pub async fn drain_and_shutdown(
     layout: &StoreLayout,
     state_db: Option<Arc<StateDb>>,
-    cache_db: Option<CacheDb>,
+    cache_db: Option<Arc<CacheDb>>,
     lock_guard: StoreLockGuard,
     handshake_stop: Option<oneshot::Sender<()>>,
 ) {
@@ -94,7 +119,7 @@ pub async fn drain_and_shutdown(
     if let Some(ref cache_db) = cache_db {
         let _ = cache_db.writer().checkpoint(CheckpointMode::Truncate).await;
     }
-    if let Some(cache_db) = cache_db {
+    if let Some(cache_db) = cache_db.and_then(Arc::into_inner) {
         cache_db.close();
     }
 

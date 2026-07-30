@@ -313,6 +313,19 @@ still detected. Verification cost is O(points) hashing; acceptable for local sha
 validation is recorded (`status` → `dirty` before rebuild) so a crash during validation itself
 re-enters the same path.
 
+As-built note (T15-03, `[SPEC]`): the daemon's MCP code-query path (11 §2) runs this validation
+unchanged on every shard open — but does so through a `VectorSource` that never answers
+(`NoRebuildVectorSource`, `crates/local-rag/src/daemon/search.rs`, always `None`). The production
+`VectorSource` (`local_rag_projection::CacheVectorSource`, T11-05, used by the switch/rebuild
+paths below) cannot serve this call site: it borrows `&StateDb`/`&CacheDb` and is scoped to one
+`(generation_id, model_space_id)` tuple *at construction time*, while the daemon's `ShardManager`
+is a single, daemon-lifetime `Arc` built once at startup, long before any request names a
+generation. The practical effect: a shard a real indexing run already filled opens and serves
+normally (validation still catches drift); one that would need §7's rebuild degrades to
+`lexical_only` instead — this card's own "no synchronous indexing call" requirement, made
+structural rather than a discipline the MCP handler has to remember. Repair stays exclusively
+T15-07's (CLI indexing) and T11-04's (backfill worker) job.
+
 ## 7. Rebuild — the single recovery path `[FIXED]`
 
 **Full rebuild is the recovery default; delta is only the normal fast path.** Local rebuild is

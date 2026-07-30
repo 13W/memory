@@ -29,6 +29,25 @@
 //! round trip) without knowing anything about MCP tool schemas. The same
 //! "type before backend" precedent this project already used for
 //! `ProjectionStore` (T07-01) and `Generator` (T11-03).
+//!
+//! # Why `RequestHandler::handle` returns `Option`, not `Box<RawValue>`
+//!
+//! T15-03, `daemon::mcp`'s consumer: MCP's own handshake requires the client
+//! to send `notifications/initialized` — a JSON-RPC **notification** (no
+//! `id`), which JSON-RPC 2.0 §4.1 says MUST NOT receive a response at all.
+//! `handle_connection`'s `Message::Request` arm only writes a `Message::
+//! Response` when `handle` returns `Some`; on `None` it writes nothing and
+//! loops. This is load-bearing all the way to the proxy: `local-rag-proxy`'s
+//! `relay.rs` forwards every `Message::Response` straight to the client's
+//! stdout with no request/response pairing of its own (spec 11 §1's "thin
+//! pass-through"), so answering a notification here would put an
+//! unsolicited, unmatched line on the client's stdin — a real protocol
+//! violation a strict MCP client need not tolerate. `RequestHandler` is an
+//! internal Rust trait (not a documented wire contract — spec 02 §4.2 fixes
+//! `RequestEnvelope`/`ResponseEnvelope`, not this trait's shape), so
+//! widening its return type here is ordinary interface evolution for the
+//! implementer T15-02's own doc already named as "later," not a deviation
+//! from already-shipped behavior.
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -67,7 +86,11 @@ pub struct HandshakeContext {
 /// since the daemon only ever runs one concrete handler at a time.
 pub trait RequestHandler: Clone + Send + Sync + 'static {
     /// Produce the MCP JSON-RPC response for one already-contextualized
-    /// request.
+    /// request, or `None` if `mcp` was a JSON-RPC **notification** (no `id`
+    /// — `notifications/initialized` is the one every MCP session sends).
+    /// JSON-RPC 2.0 §4.1 forbids a response to a notification; `None` is
+    /// what lets [`handle_connection`] honor that (see its own doc for why
+    /// this matters all the way out to the proxy's stdout).
     ///
     /// Explicit `-> impl Future<..> + Send` rather than a bare `async fn`:
     /// native async-fn-in-trait's return type is `Send` only when every
@@ -79,12 +102,14 @@ pub trait RequestHandler: Clone + Send + Sync + 'static {
         &self,
         ctx: RequestContext,
         mcp: Box<RawValue>,
-    ) -> impl std::future::Future<Output = Box<RawValue>> + Send;
+    ) -> impl std::future::Future<Output = Option<Box<RawValue>>> + Send;
 }
 
 /// T15-02's own stub: echoes the received context and payload back inside
 /// the reply, so "context on every request" is directly assertable from a
 /// real end-to-end proxy round trip with zero real MCP dispatch logic.
+/// Always answers (`Some`) — it has no notion of JSON-RPC notifications,
+/// that arrives with T15-03's real `RequestHandler`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EchoRequestHandler;
 
@@ -96,14 +121,14 @@ struct EchoResponse<'a> {
 }
 
 impl RequestHandler for EchoRequestHandler {
-    async fn handle(&self, ctx: RequestContext, mcp: Box<RawValue>) -> Box<RawValue> {
+    async fn handle(&self, ctx: RequestContext, mcp: Box<RawValue>) -> Option<Box<RawValue>> {
         let body = EchoResponse {
             echo: true,
             context: ctx,
             received: &mcp,
         };
         let text = serde_json::to_string(&body).expect("EchoResponse always serializes");
-        RawValue::from_string(text).expect("serde_json::to_string always yields valid JSON")
+        Some(RawValue::from_string(text).expect("serde_json::to_string always yields valid JSON"))
     }
 }
 
@@ -186,7 +211,11 @@ async fn handle_connection<H: RequestHandler>(
         };
         match msg {
             Message::Request(env) => {
-                let response = handler.handle(env.context, env.mcp).await;
+                let Some(response) = handler.handle(env.context, env.mcp).await else {
+                    // A JSON-RPC notification: no response, by construction
+                    // — see this module's own doc for why.
+                    continue;
+                };
                 let out = Message::Response(ResponseEnvelope { mcp: response });
                 if write_message(&mut write_half, &out).await.is_err() {
                     return;
@@ -591,6 +620,90 @@ mod tests {
             closed,
             "an oversized line must drop the connection, not buffer forever"
         );
+        server.abort();
+    }
+
+    /// A handler standing in for a real MCP dispatcher's notification
+    /// handling: answers every payload except the literal `"notify"`
+    /// string, which it treats as a JSON-RPC notification and answers with
+    /// `None`.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct SometimesSilentHandler;
+
+    impl RequestHandler for SometimesSilentHandler {
+        async fn handle(&self, _ctx: RequestContext, mcp: Box<RawValue>) -> Option<Box<RawValue>> {
+            if mcp.get() == "\"notify\"" {
+                return None;
+            }
+            Some(mcp)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handler_returning_none_writes_no_response_line() {
+        let home = TempHome::new().expect("temp home");
+        let (socket_path, listener) = bind(&home);
+        let ctx = handshake_ctx(1..=1);
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_connections(
+            listener,
+            ctx,
+            SometimesSilentHandler,
+            stop_rx,
+        ));
+
+        let next_reply = tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&socket_path).expect("connect");
+            write_line(
+                &mut stream,
+                &Message::Hello(Hello {
+                    proto: 1,
+                    proxy_version: "0.0.0".to_string(),
+                    session_id: "sess-1".to_string(),
+                    worktree_root: None,
+                    harness: "claude-code".to_string(),
+                }),
+            );
+            let mut reader = StdBufReader::new(stream.try_clone().unwrap());
+            let _welcome = read_line(&mut reader);
+
+            let context = RequestContext {
+                session_id: "sess-1".to_string(),
+                worktree_root: None,
+                repo_hint: None,
+            };
+            write_line(
+                &mut stream,
+                &Message::Request(local_rag_protocol::RequestEnvelope {
+                    context: context.clone(),
+                    mcp: RawValue::from_string("\"notify\"".to_string()).unwrap(),
+                }),
+            );
+            write_line(
+                &mut stream,
+                &Message::Request(local_rag_protocol::RequestEnvelope {
+                    context,
+                    mcp: RawValue::from_string("\"real-call\"".to_string()).unwrap(),
+                }),
+            );
+            // Racing a stray line for the notification against the real
+            // call's response: if the handler wrote anything for "notify",
+            // THIS read observes it instead of "real-call"'s answer.
+            read_line(&mut reader)
+        })
+        .await
+        .expect("blocking task");
+
+        match next_reply {
+            Some(Message::Response(env)) => {
+                assert_eq!(
+                    env.mcp.get(),
+                    "\"real-call\"",
+                    "the notification must not have produced a stray response line"
+                );
+            }
+            other => panic!("expected the real call's Response, got {other:?}"),
+        }
         server.abort();
     }
 }

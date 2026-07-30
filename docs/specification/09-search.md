@@ -423,6 +423,16 @@ there is no second leg to fall back to, because the caller did not ask for one. 
 produces `lexical_only`/`dense_only`. This generalizes `local_rag_store::requires_index_unavailable`
 (T08-03's both-legs-down predicate), which cannot express "not requested".
 
+As-built note (T15-03, `[SPEC]`): the MCP `search_code` tool's advertised `mode` schema (11 §2)
+includes `"semantic"` in its enum for exactly the reason the paragraph above gives — it is a
+*recognized*, schema-valid value, so an MCP client requesting it reaches the adapter and gets back
+`isError` + `UNSUPPORTED_MODE` (a domain answer), not `-32602 Invalid params` (which would read as
+"you spelled the mode wrong"). A genuinely unrecognized string like `"graph"` is the `-32602`
+case. `limit`'s MCP-facing default and cap (`DEFAULT_SEARCH_LIMIT = 10`, `MAX_SEARCH_LIMIT = 50`,
+`crates/local-rag/src/daemon/mcp/tools.rs`) are this task's own `[SPEC]` numbers — this section
+only discusses `limit` relative to `candidate_depth` (§4), never a caller-facing default/cap —
+picked and documented as chosen, the same precedent `MAX_MESSAGE_BYTES` set.
+
 ## 6. Symbol graph `[FIXED semantics, final shape [OPEN]]`
 
 Graph = **occurrence identity** (`OccurrenceLocator`); edges on occurrence IDs, per generation.

@@ -127,8 +127,20 @@ fn cleanup_daemon(layout: &StoreLayout, timeout: Duration) {
     }
 }
 
+/// Real cold-start spawn (no daemon pre-running) through a real MCP
+/// handshake, end to end across both binaries.
+///
+/// Before T15-03's real `RequestHandler` replaced `EchoRequestHandler`,
+/// this test drove one echo call and asserted the echoed `context` matched
+/// what the proxy sent — that assertion has no MCP-visible equivalent now
+/// (a real handler answers with tool content, not its context back). That
+/// coverage moved to `crates/local-rag/tests/mcp_tools.rs`'s
+/// `explicit_context_routing_across_two_requests_on_one_connection`, and
+/// transport-level context isolation stays covered by T15-02's own
+/// `daemon::handshake::tests::two_requests_on_one_connection_keep_their_
+/// own_context` (still run against `EchoRequestHandler`, unchanged).
 #[test]
-fn cold_start_spawns_a_daemon_and_relays_one_request_with_context() {
+fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
     let home = TempHome::new().expect("temp home");
     let layout = open_layout(&home);
 
@@ -139,20 +151,52 @@ fn cold_start_spawns_a_daemon_and_relays_one_request_with_context() {
     let mut stdin = proxy.stdin.take().expect("proxy stdin");
     let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
 
-    write_line(&mut stdin, r#"{"id":1,"method":"ping"}"#);
-    let (_stdout, line) = read_line(stdout, Duration::from_secs(20));
+    // Real MCP handshake, cold-start spawn included:
+    // initialize -> notifications/initialized -> tools/list, asserting
+    // that the *next line read back* is tools/list's own response — the
+    // only formulation that actually proves the notification produced no
+    // stray line all the way through both binaries (T15-03's own
+    // `daemon::handshake` unit test proves the daemon-local half; this is
+    // the two-binary version).
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(response["result"]["serverInfo"]["name"], "local-rag");
+    assert!(
+        response["result"]["instructions"]
+            .as_str()
+            .expect("instructions is a string")
+            .contains("search_code"),
+        "{response}"
+    );
 
-    assert_eq!(response["echo"], serde_json::json!(true));
-    assert_eq!(
-        response["context"]["session_id"],
-        serde_json::json!("test-session-cold-start")
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
     );
-    assert_eq!(
-        response["received"],
-        serde_json::json!({"id": 1, "method": "ping"})
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     );
+    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(response["id"], serde_json::json!(2));
+    let names: Vec<&str> = response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["search_code", "get_file_context", "project_overview"]
+    );
+    let _ = stdout;
 
     wait_until_daemon_ready(&layout, Duration::from_secs(5)); // must already be true by now
 
@@ -175,9 +219,12 @@ fn sigterm_to_the_proxy_does_not_reach_the_daemon_it_spawned() {
     let mut stdin = proxy.stdin.take().expect("proxy stdin");
     let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
 
-    // Drive one request through so the handshake (and therefore the spawn)
-    // is provably complete, not merely "the child process exists".
-    write_line(&mut stdin, r#"{"id":1,"method":"ping"}"#);
+    // Drive one real MCP call through so the handshake (and therefore the
+    // spawn) is provably complete, not merely "the child process exists".
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
     let _ = read_line(stdout, Duration::from_secs(20));
 
     wait_until_daemon_ready(&layout, Duration::from_secs(5));

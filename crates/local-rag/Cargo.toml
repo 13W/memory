@@ -15,6 +15,11 @@ local-rag-memory = { path = "../memory" }
 local-rag-protocol = { path = "../protocol" }
 local-rag-embed = { path = "../embed" }
 local-rag-generate = { path = "../generate" }
+# T15-03: the MCP code-query tools call `SearchEngine` directly (spec 09,
+# T12-04). 0 new external sources — `local-rag-search` itself only depends
+# on `core`/`protocol`/`store`/`projection`, all already in this crate's own
+# dependency graph.
+local-rag-search = { path = "../search" }
 # The daemon (T15-01) is the first product binary that owns a *full* tokio
 # executor: every library crate below it (store/index/memory/embed) deliberately
 # stops at `rt`/`sync`/`time` (task_local!/timeout only — see each crate's own

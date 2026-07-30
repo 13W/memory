@@ -18,8 +18,22 @@
 //!
 //! [`ErrorEnvelope`] is the wire shape `{code, message, retryable, details?}`;
 //! `details` stays a freeform `Option<String>` (spec marks its shape
-//! unfixed) — no JSON (de)serialization is wired here (`local-rag-protocol`
-//! has no `serde` dependency yet), that is group 15's concern.
+//! unfixed).
+//!
+//! As-built note (T15-03, `[SPEC]`): the JSON mapping this module's own doc
+//! once deferred to "group 15's concern" is now wired — [`ErrorCode`] has a
+//! hand-written `Serialize` delegating to [`ErrorCode::as_str`] (the same
+//! precedent [`crate::search::Snippet`]'s hand-written `Serialize` sets,
+//! rather than a derive with a `#[serde(rename)]` per variant, so the wire
+//! string stays single-sourced through one function instead of being spelled
+//! twice), and [`ErrorEnvelope`] derives `Serialize` with `details` omitted
+//! entirely when absent (`skip_serializing_if`, spec 09 §7's "absent is
+//! absent, not null" rule applied here too). Field order is declaration
+//! order — `{code, message, retryable, details?}`, literally this section's
+//! own spelling. `local-rag`'s `daemon::mcp` is the first (and, this task's
+//! own scope, only) consumer: it wraps this JSON as MCP `isError` content
+//! text (spec 02 §6: "MCP tools map `code` into `isError` content with the
+//! same code string").
 
 use std::fmt;
 
@@ -82,10 +96,19 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+impl serde::Serialize for ErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// The canonical daemon protocol error envelope (spec 02 §6:
 /// `{code, message, retryable: bool, details?}`). MCP tools map `code` into
 /// `isError` content with the same code string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ErrorEnvelope {
     /// The canonical error code.
     pub code: ErrorCode,
@@ -94,7 +117,9 @@ pub struct ErrorEnvelope {
     /// Whether the caller should retry (only [`ErrorCode::BusyRetry`] today).
     pub retryable: bool,
     /// Freeform diagnostic detail (spec 02 §6: "every degraded search response
-    /// includes the validation reason").
+    /// includes the validation reason"). Omitted from the wire form entirely
+    /// when absent — spec 09 §7's "absent is absent, not null" rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
 }
 
@@ -325,6 +350,50 @@ mod tests {
         assert_eq!(
             env.details.as_deref(),
             Some("fts: head missing; dense: shard corrupt")
+        );
+    }
+
+    #[test]
+    fn error_code_serializes_as_its_wire_string() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::WorktreeNotIndexed).unwrap(),
+            "\"WORKTREE_NOT_INDEXED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::BusyRetry).unwrap(),
+            "\"BUSY_RETRY\""
+        );
+    }
+
+    #[test]
+    fn envelope_serializes_in_declaration_order_with_details_present() {
+        let env = ErrorEnvelope::store_locked(4242, "instance-uuid-x");
+        assert_eq!(
+            serde_json::to_string(&env).unwrap(),
+            "{\"code\":\"STORE_LOCKED\",\"message\":\"the store is locked by another running \
+             daemon instance\",\"retryable\":false,\"details\":\"owner pid=4242 \
+             instance_uuid=instance-uuid-x\"}"
+        );
+    }
+
+    #[test]
+    fn absent_details_is_omitted_not_nulled() {
+        let env = ErrorEnvelope::worktree_not_indexed();
+        assert_eq!(
+            serde_json::to_string(&env).unwrap(),
+            "{\"code\":\"WORKTREE_NOT_INDEXED\",\"message\":\"worktree is unknown or has never \
+             been indexed\",\"retryable\":false}"
+        );
+        assert!(!serde_json::to_string(&env).unwrap().contains("details"));
+    }
+
+    #[test]
+    fn equal_envelopes_serialize_to_equal_bytes() {
+        let a = ErrorEnvelope::busy_retry();
+        let b = ErrorEnvelope::busy_retry();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
         );
     }
 }
