@@ -845,8 +845,14 @@ dependencies = [
 name = "local-rag-proxy"
 version = "0.0.0"
 dependencies = [
+ "libc",
+ "local-rag",
  "local-rag-core",
  "local-rag-protocol",
+ "local-rag-test-support",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

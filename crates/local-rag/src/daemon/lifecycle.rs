@@ -1,6 +1,7 @@
 //! The daemon startup/shutdown orchestrator (spec 02 §4.1's five ordered
 //! startup steps, §4.3's shutdown sequence) — T15-01.
 
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,11 +11,11 @@ use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{CacheDb, CacheOpenError, OpenError, StateDb, WriteError};
 use tokio::net::UnixListener;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::error::migration_only_reason;
-use super::handshake_stub::serve_handshake_stub;
+use super::handshake::{EchoRequestHandler, HandshakeContext, serve_connections};
 use super::idle::{IdleGateInputs, idle_eligible};
 use super::jobs::JobRegistry;
 use super::lock::{self, StoreLockError, StoreLockGuard, StoreLockInfo};
@@ -79,6 +80,12 @@ pub struct StartOptions {
     pub consolidation_lease_ms: i64,
     pub consolidation_renew_interval_ms: i64,
     pub data_policy: DataPolicy,
+    /// The `proto` range this daemon accepts in HELLO (spec 02 §4.2). A
+    /// field, not a hardcoded constant, so lifecycle-level tests can inject
+    /// a narrow/incompatible range and exercise the INCOMPATIBLE path over a
+    /// real `UnixStream` without a second binary. Production callers pass
+    /// [`local_rag_protocol::SUPPORTED_PROTO_RANGE`].
+    pub supported_proto: RangeInclusive<u16>,
 }
 
 /// A running daemon instance, in-process (spec 02 §4.1 steps 1–5 complete;
@@ -95,6 +102,10 @@ pub struct DaemonHandle {
     pub jobs: JobRegistry,
     pub lock_info: StoreLockInfo,
     pub socket_path: PathBuf,
+    /// Signaled once a connected proxy sends `SHUTDOWN_REQUEST` (spec 13
+    /// §4's upgrade flow) — [`wait_for_shutdown_trigger`] races this
+    /// against the OS signal and the idle gate.
+    pub shutdown_requested: Arc<Notify>,
     state_db: Option<Arc<StateDb>>,
     cache_db: Option<CacheDb>,
     lock_guard: Option<StoreLockGuard>,
@@ -133,6 +144,7 @@ impl DaemonHandle {
             consolidation_lease_ms,
             consolidation_renew_interval_ms,
             data_policy,
+            supported_proto,
         } = opts;
 
         layout.ensure().map_err(|e| {
@@ -146,12 +158,12 @@ impl DaemonHandle {
         // socket I/O (`SocketLivenessProbe`, up to `LIVENESS_PROBE_TIMEOUT_MS`).
         // Called directly, that blocking work would run *on this async task's
         // own executor thread* — on a single-worker runtime, that starves the
-        // very handshake-stub task (spec 02 §4.1 step 4) another instance's
-        // probe would need answered, making every liveness check spuriously
-        // time out. `spawn_blocking` moves it to the blocking thread pool,
-        // the same discipline `StateWriter`/`CacheWriter` already use for
-        // their own blocking SQLite I/O (dedicated OS threads, never inline
-        // on an async task).
+        // very connection-accept task (spec 02 §4.1 step 4) another
+        // instance's probe would need answered, making every liveness check
+        // spuriously time out. `spawn_blocking` moves it to the blocking
+        // thread pool, the same discipline `StateWriter`/`CacheWriter`
+        // already use for their own blocking SQLite I/O (dedicated OS
+        // threads, never inline on an async task).
         let mut lock_guard = {
             let layout = layout.clone();
             let instance_uuid = instance_uuid.clone();
@@ -199,8 +211,8 @@ impl DaemonHandle {
                 Err(other) => return Err(DaemonStartupError::State(other)),
             };
 
-        // Step 4: bind endpoint, write readiness marker, start the
-        // (provisional) handshake responder.
+        // Step 4: bind endpoint, write readiness marker, start the real
+        // HELLO/WELCOME connection handler.
         let listener =
             UnixListener::bind(layout.socket_path()).map_err(DaemonStartupError::Bind)?;
         lock_guard
@@ -208,12 +220,21 @@ impl DaemonHandle {
             .map_err(DaemonStartupError::MarkReady)?;
         let lock_info = lock_guard.info().clone();
 
+        let sessions = SessionRegistry::new();
+        let shutdown_requested = Arc::new(Notify::new());
+        let handshake_ctx = HandshakeContext {
+            instance_uuid: Arc::from(instance_uuid.as_str()),
+            daemon_version: Arc::from(daemon_version.as_str()),
+            supported_proto,
+            mode: mode_rx.clone(),
+            sessions: sessions.clone(),
+            shutdown_requested: Arc::clone(&shutdown_requested),
+        };
         let (handshake_stop_tx, handshake_stop_rx) = oneshot::channel();
-        let handshake_join = tokio::spawn(serve_handshake_stub(
+        let handshake_join = tokio::spawn(serve_connections(
             listener,
-            Arc::from(instance_uuid.as_str()),
-            Arc::from(daemon_version.as_str()),
-            mode_rx.clone(),
+            handshake_ctx,
+            EchoRequestHandler,
             handshake_stop_rx,
         ));
 
@@ -246,9 +267,10 @@ impl DaemonHandle {
             socket_path: layout.socket_path(),
             layout,
             mode: mode_rx,
-            sessions: SessionRegistry::new(),
+            sessions,
             jobs,
             lock_info,
+            shutdown_requested,
             state_db,
             cache_db,
             lock_guard: Some(lock_guard),
@@ -290,10 +312,16 @@ impl DaemonHandle {
             let _ = handle.await;
         }
         if let Some(handshake_join) = self.handshake_join.take() {
-            // Aborted rather than awaited after the stop signal below fires:
-            // a handshake connection already in flight is a single greeting
-            // write with no state to lose, so this is safe by construction
-            // the same way a hard kill is (spec 02 §4.3).
+            // `handshake_join` is only the *accept loop* — aborting it stops
+            // new connections, matching spec 02 §4.3 step 1 ("stop
+            // accepting"). Already-accepted connections run as independent
+            // `tokio::spawn`ed tasks this handle never tracked; they are
+            // deliberately left running rather than awaited or aborted here
+            // — `daemon::handshake`'s own module doc explains why a
+            // connection that sent `SHUTDOWN_REQUEST` must stay open through
+            // this very drain, and `main.rs::run_serve`'s `Runtime` drop is
+            // what actually reclaims them, safe by construction the same way
+            // a hard kill is (spec 02 §4.3).
             handshake_join.abort();
         }
         let lock_guard = self.lock_guard.take().expect("shutdown runs once");
@@ -346,15 +374,19 @@ pub enum ShutdownReason {
     /// Continuously idle-eligible for the configured grace period (spec 02
     /// §3.1 `idle_shutdown_secs`).
     Idle,
+    /// A connected proxy sent `SHUTDOWN_REQUEST` (spec 13 §4's upgrade
+    /// flow: a newer proxy detected a daemon version mismatch) — `run`
+    /// drains and exits so a replacement daemon can take the lock.
+    UpgradeRequested,
 }
 
 /// Wait for whichever comes first: an OS shutdown signal (already installed
 /// — see [`ShutdownSignal`]'s own doc for why installation must have
-/// happened before `start()`, not here), or continuous idle eligibility for
-/// `idle_shutdown_secs`. `poll_interval` is how often the idle gate is
-/// re-checked while waiting — a plain parameter (no `[SPEC]` number exists
-/// for it), so tests can drive it with `tokio::time::pause`/`advance`
-/// instead of real sleeps.
+/// happened before `start()`, not here), a proxy's `SHUTDOWN_REQUEST` (spec
+/// 13 §4), or continuous idle eligibility for `idle_shutdown_secs`.
+/// `poll_interval` is how often the idle gate is re-checked while waiting —
+/// a plain parameter (no `[SPEC]` number exists for it), so tests can drive
+/// it with `tokio::time::pause`/`advance` instead of real sleeps.
 pub async fn wait_for_shutdown_trigger(
     handle: &DaemonHandle,
     signal: &mut ShutdownSignal,
@@ -369,6 +401,7 @@ pub async fn wait_for_shutdown_trigger(
     loop {
         tokio::select! {
             _ = signal.wait() => return ShutdownReason::Signal,
+            _ = handle.shutdown_requested.notified() => return ShutdownReason::UpgradeRequested,
             _ = ticker.tick() => {
                 if handle.is_idle_eligible() {
                     let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);

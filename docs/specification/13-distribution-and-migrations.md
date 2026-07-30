@@ -49,3 +49,15 @@ New binary via npm → next proxy spawn detects version mismatch → `SHUTDOWN_R
 daemon (02 §4.2) → old daemon drains and exits → new daemon migrates (if needed) → serves.
 Spool format compatibility is part of the handshake (11 §4): a daemon MUST be able to import
 all spool `format_version`s ≤ its own.
+
+As-built note (T15-02, `[SPEC]`): "next proxy spawn detects version mismatch" is
+`local-rag-proxy::handshake::establish_session`'s retry loop — after a compatible `WELCOME` whose
+`daemon_version` differs from this proxy's own build, it sends `SHUTDOWN_REQUEST`, waits up to 30 s
+for the old daemon to close the connection (`wait_for_close`, 02 §4.2's as-built note), then calls
+`connect_or_spawn` again. Because the old daemon has by then released `store.lock`, that second
+call spawns the *current* on-disk binary — there is no separate "detect the new version and spawn
+it" step; the version comes from whichever `local-rag` binary `resolve_daemon_binary_path` finds
+next to this proxy at that moment, which npm's own package swap is what makes new. Bounded by
+`MAX_UPGRADE_ROUNDS = 2`, so a daemon that keeps answering with a mismatched version (a
+misconfigured install, not a normal one-shot upgrade) surfaces as `ProxyError::
+UpgradeLoopExceeded` rather than looping forever.

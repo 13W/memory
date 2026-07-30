@@ -52,6 +52,7 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         consolidation_lease_ms: LEASE_DURATION_MS,
         consolidation_renew_interval_ms: LEASE_RENEW_INTERVAL_MS,
         data_policy: DataPolicy::LocalOnly,
+        supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
     }
 }
 

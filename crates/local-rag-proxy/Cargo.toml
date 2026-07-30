@@ -1,6 +1,6 @@
 [package]
 name = "local-rag-proxy"
-description = "local-rag thin stdio MCP proxy (scaffold)."
+description = "local-rag thin stdio MCP proxy (spec 13 §1's per-session multiplexed model)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,49 @@ publish.workspace = true
 [dependencies]
 local-rag-core = { path = "../core" }
 local-rag-protocol = { path = "../protocol" }
+# T15-02: `rt`: `Builder::new_current_thread()` (a single UDS connection
+# relaying stdin/stdout is entirely IO-bound — "thin" per spec 11 §1, no
+# multi-thread executor earns its keep here). `net`: the UDS connection to
+# the daemon. `time`: backoff sleeps, the connect-or-spawn budget, and the
+# 30s upgrade `wait_for_close` timeout. `signal`: this proxy's own
+# SIGTERM/CTRL-C listener (spec 13 §2). `io-util`/`io-std`: bounded line I/O
+# over the UDS connection and stdin/stdout. `sync`: `oneshot` for its own
+# `ShutdownSignal`-pattern copy. `macros`: `#[tokio::test]`.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "net",
+    "time",
+    "signal",
+    "io-util",
+    "io-std",
+    "sync",
+    "macros",
+] }
+serde = { version = "1", features = ["derive"] }
+# `raw_value`: relays the opaque MCP JSON-RPC payload byte-exact — see
+# `local-rag-protocol`'s `handshake` module doc for why plain
+# `serde_json::Value` would not do.
+serde_json = { version = "1", features = ["raw_value"] }
+
+[target.'cfg(unix)'.dependencies]
+# `process_group(0)` (detached daemon spawn, spec 13 §2) and `kill(pid,
+# SIGTERM)` (real-subprocess tests) — same precedent as `local-rag`'s own
+# `libc` dependency.
+libc = "0.2"
+
+[dev-dependencies]
+local-rag-test-support = { path = "../test-support" }
+# Dev-only, not a runtime dependency of the shipped proxy binary (see this
+# crate's own `main.rs` doc on holding no project state): needed only so
+# `tests/subprocess.rs`'s real end-to-end scenarios can spawn a genuine
+# `local-rag serve` via `env!("CARGO_BIN_EXE_local-rag")` — Cargo only
+# builds another package's binary targets and exposes that env var for a
+# test when the package is a (dev-)dependency of the crate under test.
+local-rag = { path = "../local-rag" }
+# `test-util`: paused virtual time (`start_paused`/`advance`) for the
+# connect-backoff and 30s-upgrade-timeout tests — the only deterministic,
+# non-wall-clock way to exercise real `tokio::time::sleep`/`timeout`.
+tokio = { version = "1", default-features = false, features = ["test-util"] }
 
 [lints]
 workspace = true

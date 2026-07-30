@@ -10,13 +10,14 @@
 //! runs, mirroring `crates/store/tests/lock.rs`'s own channel-based idiom for
 //! proving real concurrency without a race.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
 
-use local_rag::daemon::probe::{Greeting, LivenessOutcome, LivenessProbe};
+use local_rag::daemon::probe::{LivenessOutcome, LivenessProbe};
 use local_rag::daemon::{SocketLivenessProbe, StoreLockError, acquire};
 use local_rag_core::paths::StoreLayout;
+use local_rag_protocol::{Message, PROTO_VERSION, Welcome, encode_message};
 use local_rag_test_support::TempHome;
 
 fn open_layout() -> (TempHome, StoreLayout) {
@@ -36,9 +37,11 @@ impl LivenessProbe for FixedProbe {
     }
 }
 
-/// Bind a `UnixListener` at `socket_path` that replies to every connection
-/// with one `Greeting` line, until `stop` fires.
-fn spawn_greeter(socket_path: std::path::PathBuf, greeting: Greeting) -> impl FnOnce() {
+/// Bind a `UnixListener` at `socket_path` that answers every connection with
+/// the real HELLO/WELCOME handshake — reads (and discards) one HELLO line,
+/// then replies with one WELCOME line carrying `store_instance_uuid` — until
+/// `stop` fires.
+fn spawn_greeter(socket_path: std::path::PathBuf, store_instance_uuid: String) -> impl FnOnce() {
     let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
     listener.set_nonblocking(true).expect("nonblocking");
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -48,9 +51,25 @@ fn spawn_greeter(socket_path: std::path::PathBuf, greeting: Greeting) -> impl Fn
                 break;
             }
             match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let line = serde_json::to_string(&greeting).unwrap();
-                    let _ = writeln!(stream, "{line}");
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking for this connection");
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line); // consume HELLO, content unused
+                    let welcome = Message::Welcome(Welcome {
+                        proto: PROTO_VERSION,
+                        daemon_version: "0.0.0".to_string(),
+                        store_instance_uuid: store_instance_uuid.clone(),
+                        capabilities: Vec::new(),
+                        mcp_passthrough_version: local_rag_protocol::MCP_PASSTHROUGH_VERSION,
+                        spool_max_format_version: local_rag_core::spool::FORMAT_VERSION,
+                        mode: "normal".to_string(),
+                    });
+                    let bytes = encode_message(&welcome).unwrap();
+                    let mut stream = stream;
+                    let _ = stream.write_all(&bytes);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::yield_now();
@@ -74,14 +93,7 @@ fn live_conflict_is_reported_and_names_the_owner() {
     let owner_uuid = "owner-instance-uuid";
     let owner_pid = std::process::id();
 
-    let stop_greeter = spawn_greeter(
-        layout.socket_path(),
-        Greeting {
-            instance_uuid: owner_uuid.to_string(),
-            daemon_version: "0.0.0".to_string(),
-            mode: "normal".to_string(),
-        },
-    );
+    let stop_greeter = spawn_greeter(layout.socket_path(), owner_uuid.to_string());
 
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -141,11 +153,7 @@ fn pid_reuse_mismatch_is_reclaimed() {
 
     let stop_greeter = spawn_greeter(
         layout.socket_path(),
-        Greeting {
-            instance_uuid: "a-totally-different-daemon".to_string(),
-            daemon_version: "0.0.0".to_string(),
-            mode: "normal".to_string(),
-        },
+        "a-totally-different-daemon".to_string(),
     );
 
     let stale_json = serde_json::json!({
