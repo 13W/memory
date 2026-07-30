@@ -8,13 +8,24 @@ publish.workspace = true
 
 [dependencies]
 local-rag-core = { path = "../core" }
+# The proxy↔daemon wire protocol (spec 02 §4.2, 11 §3.2) — T15-06's recall
+# RPC speaks it directly over a blocking `std::os::unix::net::UnixStream`
+# (this binary has no production async runtime and does not need one for a
+# single one-shot round trip). Deliberately tokio-free by its own design, so
+# it composes with either a sync or async caller — the same crate
+# `local-rag-proxy` uses over `tokio`.
+local-rag-protocol = { path = "../protocol" }
 # Parse Claude Code's hook JSON (stdin) and build the LRSP frame payload (spec
 # 07 §2/§3). `derive` generates the per-event-type Deserialize impls. Already
 # in the workspace's dependency graph via local-rag-core/local-rag-store/etc.
 # (`serde` with `derive`), so only a new dependency edge — 0 new external
 # sources. See CONTRIBUTING allowlist.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value`: T15-06's recall RPC builds `RequestEnvelope.mcp: Box<RawValue>`
+# directly (the opaque MCP JSON-RPC payload) — explicit per-crate feature
+# declaration, this project's convention, not reliance on transitive
+# unification (mirrors `local-rag-protocol`'s/`local-rag-proxy`'s own).
+serde_json = { version = "1", features = ["raw_value"] }
 # Optional, dev-only path crate (0 external sources): enabled ONLY by the
 # `failpoints` feature so the hook binary can host a named crash-injection
 # seam for the T13-06 S1/S2 real-subprocess kill tests. Never enabled in
@@ -44,6 +55,21 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
 ] }
+# Dev-only, not a runtime dependency of the shipped hook binary (T15-06's own
+# RPC client is deliberately sync/std, see the `local-rag-protocol` comment
+# above) — needed only so `tests/recall_rpc.rs`'s real end-to-end scenarios
+# can spawn a genuine `local-rag serve`. This edge is what makes Cargo build
+# `local-rag`'s binary as a sibling of this package's own test binaries in
+# `target/<profile>/`; the test locates it there by path (`CARGO_BIN_EXE_*`
+# is not set for another package's binary — see `recall_rpc.rs`'s own
+# `local_rag_binary_path` doc comment for why, verified empirically).
+local-rag = { path = "../local-rag" }
+# Test-only: `tests/recall_rpc.rs`'s adversarial-block test independently
+# recomputes the expected `additionalContext` bytes via the same already-
+# tested formatter the daemon itself uses, rather than hand-deriving the
+# escaping rules again. Already resolved throughout the workspace — 0 new
+# external sources, only a new edge.
+local-rag-memory = { path = "../memory" }
 
 [lints]
 workspace = true

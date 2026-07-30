@@ -4,11 +4,11 @@
 //! (spec 07 §2): parse hook JSON (stdin) → REDACTION
 //! (`local_rag_hook::payload`, T13-01) → compute source identity (spec 07 §4)
 //! → build the LRSP frame → durably append it (`local_rag_hook::segment`) →
-//! **always** exit 0 (fail-open, `[FIXED]`). Recall injection (spec 11 §3.2,
-//! the post-append `additionalContext` RPC) is a distinct spec subsection
-//! with its own budget and test surface, not built here — `spool_write_pipeline`
-//! returns cleanly after the append specifically so a later task can add that
-//! step without restructuring this one.
+//! for `SessionStart`/`UserPromptSubmit` only, a read-only recall RPC +
+//! `additionalContext` print (`local_rag_hook::recall`, spec 11 §3.2/§5,
+//! T15-06) → **always** exit 0 (fail-open, `[FIXED]`). Recall runs strictly
+//! after the append has already durably succeeded, and not at all if it
+//! failed — see `spool_write_pipeline`'s own call site.
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -217,6 +217,18 @@ fn spool_write_pipeline(raw: &[u8]) -> Result<(), HookError> {
         &frame_bytes,
         DEFAULT_ROTATE_THRESHOLD_BYTES,
     )?;
+
+    // Read-only recall RPC (spec 11 §3.2), strictly after the append above
+    // has already durably succeeded — never before, never at all if it
+    // failed (the `?`s above would have returned first). Fail-open by
+    // construction: `recall_and_print` never returns an error.
+    if matches!(
+        event.kind,
+        EventPayload::SessionStart(_) | EventPayload::UserPromptSubmit(_)
+    ) {
+        local_rag_hook::recall::recall_and_print(&layout, &event);
+    }
+
     Ok(())
 }
 

@@ -324,6 +324,38 @@ This preserves both constraints simultaneously: ingestion durability never depen
 daemon (spool append happens first and unconditionally), and recall-via-additionalContext from
 v1 is kept. The recall RPC MUST NOT trigger daemon startup `[SPEC]` (no spawn from hooks).
 
+As-built note (T15-06, `[SPEC]`): `local_rag_hook::recall::recall_and_print` is the
+implementation — called from `spool_write_pipeline` immediately after `segment::append_frame`
+already returned `Ok`, and not at all if it did not (recall is never attempted for an
+observation that was not itself durably recorded; ordering is therefore structural, not a
+separately-enforced mechanism). Three details this subsection leaves less precise than the
+shipped code:
+
+- **Query**: `SessionStart` recalls termless (`query` omitted from the `recall` tool call); spec
+  08 §6 ties termless recall specifically to `SessionStart` ("before any prompt exists").
+  `UserPromptSubmit` sends the hook event's own `prompt` as `query` — the one hook event where a
+  prompt genuinely exists, and `local_rag_memory::recall::pipeline`'s lexical/dense legs both use
+  `query` to rank toward relevance (termless recall falls back to pure recency).
+- **Transport**: a blocking `std::os::unix::net::UnixStream`
+  (`set_read_timeout`/`set_write_timeout`), not `tokio` — `local-rag-hook` carries no production
+  async runtime and does not need one for a single one-shot round trip; `local_rag_protocol` is
+  deliberately tokio-free by its own design specifically so it composes with either a sync or
+  async caller. A single `Instant`-based deadline is recomputed before each of the four I/O calls
+  (connect, HELLO write, WELCOME read, `tools/call` write, `Response` read), so the *whole*
+  exchange stays under the 300 ms budget rather than each call individually.
+  `local_rag_hook::recall`'s own `read_bounded_line`/`write_message` are a sync port of
+  `local-rag-proxy/src/transport.rs`'s identical algorithm — a third copy of the same D-002/D-010
+  duplicated-fragment precedent (`local_rag_protocol` must stay free of any I/O runtime).
+- **`initialize`/`notifications/initialized` are skipped**: the daemon's own dispatcher holds no
+  per-connection "has this client initialized" state, so the hook sends only HELLO → WELCOME →
+  one `tools/call` → `Response`, saving a round trip inside the budget.
+- **Response parsing**: `tools/call`'s `result.content[0].text` is itself a JSON string
+  containing the tool's own result (`daemon::mcp::content::ok`/`err`) — the hook parses the outer
+  JSON-RPC envelope, then re-parses that string for `additional_context`. A `MigrationOnly`
+  degraded response (`isError: true`, no `additional_context` field) and a JSON-RPC-level error
+  (no `result` key) both collapse to "print nothing" through this same path, with no dedicated
+  branch for either.
+
 ### 3.3 Transcript adapter
 
 Diagnostic **opt-in**, low-trust, off by default `[FIXED]` (`claude-code-transcripts` crate).
