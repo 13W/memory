@@ -42,12 +42,23 @@ fn default_model_space() -> Uuid {
 
 struct SeqUuidV7 {
     counter: AtomicU64,
+    tag: u8,
 }
 
 impl SeqUuidV7 {
     fn new() -> Self {
+        Self::tagged(0x11)
+    }
+
+    /// A second (or third, ...) independent source: distinct `tag` bytes keep
+    /// two fresh sources' first-ever `next_uuid()` from ever colliding, even
+    /// though both start counting from 0 (e.g. one used by `established()`'s
+    /// own internal `switch()`, another by a later `force_rebuild` call in
+    /// the same test).
+    fn tagged(tag: u8) -> Self {
         Self {
             counter: AtomicU64::new(0),
+            tag,
         }
     }
 }
@@ -55,7 +66,7 @@ impl SeqUuidV7 {
 impl UuidSource for SeqUuidV7 {
     fn next_uuid(&self) -> Uuid {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        uuidv7_from(3_000_000 + n, [0x11; 10])
+        uuidv7_from(3_000_000 + n, [self.tag; 10])
     }
 }
 
@@ -601,7 +612,117 @@ async fn cause_is_recorded_for_diagnostics() {
     let unopenable = RebuildCause::Unopenable.to_string();
     let divergent =
         RebuildCause::Divergent(local_rag_projection::Divergence::HeadMissing).to_string();
+    let forced = RebuildCause::Forced.to_string();
     assert_ne!(unopenable, divergent);
+    assert_ne!(unopenable, forced);
+    assert_ne!(divergent, forced);
     assert!(unopenable.contains("corruption"));
     assert!(divergent.contains("divergence"));
+    assert!(forced.contains("rebuild --dense"));
+}
+
+#[tokio::test]
+async fn force_rebuild_returns_none_with_no_active_tuple() {
+    let (_home, layout, db) = open_state();
+    let wt = worktree(&db, 40).await;
+    init_projection(&db, &wt).await;
+    let shard_dir = layout.projection_shard(&wt.to_string());
+    let quarantine_dir = layout.quarantine_dir();
+    let vectors = FakeVectors::new();
+    let uuids = SeqUuidV7::new();
+
+    let outcome = local_rag_projection::force_rebuild(
+        &db,
+        &FakeProjectionStore::new(),
+        &shard_dir,
+        &quarantine_dir,
+        params(),
+        wt,
+        &vectors,
+        &uuids,
+        2000,
+    )
+    .await
+    .expect("force_rebuild");
+    assert_eq!(outcome, None, "nothing to rebuild from before any switch");
+    assert!(!shard_dir.exists(), "the shard is never touched");
+    assert!(vectors.calls().is_empty());
+}
+
+#[tokio::test]
+async fn force_rebuild_skips_validate_and_always_rebuilds() {
+    let (_home, layout, db) = open_state();
+    let (wt, _gen_a, shard_dir) = established(&db, &layout, 41).await;
+    let quarantine_dir = layout.quarantine_dir();
+
+    // The shard is genuinely valid — an `open_and_validate` here would be a
+    // true no-op (see `valid_shard_stays_valid_and_second_open_is_a_true_
+    // no_op`, above). Confirm that directly before forcing, so this test
+    // actually proves `force_rebuild` bypasses `validate`, not merely that it
+    // rebuilds an already-divergent shard (already covered elsewhere).
+    let before_outcome = open_and_validate(
+        &db,
+        &FakeProjectionStore::new(),
+        &shard_dir,
+        &quarantine_dir,
+        params(),
+        wt,
+        &FakeVectors::new(),
+        &SeqUuidV7::new(),
+        1500,
+    )
+    .await
+    .expect("open_and_validate");
+    assert_eq!(before_outcome, OpenOutcome::Valid, "sanity: shard is valid");
+
+    let before_head = FakeProjectionStore::new()
+        .open(&shard_dir, params())
+        .expect("open before")
+        .read_head()
+        .expect("head before")
+        .expect("a valid shard already has a head");
+
+    let vectors = FakeVectors::new();
+    let outcome = local_rag_projection::force_rebuild(
+        &db,
+        &FakeProjectionStore::new(),
+        &shard_dir,
+        &quarantine_dir,
+        params(),
+        wt,
+        &vectors,
+        &SeqUuidV7::tagged(0x22),
+        2000,
+    )
+    .await
+    .expect("force_rebuild")
+    .expect("an active tuple exists");
+
+    assert!(
+        !vectors.calls().is_empty(),
+        "force_rebuild must re-derive the expected point set (it never skips \
+         the rebuild itself, only the validate() check)"
+    );
+
+    let after_head = FakeProjectionStore::new()
+        .open(&shard_dir, params())
+        .expect("open after")
+        .read_head()
+        .expect("head after")
+        .expect("rebuilt shard has a fresh head");
+    assert_ne!(
+        before_head.projection_op_id, after_head.projection_op_id,
+        "a genuinely new rebuild op happened, even though the shard was valid"
+    );
+    assert_eq!(after_head.projection_op_id, outcome.projection_op_id);
+
+    let read = db.open_read().expect("read");
+    let row = projection_state(&read, &wt.to_string())
+        .expect("row")
+        .expect("exists");
+    assert_eq!(
+        row.status,
+        ProjectionStatus::Clean,
+        "converges back to clean"
+    );
 }

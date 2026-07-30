@@ -707,6 +707,7 @@ dependencies = [
  "local-rag-generate",
  "local-rag-index",
  "local-rag-memory",
+ "local-rag-models",
  "local-rag-projection",
  "local-rag-protocol",
  "local-rag-search",

@@ -109,7 +109,7 @@ pub use model_switch::{
     switch_model_space,
 };
 pub use rebuild::{
-    OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome,
+    OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome, force_rebuild,
     open_and_validate,
 };
 pub use switch::{SwitchCommitError, SwitchError, SwitchOutcome, VectorSource, switch};

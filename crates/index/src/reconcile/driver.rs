@@ -199,6 +199,12 @@ pub struct WorktreeReconciler {
     /// Publishes the most recent failure (`None` while healthy) — the observability
     /// seam a daemon / group-07 reads via [`ReconcileHandle::failures`] (T05-05).
     failure_tx: watch::Sender<Option<ReconcileFailure>>,
+    /// Publishes the `generation_id` of the most recently *successfully*
+    /// built generation (`None` before the first success) — the
+    /// observability seam `local-rag watch` (T15-07) reads via
+    /// [`ReconcileHandle::successes`] to drive its own embed/switch/
+    /// materialize_fts follow-up after each reconcile.
+    success_tx: watch::Sender<Option<String>>,
 }
 
 impl WorktreeReconciler {
@@ -216,6 +222,7 @@ impl WorktreeReconciler {
     ) -> Self {
         let debouncer = Debouncer::new(sched, meta.is_git(), 0);
         let (failure_tx, _) = watch::channel(None);
+        let (success_tx, _) = watch::channel(None);
         Self {
             db,
             meta,
@@ -225,6 +232,7 @@ impl WorktreeReconciler {
             scanner,
             uuids,
             failure_tx,
+            success_tx,
         }
     }
 
@@ -233,6 +241,13 @@ impl WorktreeReconciler {
     /// [`ReconcileHandle`]; a daemon may take further receivers before spawning.
     pub fn subscribe_failures(&self) -> watch::Receiver<Option<ReconcileFailure>> {
         self.failure_tx.subscribe()
+    }
+
+    /// Subscribe to this reconciler's success observability (`None` before
+    /// the first successfully built generation). [`spawn_reconciler`] wires
+    /// the receiver into the returned [`ReconcileHandle`].
+    pub fn subscribe_successes(&self) -> watch::Receiver<Option<String>> {
+        self.success_tx.subscribe()
     }
 
     /// Drive the reconcile loop until every trigger sender is dropped.
@@ -307,9 +322,10 @@ impl WorktreeReconciler {
     /// in-memory observability the daemon / group-07 reads.
     async fn run_and_observe(&mut self, plan: PlannedReconcile, now_ms: i64) {
         match self.run_reconcile(plan, now_ms).await {
-            Ok(_) => {
+            Ok(report) => {
                 self.debouncer.record_success();
                 let _ = self.failure_tx.send(None);
+                let _ = self.success_tx.send(Some(report.build.generation_id));
             }
             Err(e) => {
                 self.debouncer.record_failure(now_ms);
@@ -337,17 +353,24 @@ pub struct ReconcileHandle {
     /// observability seam group 07 reads to persist
     /// `worktree_projection_state.last_error` (T05-05).
     pub failures: watch::Receiver<Option<ReconcileFailure>>,
+    /// Watch the `generation_id` of the most recently successfully built
+    /// generation (`None` before the first success) — the observability seam
+    /// `local-rag watch` (T15-07) reads to drive its own embed/switch/
+    /// materialize_fts follow-up after each reconcile.
+    pub successes: watch::Receiver<Option<String>>,
 }
 
 /// Spawn `reconciler` on the current runtime with a bounded trigger channel.
 pub fn spawn_reconciler(reconciler: WorktreeReconciler, capacity: usize) -> ReconcileHandle {
     let (sender, rx) = mpsc::channel(capacity.max(1));
     let failures = reconciler.subscribe_failures();
+    let successes = reconciler.subscribe_successes();
     let join = tokio::spawn(reconciler.run(rx));
     ReconcileHandle {
         sender,
         join,
         failures,
+        successes,
     }
 }
 

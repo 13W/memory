@@ -23,4 +23,18 @@ fn unknown_subcommand_exits_nonzero() {
         .output()
         .expect("run local-rag");
     assert!(!output.status.success(), "unknown subcommand must fail");
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn no_arguments_at_all_is_a_usage_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_local-rag"))
+        .output()
+        .expect("run local-rag");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("usage:"),
+        "{:?}",
+        output.stderr
+    );
 }

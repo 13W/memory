@@ -99,6 +99,20 @@ impl LivenessProbe for SocketLivenessProbe {
     }
 }
 
+/// Connect to `socket_path` and read the live daemon's own [`Welcome`],
+/// bounded by `timeout` — a thin public wrapper over [`read_welcome`] for
+/// callers that need more than [`LivenessOutcome`]'s bare alive/stale bit
+/// (`local-rag status`, T15-07: `Welcome.mode` is the only channel that
+/// distinguishes `Normal` from `MigrationOnly` — `store.lock`'s own `ready`
+/// flag is set in both cases, spec 11 §6). `None` on any failure (no
+/// listener, refused, timed out, INCOMPATIBLE, malformed line) — the same
+/// "every failure is uniformly unreachable" policy [`SocketLivenessProbe`]
+/// itself already uses.
+#[cfg(unix)]
+pub fn fetch_welcome(socket_path: &Path, timeout: Duration) -> Option<Welcome> {
+    read_welcome(socket_path, timeout)
+}
+
 /// Connect to `socket_path`, send this probe's own synthetic HELLO, and read
 /// one [`Welcome`] line, bounded by `timeout`. Any failure along the way (no
 /// listener, refused, timed out, INCOMPATIBLE, malformed line) folds into

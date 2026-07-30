@@ -20,6 +20,12 @@ local-rag-generate = { path = "../generate" }
 # on `core`/`protocol`/`store`/`projection`, all already in this crate's own
 # dependency graph.
 local-rag-search = { path = "../search" }
+# `local-rag init [--download-models]` (spec 11 §6, D-013) needs the installer
+# and the ONNX provider directly — the CLI is the only production caller of
+# either (`local-rag-models`'s own doc comment names this task as owner). The
+# heavy transitive deps (`ort`/`tokenizers`/`ndarray`/`ureq`) stay confined to
+# that one crate, same as every other consumer of it.
+local-rag-models = { path = "../models" }
 # The daemon (T15-01) is the first product binary that owns a *full* tokio
 # executor: every library crate below it (store/index/memory/embed) deliberately
 # stops at `rt`/`sync`/`time` (task_local!/timeout only — see each crate's own

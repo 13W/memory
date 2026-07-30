@@ -182,6 +182,24 @@ belongs where the concrete provider is constructed — the `code_raw` half to **
 memory subject function `Coverage` would otherwise count against (§3's `UnsupportedRequiredKind`
 refusal exists precisely so an unowned required kind cannot read as "covered").
 
+As-built note (T15-07, `[SPEC]`): the `code_raw` half above is now closed — `cli::init` registers it
+(`crates/local-rag/src/cli/init.rs`), gated on the default model's `.ok` marker rather than the
+`--download-models` flag (11 §6's own T15-07 note has the full rationale), and `main.rs::serve`
+wires a real `EmbedderQueryAdapter<OnnxEmbedder>` into `search_code`'s dense leg whenever that
+representation is installed and opens cleanly, falling back to the pre-existing `UnavailableEmbedder`
+degradation otherwise. The **`memory` half is still open**, and closing it turned out not to be in
+this task's reach: `ModelCatalogEntry::representation_key()` (`crates/models/src/catalog.rs`)
+hardcodes `kind: RepresentationKind::CodeRaw` — there is no way to derive a genuine `Memory`-kind key
+from the installed model without inventing untested key fields — and a grep across the whole
+workspace confirms **no production code has ever registered a `memory`-kind representation** (every
+`set_model_space_representation(.., RepresentationKind::Memory, ..)` call site is a test or
+`xtask bench`). `local_rag_memory::recall::QueryEmbedder` (the sibling trait `recall`'s dense leg
+uses) is therefore left as `UnavailableEmbedder` too, deliberately: `recall`'s honest, visible
+`dense_degraded: Some(EmbedFailed(..))` is strictly safer than wiring a provider against a key this
+task would have had to invent. The full adapter (`crates/local-rag/src/daemon/query_embedder.rs`)
+documents this as its own as-built rationale; closing the `memory` half remains open work for
+whichever task next owns group 14's model-axis registration.
+
 As-built note (T11-04, `[SPEC]`): the backfill worker is `local_rag_embed::backfill`
 (`run_backfill`), and it fixes the two things §3/§4 leave to the implementation.
 

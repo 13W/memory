@@ -432,8 +432,8 @@ the formatter cannot print what it was never given.
 ```
 local-rag serve|status|stop|restart
 local-rag init [--download-models]
-local-rag index <path> | reindex | watch          # watch = daemon-attached convenience
-local-rag repo list | repo attach <repo_id> [--path P] | worktree list
+local-rag index <path> | reindex | watch          # watch: standalone process, see the T15-07 note
+local-rag repo list | repo attach <repo_id> [--path P] [--worktree <id>] | worktree list
 local-rag rebuild --worktree <id> [--fts] [--dense]
 local-rag memory list|approve|reject|edit|retract|merge|evidence …
 local-rag inspect <observation|memory|generation> <id>
@@ -447,6 +447,55 @@ As-built note (T11-06, `[SPEC]`). `init --download-models` exists as a **typed l
 (`local_rag_models::install_model`, 10 §5): pinned-digest atomic install, license notice written to
 a caller-supplied sink, no prompting — so the command stays scriptable. Wiring it to the `local-rag`
 binary is T15-07's card, which owns `serve/status/stop/restart/init`.
+
+As-built note (T15-07, `[SPEC]`). `serve/status/stop/restart/init/index/reindex/watch/repo/
+worktree/rebuild` are implemented in `crates/local-rag/src/cli/`, hand-parsed (`std::env::args()`,
+the same convention `main.rs`/`local-rag-proxy`/`xtask::run_bench` already use — no CLI-parsing
+crate was added). Five points where the executable behavior needed a decision the sketch above left
+open:
+
+- **`watch` is a standalone foreground process, not "daemon-attached."** The sketch's inline comment
+  said otherwise; it was wrong. `local_rag_protocol` has no verb for "watch," and the daemon does not
+  spawn `local_rag_index::reconcile::{spawn_watcher, WorktreeReconciler}` anywhere — confirmed by
+  grep, every reference outside `crates/index` is `cli::watch` itself. `TriggerKind::Manual`'s own
+  doc already named `local-rag reindex` as "the manual force"; `watch` is that same CLI's always-on
+  sibling, a second direct caller of the already-tested reconcile driver, not new daemon-IPC surface.
+  It resolves worktree identity once (refusing `GlobalOnly`/`Ambiguous` exactly like `reindex`),
+  spawns the reconciler and a live filesystem watcher, forces one immediate `TriggerKind::Startup`
+  reconcile, then on every subsequent success calls the same embed → activate → materialize step
+  `index`/`reindex` use (`cli::index::project_generation`) before the next trigger is considered. It
+  exits cleanly on SIGTERM or Ctrl-C (`daemon::ShutdownSignal`, the identical primitive the daemon's
+  own lifecycle uses), flushing whatever reconcile was already in flight.
+- **`repo attach`'s `--worktree <id>` is an as-built refinement**, not in this section's original
+  one-line sketch (itself marked `[SPEC surface, commands implied by design]`).
+  `local_rag_store::registry::resolve`'s own doc names the exact scenario it exists for: "two
+  detached linked worktrees of one repository are `Ambiguous`, since a repo-level hint cannot choose
+  between them" (spec 04 §7's "an explicit attach is required"). Without `--worktree`, that case had
+  no CLI answer at all. Omitting it resolves via `resolve(..., repo_hint: Some(repo_id))`, which
+  auto-resolves only when the hint narrows the candidate set to exactly one; the CLI reports and
+  refuses (naming every candidate) when it does not.
+- **`init` registers `code_raw` gated on disk state, not on the `--download-models` flag.** Both bare
+  `init` and `init --download-models` register the representation whenever the default model is
+  already installed (`.ok` marker present) and skip registration — printing a hint — when it is not.
+  D-013's own card says "for the installed model," not "for the flag," and gating on disk state is
+  what makes a repeated `init` genuinely idempotent: `register_representation`'s `ON CONFLICT` on the
+  six-field key (T11-01) already converges repeat registrations onto one row; there is no separate
+  "did I already register this run" flag to drift out of sync with what is actually on disk.
+- **`index`/`reindex`/`watch`/`repo attach`/`repo list`/`worktree list` never take `store.lock`**
+  (`daemon::lock::acquire`) — that lock is exclusive to one *running daemon instance*, not "the only
+  writer ever." Each opens `StateDb`/`CacheDb` directly (`xtask::bench::run`'s own precedent), safe
+  alongside a live `serve`: `state.sqlite`/`cache.sqlite` are WAL-mode with `busy_timeout=5000` (spec
+  03 §2), and the generation/switch model is additive by construction. `index`/`reindex`/`repo
+  list`/`worktree list` do call `StoreLayout::ensure()` before opening `state.sqlite` — the daemon's
+  own `ensure → open` startup ordering (spec 02 §4.1) applies equally to a one-shot CLI command
+  against a store `serve` has never touched, or `StateDb::open` fails outright (SQLite cannot create
+  a file inside a directory that does not exist yet).
+- **`rebuild --fts`/`--dense` never open a live embedder.** `--fts` re-derives the FTS view from
+  already-indexed content; `--dense` (`local_rag_projection::force_rebuild`, this task) reads vectors
+  already sitting in `embedding_cache` through the same `CacheVectorSource` seam
+  `cli::index::project_generation` uses, never re-running `run_backfill`. Neither flag given is a
+  usage error (exit 2), not "both by default": the same "refuse rather than guess" precedent
+  `NoShardParams`/`UnsupportedRequiredKind` already set elsewhere in this codebase.
 
 Plugin packaging (marketplace add / plugin install, hooks + MCP auto-registration, no
 project-level init, no files written into `.claude/rules/`) carries over from v1 behavior;

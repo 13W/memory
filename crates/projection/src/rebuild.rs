@@ -67,6 +67,10 @@ pub enum RebuildCause {
     Unopenable,
     /// The shard opened, but [`crate::validate::validate`] found a divergence.
     Divergent(Divergence),
+    /// An operator explicitly requested a rebuild (`local-rag rebuild
+    /// --dense`, T15-07), independent of what [`crate::validate::validate`]
+    /// would have said — see [`force_rebuild`].
+    Forced,
 }
 
 impl fmt::Display for RebuildCause {
@@ -74,6 +78,9 @@ impl fmt::Display for RebuildCause {
         match self {
             RebuildCause::Unopenable => write!(f, "shard unopenable (suspected corruption)"),
             RebuildCause::Divergent(d) => write!(f, "divergence: {d}"),
+            RebuildCause::Forced => {
+                write!(f, "operator-requested rebuild (local-rag rebuild --dense)")
+            }
         }
     }
 }
@@ -354,7 +361,7 @@ async fn rebuild(
                 .map_err(RebuildError::Io)?;
             Some(dest)
         }
-        RebuildCause::Divergent(_) => {
+        RebuildCause::Divergent(_) | RebuildCause::Forced => {
             let shard = store
                 .open(shard_dir, shard_params)
                 .map_err(RebuildError::Backend)?;
@@ -509,4 +516,73 @@ pub async fn open_and_validate(
             Ok(OpenOutcome::Rebuilt(outcome))
         }
     }
+}
+
+/// Force a full rebuild of `worktree_id`'s shard to match its **active**
+/// tuple, independent of what [`validate`] would say (`local-rag rebuild
+/// --dense`, T15-07) — unlike [`open_and_validate`], this never opens the
+/// shard just to check whether a divergence exists; a shard that opens fine
+/// is rebuilt anyway (`RebuildCause::Forced`), and a shard that does not open
+/// falls back to the same [`RebuildCause::Unopenable`] recovery path
+/// [`open_and_validate`] already uses — a forced rebuild must not fail
+/// outright just because the existing shard happens to be unopenable.
+///
+/// Returns `Ok(None)` without touching the shard when no switch has ever
+/// completed for this worktree (same bootstrap case as
+/// [`OpenOutcome::NoActiveTuple`]) — there is nothing to rebuild *from*.
+#[allow(clippy::too_many_arguments)]
+pub async fn force_rebuild(
+    db: &StateDb,
+    store: &dyn ProjectionStore,
+    shard_dir: &Path,
+    quarantine_dir: &Path,
+    shard_params: ShardParams,
+    worktree_id: Uuid,
+    vectors: &(dyn VectorSource + Send + Sync),
+    uuids: &(dyn UuidSource + Send + Sync),
+    now_ms: i64,
+) -> Result<Option<RebuildOutcome>, RebuildError> {
+    let read = db.open_read().map_err(RebuildError::Open)?;
+    let row = projection_state(&read, &worktree_id.to_string())
+        .map_err(RebuildError::Sqlite)?
+        .ok_or(RebuildError::UnknownWorktree)?;
+    drop(read);
+
+    let (Some(active_generation_id), Some(active_model_space_id)) = (
+        row.active_generation_id.as_deref(),
+        row.active_model_space_id.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let active_generation_id: Uuid = active_generation_id
+        .parse()
+        .expect("stored active_generation_id is always a UUID minted by switch/rebuild");
+    let active_model_space_id: Uuid = active_model_space_id
+        .parse()
+        .expect("stored active_model_space_id is always a UUID minted by switch/rebuild");
+
+    let cause = match store.open(shard_dir, shard_params) {
+        Err(_) => RebuildCause::Unopenable,
+        Ok(shard) => {
+            drop(shard);
+            RebuildCause::Forced
+        }
+    };
+
+    let outcome = rebuild(
+        db,
+        store,
+        shard_dir,
+        quarantine_dir,
+        shard_params,
+        worktree_id,
+        active_generation_id,
+        active_model_space_id,
+        cause,
+        vectors,
+        uuids,
+        now_ms,
+    )
+    .await?;
+    Ok(Some(outcome))
 }
