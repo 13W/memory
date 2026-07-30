@@ -10,8 +10,8 @@ use local_rag_core::identity::remote;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::registry::{
-    PathObservation, create_repository, current_path, find_repositories_by_remote,
-    find_repository_by_path, observe_repository_path, path_history,
+    PathObservation, all_repository_ids, create_repository, current_path,
+    find_repositories_by_remote, find_repository_by_path, observe_repository_path, path_history,
 };
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{StateDb, WriteError};
@@ -482,4 +482,37 @@ async fn find_repository_by_current_path_returns_current_repo() {
         history.iter().any(|p| p.observed_path == "/loc/a"),
         "A retained in history",
     );
+}
+
+/// `all_repository_ids` is empty on a fresh store and, once populated, returns
+/// every `repo_id` in ascending order regardless of insertion order (T15-07,
+/// mirrors `worktree::all_worktree_ids`'s own acceptance test shape).
+#[tokio::test]
+async fn all_repository_ids_lists_every_repo_ascending() {
+    let (_home, db) = open_state();
+
+    {
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            all_repository_ids(&read).expect("empty store"),
+            Vec::<String>::new(),
+        );
+    }
+
+    let (id_a, id_b, id_c) = (repo_id(20), repo_id(21), repo_id(22));
+    let mut expected = vec![id_a.clone(), id_b.clone(), id_c.clone()];
+    expected.sort();
+
+    // Insert in a different order than the expected sorted output, to prove
+    // the result is genuinely ordered by the query, not by insertion order.
+    for id in [&id_b, &id_c, &id_a] {
+        let id = id.clone();
+        db.writer()
+            .transaction(move |tx| create_repository(tx, &id, None, 1000))
+            .await
+            .expect("create repository");
+    }
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(all_repository_ids(&read).expect("all ids"), expected);
 }

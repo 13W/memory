@@ -71,6 +71,20 @@ watcher}`. It is split so a **live** filesystem watcher never makes the timing u
   activation (group 07) and no typed failure/backoff bookkeeping (T05-05, which only reuses the
   builder's existing `building → failed`).
 
+As-built note (T15-07, `[SPEC]`): `local-rag watch` is the daemon-independent process that finally
+wires `spawn_watcher`/`WorktreeReconciler` together end to end (both existed and were fully tested
+since T05-04/T05-05, but nothing outside `crates/index` referenced either before this task —
+confirmed by grep). `WorktreeReconciler` gained a second observability channel alongside the
+existing `failure_tx`/`failures`: `success_tx`/`successes`, publishing the `generation_id` of the
+most recently *successfully* built generation (`None` before the first success). Without it, a
+successful reconcile's outcome was discarded entirely — only failures were observable, which is fine
+for the daemon's own future consumption but leaves nothing for `watch` to react to. `cli::watch`
+subscribes to both: on every new `successes` value it runs the same embed → activate → materialize
+step `index`/`reindex` share (`cli::index::project_generation`) before the next trigger; on `failures`
+it prints the reconcile's `last_error`/`consecutive_failures` and keeps watching (a reconcile failure
+does not stop the watch loop — the next trigger gets its own attempt). See 11 §6's own T15-07 note
+for why `watch` is a standalone process rather than daemon-IPC.
+
 ## 2. Reconcile pipeline `[FIXED]`
 
 Under the per-worktree write lock (single writer per worktree; store-level lockfile at L0):

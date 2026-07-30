@@ -162,6 +162,13 @@ fn count(conn: &Connection, table: &str) -> i64 {
         .expect("count")
 }
 
+/// The single `generation_id` in a fixture that has run exactly one
+/// reconcile (T15-07's `successes` observability test).
+fn the_one_generation_id(conn: &Connection) -> String {
+    conn.query_row("SELECT generation_id FROM generation", [], |r| r.get(0))
+        .expect("exactly one generation row")
+}
+
 /// Arm one failpoint with an injected error return (declaring it first, since the
 /// site auto-registers only when hit).
 fn arm(name: &str) {
@@ -365,6 +372,7 @@ async fn driver_records_failure_and_backs_off() {
         sender,
         join,
         failures,
+        successes: _,
     } = spawn_reconciler(reconciler, 8);
     sender.send(TriggerKind::FsChange).await.expect("send");
     drop(sender); // flush → one failing reconcile
@@ -426,6 +434,7 @@ async fn driver_reports_success_as_no_failure() {
         sender,
         join,
         failures,
+        successes: _,
     } = spawn_reconciler(reconciler, 8);
     sender.send(TriggerKind::FsChange).await.expect("send");
     drop(sender);
@@ -440,5 +449,47 @@ async fn driver_reports_success_as_no_failure() {
         count(&read, "generation"),
         1,
         "one reconcile ran to completion"
+    );
+}
+
+/// T15-07's own observability seam: a successful reconcile publishes the
+/// **built** generation's id on `successes` (mirrors `driver_reports_
+/// success_as_no_failure`'s exact fixture/trigger shape) — this is what
+/// `local-rag watch` reads to know which generation to embed/switch/
+/// materialize_fts next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_reconciler_publishes_the_built_generation_id_on_success() {
+    let _serial = serial().await;
+    let fx = fixture().await;
+    write(&fx.root, "a.rs", b"fn a() {}\n");
+    let uuids: Arc<dyn UuidSource + Send + Sync> = Arc::new(SeqUuidV7::new());
+
+    let reconciler = WorktreeReconciler::new(
+        fx.db.clone(),
+        meta(&fx),
+        ClassifierConfig::new(1 << 20),
+        Scanner::new(),
+        uuids,
+        flush_only_schedule(),
+    );
+    let successes_before = reconciler.subscribe_successes();
+    assert!(successes_before.borrow().is_none(), "nothing built yet");
+
+    let ReconcileHandle {
+        sender,
+        join,
+        failures: _,
+        successes,
+    } = spawn_reconciler(reconciler, 8);
+    sender.send(TriggerKind::FsChange).await.expect("send");
+    drop(sender);
+    join.await.expect("join");
+
+    let read = fx.db.open_read().expect("read");
+    let expected = the_one_generation_id(&read);
+    assert_eq!(
+        successes.borrow().clone(),
+        Some(expected),
+        "successes publishes exactly the generation reconcile_once built",
     );
 }

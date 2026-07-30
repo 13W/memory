@@ -1,18 +1,24 @@
 //! `local-rag` daemon + CLI entry point.
 //!
 //! `version` is a diagnostic no-op; `serve` runs the daemon lifecycle (spec
-//! 02 §4, T15-01). The rest of the CLI surface (`status`/`stop`/`restart`/
-//! `init`/`index`/...) is later group-15 cards.
+//! 02 §4, T15-01). The rest of the CLI surface — `status`/`stop`/`restart`/
+//! `init`, `index`/`reindex`/`watch`, `repo`/`worktree`, `rebuild` (spec 11
+//! §6) — lives in [`cli`] (T15-07).
+
+mod cli;
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use local_rag::daemon::{DaemonStartupError, ShutdownReason, StartOptions, StoreLockError};
+use local_rag::daemon::{
+    DaemonStartupError, EmbedderQueryAdapter, ShutdownReason, StartOptions, StoreLockError,
+};
 use local_rag_core::identity::SystemUuidV7;
 use local_rag_core::paths::{StoreLayout, SystemEnv, config_dir, data_dir};
 use local_rag_memory::recall::UnavailableEmbedder as UnavailableMemoryEmbedder;
+use local_rag_models::{DEFAULT_MODEL_ID, OnnxEmbedder, find, is_installed};
 use local_rag_protocol::ErrorEnvelope;
-use local_rag_search::UnavailableEmbedder;
+use local_rag_search::{QueryEmbedder, UnavailableEmbedder};
 use local_rag_store::{DEFAULT_WRITE_QUEUE_CAPACITY, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
 
 const BIN: &str = "local-rag";
@@ -24,8 +30,20 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("serve") => run_serve(),
+        Some("status") => cli::status::run(std::env::args().skip(2)),
+        Some("stop") => cli::service::run_stop(std::env::args().skip(2)),
+        Some("restart") => cli::service::run_restart(std::env::args().skip(2)),
+        Some("init") => cli::init::run(std::env::args().skip(2)),
+        Some("index") => cli::index::run_index(std::env::args().skip(2)),
+        Some("reindex") => cli::index::run_reindex(std::env::args().skip(2)),
+        Some("watch") => cli::watch::run_watch(std::env::args().skip(2)),
+        Some("repo") => cli::repo::run(std::env::args().skip(2)),
+        Some("worktree") => cli::worktree::run(std::env::args().skip(2)),
+        Some("rebuild") => cli::rebuild::run(std::env::args().skip(2)),
         _ => {
-            eprintln!("usage: {BIN} version|serve");
+            eprintln!(
+                "usage: {BIN} version|serve|status|stop|restart|init|index|reindex|watch|repo|worktree|rebuild"
+            );
             ExitCode::from(2)
         }
     }
@@ -72,6 +90,7 @@ async fn serve() -> ExitCode {
     let _ = data_dir(&env); // resolved via `layout`; kept for a clearer error above if it fails
 
     let now_ms = system_now_ms();
+    let query_embedder = build_query_embedder(&layout);
 
     let opts = StartOptions {
         layout,
@@ -85,14 +104,14 @@ async fn serve() -> ExitCode {
         data_policy: config.models.data_policy,
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: config.daemon.max_open_shards,
-        // The real provider is T15-07's job (it adds `local-rag-models`'
-        // ONNX weights and `init --download-models`); until then, MCP
-        // `search_code` correctly degrades to `lexical_only` with an
-        // explicit reason instead of the dense leg silently never running.
-        query_embedder: Arc::new(UnavailableEmbedder),
-        // Same precedent as `query_embedder` above, for the `recall` MCP
-        // tool's dense leg (T15-04): degrades visibly (`dense_degraded:
-        // Some(EmbedFailed(..))`) until T15-07 wires a real provider.
+        query_embedder,
+        // `recall`'s dense leg (T15-04) stays on the explicit-degradation
+        // path (`dense_degraded: Some(EmbedFailed(..))`), deliberately, not
+        // as an oversight: no `memory`-kind `RepresentationKey` has ever been
+        // registered in production (D-013 assigned that to group 14, which
+        // closed without doing it), so there is no real key to build a
+        // provider against here — see `daemon::query_embedder`'s own module
+        // doc for the full as-built rationale (T15-07).
         memory_query_embedder: Arc::new(UnavailableMemoryEmbedder),
         recall_token_budget: config.memory.recall_token_budget,
         consolidation_batch_size: config.memory.consolidation_batch_size,
@@ -129,6 +148,37 @@ fn system_now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Build `search_code`'s dense-leg provider from whatever the store already
+/// has on disk (T15-07), gated on the same signal `cli::init` uses — the
+/// default model's `.ok` marker — not on any flag or config toggle.
+///
+/// A missing model, or one that fails to open (corrupt install, no ONNX
+/// Runtime on `PATH`/`ORT_DYLIB_PATH`), degrades to [`UnavailableEmbedder`]
+/// rather than failing daemon startup: `search_code` already has a tested,
+/// spec-correct `lexical_only` fallback for exactly this case
+/// (`daemon::search::build_search_engine`'s own doc), and a store the
+/// operator has not run `local-rag init --download-models` against yet must
+/// still serve lexical search.
+fn build_query_embedder(layout: &StoreLayout) -> Arc<dyn QueryEmbedder> {
+    let Some(entry) = find(DEFAULT_MODEL_ID) else {
+        return Arc::new(UnavailableEmbedder);
+    };
+    if !is_installed(layout, entry.model_id) {
+        return Arc::new(UnavailableEmbedder);
+    }
+    match OnnxEmbedder::open(layout, entry) {
+        Ok(embedder) => Arc::new(EmbedderQueryAdapter::new(embedder)),
+        Err(e) => {
+            eprintln!(
+                "{BIN}: {} is installed but could not be opened ({e}); \
+                 search_code will stay lexical_only until this is fixed",
+                entry.model_id
+            );
+            Arc::new(UnavailableEmbedder)
+        }
+    }
 }
 
 /// A human-readable startup failure message, naming the canonical error code

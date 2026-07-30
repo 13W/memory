@@ -122,6 +122,18 @@ pub fn find_repository_by_path(
     .optional()
 }
 
+/// Every `repo_id` in the store, ascending (mirrors
+/// [`worktree::all_worktree_ids`](super::worktree::all_worktree_ids)) — a
+/// store-wide reader, not scoped by remote fingerprint or current path
+/// (`repo list`, T15-07).
+pub fn all_repository_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT repo_id FROM repository ORDER BY repo_id")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Every `repo_id` sharing `git_remote_fingerprint`, ascending (spec 03 §2.1,
 /// 12 §7).
 ///

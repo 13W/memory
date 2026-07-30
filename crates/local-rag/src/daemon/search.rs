@@ -51,16 +51,17 @@ impl VectorSource for NoRebuildVectorSource {
 /// Build the `SearchEngine` the MCP code-query tools call.
 ///
 /// `max_open_shards` comes from `config.daemon.max_open_shards`; `embedder`
-/// is `main.rs`'s `UnavailableEmbedder` today (spec-correctly producing
-/// `degraded: "lexical_only"` with an explicit reason) — a real provider is
-/// T15-07's job, the same "type before backend" precedent `RequestHandler`
-/// itself already set. `ShardParams::with_dimensions(LOCAL_BOOTSTRAP_
-/// DIMENSIONS)` is only a bootstrap fallback for a worktree with no active
-/// model space at all — `ShardManager::acquire` resolves the real
-/// dimensions from the worktree's own active space for every other case,
-/// and a worktree with no active space returns `WORKTREE_NOT_INDEXED`
-/// before ever reaching the dense leg, so this fallback value is otherwise
-/// unobservable.
+/// is `main.rs::build_query_embedder`'s result (T15-07): a real
+/// `EmbedderQueryAdapter<OnnxEmbedder>` when the default model is installed
+/// and opens cleanly, `UnavailableEmbedder` otherwise (spec-correctly
+/// producing `degraded: "lexical_only"` with an explicit reason) — the same
+/// "type before backend" precedent `RequestHandler` itself already set.
+/// `ShardParams::with_dimensions(LOCAL_BOOTSTRAP_DIMENSIONS)` is only a
+/// bootstrap fallback for a worktree with no active model space at all —
+/// `ShardManager::acquire` resolves the real dimensions from the worktree's
+/// own active space for every other case, and a worktree with no active
+/// space returns `WORKTREE_NOT_INDEXED` before ever reaching the dense leg,
+/// so this fallback value is otherwise unobservable.
 pub fn build_search_engine(
     state: Arc<StateDb>,
     cache: Arc<CacheDb>,

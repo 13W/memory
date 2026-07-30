@@ -96,8 +96,8 @@ pub use representation::{
 };
 
 pub use repository::{
-    PathObservation, create_repository, current_path, find_repositories_by_remote,
-    find_repository_by_path, observe_repository_path, path_history,
+    PathObservation, all_repository_ids, create_repository, current_path,
+    find_repositories_by_remote, find_repository_by_path, observe_repository_path, path_history,
 };
 pub use resolve::{
     AttachError, Candidate, RequestRoot, Resolution, WorktreeRootFacts, attach, resolve,

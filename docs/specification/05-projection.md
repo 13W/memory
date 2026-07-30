@@ -375,6 +375,20 @@ destroy/quarantine-then-recreate, never a diff against the shard's existing cont
 destroys/quarantines again and recreates from scratch, which is trivially idempotent given
 deterministic point IDs and a pure `state.sqlite`-derived expected set.
 
+As-built note (T15-07, `[SPEC]`): `local-rag rebuild --dense` (11 §6) needed a rebuild entry point
+independent of what §6's own validate-on-open predicates say — an operator forcing a rebuild is not
+reacting to a detected divergence. `RebuildCause` gained a third variant, `Forced`, alongside
+`Unopenable`/`Divergent`; it is handled exactly like `Divergent` in the quarantine-vs-destroy branch
+(destroy the openable shard, no quarantine — an operator-requested rebuild is not a corruption
+suspicion). The new `local_rag_projection::force_rebuild` mirrors `open_and_validate`'s own
+structure (read `projection_state`, `Ok(None)` when there is no active tuple to rebuild from) but
+skips `validate` entirely: a shard that opens fine is rebuilt anyway (`RebuildCause::Forced`), and
+one that does not open falls back to the same `Unopenable` recovery `open_and_validate` already
+uses — a forced rebuild must not fail outright just because the existing shard happens to be
+unopenable. It shares the private `rebuild()` core with `open_and_validate`, so every invariant this
+section already establishes (three separate transactions, quarantine rotation, `MissingVector`
+raised before any shard write, idempotent restart) applies to a forced rebuild unchanged.
+
 ## 8. Shard lifecycle follows registry lifecycle `[FIXED]`
 
 - attach/move of a worktree: same shard directory (keyed by `worktree_id`), never a second shard.

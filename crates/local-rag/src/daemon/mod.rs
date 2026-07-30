@@ -18,10 +18,11 @@
 //! `RequestHandler` `lifecycle` wires in place of T15-02's
 //! `EchoRequestHandler`. [`consolidation_trigger`] is the continuous
 //! consolidation-trigger background worker (spec 07 §6, D-024) —
-//! [`resume`]'s missing continuous quarter. [`lifecycle`] composes all of
-//! the above into the five startup steps and the shutdown sequence
-//! ([`shutdown`]) — [`lifecycle::run`] is what `main.rs`'s `serve` command
-//! drives.
+//! [`resume`]'s missing continuous quarter. [`query_embedder`] adapts a real
+//! `local_rag_embed::Embedder` into `search`'s `QueryEmbedder` seam (T15-07).
+//! [`lifecycle`] composes all of the above into the five startup steps and
+//! the shutdown sequence ([`shutdown`]) — [`lifecycle::run`] is what
+//! `main.rs`'s `serve` command drives.
 
 pub mod consolidation_trigger;
 pub mod error;
@@ -35,6 +36,7 @@ pub mod mcp;
 pub mod memory;
 pub mod mode;
 pub mod probe;
+pub mod query_embedder;
 pub mod resume;
 pub mod search;
 pub mod session;
@@ -56,9 +58,10 @@ pub use lock::{StoreLockError, StoreLockGuard, StoreLockInfo, acquire};
 pub use mcp::McpHandler;
 pub use memory::{MemoryContext, build_memory_context};
 pub use mode::{DaemonMode, MigrationOnlyReason};
-#[cfg(unix)]
-pub use probe::SocketLivenessProbe;
 pub use probe::{LIVENESS_PROBE_TIMEOUT_MS, LivenessOutcome, LivenessProbe};
+#[cfg(unix)]
+pub use probe::{SocketLivenessProbe, fetch_welcome};
+pub use query_embedder::EmbedderQueryAdapter;
 pub use resume::{
     ConsolidationResumeError, ResumeOutcome, build_best_effort_pool, resume_spool_import,
     resume_stale_consolidation_runs,
