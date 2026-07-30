@@ -10,11 +10,14 @@
 //! `local_rag_core::spool` (T13-03 relocated them there from this crate's own
 //! former `frame` module, so the daemon-side decoder — `local_rag_store::spool`
 //! — shares exactly one implementation with this write path rather than
-//! risking two that could drift).
+//! risking two that could drift). [`recall`] is the read-only recall RPC +
+//! `additionalContext` injection for `SessionStart`/`UserPromptSubmit` (spec
+//! 11 §3.2/§5, T15-06) — runs after the spool append above, never before.
 
 pub mod clock;
 pub mod event;
 pub mod identity;
 pub mod payload;
+pub mod recall;
 pub mod segment;
 pub mod subagent_counter;

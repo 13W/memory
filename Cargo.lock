@@ -765,7 +765,10 @@ dependencies = [
 name = "local-rag-hook"
 version = "0.0.0"
 dependencies = [
+ "local-rag",
  "local-rag-core",
+ "local-rag-memory",
+ "local-rag-protocol",
  "local-rag-store",
  "local-rag-test-support",
  "serde",
