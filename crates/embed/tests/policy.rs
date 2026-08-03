@@ -327,7 +327,10 @@ async fn a_repository_can_tighten_but_never_relax_the_global_policy() {
     );
 }
 
-/// The pure guard predicate, over the full policy × locality matrix.
+/// The pure guard predicate, over the full policy × locality matrix (T16-01:
+/// `metadata_only_remote` blocks remote selection alongside `local_only` —
+/// see `crate::policy`'s own module doc for why it is not distinct from
+/// `local_only` for this workspace's only two provider contracts).
 #[test]
 fn guard_matrix_is_exhaustive() {
     for policy in [
@@ -337,9 +340,82 @@ fn guard_matrix_is_exhaustive() {
         DataPolicy::AllowRemoteFull,
     ] {
         assert!(allows(policy, Locality::Local));
-        assert_eq!(
-            allows(policy, Locality::Remote),
-            policy != DataPolicy::LocalOnly
+        let expect_remote = matches!(
+            policy,
+            DataPolicy::AllowRemoteWithRedaction | DataPolicy::AllowRemoteFull
         );
+        assert_eq!(allows(policy, Locality::Remote), expect_remote);
     }
+}
+
+/// `metadata_only_remote` refuses remote selection the same way `local_only`
+/// does (T16-01's pragmatic as-built decision) — the typed
+/// `POLICY_BLOCKED_REMOTE` diagnostic, not a silent downgrade.
+#[test]
+fn metadata_only_remote_blocks_remote_selection_like_local_only() {
+    let remote_spy = Arc::new(ScriptedEmbedder::persistent(
+        "hosted",
+        Step::Ok("remote answer".to_string()),
+    ));
+    let pool = ProviderPool::new(vec![ProviderEntry::remote("hosted", remote_spy.clone())]);
+
+    let err = pool
+        .embed(DataPolicy::MetadataOnlyRemote, request())
+        .expect_err("remote-only pool under metadata_only_remote");
+    assert!(
+        matches!(err, EmbedError::PolicyBlockedRemote { .. }),
+        "{err}"
+    );
+    assert_eq!(
+        remote_spy.calls(),
+        0,
+        "no bytes may reach a remote provider under metadata_only_remote"
+    );
+}
+
+/// Under `allow_remote_with_redaction`, a secret in the request text is
+/// stripped before it ever reaches a remote provider — the literal "redaction
+/// before remote" the card names.
+#[test]
+fn redaction_strips_secrets_before_a_remote_call_under_allow_remote_with_redaction() {
+    let remote = Arc::new(ScriptedEmbedder::persistent(
+        "hosted",
+        Step::Ok("remote answer".to_string()),
+    ));
+    let pool = ProviderPool::new(vec![ProviderEntry::remote("hosted", remote.clone())]);
+
+    let secret_text = "aws_key = \"AKIAIOSFODNN7EXAMPLE\"".to_string();
+    let req = EmbedRequest::new(RepresentationKind::CodeRaw, vec![secret_text.clone()]);
+    pool.embed(DataPolicy::AllowRemoteWithRedaction, req)
+        .expect("remote allowed under allow_remote_with_redaction");
+
+    let received = remote.last_request().expect("the spy was called");
+    assert_ne!(
+        received.texts[0], secret_text,
+        "the secret must not reach the remote provider unredacted"
+    );
+    assert!(
+        !received.texts[0].contains("AKIAIOSFODNN7EXAMPLE"),
+        "{}",
+        received.texts[0]
+    );
+}
+
+/// Under `allow_remote_full`, the request reaches the remote provider
+/// byte-for-byte unredacted — the explicit "full" half of the matrix.
+#[test]
+fn allow_remote_full_sends_the_original_text_unredacted() {
+    let remote = Arc::new(ScriptedEmbedder::persistent(
+        "hosted",
+        Step::Ok("remote answer".to_string()),
+    ));
+    let pool = ProviderPool::new(vec![ProviderEntry::remote("hosted", remote.clone())]);
+
+    let secret_text = "aws_key = \"AKIAIOSFODNN7EXAMPLE\"".to_string();
+    let req = EmbedRequest::new(RepresentationKind::CodeRaw, vec![secret_text.clone()]);
+    pool.embed(DataPolicy::AllowRemoteFull, req)
+        .expect("remote allowed under allow_remote_full");
+
+    let received = remote.last_request().expect("the spy was called");
+    assert_eq!(received.texts[0], secret_text);
 }

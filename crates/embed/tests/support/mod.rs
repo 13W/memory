@@ -11,7 +11,10 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use local_rag_embed::{EmbedError, EmbedRequest, Embedder, HashingEmbedder, Sleeper, Vector};
+use local_rag_embed::{
+    EmbedError, EmbedRequest, Embedder, FinishReason, GenError, GenRequest, GenResponse, Generator,
+    HashingEmbedder, Sleeper, Vector,
+};
 use local_rag_store::{RepresentationKey, RepresentationKind};
 
 /// A `Sleeper` that records the delays it was asked for instead of sleeping.
@@ -57,6 +60,7 @@ pub struct ScriptedEmbedder {
     steps: Mutex<std::collections::VecDeque<Step>>,
     persistent: Option<Step>,
     calls: AtomicUsize,
+    last_request: Mutex<Option<EmbedRequest>>,
 }
 
 impl ScriptedEmbedder {
@@ -67,6 +71,7 @@ impl ScriptedEmbedder {
             steps: Mutex::new(steps.into()),
             persistent: None,
             calls: AtomicUsize::new(0),
+            last_request: Mutex::new(None),
         }
     }
 
@@ -78,6 +83,7 @@ impl ScriptedEmbedder {
             steps: Mutex::new(Default::default()),
             persistent: Some(step),
             calls: AtomicUsize::new(0),
+            last_request: Mutex::new(None),
         }
     }
 
@@ -91,11 +97,20 @@ impl ScriptedEmbedder {
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// The `EmbedRequest` this provider actually received on its most recent
+    /// call — what a test inspects to prove policy-driven payload transforms
+    /// (redaction, T16-01) actually reached the provider, not just that it
+    /// was called.
+    pub fn last_request(&self) -> Option<EmbedRequest> {
+        self.last_request.lock().expect("last_request lock").clone()
+    }
 }
 
 impl Embedder for ScriptedEmbedder {
     fn embed(&self, req: EmbedRequest) -> Result<Vec<Vector>, EmbedError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_request.lock().expect("last_request lock") = Some(req.clone());
         let step = {
             let mut steps = self.steps.lock().expect("script lock");
             steps
@@ -138,6 +153,88 @@ pub fn batch() -> Vec<String> {
         "export function handler(req, res) { return res.json({}) }".to_string(),
         "class Repository { find(id) { return this.rows.get(id) } }".to_string(),
     ]
+}
+
+/// One scripted generator response — the [`Step`] twin for [`Generator`].
+#[derive(Debug, Clone)]
+pub enum GenStep {
+    Ok(String),
+    Retryable(String, Option<u64>),
+    Permanent(String),
+}
+
+/// A programmable `Generator`, mirroring [`ScriptedEmbedder`]: replays
+/// `steps`, then repeats `persistent` forever; records the last
+/// [`GenRequest`] it received so a test can inspect the actual message
+/// content a provider was handed (redaction, T16-01).
+pub struct ScriptedGenerator {
+    name: String,
+    steps: Mutex<std::collections::VecDeque<GenStep>>,
+    persistent: Option<GenStep>,
+    calls: AtomicUsize,
+    last_request: Mutex<Option<GenRequest>>,
+}
+
+impl ScriptedGenerator {
+    pub fn new(name: &str, steps: Vec<GenStep>) -> Self {
+        ScriptedGenerator {
+            name: name.to_string(),
+            steps: Mutex::new(steps.into()),
+            persistent: None,
+            calls: AtomicUsize::new(0),
+            last_request: Mutex::new(None),
+        }
+    }
+
+    /// A provider that always answers with `step`.
+    pub fn persistent(name: &str, step: GenStep) -> Self {
+        ScriptedGenerator {
+            name: name.to_string(),
+            steps: Mutex::new(Default::default()),
+            persistent: Some(step),
+            calls: AtomicUsize::new(0),
+            last_request: Mutex::new(None),
+        }
+    }
+
+    /// How many times `generate` was invoked.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    /// The `GenRequest` this provider actually received on its most recent
+    /// call.
+    pub fn last_request(&self) -> Option<GenRequest> {
+        self.last_request.lock().expect("last_request lock").clone()
+    }
+}
+
+impl Generator for ScriptedGenerator {
+    fn generate(&self, req: GenRequest) -> Result<GenResponse, GenError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_request.lock().expect("last_request lock") = Some(req.clone());
+        let step = {
+            let mut steps = self.steps.lock().expect("script lock");
+            steps
+                .pop_front()
+                .or_else(|| self.persistent.clone())
+                .unwrap_or_else(|| {
+                    panic!("{}: script exhausted with no persistent step", self.name)
+                })
+        };
+        match step {
+            GenStep::Ok(text) => Ok(GenResponse {
+                text,
+                finish_reason: FinishReason::Stop,
+                tokens_generated: None,
+            }),
+            GenStep::Retryable(message, after) => Err(GenError::Retryable {
+                message,
+                retry_after_ms: after,
+            }),
+            GenStep::Permanent(message) => Err(GenError::permanent(message)),
+        }
+    }
 }
 
 pub mod store;
