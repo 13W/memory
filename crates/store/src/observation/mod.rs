@@ -523,6 +523,172 @@ pub(crate) fn envelopes_in_range(
     Ok(rows)
 }
 
+/// One full `observation_envelope` row (spec 03 §2.5, every column) —
+/// `inspect observation <id>` (11 §6, T16-02) is the first consumer needing
+/// more than a partial projection (`WindowEnvelopeRow` above,
+/// `observation_evidence_source` in `crate::memory::review`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservationEnvelopeRow {
+    pub received_seq: i64,
+    pub observation_id: String,
+    pub source_event_id: String,
+    pub dedup_key: Option<String>,
+    pub payload_hash: String,
+    pub event_type: String,
+    pub evidence_kind: EvidenceKind,
+    pub trust: TrustLevel,
+    pub source_timestamp: Option<i64>,
+    pub repo_id: Option<String>,
+    pub worktree_id: Option<String>,
+    pub session_id: String,
+    pub agent_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub batch_id: Option<String>,
+    pub commit_hash: Option<String>,
+    pub short_evidence_excerpt: Option<String>,
+    pub redaction_version: Option<i64>,
+}
+
+const ENVELOPE_ROW_COLUMNS: &str = "received_seq, observation_id, source_event_id, dedup_key, \
+     payload_hash, event_type, evidence_kind, trust, source_timestamp, repo_id, worktree_id, \
+     session_id, agent_id, turn_id, batch_id, commit_hash, short_evidence_excerpt, \
+     redaction_version";
+
+fn read_envelope_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationEnvelopeRow> {
+    let raw_evidence_kind: String = r.get(6)?;
+    let evidence_kind = EvidenceKind::from_db(&raw_evidence_kind).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            6,
+            Type::Text,
+            format!("invalid observation_envelope.evidence_kind {raw_evidence_kind:?}").into(),
+        )
+    })?;
+    let raw_trust: String = r.get(7)?;
+    let trust = TrustLevel::from_db(&raw_trust).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            7,
+            Type::Text,
+            format!("invalid observation_envelope.trust {raw_trust:?}").into(),
+        )
+    })?;
+    Ok(ObservationEnvelopeRow {
+        received_seq: r.get(0)?,
+        observation_id: r.get(1)?,
+        source_event_id: r.get(2)?,
+        dedup_key: r.get(3)?,
+        payload_hash: r.get(4)?,
+        event_type: r.get(5)?,
+        evidence_kind,
+        trust,
+        source_timestamp: r.get(8)?,
+        repo_id: r.get(9)?,
+        worktree_id: r.get(10)?,
+        session_id: r.get(11)?,
+        agent_id: r.get(12)?,
+        turn_id: r.get(13)?,
+        batch_id: r.get(14)?,
+        commit_hash: r.get(15)?,
+        short_evidence_excerpt: r.get(16)?,
+        redaction_version: r.get(17)?,
+    })
+}
+
+/// The full `observation_envelope` row for `observation_id`, or `None` if
+/// unknown — `inspect observation <id>`'s own read (11 §6, T16-02).
+pub(crate) fn observation_envelope_row(
+    conn: &Connection,
+    observation_id: &str,
+) -> rusqlite::Result<Option<ObservationEnvelopeRow>> {
+    conn.query_row(
+        &format!(
+            "SELECT {ENVELOPE_ROW_COLUMNS} FROM observation_envelope WHERE observation_id = ?1"
+        ),
+        params![observation_id],
+        read_envelope_row,
+    )
+    .optional()
+}
+
+/// Every `normalized_path` captured for `observation_id`, ascending —
+/// `inspect observation <id>`'s own read (T16-02).
+pub(crate) fn observation_paths_for(
+    conn: &Connection,
+    observation_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT normalized_path FROM observation_path WHERE observation_id = ?1 \
+         ORDER BY normalized_path",
+    )?;
+    let paths = stmt
+        .query_map(params![observation_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths)
+}
+
+/// `observation_id`'s `observation_payload` state as of `now_ms` — `inspect
+/// observation <id>`/`export`'s own read (11 §6, T16-02). A payload that
+/// never existed (an envelope-only/denied event) and one that existed but has
+/// since been TTL-swept (`run_payload_ttl_sweep`) are indistinguishable by
+/// design (spec 03 §2.5's own doc: "short TTL; envelope survives it" — a
+/// payload row's absence *is* the expiry signal, there is no tombstone row
+/// for a payload) — [`PayloadStatus::None`] covers both. [`PayloadStatus::
+/// Expired`] only fires for a live row whose `expires_at` has passed but the
+/// sweep has not yet reclaimed it; the boundary is inclusive
+/// (`expires_at <= now_ms` ⇒ expired), mirroring the sweep's own `<=`
+/// convention (`payload_ttl::run_payload_ttl_sweep`). `Present::text` is a
+/// lossy UTF-8 decode of `redacted_payload` — the scanner-redacted bytes
+/// `local_rag_hook::payload::prepare_payload` already produced before
+/// anything reached the spool (spec 12 §2); this reader adds no further
+/// scanning or truncation of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadStatus {
+    Present {
+        byte_size: i64,
+        expires_at: i64,
+        text: String,
+    },
+    Expired {
+        expires_at: i64,
+    },
+    None,
+}
+
+pub(crate) fn observation_payload_status(
+    conn: &Connection,
+    observation_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<PayloadStatus> {
+    let row: Option<(Vec<u8>, i64, i64)> = conn
+        .query_row(
+            "SELECT redacted_payload, byte_size, expires_at FROM observation_payload \
+             WHERE observation_id = ?1",
+            params![observation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        None => PayloadStatus::None,
+        Some((_, _, expires_at)) if expires_at <= now_ms => PayloadStatus::Expired { expires_at },
+        Some((redacted_payload, byte_size, expires_at)) => PayloadStatus::Present {
+            byte_size,
+            expires_at,
+            text: String::from_utf8_lossy(&redacted_payload).into_owned(),
+        },
+    })
+}
+
+/// Every distinct `session_id` with at least one `observation_envelope` row,
+/// ascending — `purge --all`'s own enumeration seam (T16-02), the
+/// observation-side analog of `crate::memory::entry::all_memory_entry_ids`.
+pub(crate) fn all_session_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT session_id FROM observation_envelope ORDER BY session_id")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +1071,127 @@ mod tests {
         assert_eq!(
             window[1].payload, None,
             "obs-without never had a payload row (envelope-only event) — not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_envelope_row_reads_every_column_then_none_for_unknown_id() {
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(move |tx| {
+                insert_envelope(
+                    tx,
+                    &NewObservationEnvelope {
+                        redaction_version: Some(1),
+                        ..row("obs-1", "sess-1", "evt-1", Some("dedup-1"), Some(1000))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        let found = observation_envelope_row(&read, "obs-1")
+            .expect("read")
+            .expect("row present");
+        assert_eq!(found.observation_id, "obs-1");
+        assert_eq!(found.source_event_id, "evt-1");
+        assert_eq!(found.dedup_key.as_deref(), Some("dedup-1"));
+        assert_eq!(found.payload_hash, "deadbeef");
+        assert_eq!(found.event_type, "Stop");
+        assert_eq!(found.evidence_kind, EvidenceKind::ModelClaim);
+        assert_eq!(found.trust, TrustLevel::Low);
+        assert_eq!(found.source_timestamp, Some(1000));
+        assert_eq!(found.session_id, "sess-1");
+        assert_eq!(found.redaction_version, Some(1));
+
+        assert_eq!(
+            observation_envelope_row(&read, "unknown").unwrap(),
+            None,
+            "unknown observation_id reads back as None, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_paths_for_returns_every_path_ascending() {
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(|tx| {
+                insert_envelope(tx, &row("obs-1", "sess-1", "evt-1", None, Some(1)))?;
+                insert_path(tx, "obs-1", "src/z.rs")?;
+                insert_path(tx, "obs-1", "src/a.rs")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            observation_paths_for(&read, "obs-1").unwrap(),
+            vec!["src/a.rs".to_string(), "src/z.rs".to_string()],
+        );
+        assert_eq!(
+            observation_paths_for(&read, "unknown").unwrap(),
+            Vec::<String>::new(),
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_payload_status_present_then_expired_at_the_boundary_then_none() {
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(|tx| {
+                insert_envelope(tx, &row("obs-live", "sess-1", "evt-1", None, Some(1)))?;
+                insert_payload(tx, "obs-live", b"hello", 5000)?;
+                insert_envelope(tx, &row("obs-expiring", "sess-1", "evt-2", None, Some(2)))?;
+                insert_payload(tx, "obs-expiring", b"bye", 5000)?;
+                insert_envelope(tx, &row("obs-none", "sess-1", "evt-3", None, Some(3)))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            observation_payload_status(&read, "obs-live", 4999).unwrap(),
+            PayloadStatus::Present {
+                byte_size: 5,
+                expires_at: 5000,
+                text: "hello".to_string(),
+            },
+        );
+        assert_eq!(
+            observation_payload_status(&read, "obs-expiring", 5000).unwrap(),
+            PayloadStatus::Expired { expires_at: 5000 },
+            "expires_at == now_ms is expired, the sweep's own <= convention"
+        );
+        assert_eq!(
+            observation_payload_status(&read, "obs-none", 0).unwrap(),
+            PayloadStatus::None,
+        );
+        assert_eq!(
+            observation_payload_status(&read, "unknown", 0).unwrap(),
+            PayloadStatus::None,
+            "an unknown observation_id reads back as None, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_session_ids_is_distinct_and_ascending() {
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(|tx| {
+                insert_envelope(tx, &row("obs-1", "sess-b", "evt-1", None, Some(1)))?;
+                insert_envelope(tx, &row("obs-2", "sess-a", "evt-2", None, Some(2)))?;
+                insert_envelope(tx, &row("obs-3", "sess-b", "evt-3", None, Some(3)))
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            all_session_ids(&read).unwrap(),
+            vec!["sess-a".to_string(), "sess-b".to_string()],
         );
     }
 }

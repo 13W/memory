@@ -359,6 +359,7 @@ pub mod lock;
 pub mod memory;
 pub mod migrate;
 pub mod observation;
+pub mod privacy;
 pub mod registry;
 pub mod retention;
 pub mod spool;
@@ -432,29 +433,36 @@ pub use memory::{
     consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
     edit_candidate, find_by_idempotency_key, insert_audit_event, insert_candidate_evidence,
     insert_memory_evidence, lease_expired, list_candidates, list_memory_entries_for_scope,
-    memory_entry_counts, memory_entry_state, memory_entry_summary, memory_evidence_for,
-    observation_evidence_source, open_next_run, pending_backlog, pending_candidate_ages,
-    pending_candidate_counts, processing_cursor, propose_candidate, read_audit_events_for_entity,
-    recall_candidate_by_id, recall_candidates_for_scope, reject_candidate, renew_lease, retry_run,
-    run_once, stale_runs, transition_candidate, transition_memory_entry, transition_run,
-    upsert_processing_cursor,
+    memory_entry_by_id, memory_entry_counts, memory_entry_state, memory_entry_summary,
+    memory_evidence_for, observation_evidence_source, open_next_run, pending_backlog,
+    pending_candidate_ages, pending_candidate_counts, processing_cursor, propose_candidate,
+    read_audit_events_for_entity, recall_candidate_by_id, recall_candidates_for_scope,
+    reject_candidate, renew_lease, retry_run, run_once, stale_runs, transition_candidate,
+    transition_memory_entry, transition_run, upsert_processing_cursor,
 };
 pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
 pub use observation::{
     EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, NewObservationEnvelope,
-    PayloadSweepError, PayloadSweepReport, TrustLevel, import_batch, import_session_tail,
-    insert_envelope, known_spool_sessions, run_payload_ttl_sweep,
+    PayloadStatus, PayloadSweepError, PayloadSweepReport, TrustLevel, import_batch,
+    import_session_tail, insert_envelope, known_spool_sessions, run_payload_ttl_sweep,
+};
+pub use privacy::{
+    EvidenceSummary, MemoryInspection, ObservationInspection, PurgeAllPreview, PurgeAllReport,
+    PurgeMemoryError, PurgeMemoryPreview, PurgeMemoryReport, PurgeSessionPreview,
+    PurgeSessionReport, export_scope, inspect_generation, inspect_memory, inspect_observation,
+    preview_purge_all, preview_purge_memory, preview_purge_session, purge_all, purge_memory,
+    purge_session,
 };
 pub use registry::{
-    AttachError, Candidate, DATA_POLICY_KEY, GenerationState, GenerationTransitionError,
-    IllegalGenerationTransition, IllegalWorktreeTransition, PathObservation, RequestRoot,
-    Resolution, WorktreeKind, WorktreePathObservation, WorktreeRootFacts, WorktreeState,
-    WorktreeStateClock, WorktreeSummary, WorktreeTransitionError, active_generations,
-    all_repository_ids, all_worktree_ids, allocate_generation, attach, create_repository,
-    create_worktree, current_generation, current_path, current_worktree_path,
+    AttachError, Candidate, DATA_POLICY_KEY, GenerationRow, GenerationState,
+    GenerationTransitionError, IllegalGenerationTransition, IllegalWorktreeTransition,
+    PathObservation, RequestRoot, Resolution, WorktreeKind, WorktreePathObservation,
+    WorktreeRootFacts, WorktreeState, WorktreeStateClock, WorktreeSummary, WorktreeTransitionError,
+    active_generations, all_repository_ids, all_worktree_ids, allocate_generation, attach,
+    create_repository, create_worktree, current_generation, current_path, current_worktree_path,
     effective_data_policy, ensure_store_instance_uuid, find_repositories_by_remote,
     find_repository_by_path, find_worktree_by_current_path, find_worktrees_by_path_fingerprint,
-    generation_number, generation_state, get_repo_setting, observe_repository_path,
+    generation_number, generation_row, generation_state, get_repo_setting, observe_repository_path,
     observe_worktree_path, path_history, repo_data_policy, repo_settings, resolve,
     set_current_generation, set_repo_data_policy, set_repo_setting, store_instance_uuid,
     transition_generation, transition_worktree_state, worktree_path_history, worktree_state,
