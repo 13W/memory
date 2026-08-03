@@ -71,6 +71,26 @@ impl std::fmt::Display for Divergence {
     }
 }
 
+/// The first two predicates of [`validate`]'s table, decidable from
+/// `worktree_projection_state` alone, before any shard I/O (spec 05 §6).
+/// Extracted so a caller that must not open the shard when it isn't already
+/// known to exist ([`crate::rebuild::check_dense`], T16-03) can run these
+/// first: `ProjectionStore::open`'s own implementations (e.g.
+/// `BruteForceShard::open`) create the shard directory as a side effect if it
+/// is missing, so a caller with nothing to gain from opening a shard that a
+/// row-only divergence already condemns should never reach that call.
+pub fn validate_row_only(row: &ProjectionStateRow) -> Option<Divergence> {
+    if row.status != ProjectionStatus::Clean {
+        return Some(Divergence::NotClean { status: row.status });
+    }
+    if row.active_generation_id != row.projected_generation_id
+        || row.active_model_space_id != row.projected_model_space_id
+    {
+        return Some(Divergence::ActiveProjectedMismatch);
+    }
+    None
+}
+
 /// Run spec 05 §6's predicate table against already-read inputs.
 ///
 /// `shard_manifest_hash` MUST be recomputed from the shard's *actual*
@@ -86,13 +106,8 @@ pub fn validate(
     shard_point_count: u64,
     shard_manifest_hash: &Hash32,
 ) -> Option<Divergence> {
-    if row.status != ProjectionStatus::Clean {
-        return Some(Divergence::NotClean { status: row.status });
-    }
-    if row.active_generation_id != row.projected_generation_id
-        || row.active_model_space_id != row.projected_model_space_id
-    {
-        return Some(Divergence::ActiveProjectedMismatch);
+    if let Some(divergence) = validate_row_only(row) {
+        return Some(divergence);
     }
     let Some(head) = head else {
         return Some(Divergence::HeadMissing);
@@ -281,6 +296,34 @@ mod tests {
             validate(&row, Some(&head), 2, &shard_manifest),
             Some(Divergence::ManifestMismatch),
             "equal count must not mask a differing id set"
+        );
+    }
+
+    #[test]
+    fn validate_row_only_matches_validates_first_two_predicates() {
+        // Clean and consistent: no row-only divergence, though a real
+        // `validate` call still needs a head/shard to reach `None` overall.
+        assert_eq!(validate_row_only(&valid_row()), None);
+
+        for status in [
+            ProjectionStatus::Updating,
+            ProjectionStatus::Dirty,
+            ProjectionStatus::Rebuilding,
+        ] {
+            let mut row = valid_row();
+            row.status = status;
+            assert_eq!(
+                validate_row_only(&row),
+                Some(Divergence::NotClean { status }),
+                "{status:?}"
+            );
+        }
+
+        let mut row = valid_row();
+        row.projected_generation_id = Some(other_gen_id().to_string());
+        assert_eq!(
+            validate_row_only(&row),
+            Some(Divergence::ActiveProjectedMismatch)
         );
     }
 

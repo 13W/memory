@@ -561,3 +561,68 @@ resolved detail the one-line sketch left open:
   partially-completed purge is a worse outcome than a slow one for an all-or-nothing
   privacy/legal operation, so atomicity here is a correctness requirement, not an optimization
   being skipped.
+
+As-built note (T16-03, `[SPEC]`, D-025). `doctor [--worktree <id>] [--json]` is implemented in
+`crates/local-rag/src/cli/doctor.rs`. Its defining constraint, not visible in this section's
+one-line sketch, is that `doctor` must be categorically read-only, but every normal constructor
+this workspace has (`StateDb::open`, `CacheDb::open`, `StoreLayout::ensure`) either applies
+pending migrations, rebuilds an incompatible cache, or re-asserts permissions as a side effect of
+opening — exactly the machinery this command exists to diagnose, not to run. `build_report`
+therefore follows one **fixed call order**, never incidental code layout, each step backed by a
+new read-only function extracted (not duplicated) from the existing mutating orchestrator it
+mirrors, proven behavior-preserving by the pre-existing test suite for each staying green
+unchanged:
+
+1. **lock** — a pure file read (`daemon::read_store_lock_file`), distinguishing absent from
+   corrupt, unlike `status`'s own best-effort read which collapses both. No `flock` attempt, no
+   liveness probe — "is the named pid actually alive" is left to `local-rag status`.
+2. **permissions** — `stat`/`lstat` only (`StoreLayout::audit_permissions`, new
+   `core::paths::perms::audit_path`), run **before** anything else so a later step's own
+   `ensure_dir`/`ensure_file_0600` re-assert (D-027) can never silently erase the very fault this
+   section exists to report.
+3. **versions** — a raw `SQLITE_OPEN_READ_ONLY` connection (`StateDb::diagnose_versions`, new
+   `migrate::{VersionDiagnosis, check_applied}` extracted from `migrate::run`'s own compatibility
+   check), never `StateDb::open`/`migrate::run`.
+4. **cache binding** — likewise raw and read-only (`CacheDb::diagnose_binding`, new
+   `cache::CacheDiagnosis`), never `CacheDb::open`.
+5. Only once versions confirms the store is compatible **and has nothing pending** does `doctor`
+   construct a real `StateDb::open` at all, for **orphans** and **heads**. Any other versions
+   outcome (`NotInitialized`/`MissingBookkeeping`/`Fault`, or `Applied` with nonzero `pending`)
+   reports both sections `Skipped` — opening `StateDb` in the nonzero-`pending` case specifically
+   would silently apply the exact migrations this command exists to report as pending.
+6. **heads**, per worktree (`all_worktree_ids`, or narrowed by `--worktree`): dense via new
+   `projection::check_dense` (extracted from `open_and_validate`, row-only divergence predicates
+   — `validate_row_only` — checked strictly before any shard I/O, so a missing shard directory is
+   reported without ever calling `store.open()`'s own `fs::create_dir_all`); FTS via new
+   `cache::check_fts` (extracted from `open_and_validate_fts`, already-read-only up to the point a
+   real divergence triggers repair).
+
+**Orphans is three dry-run sweeps, not `gc`'s full six.** `run_orphan_shard_sweep`/
+`run_expired_shard_sweep`/`run_unreferenced_space_sweep` — the file-system "orphan artifacts"
+this section's sketch names — always with `dry_run: true`, never a CLI flag: non-mutation is an
+architectural property of this command, not a mode. The three DB-row sweeps `gc` also owns
+(spool session / payload TTL / candidate expiry) are not artifacts in that sense and stay `gc`'s
+alone.
+
+**No `--fix`/`--repair` flag, deliberately.** The card and D-025 draw a hard line between
+diagnose (`doctor`) and repair (`rebuild --fts`/`--dense`, T15-07, untouched by this task); a
+combined flag would erase that line. An operator reads a divergent head here and runs `rebuild`
+themselves.
+
+**A worktree never indexed on either leg is not a fault.** `is_clean()` treats
+`VersionDiagnosis::NotInitialized` (nothing to diagnose yet) and, per worktree,
+`FtsCheckOutcome::NoActiveGeneration` + `DenseCheckOutcome::NoActiveTuple` together (nothing
+indexed yet) as the same benign bootstrap state — the per-worktree analogue of the store-wide
+case. `requires_index_unavailable`'s `both_legs_unavailable` (spec 02 §6) is `true` in exactly
+this state too (correctly — the worktree genuinely cannot be searched yet), but it is not an
+independent `is_clean()` gate: a genuinely broken leg already fails its own outcome match
+(`Divergent`/`Err` is neither `Valid` nor `NoActive*`), so the two per-leg checks alone are
+sufficient, and `both_legs_unavailable` stays on the report purely as an informational signal for
+a human/JSON reader.
+
+D-027 (spec 12 §6 `[FIXED]` "files/segments 0600") was found by this task's own permissions
+section on its first real smoke test against a freshly-indexed store: `state.sqlite`/
+`cache.sqlite` were created by a bare `Connection::open()` with no explicit mode, landing at the
+process umask's default (typically `0644`) instead of `0600` — pre-existing since T01-02/T01-05,
+unrelated to any new code in this task. Fixed and closed within this same task per the deviation
+workflow before `doctor` itself was finished (`DEVIATIONS.md`).

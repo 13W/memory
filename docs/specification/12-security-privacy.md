@@ -220,6 +220,15 @@ named pipe with owner-only ACL; per-user store paths (02 §2.1). Shared machine/
 store MUST NOT be shared between OS users; the daemon refuses to start on a store whose owner
 uid differs `[SPEC]`.
 
+As-built note (D-027, `[SPEC]`, found at T16-03 by its own new permissions-audit section).
+`state.sqlite`/`cache.sqlite` were the two most frequently opened files in the store yet were the
+only managed files never wrapped in `local_rag_core::paths::ensure_file_0600` — `open_state_rw`/
+`open_cache_rw` (`crates/store/src/{state,cache}/open.rs`) called a bare `Connection::open(path)`,
+so a freshly created file landed at the process umask's default (typically `0644`), not `0600`,
+pre-existing since T01-02/T01-05. Both functions now call `ensure_file_0600(path)` first, the
+same idiom `store.lock`/spool segments/migration backups/the migration lock already used —
+idempotent: `0600` on first creation, owner-verified and re-asserted on every subsequent open.
+
 ## 7. Remote fingerprint `[FIXED]`
 
 Git remote identity: credentials stripped, SSH/HTTPS normalized to a canonical form, only the

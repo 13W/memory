@@ -14,7 +14,9 @@ use std::time::Duration;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::migrate::{Migration, MigrationError, run};
 use local_rag_store::rusqlite::Connection;
-use local_rag_store::{StateDb, create_repository, rusqlite, worktree_state_clocks};
+use local_rag_store::{
+    StateDb, VersionDiagnosis, create_repository, rusqlite, worktree_state_clocks,
+};
 use local_rag_test_support::TempHome;
 
 // Synthetic migrations. Each creates a distinct table so "applied" is
@@ -543,6 +545,147 @@ async fn migration_8_adds_the_envelope_redaction_version_column_with_no_backfill
 /// added yet, with an explicit `last_seen_at` the backfill can be observed
 /// through. (`create_worktree` itself writes the post-migration column list, so
 /// it cannot be used against a version-4 store.)
+// ---------------------------------------------------------------------------
+// T16-03: `StateDb::diagnose_versions` — read-only, never bootstraps/applies.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diagnose_versions_reports_not_initialized_when_state_sqlite_is_absent() {
+    let (_home, layout) = temp_store();
+    // `temp_store()` only ensures the directory tree; `state.sqlite` itself
+    // was never created.
+    let diagnosis = StateDb::diagnose_versions(&layout.state_db(), SET_123).expect("diagnose");
+    assert!(matches!(diagnosis, VersionDiagnosis::NotInitialized));
+    assert!(
+        !layout.state_db().exists(),
+        "diagnose_versions must not create the file it is diagnosing"
+    );
+}
+
+#[test]
+fn diagnose_versions_reports_missing_bookkeeping_on_a_non_sqlite_file() {
+    let (_home, layout) = temp_store();
+    std::fs::write(layout.state_db(), b"not a sqlite database").expect("seed garbage file");
+
+    let diagnosis = StateDb::diagnose_versions(&layout.state_db(), SET_123).expect("diagnose");
+    assert!(matches!(diagnosis, VersionDiagnosis::MissingBookkeeping));
+}
+
+#[test]
+fn diagnose_versions_reports_applied_with_empty_pending_on_a_fresh_store() {
+    let (_home, layout) = temp_store();
+    let mut conn = raw_conn(&layout.state_db());
+    run(&mut conn, SET_123, &layout.migration_lock(), 1000).expect("migrate to v3");
+    drop(conn);
+
+    let diagnosis = StateDb::diagnose_versions(&layout.state_db(), SET_123).expect("diagnose");
+    match diagnosis {
+        VersionDiagnosis::Applied(report) => {
+            assert_eq!(report.store_version, 3);
+            assert_eq!(report.binary_max_version, 3);
+            assert!(report.pending.is_empty());
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+}
+
+#[test]
+fn diagnose_versions_reports_pending_when_the_binary_set_has_new_migrations() {
+    let (_home, layout) = temp_store();
+    let mut conn = raw_conn(&layout.state_db());
+    run(&mut conn, SET_12, &layout.migration_lock(), 1000).expect("migrate to v2");
+    drop(conn);
+
+    // Diagnose with the full 4-migration set: 2 are still pending.
+    let diagnosis = StateDb::diagnose_versions(&layout.state_db(), SET_1234).expect("diagnose");
+    match diagnosis {
+        VersionDiagnosis::Applied(report) => {
+            assert_eq!(report.store_version, 2);
+            assert_eq!(report.binary_max_version, 4);
+            assert_eq!(report.pending, vec![3, 4]);
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+
+    // The diagnosis itself never applied anything: a real `run()` afterward
+    // still finds versions 3/4 pending, not already-applied.
+    let mut conn = raw_conn(&layout.state_db());
+    let report = run(&mut conn, SET_1234, &layout.migration_lock(), 2000).expect("real run");
+    assert_eq!(
+        report.applied,
+        vec![3, 4],
+        "diagnose_versions applied nothing on its own"
+    );
+}
+
+#[test]
+fn diagnose_versions_reports_fault_on_checksum_drift() {
+    let (_home, layout) = temp_store();
+    let mut conn = raw_conn(&layout.state_db());
+    run(&mut conn, &[M1], &layout.migration_lock(), 1000).expect("apply v1");
+    drop(conn);
+
+    let diagnosis = StateDb::diagnose_versions(&layout.state_db(), &[M1B]).expect("diagnose");
+    match diagnosis {
+        VersionDiagnosis::Fault(MigrationError::ChecksumDrift { version, .. }) => {
+            assert_eq!(version, 1);
+        }
+        other => panic!("expected Fault(ChecksumDrift), got {other:?}"),
+    }
+}
+
+#[test]
+fn diagnose_versions_reports_fault_on_incompatible_newer_store() {
+    let (_home, layout) = temp_store();
+    let mut conn = raw_conn(&layout.state_db());
+    run(&mut conn, SET_123, &layout.migration_lock(), 1000).expect("apply to v3");
+    drop(conn);
+
+    let diagnosis = StateDb::diagnose_versions(&layout.state_db(), SET_12).expect("diagnose");
+    match diagnosis {
+        VersionDiagnosis::Fault(MigrationError::IncompatibleStore {
+            store_version,
+            binary_max_version,
+        }) => {
+            assert_eq!(store_version, 3);
+            assert_eq!(binary_max_version, 2);
+        }
+        other => panic!("expected Fault(IncompatibleStore), got {other:?}"),
+    }
+}
+
+#[test]
+fn diagnose_versions_never_touches_the_migration_lock_file() {
+    let (_home, layout) = temp_store();
+    let mut conn = raw_conn(&layout.state_db());
+    run(&mut conn, SET_123, &layout.migration_lock(), 1000).expect("apply to v3");
+    drop(conn);
+
+    // `run()` itself creates `migration.lock` (via `MigrationLock::acquire`'s
+    // own `ensure_file_0600`) as a side effect of the *real* migration above —
+    // this test isolates whether `diagnose_versions` touches it *again*, not
+    // whether it exists at all.
+    assert!(
+        layout.migration_lock().exists(),
+        "sanity: the real run() above did create migration.lock"
+    );
+    let before = std::fs::metadata(layout.migration_lock())
+        .expect("stat before")
+        .modified()
+        .expect("mtime before");
+
+    StateDb::diagnose_versions(&layout.state_db(), SET_123).expect("diagnose");
+
+    let after = std::fs::metadata(layout.migration_lock())
+        .expect("stat after")
+        .modified()
+        .expect("mtime after");
+    assert_eq!(
+        before, after,
+        "diagnose_versions must never touch migration.lock"
+    );
+}
+
 fn create_worktree_v4(
     tx: &rusqlite::Transaction<'_>,
     worktree_id: &str,

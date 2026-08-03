@@ -342,6 +342,86 @@ pub enum ValidationDepth {
     Strong,
 }
 
+/// The result of [`check_fts`] — the read-only half of
+/// [`open_and_validate_fts`], with no repair attempted or implied.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FtsCheckOutcome {
+    /// `worktree.current_generation_id` is `NULL` — no generation has ever
+    /// been activated for this worktree; nothing to validate yet.
+    NoActiveGeneration,
+    /// Every checked predicate passed.
+    Valid,
+    /// A divergence was found. Unlike [`FtsOpenOutcome::DeferredBackground`],
+    /// this carries no cost estimate — "how expensive would a rebuild be" is
+    /// a repair-planning question a caller asks separately, only once it has
+    /// decided to act on a confirmed divergence (D-006: never mixed into the
+    /// validation input itself).
+    Divergent {
+        /// Why the view was judged untrustworthy.
+        divergence: FtsDivergence,
+        /// The generation the divergence was evaluated against.
+        active_generation_id: String,
+    },
+}
+
+/// Read-only FTS validation for `worktree_id` (spec 06 §4) — the read+compare
+/// half [`open_and_validate_fts`] itself uses before deciding whether to
+/// repair. Extracted so a caller that must never mutate (`local-rag doctor`,
+/// T16-03) can ask "is this valid, and why not" without risking the
+/// synchronous [`materialize_fts`] call `open_and_validate_fts` makes on any
+/// divergence. Takes already-open connections rather than [`StateDb`]/
+/// [`CacheDb`] handles precisely so a caller can supply a cache connection
+/// that was never routed through [`CacheDb::open`]'s own rebuild-on-doubt
+/// policy (see [`CacheDb::open_read_only`]).
+pub fn check_fts(
+    state_read: &rusqlite::Connection,
+    cache_read: &rusqlite::Connection,
+    worktree_id: &str,
+    depth: ValidationDepth,
+) -> Result<FtsCheckOutcome, FtsRebuildError> {
+    let Some(active_generation_id) =
+        current_generation(state_read, worktree_id).map_err(FtsRebuildError::StateRead)?
+    else {
+        return Ok(FtsCheckOutcome::NoActiveGeneration);
+    };
+
+    // D-006: the validation input is the cache's OWN actual current content,
+    // never state.sqlite's expectation for the source generation — see the
+    // module docs.
+    let head =
+        read_fts_projection_head(cache_read, worktree_id).map_err(FtsRebuildError::CacheRead)?;
+    let actual_cache_occurrence_count =
+        fts_doc_occurrence_count(cache_read, worktree_id).map_err(FtsRebuildError::CacheRead)?;
+
+    let divergence = match depth {
+        ValidationDepth::Cheap => validate_fts_cheap(
+            head.as_ref(),
+            &active_generation_id,
+            actual_cache_occurrence_count,
+        ),
+        ValidationDepth::Strong => {
+            let ids = fts_doc_occurrence_ids(cache_read, worktree_id)
+                .map_err(FtsRebuildError::CacheRead)?;
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let manifest_hash = fts_manifest_hash(worktree_id, &active_generation_id, &refs);
+            validate_fts_strong(
+                head.as_ref(),
+                &active_generation_id,
+                actual_cache_occurrence_count,
+                &manifest_hash,
+            )
+        }
+    };
+
+    Ok(match divergence {
+        None => FtsCheckOutcome::Valid,
+        Some(divergence) => FtsCheckOutcome::Divergent {
+            divergence,
+            active_generation_id,
+        },
+    })
+}
+
 /// Validate the FTS view for `worktree_id` (spec 06 §4) and repair it on any
 /// divergence: [`materialize_fts`] again if the fresh occurrence count is
 /// under [`FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD`], else report
@@ -353,52 +433,19 @@ pub async fn open_and_validate_fts(
     depth: ValidationDepth,
     now_ms: i64,
 ) -> Result<FtsOpenOutcome, FtsRebuildError> {
-    let active_generation_id = {
-        let read = state.open_read().map_err(FtsRebuildError::StateOpen)?;
-        current_generation(&read, worktree_id).map_err(FtsRebuildError::StateRead)?
-    };
-    let Some(active_generation_id) = active_generation_id else {
-        return Ok(FtsOpenOutcome::NoActiveGeneration);
-    };
+    let state_read = state.open_read().map_err(FtsRebuildError::StateOpen)?;
+    let cache_read = cache.open_read().map_err(FtsRebuildError::CacheOpen)?;
+    let outcome = check_fts(&state_read, &cache_read, worktree_id, depth)?;
+    drop(state_read);
+    drop(cache_read);
 
-    let head = {
-        let read = cache.open_read().map_err(FtsRebuildError::CacheOpen)?;
-        read_fts_projection_head(&read, worktree_id).map_err(FtsRebuildError::CacheRead)?
-    };
-    // D-006: the validation input is the cache's OWN actual current content,
-    // never state.sqlite's expectation for the source generation (see the
-    // module docs — that expectation is generation-invariant and cannot see
-    // direct cache-row corruption).
-    let actual_cache_occurrence_count = {
-        let read = cache.open_read().map_err(FtsRebuildError::CacheOpen)?;
-        fts_doc_occurrence_count(&read, worktree_id).map_err(FtsRebuildError::CacheRead)?
-    };
-
-    let divergence = match depth {
-        ValidationDepth::Cheap => validate_fts_cheap(
-            head.as_ref(),
-            &active_generation_id,
-            actual_cache_occurrence_count,
-        ),
-        ValidationDepth::Strong => {
-            let manifest_hash = {
-                let read = cache.open_read().map_err(FtsRebuildError::CacheOpen)?;
-                let ids = fts_doc_occurrence_ids(&read, worktree_id)
-                    .map_err(FtsRebuildError::CacheRead)?;
-                let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-                fts_manifest_hash(worktree_id, &active_generation_id, &refs)
-            };
-            validate_fts_strong(
-                head.as_ref(),
-                &active_generation_id,
-                actual_cache_occurrence_count,
-                &manifest_hash,
-            )
-        }
-    };
-
-    let Some(divergence) = divergence else {
-        return Ok(FtsOpenOutcome::Valid);
+    let (divergence, active_generation_id) = match outcome {
+        FtsCheckOutcome::NoActiveGeneration => return Ok(FtsOpenOutcome::NoActiveGeneration),
+        FtsCheckOutcome::Valid => return Ok(FtsOpenOutcome::Valid),
+        FtsCheckOutcome::Divergent {
+            divergence,
+            active_generation_id,
+        } => (divergence, active_generation_id),
     };
 
     // A genuinely different question from the validation input above ("how

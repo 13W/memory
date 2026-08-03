@@ -24,11 +24,12 @@ use local_rag_store::registry::{
 };
 use local_rag_store::rusqlite;
 use local_rag_store::{
-    CacheDb, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsDivergence, FtsOpenOutcome,
-    StateDb, ValidationDepth, derive_content_blob, fts_doc_occurrence_ids, fts_manifest_hash,
-    insert_content_blob, insert_file_revision, insert_generation_file, insert_occurrence,
-    insert_parsed_unit, materialize_fts, occurrence_id, occurrence_ids_for_generation,
-    open_and_validate_fts, read_fts_projection_head, requires_index_unavailable,
+    CacheDb, FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsCheckOutcome,
+    FtsDivergence, FtsOpenOutcome, StateDb, ValidationDepth, check_fts, derive_content_blob,
+    fts_doc_occurrence_ids, fts_manifest_hash, insert_content_blob, insert_file_revision,
+    insert_generation_file, insert_occurrence, insert_parsed_unit, materialize_fts, occurrence_id,
+    occurrence_ids_for_generation, open_and_validate_fts, read_fts_projection_head,
+    requires_index_unavailable,
 };
 use local_rag_test_support::TempHome;
 
@@ -562,6 +563,174 @@ async fn strong_check_catches_swapped_occurrence_id_invisible_to_state_sqlite() 
     assert!(
         !ids.contains(&fake_id),
         "rebuild must remove the swapped-in fake id: {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T16-03: `check_fts` — the read-only half of `open_and_validate_fts`, pinned
+// against the same fixtures to match its outcome, and proven never to mutate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn check_fts_matches_bootstrap_no_active_generation() {
+    let (_home, state, cache) = open_both();
+    let wt = seed_worktree(&state, 200).await;
+
+    let state_read = state.open_read().expect("state read");
+    let cache_read = cache.open_read().expect("cache read");
+    let outcome =
+        check_fts(&state_read, &cache_read, &wt, ValidationDepth::Strong).expect("check_fts");
+    assert_eq!(outcome, FtsCheckOutcome::NoActiveGeneration);
+}
+
+#[tokio::test]
+async fn check_fts_matches_valid_after_a_real_rebuild() {
+    let (_home, state, cache) = open_both();
+    let wt = seed_worktree(&state, 210).await;
+    let gen_id = uuid(220);
+    seed_generation(&state, &wt, &gen_id, 1).await;
+    let rev = uuid(221);
+    let unit = uuid(222);
+    seed_file_content(&state, &rev, &unit, "fn g() {}", Some("g")).await;
+    seed_occurrence(&state, &gen_id, "g.rs", &rev, &unit).await;
+    activate_generation(&state, &wt, &gen_id).await;
+    materialize_fts(&state, &cache, &wt, &gen_id, NOW)
+        .await
+        .expect("materialize");
+
+    let state_read = state.open_read().expect("state read");
+    let cache_read = cache.open_read().expect("cache read");
+    let outcome =
+        check_fts(&state_read, &cache_read, &wt, ValidationDepth::Strong).expect("check_fts");
+    assert_eq!(outcome, FtsCheckOutcome::Valid);
+}
+
+#[tokio::test]
+async fn check_fts_reports_the_same_generation_mismatch_open_and_validate_fts_would_repair() {
+    let (_home, state, cache) = open_both();
+    let wt = seed_worktree(&state, 230).await;
+
+    let gen_a = uuid(240);
+    seed_generation(&state, &wt, &gen_a, 1).await;
+    let rev_a = uuid(241);
+    let unit_a = uuid(242);
+    seed_file_content(&state, &rev_a, &unit_a, "fn a() {}", Some("a")).await;
+    seed_occurrence(&state, &gen_a, "a.rs", &rev_a, &unit_a).await;
+    activate_generation(&state, &wt, &gen_a).await;
+    materialize_fts(&state, &cache, &wt, &gen_a, NOW)
+        .await
+        .expect("materialize A");
+
+    // Activate generation B without touching the cache -- the head now points
+    // at a superseded generation (same fixture as `stale_generation_head_self_heals`).
+    let gen_b = uuid(250);
+    seed_generation(&state, &wt, &gen_b, 2).await;
+    let rev_b = uuid(251);
+    let unit_b = uuid(252);
+    seed_file_content(&state, &rev_b, &unit_b, "fn b() {}", Some("b")).await;
+    seed_occurrence(&state, &gen_b, "b.rs", &rev_b, &unit_b).await;
+    activate_generation(&state, &wt, &gen_b).await;
+
+    let head_before = read_fts_projection_head(&cache.open_read().expect("read"), &wt)
+        .expect("read head")
+        .expect("head present");
+    let rows_before = fts_doc_row_count(&cache);
+
+    let state_read = state.open_read().expect("state read");
+    let cache_read = cache.open_read().expect("cache read");
+    let outcome =
+        check_fts(&state_read, &cache_read, &wt, ValidationDepth::Cheap).expect("check_fts");
+    match outcome {
+        FtsCheckOutcome::Divergent {
+            divergence,
+            active_generation_id,
+        } => {
+            assert_eq!(active_generation_id, gen_b);
+            assert_eq!(
+                divergence,
+                FtsDivergence::GenerationMismatch {
+                    head: gen_a.clone(),
+                    active: gen_b.clone(),
+                }
+            );
+        }
+        other => panic!("expected Divergent, got {other:?}"),
+    }
+    drop(state_read);
+    drop(cache_read);
+
+    // Read-only: check_fts alone never rebuilt anything, unlike
+    // `open_and_validate_fts` on the identical fixture (proven above by
+    // `stale_generation_head_self_heals`).
+    let head_after = read_fts_projection_head(&cache.open_read().expect("read"), &wt)
+        .expect("read head")
+        .expect("head present");
+    assert_eq!(
+        head_before, head_after,
+        "check_fts must not rewrite the head"
+    );
+    assert_eq!(
+        rows_before,
+        fts_doc_row_count(&cache),
+        "check_fts must not touch fts_doc"
+    );
+}
+
+#[tokio::test]
+async fn check_fts_is_read_only_on_a_strong_only_divergence() {
+    let (_home, state, cache) = open_both();
+    let wt = seed_worktree(&state, 260).await;
+    let gen_id = uuid(270);
+    seed_generation(&state, &wt, &gen_id, 1).await;
+    let rev = uuid(271);
+    let unit = uuid(272);
+    seed_file_content(&state, &rev, &unit, "fn h() {}", Some("h")).await;
+    let occ = seed_occurrence(&state, &gen_id, "h.rs", &rev, &unit).await;
+    activate_generation(&state, &wt, &gen_id).await;
+    materialize_fts(&state, &cache, &wt, &gen_id, NOW)
+        .await
+        .expect("materialize");
+
+    // Swap the occurrence_id directly -- count-preserving corruption, the
+    // same fixture as `strong_check_catches_swapped_occurrence_id_invisible_to_state_sqlite`.
+    let fake_id = "f".repeat(64);
+    let (w, real_id, fake) = (wt.clone(), occ.clone(), fake_id.clone());
+    cache
+        .writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE fts_doc SET occurrence_id = ?1 \
+                 WHERE worktree_id = ?2 AND occurrence_id = ?3",
+                rusqlite::params![fake, w, real_id],
+            )
+        })
+        .await
+        .expect("swap occurrence id");
+
+    // Cheap is deliberately blind (count-preserving); check_fts must match.
+    let state_read = state.open_read().expect("state read");
+    let cache_read = cache.open_read().expect("cache read");
+    let cheap = check_fts(&state_read, &cache_read, &wt, ValidationDepth::Cheap).expect("cheap");
+    assert_eq!(cheap, FtsCheckOutcome::Valid);
+
+    let strong = check_fts(&state_read, &cache_read, &wt, ValidationDepth::Strong).expect("strong");
+    match strong {
+        FtsCheckOutcome::Divergent { divergence, .. } => {
+            assert_eq!(divergence, FtsDivergence::ManifestMismatch);
+        }
+        other => panic!("expected Divergent(ManifestMismatch), got {other:?}"),
+    }
+    drop(state_read);
+    drop(cache_read);
+
+    // Read-only: the swapped-in fake id is still there -- no rebuild happened.
+    let ids = {
+        let read = cache.open_read().expect("read conn");
+        fts_doc_occurrence_ids(&read, &wt).expect("read occurrence ids")
+    };
+    assert!(
+        ids.contains(&fake_id),
+        "check_fts must not repair the swap: {ids:?}"
     );
 }
 

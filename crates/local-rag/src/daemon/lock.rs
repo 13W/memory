@@ -332,3 +332,37 @@ fn read_lock_info(path: &Path) -> Option<StoreLockInfo> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
+
+/// The three states `store.lock` can be found in by a pure read (T16-03,
+/// `local-rag doctor`'s "lock" check). Unlike [`acquire`], this never
+/// contends for the `flock` and never writes anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreLockFileState {
+    /// No `store.lock` file exists at all.
+    Absent,
+    /// A file exists, but its content is not valid [`StoreLockInfo`] JSON — a
+    /// torn write from a crash, or something else entirely at the path.
+    Corrupt,
+    /// Successfully parsed. A live daemon holding this lock is the expected,
+    /// healthy case — not itself a fault; the caller decides what to do with
+    /// it (`local-rag status`'s own live socket probe, or `doctor`'s simpler
+    /// `pid_exists` check).
+    Parsed(StoreLockInfo),
+}
+
+/// Read-only inspection of `store.lock` — the read-side counterpart to
+/// [`acquire`]'s own best-effort [`read_lock_info`], but distinguishing
+/// "absent" from "corrupt" rather than collapsing both into "stale, unknown
+/// owner" the way [`acquire_inner`]'s recovery path deliberately does (the
+/// right choice for recovery, not for a diagnostic that wants to say which
+/// one it actually found).
+pub fn read_store_lock_file(layout: &StoreLayout) -> StoreLockFileState {
+    match std::fs::read(layout.store_lock()) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => StoreLockFileState::Absent,
+        Err(_) => StoreLockFileState::Corrupt,
+        Ok(bytes) => match serde_json::from_slice::<StoreLockInfo>(&bytes) {
+            Ok(info) => StoreLockFileState::Parsed(info),
+            Err(_) => StoreLockFileState::Corrupt,
+        },
+    }
+}

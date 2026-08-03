@@ -4,7 +4,7 @@
 //! 02 §4, T15-01). The rest of the CLI surface — `status`/`stop`/`restart`/
 //! `init`, `index`/`reindex`/`watch`, `repo`/`worktree`, `rebuild` (spec 11
 //! §6) — lives in [`cli`] (T15-07); `memory`/`gc`/`stats` are T15-08 (D-025);
-//! `inspect`/`export`/`purge` are T16-02 (D-025).
+//! `inspect`/`export`/`purge` are T16-02 (D-025); `doctor` is T16-03 (D-025).
 
 mod cli;
 
@@ -47,9 +47,10 @@ fn main() -> ExitCode {
         Some("inspect") => cli::inspect::run(std::env::args().skip(2)),
         Some("export") => cli::export::run(std::env::args().skip(2)),
         Some("purge") => cli::purge::run(std::env::args().skip(2)),
+        Some("doctor") => cli::doctor::run(std::env::args().skip(2)),
         _ => {
             eprintln!(
-                "usage: {BIN} version|serve|status|stop|restart|init|index|reindex|watch|repo|worktree|rebuild|memory|gc|stats|inspect|export|purge"
+                "usage: {BIN} version|serve|status|stop|restart|init|index|reindex|watch|repo|worktree|rebuild|memory|gc|stats|inspect|export|purge|doctor"
             );
             ExitCode::from(2)
         }

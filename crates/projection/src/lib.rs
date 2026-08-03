@@ -109,11 +109,11 @@ pub use model_switch::{
     switch_model_space,
 };
 pub use rebuild::{
-    OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError, RebuildOutcome, force_rebuild,
-    open_and_validate,
+    DenseCheckOutcome, OpenOutcome, QUARANTINE_RETENTION, RebuildCause, RebuildError,
+    RebuildOutcome, check_dense, force_rebuild, open_and_validate,
 };
 pub use switch::{SwitchCommitError, SwitchError, SwitchOutcome, VectorSource, switch};
-pub use validate::{Divergence, validate};
+pub use validate::{Divergence, validate, validate_row_only};
 pub use vectors::{CacheVectorSource, projection_kind_to_store};
 
 #[cfg(feature = "failpoints")]

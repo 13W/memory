@@ -15,7 +15,9 @@ use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
 
 use local_rag::daemon::probe::{LivenessOutcome, LivenessProbe};
-use local_rag::daemon::{SocketLivenessProbe, StoreLockError, acquire};
+use local_rag::daemon::{
+    SocketLivenessProbe, StoreLockError, StoreLockFileState, acquire, read_store_lock_file,
+};
 use local_rag_core::paths::StoreLayout;
 use local_rag_protocol::{Message, PROTO_VERSION, Welcome, encode_message};
 use local_rag_test_support::TempHome;
@@ -480,4 +482,59 @@ fn a_not_yet_ready_owner_with_a_dead_pid_is_reclaimed() {
     let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, &probe)
         .expect("a dead not-yet-ready owner must be reclaimed");
     assert_eq!(guard.info().instance_uuid, "fresh-instance");
+}
+
+// ---------------------------------------------------------------------------
+// T16-03: `read_store_lock_file` — pure read, no `flock` contention, no
+// mutation; distinguishes absent from corrupt, unlike `acquire`'s own
+// best-effort `read_lock_info` (which deliberately collapses both).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_store_lock_file_is_absent_when_no_lock_file_exists() {
+    let (_home, layout) = open_layout();
+    assert_eq!(read_store_lock_file(&layout), StoreLockFileState::Absent);
+}
+
+#[test]
+fn read_store_lock_file_is_corrupt_on_unparseable_content() {
+    let (_home, layout) = open_layout();
+    local_rag_core::paths::ensure_file_0600(&layout.store_lock()).expect("ensure lock file");
+    std::fs::write(layout.store_lock(), b"{not valid json at all").expect("seed torn write");
+
+    assert_eq!(read_store_lock_file(&layout), StoreLockFileState::Corrupt);
+}
+
+#[test]
+fn read_store_lock_file_parses_a_real_lock_written_by_acquire() {
+    let (_home, layout) = open_layout();
+    let probe = FixedProbe(LivenessOutcome::Alive); // never consulted -- fresh acquire
+    let guard = acquire(&layout, "instance-a", 42, "0.0.0", 1_000, &probe).expect("acquire");
+    assert_eq!(guard.info().pid, 42);
+
+    match read_store_lock_file(&layout) {
+        StoreLockFileState::Parsed(info) => {
+            assert_eq!(info.instance_uuid, "instance-a");
+            assert_eq!(info.pid, 42);
+            assert!(!info.ready, "mark_ready was never called");
+        }
+        other => panic!("expected Parsed, got {other:?}"),
+    }
+}
+
+#[test]
+fn read_store_lock_file_never_contends_with_a_live_flock() {
+    let (_home, layout) = open_layout();
+    let probe = FixedProbe(LivenessOutcome::Alive);
+    // Hold the real flock via a live guard for the whole test -- a mutating
+    // read (or one that tried to `try_lock`) would either fail or need to
+    // wait; `read_store_lock_file` must do neither.
+    let guard = acquire(&layout, "instance-b", 99, "0.0.0", 1_000, &probe).expect("acquire");
+
+    match read_store_lock_file(&layout) {
+        StoreLockFileState::Parsed(info) => assert_eq!(info.instance_uuid, "instance-b"),
+        other => panic!("expected Parsed, got {other:?}"),
+    }
+
+    drop(guard);
 }

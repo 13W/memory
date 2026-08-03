@@ -103,6 +103,72 @@ fn verify_owner_meta(path: &Path, meta: &fs::Metadata) -> Result<(), PathError> 
     Ok(())
 }
 
+/// The kind of filesystem object [`audit_path`] expects at a managed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedKind {
+    Dir,
+    File,
+}
+
+/// Read-only permission/ownership audit of one managed store path (spec 12
+/// §6, T16-03's `local-rag doctor`). Unlike [`ensure_dir`]/
+/// [`ensure_file_0600`], this never creates, chmods, or otherwise touches
+/// anything — it only reports what it finds. `None` covers both "the path
+/// does not exist" (absence is a different section's business — versions/
+/// cache-binding/orphans — not a permissions finding) and "the path exists
+/// and is fully compliant".
+#[cfg(unix)]
+pub fn audit_path(path: &Path, kind: ExpectedKind) -> Option<PathError> {
+    // `symlink_metadata` mirrors `ensure_dir`/`ensure_file_0600`'s own
+    // symlink-swap defence: a symlink reports as itself, never as whatever it
+    // points at.
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(PathError::io(path, e)),
+    };
+
+    let type_ok = match kind {
+        ExpectedKind::Dir => meta.file_type().is_dir(),
+        ExpectedKind::File => meta.file_type().is_file(),
+    };
+    if !type_ok {
+        return Some(PathError::UnexpectedType {
+            path: path.to_path_buf(),
+            expected: match kind {
+                ExpectedKind::Dir => "directory",
+                ExpectedKind::File => "file",
+            },
+        });
+    }
+
+    if let Err(e) = verify_owner_meta(path, &meta) {
+        return Some(e);
+    }
+
+    let expected_mode = match kind {
+        ExpectedKind::Dir => 0o700,
+        ExpectedKind::File => 0o600,
+    };
+    let found_mode = meta.permissions().mode() & 0o777;
+    if found_mode != expected_mode {
+        return Some(PathError::WrongMode {
+            path: path.to_path_buf(),
+            expected: expected_mode,
+            found: found_mode,
+        });
+    }
+
+    None
+}
+
+/// No-op on platforms without POSIX mode/uid semantics (default ACLs apply) —
+/// mirrors [`verify_owner`]'s own no-op convention.
+#[cfg(not(unix))]
+pub fn audit_path(_path: &Path, _kind: ExpectedKind) -> Option<PathError> {
+    None
+}
+
 /// The current process's effective uid.
 ///
 /// `std` exposes no `geteuid`, so this calls libc directly (see the dependency
@@ -248,6 +314,74 @@ mod tests {
         }
         match verify_owner(Path::new("/")) {
             Err(PathError::WrongOwner { found_uid: 0, .. }) => {}
+            other => panic!("expected WrongOwner(found_uid: 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_path_is_none_for_an_absent_path() {
+        let home = TempHome::new().expect("temp home");
+        let missing = home.join("never-created");
+        assert!(audit_path(&missing, ExpectedKind::Dir).is_none());
+        assert!(audit_path(&missing, ExpectedKind::File).is_none());
+    }
+
+    #[test]
+    fn audit_path_is_none_for_a_compliant_dir_and_file() {
+        let home = TempHome::new().expect("temp home");
+        let dir = home.join("private");
+        ensure_dir(&dir).expect("create dir");
+        let file = home.join("secret");
+        ensure_file_0600(&file).expect("create file");
+
+        assert!(audit_path(&dir, ExpectedKind::Dir).is_none());
+        assert!(audit_path(&file, ExpectedKind::File).is_none());
+    }
+
+    #[test]
+    fn audit_path_reports_wrong_mode_without_fixing_it() {
+        let home = TempHome::new().expect("temp home");
+        let dir = home.join("private");
+        ensure_dir(&dir).expect("create dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("widen mode");
+
+        match audit_path(&dir, ExpectedKind::Dir) {
+            Some(PathError::WrongMode {
+                expected, found, ..
+            }) => {
+                assert_eq!(expected, 0o700);
+                assert_eq!(found, 0o755);
+            }
+            other => panic!("expected WrongMode, got {other:?}"),
+        }
+
+        // Read-only: the widened mode is still there after the audit.
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "audit_path must never fix what it finds");
+    }
+
+    #[test]
+    fn audit_path_reports_unexpected_type() {
+        let home = TempHome::new().expect("temp home");
+        let file = home.join("afile");
+        ensure_file_0600(&file).expect("create file");
+
+        match audit_path(&file, ExpectedKind::Dir) {
+            Some(PathError::UnexpectedType { expected, .. }) => {
+                assert_eq!(expected, "directory");
+            }
+            other => panic!("expected UnexpectedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_path_reports_wrong_owner_without_widening_scope() {
+        // Same platform-gated approach as `verify_owner_refuses_foreign_owner`.
+        if effective_uid() == 0 {
+            return;
+        }
+        match audit_path(Path::new("/"), ExpectedKind::Dir) {
+            Some(PathError::WrongOwner { found_uid: 0, .. }) => {}
             other => panic!("expected WrongOwner(found_uid: 0), got {other:?}"),
         }
     }

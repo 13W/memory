@@ -54,7 +54,10 @@ pub use jobs::{JobGuard, JobKind, JobRegistry};
 pub use lifecycle::{
     DaemonHandle, DaemonStartupError, ShutdownReason, StartOptions, run, wait_for_shutdown_trigger,
 };
-pub use lock::{StoreLockError, StoreLockGuard, StoreLockInfo, acquire};
+pub use lock::{
+    StoreLockError, StoreLockFileState, StoreLockGuard, StoreLockInfo, acquire,
+    read_store_lock_file,
+};
 pub use mcp::McpHandler;
 pub use memory::{MemoryContext, build_memory_context};
 pub use mode::{DaemonMode, MigrationOnlyReason};

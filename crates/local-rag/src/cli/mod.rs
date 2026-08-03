@@ -2,7 +2,7 @@
 //! — T15-07: `status`/`stop`/`restart`/`init`, `index`/`reindex`/`watch`,
 //! `repo`/`worktree`, `rebuild`. T15-08 (D-025): `memory`, `gc`, `stats`.
 //! T16-02 (D-025): `inspect`, `export`, `purge`, over the domain layer in
-//! `local_rag_store::privacy`. `doctor` remains T16-03's deferred scope.
+//! `local_rag_store::privacy`. T16-03 (D-025): `doctor`.
 //!
 //! Argument parsing is deliberately hand-rolled (`std::env::args()`, the same
 //! convention `main.rs`/`local-rag-proxy`/`xtask`'s own `run_bench` already
@@ -22,6 +22,7 @@
 //! construction (concurrent indexers of the *same* worktree are wasteful,
 //! never unsafe).
 
+pub mod doctor;
 pub mod export;
 pub mod gc;
 pub mod index;

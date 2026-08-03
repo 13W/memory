@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_projection::{
-    FakeProjectionStore, OpenOutcome, ProjectionStore, RebuildCause, RebuildError,
-    RepresentationKind, ShardParams, VectorSource, open_and_validate, switch,
+    DenseCheckOutcome, Divergence, FakeProjectionStore, OpenOutcome, ProjectionStore, RebuildCause,
+    RebuildError, RepresentationKind, ShardParams, VectorSource, check_dense, open_and_validate,
+    switch,
 };
 use local_rag_store::{
     DEFAULT_MODEL_SPACE_ID, GenerationState, NewContentBlob, NewFileRevision, NewOccurrence,
@@ -724,5 +725,109 @@ async fn force_rebuild_skips_validate_and_always_rebuilds() {
         row.status,
         ProjectionStatus::Clean,
         "converges back to clean"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T16-03: `check_dense` — the read-only half of `open_and_validate`, pinned
+// against the same fixtures, and proven never to create the shard directory.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn check_dense_matches_bootstrap_no_active_tuple() {
+    let (_home, layout, db) = open_state();
+    let wt = worktree(&db, 60).await;
+    init_projection(&db, &wt).await;
+    let shard_dir = layout.projection_shard(&wt.to_string());
+
+    let read = db.open_read().expect("read");
+    let outcome = check_dense(&read, &FakeProjectionStore::new(), &shard_dir, params(), wt)
+        .expect("check_dense");
+    assert_eq!(outcome, DenseCheckOutcome::NoActiveTuple);
+    assert!(!shard_dir.exists(), "the shard is never touched");
+}
+
+#[tokio::test]
+async fn check_dense_matches_valid_after_a_real_switch() {
+    let (_home, layout, db) = open_state();
+    let (wt, _gen_a, shard_dir) = established(&db, &layout, 61).await;
+
+    let read = db.open_read().expect("read");
+    let outcome = check_dense(&read, &FakeProjectionStore::new(), &shard_dir, params(), wt)
+        .expect("check_dense");
+    assert_eq!(outcome, DenseCheckOutcome::Valid);
+}
+
+/// The central mutation-freedom test: an active tuple whose shard directory
+/// was deleted out from under it (the card's own "dense... recovery solely
+/// from state" scenario) must be reported as a divergence *without*
+/// `check_dense` creating the directory as a side effect of checking —
+/// disproving the `store.open`/`fs::create_dir_all` concern directly.
+#[tokio::test]
+async fn check_dense_reports_head_missing_without_creating_the_shard_directory_when_absent() {
+    let (_home, layout, db) = open_state();
+    let (wt, gen_a, shard_dir) = established(&db, &layout, 62).await;
+    let ms = default_model_space();
+
+    std::fs::remove_dir_all(&shard_dir).expect("delete the shard directory entirely");
+    assert!(!shard_dir.exists(), "sanity: the directory is really gone");
+
+    let read = db.open_read().expect("read");
+    let outcome = check_dense(&read, &FakeProjectionStore::new(), &shard_dir, params(), wt)
+        .expect("check_dense");
+    match outcome {
+        DenseCheckOutcome::Divergent {
+            cause: RebuildCause::Divergent(Divergence::HeadMissing),
+            active_generation_id,
+            active_model_space_id,
+        } => {
+            assert_eq!(active_generation_id, gen_a);
+            assert_eq!(active_model_space_id, ms);
+        }
+        other => panic!("expected Divergent(HeadMissing), got {other:?}"),
+    }
+
+    assert!(
+        !shard_dir.exists(),
+        "check_dense must never create the shard directory it is diagnosing"
+    );
+}
+
+/// Ordering regression: when *both* a row-only divergence (`NotClean`) and a
+/// missing shard directory are present, `NotClean` must win — proving
+/// `check_dense` really does check the row before ever looking at the
+/// filesystem, not merely happening to skip `store.open` in this scenario.
+#[tokio::test]
+async fn check_dense_prefers_not_clean_over_a_missing_directory() {
+    let (_home, layout, db) = open_state();
+    let (wt, _gen_a, shard_dir) = established(&db, &layout, 63).await;
+
+    std::fs::remove_dir_all(&shard_dir).expect("delete the shard directory entirely");
+    let w = wt.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE worktree_projection_state SET status = 'dirty' WHERE worktree_id = ?1",
+                local_rag_store::rusqlite::params![w],
+            )
+        })
+        .await
+        .expect("mark dirty directly");
+
+    let read = db.open_read().expect("read");
+    let outcome = check_dense(&read, &FakeProjectionStore::new(), &shard_dir, params(), wt)
+        .expect("check_dense");
+    match outcome {
+        DenseCheckOutcome::Divergent {
+            cause: RebuildCause::Divergent(Divergence::NotClean { status }),
+            ..
+        } => {
+            assert_eq!(status, ProjectionStatus::Dirty);
+        }
+        other => panic!("expected Divergent(NotClean), got {other:?}"),
+    }
+    assert!(
+        !shard_dir.exists(),
+        "still never created, even on the row-only path"
     );
 }
