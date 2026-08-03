@@ -1,6 +1,8 @@
 //! The `local-rag` binary's CLI surface beyond `version`/`serve` (spec 11 §6)
 //! — T15-07: `status`/`stop`/`restart`/`init`, `index`/`reindex`/`watch`,
-//! `repo`/`worktree`, `rebuild`.
+//! `repo`/`worktree`, `rebuild`. T15-08 (D-025): `memory`, `gc`, `stats`.
+//! `inspect`/`export`/`purge`/`doctor` are D-025's deferred scope, owned by
+//! T16-02/T16-03 — no domain code exists yet for them to adapt.
 //!
 //! Argument parsing is deliberately hand-rolled (`std::env::args()`, the same
 //! convention `main.rs`/`local-rag-proxy`/`xtask`'s own `run_bench` already
@@ -20,11 +22,14 @@
 //! construction (concurrent indexers of the *same* worktree are wasteful,
 //! never unsafe).
 
+pub mod gc;
 pub mod index;
 pub mod init;
+pub mod memory;
 pub mod rebuild;
 pub mod repo;
 pub mod service;
+pub mod stats;
 pub mod status;
 pub mod watch;
 pub mod worktree;

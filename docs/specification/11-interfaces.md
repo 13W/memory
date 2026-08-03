@@ -501,3 +501,29 @@ Plugin packaging (marketplace add / plugin install, hooks + MCP auto-registratio
 project-level init, no files written into `.claude/rules/`) carries over from v1 behavior;
 the RECALL → SEARCH_CODE → THINK → ACT → REMEMBER protocol is delivered via MCP server
 instructions at handshake `[SPEC: keep v1 mechanism]`.
+
+As-built note (T15-08, `[SPEC]`, D-025). `memory`/`gc`/`stats` are implemented in
+`crates/local-rag/src/cli/{memory,gc,stats}.rs`, the same hand-rolled-parsing, module-per-concern
+convention T15-07 established. `inspect <observation|memory|generation> <id>`, `export`, and
+`purge` are **not** built by this task: D-025 (found while planning T15-08, before any code) found
+that their domain layer — scoped export, hard-delete-with-audit-tombstone-rewrite — does not exist
+anywhere in the workspace and is explicitly T16-02's own promised result
+(`groups/16-security-and-recovery.md`); adapting a CLI command to a domain that does not exist
+would mean either duplicating T16-02's future work here or shipping a hollow command that has to be
+rebuilt once T16-02 lands, the same reasoning D-013 used for `model_space_representation`
+registration. `doctor` is deferred the same way, to T16-03. Three points where this task refined
+the one-line sketch above:
+
+- **`memory list --candidates`** is a flag, not a second subcommand:
+  `pending_memory_candidate` has no scope column (spec 03 §2.5), so there is nothing for a
+  separate candidate-listing subcommand to scope-resolve that the flag does not already skip.
+- **`memory evidence <id>`** ships now, even though it is textually part of "inspect" in this
+  section's own sketch: unlike the three-kind `local-rag inspect` command, it already had a domain
+  function (`memory_evidence_for`) and an MCP precedent (`inspect_memory_evidence`, T15-04) before
+  this task — nothing new had to be built for it, so D-025's "no domain to adapt to" reasoning does
+  not apply.
+- **`gc` takes no confirmation prompt**, unlike the destructive-purge class this section's own
+  card language anticipates: every one of its six sweeps (`crates/store/src/housekeeping.rs`,
+  `src/observation/payload_ttl.rs` — T06-03, D-007, D-011, T13-05, T14-05) is already-established,
+  already-gated retention/GC behavior (specs 05 §8, 07 §6, 12 §3) with its own `dry_run` parameter;
+  this task is their first production caller, not new destructive surface.
