@@ -474,3 +474,76 @@ async fn huge_file_is_skipped_without_reading() {
         vec![("big.rs".to_string(), "huge".to_string())],
     );
 }
+
+// ---------------------------------------------------------------------
+// T16-04: adversarial corpus, end-to-end through the real scan→classify→
+// build pipeline (spec 12 §2/§5, 14 §6) — extends `classify.rs`'s own
+// `every_skip_reason_yields_no_occurrence_and_no_source_blob`, which
+// deliberately bypasses this seam by calling `classify()`/
+// `insert_skipped_file()` directly, to the real driver a repo on disk
+// actually goes through.
+// ---------------------------------------------------------------------
+
+/// spec 12 §2/§5 `[FIXED]`: a file whose content the redaction `Scanner`
+/// flags as a secret is `skipped_file(reason='secret')` — no `source_blob`,
+/// no occurrences — through the real pipeline, not just `classify()` called
+/// directly (`adversarial.index.secret-content-skipped-end-to-end`).
+#[tokio::test]
+async fn secret_content_is_skipped_and_leaves_no_source_blob() {
+    let fx = fixture().await;
+    let uuids = SeqUuidV7::new();
+    // Same literal `crates/index/tests/classify.rs`'s own secret-skip test uses.
+    write(&fx.root, "config.rs", b"aws = \"AKIAIOSFODNN7EXAMPLE\"\n");
+    write(&fx.root, "ok.rs", b"fn ok() {}\n");
+
+    let genr = scan_and_build(&fx, &uuids).await;
+    assert_eq!(genr.files_indexed, 1, "ok.rs indexed");
+    assert_eq!(genr.files_skipped, 1, "config.rs skipped");
+
+    let read = fx.db.open_read().expect("read");
+    assert_eq!(
+        skips(&read, &genr.generation_id),
+        vec![("config.rs".to_string(), "secret".to_string())]
+    );
+    assert_eq!(
+        members(&read, &genr.generation_id),
+        vec!["ok.rs".to_string()]
+    );
+}
+
+/// spec 12 §2 threat model ("symlink/path tricks") + `crates/index/tests/
+/// scan.rs::symlinks_are_excluded_and_not_followed`'s manifest-level
+/// guarantee, now proven through the full pipeline: a symlink inside the
+/// worktree pointing at a file *outside* the worktree root never becomes a
+/// member or even a skip row (it is excluded before classification ever
+/// sees it, per `scan()`'s own manifest) — only the real file it points at
+/// (and whatever secret-shaped content lives there) never enters the store
+/// at all (`adversarial.index.symlink-escape-excluded-end-to-end`).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlink_escaping_the_worktree_root_produces_no_member_or_occurrence() {
+    use std::os::unix::fs::symlink;
+
+    let fx = fixture().await;
+    let uuids = SeqUuidV7::new();
+    write(&fx.root, "ok.rs", b"fn ok() {}\n");
+    let outside = fx._home.join("secret-outside.txt");
+    std::fs::write(&outside, b"aws = \"AKIAIOSFODNN7EXAMPLE\"\n").expect("write outside file");
+    symlink(&outside, fx.root.join("link.rs")).expect("symlink escaping the worktree root");
+
+    let genr = scan_and_build(&fx, &uuids).await;
+    assert_eq!(
+        genr.files_indexed, 1,
+        "only ok.rs — the symlink is invisible"
+    );
+
+    let read = fx.db.open_read().expect("read");
+    assert!(
+        skips(&read, &genr.generation_id).is_empty(),
+        "no skip row either — the symlink is excluded, not classified"
+    );
+    assert_eq!(
+        members(&read, &genr.generation_id),
+        vec!["ok.rs".to_string()]
+    );
+}

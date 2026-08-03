@@ -69,12 +69,13 @@
     {
       "name": "adversarial",
       "spec_ref": "14 §1.5, 14 §6, 12 §4",
-      "coverage": "partial",
+      "coverage": "full",
       "artifact": "adversarial/index.json",
       "provenance": [
         "src/router.test.ts (reasoning-leak, CJK-leak, empty/invalid, null/non-array)",
         "scripts/test-parser-fix.ts (malformed JSON CASES)",
-        "T14-08 authored the recall-formatter slice directly (adversarial.recall.* cases; no v1 source, see GAP-05)"
+        "T14-08 authored the recall-formatter slice directly (adversarial.recall.* cases; no v1 source, see GAP-05)",
+        "T16-04 authored the end-to-end slice directly (adversarial.{recall.end-to-end-*,code.*,index.*,hook.*} cases; no v1 source, closes GAP-05)"
       ],
       "gaps": ["GAP-05"]
     },
@@ -124,7 +125,7 @@
     {
       "id": "GAP-05",
       "family": "adversarial",
-      "description": "PARTIALLY RESOLVED (T14-08). Prompt-injection round-trip-inert, delimiter-collision escaping and recall per-entry/per-block caps (14 §6, 12 §4) are v2-spec requirements absent in v1. T14-08 closes the formatter-level slice -- `additionalContext` sanitization/escaping/1KiB-caps/exact-len/empty-output -- with real unit tests in `crates/memory/src/recall/format.rs` and 5 documented `adversarial.recall.*` cases in adversarial/index.json. The full end-to-end corpus (a memory stored through the real op engine, recalled through the wired daemon/MCP surface, verified inert) remains T16-04's -- group 15 has not wired transport yet, so nothing to drive an end-to-end round trip through exists before then.",
+      "description": "RESOLVED (T14-08, T16-04). Prompt-injection round-trip-inert, delimiter-collision escaping and recall per-entry/per-block caps (14 §6, 12 §4) are v2-spec requirements absent in v1. T14-08 closed the formatter-level slice -- `additionalContext` sanitization/escaping/1KiB-caps/exact-len/empty-output -- with real unit tests in `crates/memory/src/recall/format.rs` and 5 documented `adversarial.recall.*` cases in adversarial/index.json. T16-04 closed the remaining end-to-end slice -- a memory stored through the real `remember` op engine, recalled through the real wired daemon/MCP `recall` tool, verified inert (`adversarial.recall.end-to-end-*`), plus the card's adjacent adversarial/ownership corpus: malicious indexed code round-tripping via plain JSON encoding (`adversarial.code.*`), source secrets and symlink escapes through the real scan/reconcile/build pipeline (`adversarial.index.*`), and hook-captured secrets never touching disk (`adversarial.hook.*`).",
       "blocking": false,
       "resolves_in": "T14-08, T16-04"
     },

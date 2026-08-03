@@ -181,6 +181,34 @@ async fn a_checksum_drift_store_enters_migration_only_mode_too() {
     handle.shutdown().await;
 }
 
+/// spec 12 §6 `[SPEC]` ("the daemon refuses to start on a store whose owner
+/// uid differs"), T16-04's "owner-only endpoint" — platform gated: `chown`
+/// to a different uid only ever succeeds when this test process is already
+/// root (`EPERM` otherwise), so the attempt itself is the gate, no separate
+/// uid probe needed. Only `layout.root()` (a `TempHome`-isolated directory,
+/// never a real system path) is ever chowned, and only when the attempt
+/// already succeeded — this can never touch anything outside the test's own
+/// temp tree. `perms::ensure_dir`'s `AlreadyExists` branch does
+/// `symlink_metadata`/`verify_owner_meta` (both read-only) strictly
+/// *before* its one write (`fs::set_permissions`), so the refusal below is
+/// provably read-only regardless of privilege.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_wrong_owner_store_refuses_startup() {
+    let (_home, layout) = open_layout(); // creates the tree, owned by us
+
+    if std::os::unix::fs::chown(layout.root(), Some(1), None).is_err() {
+        eprintln!("SKIP: not running as root — cannot fabricate a wrong-owner store");
+        return;
+    }
+
+    match DaemonHandle::start(start_options(layout.clone())).await {
+        Err(DaemonStartupError::Path(_)) => {}
+        Ok(_) => panic!("a daemon must not start against a store it does not own"),
+        Err(other) => panic!("expected Path(WrongOwner), got {other:?}"),
+    }
+}
+
 /// A store lock already held by a live process refuses startup outright —
 /// no partial `DaemonHandle`, a genuine [`DaemonStartupError`].
 #[tokio::test]

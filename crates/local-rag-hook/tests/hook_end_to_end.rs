@@ -79,6 +79,40 @@ fn fs_metadata_len(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).expect("segment metadata").len()
 }
 
+/// spec 12 §2 `[FIXED]` ("Secret redaction runs before anything is written
+/// to the spool"), the on-disk half T16-04 closes: `crates/local-rag-hook/
+/// tests/payload.rs`'s own tests already prove the raw secret never reaches
+/// `PreparedPayload::bytes` in memory; this reads the real, on-disk `.seg`
+/// file the compiled binary wrote and confirms the raw secret is absent
+/// there too, not just in the in-memory value the earlier tests inspect
+/// (`adversarial.hook.secret-redacted-on-disk`). `main.rs::
+/// spool_write_pipeline` scans the *entire* raw stdin JSON
+/// (`String::from_utf8_lossy(raw)`), so a secret anywhere in the event
+/// lands in the redacted `FramePayload.payload`, encoded uncompressed
+/// (`local_rag_core::spool::encode_frame`) — plain, directly-searchable
+/// bytes on disk.
+#[test]
+fn a_secret_in_the_payload_is_redacted_on_disk_not_just_in_memory() {
+    let home = TempHome::new().expect("temp home");
+    std::fs::create_dir_all(spool_dir(&home)).unwrap();
+
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let input = format!(
+        r#"{{"session_id":"sess-secret","hook_event_name":"Stop","last_assistant_message":"token = {secret}"}}"#
+    );
+    let output = run_spool_write(&home, input.as_bytes());
+    assert!(output.status.success(), "{output:?}");
+
+    let seg = spool_dir(&home).join("sess-secret").join("000001.seg");
+    let bytes = std::fs::read(&seg).expect("read segment");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains(secret), "raw secret must never reach disk");
+    assert!(
+        text.contains("[REDACTED]"),
+        "the redaction marker must be present"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_permission_denied_session_dir_fails_open_without_a_panic() {

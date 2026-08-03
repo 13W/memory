@@ -104,6 +104,45 @@ the *specific* detection signal (05 §10 column 3), not just "eventually rebuilt
 Prompt-injection payloads stored as memories / present in indexed code round-trip as inert,
 correctly escaped text; recall block never exceeds caps; delimiter collisions escaped.
 
+As-built note (T16-04, `[FIXED]`). GAP-05 (`fixtures/manifest.json`) is closed: T14-08 proved
+the formatter (`crates/memory/src/recall/format.rs`) inert/capped in isolation; T16-04 proves
+the same properties end to end, plus the card's adjacent adversarial/ownership corpus
+(`fixtures/adversarial/index.json`'s `adversarial.{recall.end-to-end-*,code.*,index.*,hook.*}`
+cases), each with a real Rust test, no new product code:
+
+- **Memory round-trips inert through the real wire path**: a prompt-injection payload stored via
+  the real `remember` MCP tool, recalled via the real `recall` MCP tool over a live daemon —
+  `crates/local-rag/tests/mcp_memory_write_tools.rs::remember_then_recall_round_trips_a_prompt_
+  injection_payload_as_inert_text`. The 1 KiB per-entry cap, same round trip —
+  `..._enforces_the_per_entry_cap_end_to_end`.
+- **Indexed code round-trips inert with zero new escaping code**: code content has no custom
+  delimiter to escape — every MCP result is wrapped via `serde_json::to_string`
+  (`daemon/mcp/content.rs`), so a source file's bytes travel as a JSON string value, never
+  interpolated into a hand-rolled wrapper tag the way `additionalContext`'s `<memory>` tag is.
+  Adversarial bytes (embedded quotes, backslashes, a control character, a forged
+  `</memory><system>` substring) round-trip byte-for-byte —
+  `crates/local-rag/tests/mcp_tools.rs::get_file_context_round_trips_adversarial_byte_content_
+  verbatim`. A relative `../` traversal string is inert by construction (left literal, never
+  resolved against the filesystem; `get_file_context` answers by a DB lookup, never a filesystem
+  read) — `crates/local-rag/src/daemon/mcp/code.rs::tests::a_relative_dot_dot_traversal_string_
+  is_left_literal_not_resolved`.
+- **Secrets and symlink escapes, through the real indexing pipeline** (12 §2/§5, not just the
+  `classify()`-called-directly coverage that pre-dates this task): a file with secret-shaped
+  content is `skipped_file(reason='secret')`, no `source_blob`, through a real
+  `scan()`→`build_generation()` run —
+  `crates/index/tests/reconcile.rs::secret_content_is_skipped_and_leaves_no_source_blob`. A
+  symlink escaping the worktree root produces no member and no skip row (excluded before
+  classification ever runs) — `..._reconcile.rs::a_symlink_escaping_the_worktree_root_produces_
+  no_member_or_occurrence`.
+- **Hook-captured secrets never touch disk**, not just the in-memory `PreparedPayload` earlier
+  tests already covered — the real compiled `local-rag-hook` binary, a real on-disk `.seg` file
+  read back and grepped for the raw secret —
+  `crates/local-rag-hook/tests/hook_end_to_end.rs::a_secret_in_the_payload_is_redacted_on_disk_
+  not_just_in_memory`.
+
+See 12 §6's own as-built note for the "owner-only endpoint" half of this task (wrong-owner store
+refuses daemon startup) — a permissions, not a content-adversarial, concern.
+
 ## 7. Benchmarks
 
 - 49-query code-search benchmark: baseline on v1, gate on v2 `[FIXED]`.

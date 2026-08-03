@@ -89,7 +89,10 @@ pub struct SeededWorktree {
 }
 
 /// Seed `layout`'s `state.sqlite`/`cache.sqlite` with one indexed worktree,
-/// rooted at a real, freshly `git init`'d directory under `home`.
+/// rooted at a real, freshly `git init`'d directory under `home` — the
+/// default `fn hello() {}\n` content (T16-04's own `seed_indexed_worktree_
+/// with_content` is the parameterized sibling this delegates to, used to
+/// seed adversarial byte content instead).
 ///
 /// Must run *before* `DaemonHandle::start(...)` ever opens either database
 /// — this function opens its own `StateDb`/`CacheDb` handles, writes
@@ -97,6 +100,19 @@ pub struct SeededWorktree {
 /// `tests/lifecycle_startup.rs`'s pre-seeded-incompatible-store test already
 /// establishes for daemon-startup fixtures.
 pub async fn seed_indexed_worktree(home: &TempHome, layout: &StoreLayout) -> SeededWorktree {
+    seed_indexed_worktree_with_content(home, layout, "fn hello() {}\n").await
+}
+
+/// [`seed_indexed_worktree`] with the single seeded file's content
+/// parameterized — this never runs the real parser (it hand-inserts
+/// `file_revision`/`content_blob`/`parsed_unit`/`occurrence` rows directly),
+/// so arbitrary bytes (quotes, backslashes, control characters, a literal
+/// `</memory><system>`-shaped string) never risk a parse failure.
+pub async fn seed_indexed_worktree_with_content(
+    home: &TempHome,
+    layout: &StoreLayout,
+    content: &str,
+) -> SeededWorktree {
     let repo_path = home.join("repo");
     std::fs::create_dir_all(&repo_path).expect("create repo dir");
     git(&repo_path, &["init", "-q"]);
@@ -210,7 +226,6 @@ pub async fn seed_indexed_worktree(home: &TempHome, layout: &StoreLayout) -> See
     }
 
     // One file, one unit, one occurrence.
-    let content = "fn hello() {}\n";
     let derived = derive_content_blob("rust", content);
     let occ_id = occurrence_id(
         &generation_id.to_string(),
@@ -223,6 +238,7 @@ pub async fn seed_indexed_worktree(home: &TempHome, layout: &StoreLayout) -> See
         let generation_id = generation_id.to_string();
         let derived = derived.clone();
         let occ_id = occ_id.clone();
+        let content = content.to_string();
         state
             .writer()
             .transaction(move |tx| {
