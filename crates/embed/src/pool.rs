@@ -34,10 +34,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use local_rag_core::config::DataPolicy;
+use local_rag_core::redaction::Scanner;
 use local_rag_store::RepresentationKind;
 
 use crate::contract::{EmbedError, EmbedRequest, Embedder, ProviderFailure, Vector};
 use crate::policy::{Locality, allows};
+
+/// Transform `req` for transmission to a provider of `locality` under
+/// `policy` (spec 12 §1's "metadata-only/redaction/full semantics",
+/// `crate::policy`'s own module doc for the as-built matrix). `None` means
+/// "send `req` unchanged" — the common case (every local call, and every
+/// `allow_remote_full` remote call). Only `allow_remote_with_redaction`
+/// against a `Remote` entry redacts: local providers never have their input
+/// rewritten, and `allows()` already keeps `local_only`/`metadata_only_remote`
+/// from ever reaching a remote entry at all.
+fn redact_for_transmission(
+    policy: DataPolicy,
+    locality: Locality,
+    req: &EmbedRequest,
+) -> Option<EmbedRequest> {
+    if locality != Locality::Remote || policy != DataPolicy::AllowRemoteWithRedaction {
+        return None;
+    }
+    let scanner = Scanner::new();
+    Some(EmbedRequest {
+        kind: req.kind,
+        texts: req.texts.iter().map(|t| scanner.redact(t).text).collect(),
+    })
+}
 
 /// Attempts per provider before the pool falls back (`[SPEC]`, matches the v1
 /// fixtures' own `max_attempts`).
@@ -249,7 +273,9 @@ impl ProviderPool {
 
         let mut failures = Vec::new();
         for entry in allowed {
-            match self.try_provider(entry, &req) {
+            let redacted = redact_for_transmission(policy, entry.locality, &req);
+            let req_for_entry = redacted.as_ref().unwrap_or(&req);
+            match self.try_provider(entry, req_for_entry) {
                 Ok(vectors) => return Ok(vectors),
                 Err(ProviderOutcome::Contract(err)) => return Err(err),
                 Err(ProviderOutcome::Failed(failure)) => failures.push(failure),

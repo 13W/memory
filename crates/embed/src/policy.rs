@@ -8,23 +8,39 @@
 //!
 //! This module is deliberately tiny and *pure*: the effective policy is computed
 //! elsewhere (`local_rag_store::effective_data_policy`, T02-05, which folds the
-//! global value with every involved repository's stricter setting), and this
-//! guard only answers "may a provider of this locality be selected under this
-//! effective policy?".
+//! global value with every involved repository's stricter setting — wired into
+//! the real call sites by T16-01: `local_rag_memory::router::route` folds over
+//! a consolidation window's involved repositories; `cli::index::project_
+//! generation` folds over the worktree being indexed), and this guard only
+//! answers "may a provider of this locality be selected under this effective
+//! policy?".
 //!
-//! Scope boundary: the three non-`local_only` policies differ in *what may be
-//! sent* (metadata only / redacted / full payload) rather than in *which
-//! provider may be selected*. Those payload semantics — plus redaction before
-//! transmission and the full policy × provider matrix — are **T16-01**'s card
-//! ("all Embedder/Generator remote selections pass one effective-policy guard;
-//! metadata-only/redaction/full semantics explicit"). T11-03 ships the seam and
-//! the one rule that is `[FIXED]` and testable today: under `local_only` a
-//! remote provider is never selected, not even as a fallback.
+//! # The as-built policy × selection matrix (T16-01)
+//!
+//! | Policy | Remote selectable? | What a *selected* remote provider receives |
+//! | --- | --- | --- |
+//! | `local_only` | no | — |
+//! | `metadata_only_remote` | **no** (see below) | — |
+//! | `allow_remote_with_redaction` | yes | text run through `local_rag_core::redaction::Scanner::redact` first (`crate::pool`/`crate::gen_pool`) |
+//! | `allow_remote_full` | yes | the original, unredacted text |
+//!
+//! **`metadata_only_remote` is a pragmatic as-built decision, not a spec
+//! reading.** Spec 12 §1 names it but never defines what "metadata only" means
+//! for an `Embedder`/`Generator` call — both of this workspace's only two
+//! provider contracts fundamentally require real body text to produce anything
+//! useful (`EmbedRequest.texts`, `GenRequest.messages[].content`); neither has a
+//! metadata-only request variant to distinguish this policy from `local_only`.
+//! Rather than invent a lossy placeholder-payload mode nothing asks for, this
+//! policy is treated identically to `local_only` for both contracts — a
+//! deliberate, documented limitation (spec 12 §1's own as-built note), not an
+//! oversight. A future group that adds an operation genuinely separable into
+//! "metadata" vs. "content" (e.g. a remote capability/model-listing call) would
+//! be the first real consumer of a distinct `metadata_only_remote` behavior.
 
 use local_rag_core::config::DataPolicy;
 use local_rag_protocol::{ErrorCode, ErrorEnvelope};
 
-use crate::EmbedError;
+use crate::{EmbedError, GenError};
 
 /// Where a provider runs.
 ///
@@ -52,13 +68,17 @@ impl Locality {
 
 /// Whether `locality` may be selected under the effective `policy`.
 ///
-/// `local_only` admits local providers only. Every less restrictive policy
-/// admits both localities — they constrain the *payload*, not the provider
-/// (T16-01).
+/// Local providers are always admitted. A remote provider is admitted only
+/// under `allow_remote_with_redaction`/`allow_remote_full` — `local_only` and
+/// `metadata_only_remote` both refuse remote selection (see this module's own
+/// doc for why `metadata_only_remote` is not distinct from `local_only` here).
 pub fn allows(policy: DataPolicy, locality: Locality) -> bool {
     match locality {
         Locality::Local => true,
-        Locality::Remote => policy != DataPolicy::LocalOnly,
+        Locality::Remote => matches!(
+            policy,
+            DataPolicy::AllowRemoteWithRedaction | DataPolicy::AllowRemoteFull
+        ),
     }
 }
 
@@ -93,6 +113,17 @@ pub fn envelope_for(error: &EmbedError) -> Option<ErrorEnvelope> {
     }
 }
 
+/// [`envelope_for`]'s [`GenError`] twin (T16-01: "blocked call typed" applies
+/// equally to `Embedder` and `Generator` remote selections).
+pub fn envelope_for_gen(error: &GenError) -> Option<ErrorEnvelope> {
+    match error {
+        GenError::PolicyBlockedRemote { policy, blocked } => {
+            Some(policy_blocked_remote(*policy, blocked))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,12 +147,21 @@ mod tests {
     }
 
     #[test]
-    fn local_only_is_the_one_policy_that_blocks_remote() {
-        assert!(!allows(DataPolicy::LocalOnly, Locality::Remote));
-        for policy in ALL.into_iter().filter(|p| *p != DataPolicy::LocalOnly) {
+    fn local_only_and_metadata_only_remote_both_block_remote_selection() {
+        for policy in [DataPolicy::LocalOnly, DataPolicy::MetadataOnlyRemote] {
+            assert!(
+                !allows(policy, Locality::Remote),
+                "{} must block remote provider selection",
+                policy.as_str()
+            );
+        }
+        for policy in [
+            DataPolicy::AllowRemoteWithRedaction,
+            DataPolicy::AllowRemoteFull,
+        ] {
             assert!(
                 allows(policy, Locality::Remote),
-                "{} must not block provider selection (payload semantics are T16-01)",
+                "{} must admit remote provider selection",
                 policy.as_str()
             );
         }
@@ -148,5 +188,19 @@ mod tests {
         );
         assert!(envelope_for(&EmbedError::permanent("400")).is_none());
         assert!(envelope_for(&EmbedError::retryable("500")).is_none());
+    }
+
+    #[test]
+    fn only_the_policy_gen_error_maps_to_a_canonical_code() {
+        let blocked = GenError::PolicyBlockedRemote {
+            policy: DataPolicy::LocalOnly,
+            blocked: vec!["hosted".to_string()],
+        };
+        assert_eq!(
+            envelope_for_gen(&blocked).map(|e| e.code),
+            Some(ErrorCode::PolicyBlockedRemote)
+        );
+        assert!(envelope_for_gen(&GenError::permanent("400")).is_none());
+        assert!(envelope_for_gen(&GenError::retryable("500")).is_none());
     }
 }

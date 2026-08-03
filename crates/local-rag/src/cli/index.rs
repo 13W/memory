@@ -34,8 +34,9 @@ use local_rag_projection::{
 use local_rag_store::{
     CacheDb, Candidate, DEFAULT_MODEL_SPACE_ID, FtsMaterializeError, FtsMaterializeOutcome,
     RequestRoot, Resolution, RetentionParams, StateDb, WorktreeRootFacts, WriteError,
-    create_repository, create_worktree, ensure_store_instance_uuid, insert_projection_state,
-    materialize_fts, observe_repository_path, observe_worktree_path, resolve,
+    create_repository, create_worktree, effective_data_policy, ensure_store_instance_uuid,
+    insert_projection_state, materialize_fts, observe_repository_path, observe_worktree_path,
+    resolve, worktree_summary,
 };
 
 use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
@@ -68,6 +69,7 @@ pub(crate) enum IndexError {
     VectorSource(rusqlite::Error),
     Switch(SwitchError),
     Fts(FtsMaterializeError),
+    EffectivePolicy(rusqlite::Error),
 }
 
 impl std::fmt::Display for IndexError {
@@ -93,6 +95,9 @@ impl std::fmt::Display for IndexError {
             IndexError::VectorSource(e) => write!(f, "could not read cached vectors: {e}"),
             IndexError::Switch(e) => write!(f, "activating the new generation failed: {e}"),
             IndexError::Fts(e) => write!(f, "FTS materialization failed: {e}"),
+            IndexError::EffectivePolicy(e) => {
+                write!(f, "could not resolve the effective data_policy: {e}")
+            }
         }
     }
 }
@@ -104,6 +109,24 @@ pub(crate) struct ProjectOutcome {
     pub backfill: BackfillReport,
     pub switch: SwitchOutcome,
     pub fts: FtsMaterializeOutcome,
+}
+
+/// The effective `data_policy` (spec 02 §3.2, T16-01) for indexing
+/// `worktree_id`: `global` folded with its owning repository's own stricter
+/// setting, if any (`local_rag_store::effective_data_policy`). A repository
+/// can only tighten, never relax, the global default. A worktree row that no
+/// longer exists is `IndexError::WorktreeVanished` — the same condition this
+/// module already names for a worktree disappearing mid-run elsewhere.
+fn effective_data_policy_for_worktree(
+    conn: &rusqlite::Connection,
+    global: local_rag_core::config::DataPolicy,
+    worktree_id: &str,
+) -> Result<local_rag_core::config::DataPolicy, IndexError> {
+    let summary = worktree_summary(conn, worktree_id)
+        .map_err(IndexError::EffectivePolicy)?
+        .ok_or(IndexError::WorktreeVanished)?;
+    effective_data_policy(global, conn, &[summary.repo_id.as_str()])
+        .map_err(IndexError::EffectivePolicy)
 }
 
 /// Embed → activate → materialize a generation that [`reconcile_once`] has
@@ -120,12 +143,16 @@ pub(crate) async fn project_generation(
     generation_id: Uuid,
     now_ms: i64,
 ) -> Result<ProjectOutcome, IndexError> {
-    let params = {
+    let (params, policy) = {
         let read = ctx
             .state
             .open_read()
             .map_err(|e| IndexError::ModelSpaceParams(ModelSwitchError::Open(e)))?;
-        params_for_model_space(&read, &ctx.model_space_id).map_err(IndexError::ModelSpaceParams)?
+        let params = params_for_model_space(&read, &ctx.model_space_id)
+            .map_err(IndexError::ModelSpaceParams)?;
+        let policy =
+            effective_data_policy_for_worktree(&read, ctx.data_policy, &worktree_id.to_string())?;
+        (params, policy)
     };
 
     let pool = ProviderPool::new(vec![ProviderEntry::local("cli", ctx.embedder.clone())]);
@@ -133,7 +160,7 @@ pub(crate) async fn project_generation(
         &ctx.state,
         &ctx.cache,
         &pool,
-        ctx.data_policy,
+        policy,
         &ctx.model_space_id.to_string(),
         &BackfillParams::default(),
         &ctx.retention,
@@ -564,6 +591,7 @@ mod tests {
     use local_rag_search::{QueryEmbedder, SearchRequest};
     use local_rag_store::{
         RepresentationKind, WorktreeKind, register_representation, set_model_space_representation,
+        set_repo_data_policy,
     };
     use local_rag_test_support::TempHome;
 
@@ -846,5 +874,84 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("init --download-models"), "{err}");
+    }
+
+    /// T16-01: `project_generation` must resolve the *effective* `data_policy`
+    /// for the worktree being indexed — global folded with its owning
+    /// repository's own stricter setting — not just pass `ctx.data_policy`
+    /// straight through. A repository can only tighten, never relax it.
+    #[tokio::test]
+    async fn effective_policy_folds_in_the_worktree_owning_repositorys_stricter_setting() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).expect("repo dir");
+
+        let mut ctx = open_ctx(&layout);
+        ctx.data_policy = local_rag_core::config::DataPolicy::AllowRemoteFull;
+        let now_ms = 1_000;
+
+        let repo_id = ctx.uuids.next_uuid();
+        let worktree_id = ctx.uuids.next_uuid();
+        let facts = facts_for(&root);
+        register_new_worktree(&ctx.state, repo_id, worktree_id, &facts, now_ms)
+            .await
+            .expect("register worktree");
+
+        // Before any repository-level override, the effective policy is just
+        // the global one.
+        {
+            let read = ctx.state.open_read().expect("read conn");
+            let policy = effective_data_policy_for_worktree(
+                &read,
+                ctx.data_policy,
+                &worktree_id.to_string(),
+            )
+            .expect("resolve effective policy");
+            assert_eq!(policy, local_rag_core::config::DataPolicy::AllowRemoteFull);
+        }
+
+        // The repository tightens its own policy below the lax global
+        // default.
+        let repo_id_string = repo_id.to_string();
+        ctx.state
+            .writer()
+            .transaction(move |tx| {
+                set_repo_data_policy(
+                    tx,
+                    &repo_id_string,
+                    local_rag_core::config::DataPolicy::LocalOnly,
+                )
+            })
+            .await
+            .expect("tighten repository policy");
+
+        let read = ctx.state.open_read().expect("read conn");
+        let policy =
+            effective_data_policy_for_worktree(&read, ctx.data_policy, &worktree_id.to_string())
+                .expect("resolve effective policy");
+        assert_eq!(
+            policy,
+            local_rag_core::config::DataPolicy::LocalOnly,
+            "the repository's stricter setting must win over the lax global default"
+        );
+    }
+
+    /// A worktree row that no longer exists is the same `WorktreeVanished`
+    /// this module already names for a worktree disappearing mid-run
+    /// elsewhere, not a fresh error shape.
+    #[tokio::test]
+    async fn effective_policy_of_an_unknown_worktree_is_worktree_vanished() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let ctx = open_ctx(&layout);
+
+        let read = ctx.state.open_read().expect("read conn");
+        let bogus_worktree_id = ctx.uuids.next_uuid().to_string();
+        let err = effective_data_policy_for_worktree(&read, ctx.data_policy, &bogus_worktree_id)
+            .expect_err("no such worktree");
+        assert!(matches!(err, IndexError::WorktreeVanished), "{err}");
     }
 }

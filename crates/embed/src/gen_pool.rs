@@ -14,10 +14,39 @@
 use std::sync::Arc;
 
 use local_rag_core::config::DataPolicy;
+use local_rag_core::redaction::Scanner;
 
-use crate::contract::{GenError, GenRequest, GenResponse, Generator, ProviderFailure};
+use crate::contract::{GenError, GenMessage, GenRequest, GenResponse, Generator, ProviderFailure};
 use crate::policy::{Locality, allows};
 use crate::pool::{RetryPolicy, Sleeper, ThreadSleeper, retry_delay_ms};
+
+/// Transform `req` for transmission to a provider of `locality` under
+/// `policy` — the [`crate::pool`]'s `redact_for_transmission` twin for chat
+/// messages instead of a text batch (spec 12 §1, `crate::policy`'s own module
+/// doc for the as-built matrix). `None` means "send `req` unchanged".
+fn redact_for_transmission(
+    policy: DataPolicy,
+    locality: Locality,
+    req: &GenRequest,
+) -> Option<GenRequest> {
+    if locality != Locality::Remote || policy != DataPolicy::AllowRemoteWithRedaction {
+        return None;
+    }
+    let scanner = Scanner::new();
+    Some(GenRequest {
+        messages: req
+            .messages
+            .iter()
+            .map(|m| GenMessage {
+                role: m.role,
+                content: scanner.redact(&m.content).text,
+            })
+            .collect(),
+        max_tokens: req.max_tokens,
+        sampling: req.sampling,
+        json_schema: req.json_schema.clone(),
+    })
+}
 
 /// One generator in the pool, with the locality the guard reads.
 #[derive(Clone)]
@@ -141,7 +170,9 @@ impl GeneratorPool {
 
         let mut failures = Vec::new();
         for entry in allowed {
-            match self.try_provider(entry, &req) {
+            let redacted = redact_for_transmission(policy, entry.locality, &req);
+            let req_for_entry = redacted.as_ref().unwrap_or(&req);
+            match self.try_provider(entry, req_for_entry) {
                 Ok(resp) => return Ok(resp),
                 Err(failure) => failures.push(failure),
             }

@@ -20,6 +20,26 @@ model at all, inverting the policy's intent. The download is still constrained: 
 every file's `sha256`/`size` are pinned in the binary (ADR-0005), so "fetch a model" cannot become
 "fetch arbitrary bytes". Embedding *through* a remote provider remains gated exactly as fixed above.
 
+As-built note (T16-01, `[SPEC]`). The guard (`local_rag_embed::policy::allows`, T11-03) is now
+wired to the real *effective* policy at both call sites that select a provider —
+`local_rag_memory::router::route` folds `local_rag_store::effective_data_policy` over a
+consolidation window's own involved repositories before calling the generator pool;
+`cli::index::project_generation` folds it over the worktree being indexed before calling the
+embed pool — not just the raw global `[models] data_policy` value, so a repository's stricter
+stored setting now has a real, observable effect end to end (previously computed correctly in
+isolation, T02-05, but never actually consulted by production code). The three non-`local_only`
+levels are now behaviorally distinct, each in `ProviderPool::embed`/`GeneratorPool::generate`:
+`allow_remote_full` sends the original text/messages unchanged; `allow_remote_with_redaction` runs
+them through the same `Scanner::redact` (§2) before a remote provider ever sees them.
+`metadata_only_remote` is a **pragmatic as-built decision**, not a spec reading: neither of this
+workspace's two provider contracts (`Embedder`/`Generator`) has a metadata-only request shape —
+both fundamentally need real body text to produce anything useful — so this policy is treated
+identically to `local_only` (remote never selected) rather than inventing a lossy
+placeholder-payload mode nothing asks for. No real remote provider exists to gate in v0 (D-008);
+this task proves the guard's correctness against a fake/test remote provider
+(`crates/embed/tests/{policy,gen_policy}.rs`), the same "mechanism real, remote unreachable until a
+provider is registered" shape D-026 already documented for `POLICY_BLOCKED_REMOTE` itself.
+
 ## 2. Redaction & caps `[FIXED]`
 
 - Secret redaction runs **before** anything is written to the spool `[FIXED]` and again before

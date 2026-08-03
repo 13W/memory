@@ -15,10 +15,14 @@
 
 use std::collections::HashMap;
 
+use std::collections::BTreeSet;
+
 use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::UuidSource;
 use local_rag_embed::{GenMessage, GenRequest, GenRole, GeneratorPool};
-use local_rag_store::{ConsolidationWindow, GeneratedOp, StateDb, WindowObservation};
+use local_rag_store::{
+    ConsolidationWindow, GeneratedOp, StateDb, WindowObservation, effective_data_policy,
+};
 
 use crate::{guard, parse, prompt, recall, schema};
 
@@ -44,16 +48,33 @@ fn trace_raw_response(text: &str) {
 /// [`crate::guard::materialize`] needs — injected so tests (and, in
 /// production, the daemon) control it explicitly, never a bare OS call
 /// buried in this crate.
+///
+/// `global_policy` is the store-wide `data_policy` default; T16-01 folds it
+/// with every repository the window's own observations reference
+/// (`local_rag_store::effective_data_policy`, spec 02 §3.2) before the
+/// generator pool ever sees it, so a repository whose stored policy is
+/// stricter than the global default actually blocks a remote generator here
+/// — not just in the isolated fold+pool tests. A repository can only
+/// tighten, never relax, this effective value.
 pub async fn route(
     state_db: &StateDb,
     pool: &GeneratorPool,
-    policy: DataPolicy,
+    global_policy: DataPolicy,
     uuids: &(dyn UuidSource + Send + Sync),
     window: ConsolidationWindow,
 ) -> Result<Vec<GeneratedOp>, String> {
     let conn = state_db.open_read().map_err(|e| e.to_string())?;
     let existing =
         recall::candidate_conflict_set(&conn, &window.observations).map_err(|e| e.to_string())?;
+
+    let repo_ids: BTreeSet<&str> = window
+        .observations
+        .iter()
+        .filter_map(|o| o.repo_id.as_deref())
+        .collect();
+    let repo_ids: Vec<&str> = repo_ids.into_iter().collect();
+    let policy =
+        effective_data_policy(global_policy, &conn, &repo_ids).map_err(|e| e.to_string())?;
 
     let messages = prompt::initial_messages(&window, &existing);
     let request = GenRequest::new(messages.clone(), MAX_GENERATION_TOKENS)
@@ -277,5 +298,67 @@ mod tests {
             .await
             .expect("empty is valid");
         assert!(ops.is_empty());
+    }
+
+    /// A generator that records how many times it was actually invoked — a
+    /// remote-selection spy for the T16-01 wiring test below.
+    #[derive(Default)]
+    struct SpyGenerator {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl Generator for SpyGenerator {
+        fn generate(&self, _req: local_rag_embed::GenRequest) -> Result<GenResponse, GenError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(GenResponse {
+                text: "[]".to_string(),
+                finish_reason: FinishReason::Stop,
+                tokens_generated: None,
+            })
+        }
+    }
+
+    /// T16-01: `route` itself — not just the isolated
+    /// `effective_data_policy`+pool combo `crates/embed/tests/policy.rs`
+    /// already covers — must fold in a repository's stricter stored
+    /// `data_policy` before ever calling the generator pool. A lax global
+    /// policy plus a tightened per-repository setting must still block a
+    /// remote-only pool.
+    #[tokio::test]
+    async fn a_repository_can_tighten_the_router_generators_policy_for_real() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+
+        let repo_id = "11111111-1111-7111-8111-111111111111";
+        db.writer()
+            .transaction(move |tx| {
+                local_rag_store::create_repository(tx, repo_id, None, 1_000)?;
+                local_rag_store::set_repo_data_policy(tx, repo_id, DataPolicy::LocalOnly)
+            })
+            .await
+            .expect("seed a repository with a stricter-than-global policy");
+
+        let mut window = window_with("o1");
+        window.observations[0].repo_id = Some(repo_id.to_string());
+
+        let remote = Arc::new(SpyGenerator::default());
+        let pool = GeneratorPool::new(vec![local_rag_embed::GeneratorEntry::remote(
+            "hosted",
+            remote.clone(),
+        )]);
+        let uuids = SeqUuidV7::new();
+
+        // Global policy is lax (would admit the remote generator on its own);
+        // the repository's own stricter setting must still win.
+        let result = route(&db, &pool, DataPolicy::AllowRemoteFull, &uuids, window).await;
+        assert!(
+            result.is_err(),
+            "the tightened effective policy must block the remote-only pool"
+        );
+        assert_eq!(
+            remote.calls.load(Ordering::Relaxed),
+            0,
+            "no bytes may reach the remote generator once the repository tightens the policy"
+        );
     }
 }
