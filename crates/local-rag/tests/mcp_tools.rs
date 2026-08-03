@@ -155,3 +155,41 @@ async fn a_never_indexed_worktree_responds_promptly() {
 
     handle.shutdown().await;
 }
+
+/// `get_file_context`'s own MCP-dispatch-level contract (G15/D-026: unlike
+/// `search_code`/`project_overview` above, this tool had no store-backed
+/// `tools/call` test at all before this — only its private path-helper and
+/// the underlying `SearchEngine` method were covered). Real, seeded,
+/// indexed worktree; asserts the occurrence list names the seeded path.
+#[tokio::test]
+async fn get_file_context_returns_the_seeded_occurrence() {
+    if !git_available() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (home, layout) = open_layout();
+    let seeded = seed_indexed_worktree(&home, &layout).await;
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let repo_path = seeded.repo_path.to_string_lossy().into_owned();
+
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_file_context","arguments":{"path":"src/lib.rs"}}}"#,
+            Some(&repo_path),
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["path"], "src/lib.rs", "{text}");
+    let occurrences = parsed["occurrences"].as_array().expect("occurrences array");
+    assert!(!occurrences.is_empty(), "{text}");
+
+    handle.shutdown().await;
+}
