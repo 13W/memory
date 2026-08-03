@@ -36,6 +36,10 @@ use super::shutdown::{ShutdownSignal, drain_and_shutdown};
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DaemonStartupError {
+    /// Step 0: creating/verifying the store directory tree failed — a
+    /// permission or ownership mismatch (spec 12 §6, T16-04), before any of
+    /// the five ordered startup steps below even begin.
+    Path(local_rag_core::paths::PathError),
     /// Step 1: the store is held by another live instance, or a lock I/O
     /// error.
     Lock(StoreLockError),
@@ -56,6 +60,9 @@ pub enum DaemonStartupError {
 impl std::fmt::Display for DaemonStartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DaemonStartupError::Path(e) => {
+                write!(f, "could not prepare the store directory tree: {e}")
+            }
             DaemonStartupError::Lock(e) => write!(f, "{e}"),
             DaemonStartupError::State(e) => write!(f, "could not open state.sqlite: {e}"),
             DaemonStartupError::StoreInstanceUuid(e) => {
@@ -196,9 +203,7 @@ impl DaemonHandle {
             consolidation_poll_interval,
         } = opts;
 
-        layout.ensure().map_err(|e| {
-            DaemonStartupError::Bind(std::io::Error::other(format!("store tree: {e}")))
-        })?;
+        layout.ensure().map_err(DaemonStartupError::Path)?;
 
         // Step 1: store lock (L0), with stale-owner recovery.
         let instance_uuid = uuids.next_uuid().to_string();

@@ -199,6 +199,32 @@ mod tests {
         assert_eq!(normalized, "src/a.rs");
     }
 
+    /// T16-04 (spec 12 threat model, "symlink/path tricks"): a relative
+    /// `..`-traversal string is not a real vulnerability, only a coverage
+    /// gap next to the existing absolute-path tests below. This function's
+    /// own doc explains why: for a non-absolute `raw`, resolution never
+    /// touches the filesystem or `root` at all —
+    /// `normalize_relative`/`normalize_separators_and_dots` filters only
+    /// empty and literal `.` segments, leaving `..` untouched — and the
+    /// caller (`SearchEngine::get_file_context`,
+    /// `crates/search/src/context.rs`) resolves the result via a DB lookup
+    /// keyed by `(generation_id, normalized_path)`, never a filesystem
+    /// read. No indexer ever writes a `normalized_path` containing `..`, so
+    /// this string can only ever miss and land on the ordinary
+    /// `PATH_NOT_INDEXED` answer (`adversarial.code.
+    /// relative-traversal-is-inert`).
+    #[test]
+    fn a_relative_dot_dot_traversal_string_is_left_literal_not_resolved() {
+        let root = RequestRoot {
+            worktree_root: None,
+            repo_hint: None,
+        };
+        let normalized =
+            normalized_relative_path(&root, "../../etc/passwd", CaseSensitivity::Sensitive)
+                .unwrap();
+        assert_eq!(normalized, "../../etc/passwd");
+    }
+
     #[test]
     fn an_absolute_path_inside_the_worktree_is_stripped_to_relative() {
         let dir = std::env::temp_dir().join(format!("local-rag-code-test-{}", std::process::id()));

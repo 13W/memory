@@ -187,6 +187,10 @@ A single XML tag is not a boundary. Defenses, all mandatory:
 5. **Adversarial tests** in the acceptance suite (14 §6): prompt-injection payloads stored as
    memories must survive round-trip as inert text.
 
+As-built note (T16-04, `[FIXED]`): item 5 (GAP-05) is closed end to end, plus the adjacent
+malicious-indexed-code/secret/symlink corpus the group-16 card also names — see 14 §6's own
+as-built note for the full list of tests, one per property.
+
 As-built note (T14-07, `[SPEC]`): item 4's "model-claims are never auto-promoted to facts" is
 enforced twice, independently, on purpose. First, proactively:
 `local_rag_memory::guard::materialize` downgrades a router-proposed `create`/`supersede` of kind
@@ -228,6 +232,16 @@ so a freshly created file landed at the process umask's default (typically `0644
 pre-existing since T01-02/T01-05. Both functions now call `ensure_file_0600(path)` first, the
 same idiom `store.lock`/spool segments/migration backups/the migration lock already used —
 idempotent: `0600` on first creation, owner-verified and re-asserted on every subsequent open.
+
+As-built note (T16-04, `[SPEC]`). "The daemon refuses to start on a store whose owner uid
+differs" now has a dedicated integration test, `crates/local-rag/tests/lifecycle_startup.rs::
+a_wrong_owner_store_refuses_startup` — platform-gated (`chown` to a different uid only succeeds
+under root; the attempt itself is the gate) and provably safe regardless of privilege
+(`perms::ensure_dir`'s owner check runs strictly before its only write, and only a
+`TempHome`-isolated directory is ever touched, never a real system path). `DaemonHandle::start`'s
+own `layout.ensure()` failure now surfaces as a typed `DaemonStartupError::Path(PathError)`
+(`crates/local-rag/src/daemon/lifecycle.rs`), replacing a prior lossy `Bind(io::Error::other(...))`
+wrap that wasted the already-computed `PathError::WrongOwner` structure.
 
 ## 7. Remote fingerprint `[FIXED]`
 
