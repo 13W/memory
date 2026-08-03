@@ -1,0 +1,17 @@
+{
+  "name": "@13w/local-rag-win32-x64",
+  "version": "0.0.0",
+  "description": "local-rag native binaries for win32-x64 (Windows). Not meant to be installed directly — install @13w/local-rag instead.",
+  "license": "UNLICENSED",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

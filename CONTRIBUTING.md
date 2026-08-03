@@ -264,6 +264,43 @@ rewritten.
   winning backend is promoted into the product workspace at T12-02. Never
   distributed.
 
+## npm packages (`npm/`)
+
+T17-01's six npm packages (spec 13 §1), parallel to `crates/` rather than inside it — a
+self-contained subtree with different tooling, the same pattern `spike/` already established for
+its own separate Cargo workspace:
+
+- `npm/local-rag/` — `@13w/local-rag`, the thin JS launcher (`bin/local-rag-mcp.js`, glue only)
+  that resolves the caller's platform package (`src/resolve.js`, `require.resolve`/
+  `createRequire`-based — the same hoisting-aware algorithm every package manager's
+  npm/pnpm/yarn layout already targets, not a hand-rolled `node_modules` walk) and execs the
+  native `local-rag-proxy` in place (`stdio: 'inherit'`), forwarding `SIGINT`/`SIGTERM`
+  (`src/lifecycle.js`) 1:1 to it — never `detached`, the inverse of `crates/local-rag-proxy/src/
+  connect.rs::spawn_detached_daemon`'s own process-group isolation.
+- `npm/local-rag-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}/` — the five
+  `optionalDependencies` platform packages (`os`/`cpu` fields select the right one at install
+  time). `win32-arm64` is deferred `[FIXED]`, spec 13 §1 — no sixth package.
+- In this checkout, every platform package ships `package.json`/`README.md` only — `bin/` (the
+  three product binaries `local-rag`/`local-rag-proxy`/`local-rag-hook`) is populated by T17-03's
+  release build, not committed here. T17-01's own tests never depend on a real compiled binary:
+  they build synthetic fixture trees (`npm/local-rag/test/helpers/fixture-layout.js`) standing in
+  for npm-flat, npm-nested, and pnpm-symlinked installs, and a scriptable stand-in
+  (`test/helpers/fake-binary.js`) for `local-rag-proxy` in the real-subprocess signal tests.
+
+Run the suite: `cd npm/local-rag && node --test test/*.test.js` — **not** bare `node --test`
+(Node's default test-file discovery treats every `.js` file under a directory named `test` as a
+test file, which would try to run `test/helpers/fake-binary.js` itself and hang forever in its
+own `setInterval`; the explicit glob scopes discovery to the top-level `*.test.js` files only).
+Zero `dependencies`/`devDependencies` — only `node:test`/`node:assert`/`node:child_process`/
+`node:module`/`node:path`/`node:os`/`node:fs` built-ins, the same "built-ins over an external
+dependency" stance the Rust "Dependency policy" section above takes; `npm` itself (bundled with
+Node) is the one host tool `test/package-contents.test.js` needs, purely locally (`npm pack
+--dry-run`), no registry contact. Requires Node.js ≥20.
+
+Not yet wired into `cargo xtask ci` / `.github/workflows/ci.yml` — that file's own comment already
+earmarks "additional platform targets are added by the distribution work (T17)"; running the npm
+suite locally is a manual step for anyone touching `npm/` until T17-03 adds real CI coverage.
+
 ## Committing
 
 Each completed task lands as a single focused commit; see the task execution
