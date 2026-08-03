@@ -148,6 +148,28 @@ deferral every sweep in this crate carries (triggering it periodically is the da
 15).
 - `inspect / export / purge` exist as first-class CLI operations (11 §6). `purge` is the only
   hard-delete path and tombstones audit references `[SPEC]`.
+
+As-built note (T16-02, `[SPEC]`): implemented as `local_rag_store::privacy::{inspect,export,
+purge}` (11 §6's own as-built note has the CLI wiring and flag shape). `purge_memory` deletes the
+`memory_entry` row and its `memory_evidence` rows, relinks any descendant whose `supersedes_id`
+pointed at it to `NULL` (the FK has no `ON DELETE` clause — SQLite would otherwise refuse the
+delete outright), and rewrites its `audit_event` trail: every prior row's `payload` is set to
+`NULL`, and a new terminal `op = "purge"` row is appended. `entity_kind`/`entity_id` on
+`audit_event` carry no FK (03 §2.5), so a row outliving its `memory_entry` parent — the tombstone
+itself — is not a constraint violation. `purge_session` hard-deletes every `observation_envelope`
+(cascading `observation_path`/`observation_payload`) for a session, first deleting any
+`memory_evidence`/`candidate_evidence` rows that reference those envelopes (same FK reasoning);
+this can leave a `memory_entry` or `pending_memory_candidate` with zero evidence rows, an
+already-legal state this schema tolerates elsewhere (`propose_candidate` already accepts an empty
+evidence set) and not a new orphan class. `audit_event` is never touched by a session purge — this
+crate's `entity_kind` values are only `memory_entry`/`candidate`, never `observation_envelope`,
+and the only writer of `audit_event.payload` (`apply_merge`) stores loser memory-ids, never raw
+observation content. `purge_all` purges every memory entry and every session's observations
+**unconditionally, in one transaction** — not batched like the retention sweep (05 §5): a
+partially-completed purge is a worse outcome than a slow one for an all-or-nothing privacy/legal
+operation. `local_rag_store::retention::ExternalPins.referenced_generations` (06 §5) is not wired
+by this task: no column on `memory_entry`/`observation_envelope` carries an actual `generation_id`
+reference today, so there is nothing yet for that pin to name.
 - Optional encryption at rest (SQLite-level, e.g. SQLCipher-compatible) — optional feature,
   off by default `[FIXED optionality]`.
 

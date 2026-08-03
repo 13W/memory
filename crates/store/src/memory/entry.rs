@@ -781,6 +781,32 @@ pub fn list_memory_entries_for_scope(
     Ok(rows)
 }
 
+/// One full `memory_entry` row by id, regardless of state — `inspect memory
+/// <id>`/`export`/`purge memory <id>`'s own read (11 §6, 12 §3, T16-02), the
+/// full-row sibling of [`memory_entry_summary`]'s narrower shape.
+pub fn memory_entry_by_id(
+    conn: &Connection,
+    memory_id: &str,
+) -> rusqlite::Result<Option<MemoryEntryRow>> {
+    conn.query_row(
+        &format!("SELECT {FULL_ROW_COLUMNS} FROM memory_entry WHERE memory_id = ?1"),
+        params![memory_id],
+        read_full_row,
+    )
+    .optional()
+}
+
+/// Every `memory_id` in the store, regardless of scope or state, ascending —
+/// `purge --all`'s own enumeration seam (T16-02), the memory-side analog of
+/// `crate::observation::all_session_ids`.
+pub(crate) fn all_memory_entry_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT memory_id FROM memory_entry ORDER BY memory_id")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

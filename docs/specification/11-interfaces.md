@@ -527,3 +527,37 @@ the one-line sketch above:
   `src/observation/payload_ttl.rs` — T06-03, D-007, D-011, T13-05, T14-05) is already-established,
   already-gated retention/GC behavior (specs 05 §8, 07 §6, 12 §3) with its own `dry_run` parameter;
   this task is their first production caller, not new destructive surface.
+
+As-built note (T16-02, `[SPEC]`, D-025). `inspect <observation|memory|generation> <id>`, `export
+[--scope …]`, and `purge [--memory <id>|--session <id>|--all]` are implemented in
+`crates/local-rag/src/cli/{inspect,export,purge}.rs`, D-025's own named owner, over a new
+`local_rag_store::privacy` module (`inspect`/`export`/`purge` submodules). Points where this task
+resolved detail the one-line sketch left open:
+
+- **`export`'s scope flag is `--scope global|repository|worktree`**, resolved through the exact
+  same `resolve() → scopes_for() → optional ScopeKind filter` pipeline `memory list` already uses
+  — no new `--repo-id`/`--worktree-id` flags. A `memory_entry`'s exported shape is the same
+  `entry`/`evidence`/`audit_trail` triple `inspect memory` produces (one shared `MemoryInspection`
+  type, spec 12 §3) — export is never poorer than inspect for the identical relationship.
+- **`inspect`/`export` include the evidence payload's actual text**, not just its size: the
+  captured `observation_payload.redacted_payload` has already passed `Scanner::redact` (12 §2)
+  before ever reaching the spool, so showing it is not a new confidentiality boundary — the same
+  local operator already has direct `state.sqlite` access — and hiding it would leave "did
+  redaction actually work" unanswerable, defeating the transparency purpose this section's own
+  framing gives these commands. Gated the same way as the TTL: an expired or never-captured
+  payload never has its `text` field populated (`PayloadStatus::{Present{text,..},Expired,None}`).
+- **`purge` requires both an explicit selector and an explicit `--yes` on every one of its three
+  modes**, not just `--all`: purge is the only hard-delete path in the whole system, so all three
+  modes get the identical "compute and print what would happen, then require confirmation" shape.
+  `--memory` additionally requires `--expected-version`, the same optimistic-concurrency contract
+  `memory edit`/`retract`/`merge` already give.
+- **Purge's audit tombstone is two things, not one** (12 §3's own as-built note has the full
+  rationale): every prior `audit_event` row for the purged entity has its `payload` set to `NULL`,
+  *and* a new terminal `op = "purge"` row is appended — row-absence alone (no `memory_entry` row,
+  but an audit trail that still exists) is already an unambiguous "this was purged" signal, but an
+  explicit marker keeps purge consistent with every other mutation in this crate, which always
+  writes its own audit event.
+- **`purge --all` runs as one transaction**, not batched like the retention sweep: a
+  partially-completed purge is a worse outcome than a slow one for an all-or-nothing
+  privacy/legal operation, so atomicity here is a correctness requirement, not an optimization
+  being skipped.

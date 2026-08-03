@@ -19,7 +19,8 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_store::registry::{
     GenerationState, GenerationTransitionError, IllegalGenerationTransition, WorktreeKind,
     active_generations, allocate_generation, create_repository, create_worktree,
-    current_generation, generation_state, set_current_generation, transition_generation,
+    current_generation, generation_row, generation_state, set_current_generation,
+    transition_generation,
 };
 use local_rag_store::{StateDb, WriteError};
 use local_rag_test_support::TempHome;
@@ -399,4 +400,45 @@ async fn one_active_invariant() {
         "skipping the retire leaves two active rows — the invariant is procedural, got {actives:?}",
     );
     assert!(actives.contains(&g_new) && actives.contains(&g_third));
+}
+
+/// `generation_row` (T16-02, `inspect generation <id>`'s own read) returns
+/// every column, tracks a state transition, and reads back `None` for an
+/// unknown id.
+#[tokio::test]
+async fn generation_row_reads_every_column_then_none_for_unknown_id() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+    let genr = allocate(&db, &wt, 10).await;
+
+    let read = db.open_read().expect("read conn");
+    let row = generation_row(&read, &genr)
+        .expect("read")
+        .expect("row present");
+    assert_eq!(row.generation_id, genr);
+    assert_eq!(row.worktree_id, wt);
+    assert_eq!(row.generation_number, 1);
+    assert_eq!(row.state, GenerationState::Building);
+    assert_eq!(row.created_at, 1000);
+    drop(read);
+
+    assert_eq!(
+        transition(&db, &genr, GenerationState::Failed).await,
+        Ok(())
+    );
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        generation_row(&read, &genr)
+            .expect("read")
+            .expect("row")
+            .state,
+        GenerationState::Failed,
+        "generation_row reflects the current state, not a stale snapshot"
+    );
+
+    assert_eq!(
+        generation_row(&read, "unknown-id").expect("read"),
+        None,
+        "an unknown generation_id reads back as None, not an error"
+    );
 }

@@ -70,8 +70,9 @@ mod settings;
 pub mod worktree;
 
 pub use generation::{
-    GenerationState, GenerationTransitionError, IllegalGenerationTransition, active_generations,
-    allocate_generation, generation_number, generation_state, transition_generation,
+    GenerationRow, GenerationState, GenerationTransitionError, IllegalGenerationTransition,
+    active_generations, allocate_generation, generation_number, generation_row, generation_state,
+    transition_generation,
 };
 
 pub use instance::{ensure_store_instance_uuid, store_instance_uuid};

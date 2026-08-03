@@ -314,6 +314,49 @@ pub fn active_generations(conn: &Connection, worktree_id: &str) -> rusqlite::Res
     Ok(ids)
 }
 
+/// One full `generation` row (spec 03 §2.1, all five columns) — `inspect
+/// generation <id>`'s own read (11 §6, T16-02). No evidence/audit concept
+/// applies to a generation the way it does to a memory entry, so unlike
+/// [`crate::memory::entry::MemoryEntryRow`]'s privacy-module wrapper, this
+/// type is consumed as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRow {
+    pub generation_id: String,
+    pub worktree_id: String,
+    pub generation_number: i64,
+    pub state: GenerationState,
+    pub created_at: i64,
+}
+
+pub fn generation_row(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<Option<GenerationRow>> {
+    conn.query_row(
+        "SELECT generation_id, worktree_id, generation_number, state, created_at \
+         FROM generation WHERE generation_id = ?1",
+        params![generation_id],
+        |r| {
+            let raw_state: String = r.get(3)?;
+            let state = GenerationState::from_db(&raw_state).ok_or_else(|| {
+                Error::FromSqlConversionFailure(
+                    3,
+                    Type::Text,
+                    format!("invalid generation.state {raw_state:?}").into(),
+                )
+            })?;
+            Ok(GenerationRow {
+                generation_id: r.get(0)?,
+                worktree_id: r.get(1)?,
+                generation_number: r.get(2)?,
+                state,
+                created_at: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

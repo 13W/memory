@@ -23,8 +23,8 @@ use local_rag_store::memory::{
     ScopeKind, active_entries_for_scope, candidate_state, canonical_key_owner,
     consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
     insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
-    list_memory_entries_for_scope, memory_entry_counts, memory_entry_state, memory_entry_summary,
-    memory_evidence_for, processing_cursor, read_audit_events_for_entity,
+    list_memory_entries_for_scope, memory_entry_by_id, memory_entry_counts, memory_entry_state,
+    memory_entry_summary, memory_evidence_for, processing_cursor, read_audit_events_for_entity,
     recall_candidates_for_scope, transition_candidate, transition_memory_entry, transition_run,
     upsert_processing_cursor,
 };
@@ -1413,6 +1413,59 @@ async fn memory_entry_summary_is_none_for_an_unknown_id() {
     assert_eq!(
         memory_entry_summary(&read, &uuid(160)).expect("query"),
         None
+    );
+}
+
+/// `memory_entry_by_id` (T16-02, `inspect memory <id>`/`export`/`purge
+/// memory <id>`'s own read) returns every column and tracks a state/version
+/// change, unlike the narrower [`memory_entry_summary`] projection.
+#[tokio::test]
+async fn memory_entry_by_id_reads_every_column_regardless_of_state_then_none_for_unknown_id() {
+    let (_home, db) = open_state();
+    let owner = uuid(161);
+    let id = uuid(162);
+    create_memory(
+        &db,
+        &id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        Some("canon-key"),
+    )
+    .await
+    .expect("create fact");
+
+    let read = db.open_read().expect("read conn");
+    let row = memory_entry_by_id(&read, &id)
+        .expect("query")
+        .expect("row present");
+    assert_eq!(row.memory_id, id);
+    assert_eq!(row.kind, MemoryKind::Fact);
+    assert_eq!(row.state, MemoryState::Active);
+    assert_eq!(row.text, "some durable text");
+    assert_eq!(row.canonical_key.as_deref(), Some("canon-key"));
+    assert_eq!(row.scope_kind, ScopeKind::Worktree);
+    assert_eq!(row.scope_owner_id, owner);
+    assert_eq!(row.entry_version, 1);
+    drop(read);
+
+    transition_entry(&db, &id, MemoryState::Retracted)
+        .await
+        .expect("retract");
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_by_id(&read, &id)
+            .expect("query")
+            .expect("row present")
+            .state,
+        MemoryState::Retracted,
+        "memory_entry_by_id finds a terminal-state row too, like memory_entry_summary"
+    );
+
+    assert_eq!(
+        memory_entry_by_id(&read, &uuid(163)).expect("query"),
+        None,
+        "an unknown memory_id reads back as None, not an error"
     );
 }
 
