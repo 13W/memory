@@ -204,6 +204,7 @@ async fn tools_call_argument_errors_get_invalid_params() {
             r#"{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"merge_memories","arguments":{"ids":[{"memory_id":"m-1","expected_version":1}],"survivor_id":"m-1"}}}"#,
             r#"{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"merge_memories","arguments":{"ids":[{"memory_id":"m-1","expected_version":1},{"memory_id":"m-2","expected_version":1}],"survivor_id":"m-3"}}}"#,
             r#"{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"give_feedback","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"get_file_context","arguments":{}}}"#,
         ];
         cases
             .iter()

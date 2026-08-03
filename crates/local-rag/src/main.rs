@@ -206,3 +206,51 @@ fn startup_error_message(e: &DaemonStartupError) -> String {
         other => other.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use local_rag::daemon::StoreLockInfo;
+
+    fn owner(ready: bool) -> StoreLockInfo {
+        StoreLockInfo {
+            instance_uuid: "instance-a".to_string(),
+            pid: 4242,
+            daemon_version: "9.9.9".to_string(),
+            started_at: 1_000,
+            ready,
+            ready_at: ready.then_some(1_500),
+            socket_path: ready.then(|| "/tmp/does-not-matter/daemon.sock".to_string()),
+        }
+    }
+
+    /// spec 02 §6's `MIGRATION_IN_PROGRESS` row: the CLI-level message for a
+    /// live-but-not-yet-`ready` owner (still starting, most commonly still
+    /// migrating) — this branch has no test at any level (its sibling,
+    /// `STORE_LOCKED` below, is proven end to end in
+    /// `tests/serve_subprocess.rs`; this one only exists as this pure
+    /// function, so a unit test is what closes the gap, G15/D-026).
+    #[test]
+    fn a_not_ready_owner_reports_migration_in_progress() {
+        let err = DaemonStartupError::Lock(StoreLockError::Locked {
+            owner: owner(false),
+        });
+        let message = startup_error_message(&err);
+        assert!(message.contains("MIGRATION_IN_PROGRESS"), "{message}");
+        assert!(message.contains("still be starting up"), "{message}");
+        assert!(message.contains("4242"), "{message}");
+    }
+
+    /// The sibling branch: a fully-`ready` owner reports `STORE_LOCKED`
+    /// instead — asserted here side by side with the branch above so the
+    /// `ready` flag is what is proven to select between them, not just each
+    /// message's own text in isolation.
+    #[test]
+    fn a_ready_owner_reports_store_locked() {
+        let err = DaemonStartupError::Lock(StoreLockError::Locked { owner: owner(true) });
+        let message = startup_error_message(&err);
+        assert!(message.contains("STORE_LOCKED"), "{message}");
+        assert!(message.contains("already served by pid 4242"), "{message}");
+        assert!(!message.contains("MIGRATION_IN_PROGRESS"), "{message}");
+    }
+}

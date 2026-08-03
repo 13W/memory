@@ -8,12 +8,16 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixListener;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::time::{Duration, Instant};
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::process::pid_exists;
+use local_rag_protocol::{
+    MCP_PASSTHROUGH_VERSION, Message, ShutdownRequest, Welcome, decode_message, encode_message,
+};
 use local_rag_test_support::TempHome;
 
 fn open_layout(home: &TempHome) -> StoreLayout {
@@ -80,6 +84,24 @@ fn send_sigterm(pid: u32) {
         rc,
         0,
         "kill(SIGTERM) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Send a real `SIGKILL` — an ungraceful crash, unlike [`send_sigterm`]: the
+/// killed process never runs its own orderly-shutdown socket cleanup (spec
+/// 02 §4.3), leaving `run/daemon.sock` behind as a stale, unbound file
+/// (§4.1's own as-built note: "the socket file itself has no auto-cleanup
+/// and can genuinely outlive a SIGKILLed daemon") — the real-world "daemon
+/// down" precondition the restart test below needs.
+fn send_sigkill(pid: u32) {
+    // SAFETY: same as `send_sigterm`.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(
+        rc,
+        0,
+        "kill(SIGKILL) failed: {}",
         std::io::Error::last_os_error()
     );
 }
@@ -263,6 +285,228 @@ fn sigterm_to_the_proxy_does_not_reach_the_daemon_it_spawned() {
         pid_exists(daemon),
         "the daemon must remain alive after the proxy that spawned it is killed"
     );
+
+    cleanup_daemon(&layout, Duration::from_secs(20));
+}
+
+// ---------------------------------------------------------------------
+// G15/D-026: the upgrade flow (spec 13 §4) end to end, and a real
+// "daemon down/restart" recovery — the two scenarios the gate's own text
+// names ("daemon down/restart/upgrade") that no existing test drove
+// through the real `establish_session` state machine.
+// ---------------------------------------------------------------------
+
+/// Mirrors `local-rag-proxy/src/handshake.rs::MAX_UPGRADE_ROUNDS` (not
+/// importable here — that crate has no `lib.rs`, only a `main.rs`, so this
+/// integration test binary sees none of its internals, only the compiled
+/// binary). `establish_session`'s own loop sends `SHUTDOWN_REQUEST` after
+/// every round except the globally final one.
+const MAX_UPGRADE_ROUNDS: u32 = 2;
+
+/// A minimal, blocking fake "old daemon": binds `socket_path` and answers
+/// `connections` consecutive connections, each with a `Welcome` whose
+/// `daemon_version` deliberately does not match this workspace's real
+/// build — driving the real proxy's `establish_session` through the
+/// version-mismatch branch of spec 13 §4's upgrade flow. On every
+/// connection whose round number is below [`MAX_UPGRADE_ROUNDS`], the real
+/// loop sends a `SHUTDOWN_REQUEST` before waiting for this fake to close —
+/// this reads and discards that line to let `wait_for_close` succeed; the
+/// globally final round gets no such message (the real loop just gives up
+/// there), so nothing further is read on it. Dropping the listener once
+/// `connections` have been served un-binds the socket, so a next connect
+/// attempt genuinely fails (nothing listening) rather than queuing.
+fn spawn_fake_mismatched_daemon(
+    socket_path: std::path::PathBuf,
+    connections: u32,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+        for round in 1..=connections {
+            let (stream, _) = listener.accept().expect("accept fake daemon connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+            let mut writer = stream;
+
+            let mut hello_line = String::new();
+            reader.read_line(&mut hello_line).expect("read HELLO");
+
+            let welcome = Message::Welcome(Welcome {
+                proto: local_rag_protocol::PROTO_VERSION,
+                daemon_version: "0.0.0-fake-old".to_string(),
+                store_instance_uuid: "fake-instance".to_string(),
+                capabilities: Vec::new(),
+                mcp_passthrough_version: MCP_PASSTHROUGH_VERSION,
+                spool_max_format_version: local_rag_core::spool::FORMAT_VERSION,
+                mode: "normal".to_string(),
+            });
+            let bytes = encode_message(&welcome).expect("encode WELCOME");
+            writer.write_all(&bytes).expect("write WELCOME");
+
+            if round < MAX_UPGRADE_ROUNDS {
+                let mut shutdown_line = String::new();
+                reader
+                    .read_line(&mut shutdown_line)
+                    .expect("read SHUTDOWN_REQUEST");
+                let msg =
+                    decode_message(shutdown_line.trim_end()).expect("decode SHUTDOWN_REQUEST");
+                assert!(
+                    matches!(msg, Message::ShutdownRequest(ShutdownRequest { .. })),
+                    "expected a ShutdownRequest, got {msg:?}"
+                );
+            }
+            // Dropping `reader`/`writer` here is this fake daemon's own
+            // "drain and exit" — the real loop's `wait_for_close` observes
+            // the resulting EOF.
+        }
+    })
+}
+
+/// The real `establish_session` upgrade loop, driven end to end: a fake
+/// "old" daemon answers round 1 with a mismatched version, the real proxy
+/// sends `SHUTDOWN_REQUEST` and waits for it to close, then — with the fake
+/// listener's socket now unbound — `connect_or_spawn`'s round-2 attempt
+/// genuinely fails to connect and spawns a real, current-version `local-rag
+/// serve` daemon (inheriting this proxy's own `LOCAL_RAG_HOME`, exactly the
+/// way `spawn_detached_daemon` always has), which the proxy then completes
+/// a real MCP handshake against.
+#[test]
+fn daemon_version_mismatch_triggers_the_upgrade_flow_and_completes_against_the_new_daemon() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    let fake = spawn_fake_mismatched_daemon(layout.socket_path(), 1);
+
+    let mut proxy = spawn_proxy(&home, &[("LOCAL_RAG_SESSION_ID", "test-session-upgrade")]);
+    let mut stdin = proxy.stdin.take().expect("proxy stdin");
+    let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
+
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    // Generous budget: this handshake pays for the fake round-trip *and* a
+    // real daemon spawn, unlike the plain cold-start test's 20s.
+    let (stdout, line) = read_line(stdout, Duration::from_secs(25));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(
+        response["result"]["serverInfo"]["name"], "local-rag",
+        "the proxy must complete the handshake against the newly spawned, \
+         version-matched daemon: {response}"
+    );
+    let _ = stdout;
+
+    fake.join().expect("fake old daemon thread panicked");
+    wait_until_daemon_ready(&layout, Duration::from_secs(5));
+
+    drop(stdin);
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(20));
+    assert!(status.success(), "proxy must exit 0: {status:?}");
+
+    cleanup_daemon(&layout, Duration::from_secs(20));
+}
+
+/// A persistently mismatched daemon (every round, not just the first) makes
+/// the proxy give up after `MAX_UPGRADE_ROUNDS` — `ProxyError::
+/// UpgradeLoopExceeded`, exit non-zero, diagnostic on stderr — rather than
+/// looping forever against a misbehaving/flapping peer.
+#[test]
+fn persistent_version_mismatch_exceeds_the_upgrade_round_budget() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    let fake = spawn_fake_mismatched_daemon(layout.socket_path(), MAX_UPGRADE_ROUNDS);
+
+    let mut proxy = spawn_proxy(
+        &home,
+        &[("LOCAL_RAG_SESSION_ID", "test-session-upgrade-exceeded")],
+    );
+    let mut stderr = proxy.stderr.take().expect("proxy stderr");
+
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(25));
+    assert!(
+        !status.success(),
+        "the proxy must exit non-zero once the upgrade round budget is exhausted: {status:?}"
+    );
+
+    let mut stderr_text = String::new();
+    stderr
+        .read_to_string(&mut stderr_text)
+        .expect("read proxy stderr");
+    assert!(
+        stderr_text.contains("gave up after repeated version-mismatch upgrade attempts"),
+        "{stderr_text}"
+    );
+
+    fake.join().expect("fake old daemon thread panicked");
+}
+
+/// The literal "daemon down/restart" scenario: a real daemon is killed
+/// ungracefully (`SIGKILL`, leaving a stale, unbound `run/daemon.sock`
+/// behind — see [`send_sigkill`]'s own doc), and a **fresh** proxy
+/// invocation against the same store must transparently detect the dead
+/// owner, spawn a brand-new daemon, and complete a real MCP handshake —
+/// proxy's own connections are one-per-process (`establish_session` runs
+/// once at startup, spec 02 §3.3's own as-built note), so "restart" is
+/// necessarily exercised by a *new* proxy process, not a live reconnect
+/// inside an existing one.
+#[test]
+fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    let mut proxy1 = spawn_proxy(&home, &[("LOCAL_RAG_SESSION_ID", "test-session-restart-1")]);
+    let mut stdin1 = proxy1.stdin.take().expect("proxy stdin");
+    let stdout1 = BufReader::new(proxy1.stdout.take().expect("proxy stdout"));
+    write_line(
+        &mut stdin1,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    let (stdout1, _line) = read_line(stdout1, Duration::from_secs(20));
+    let _ = stdout1;
+    wait_until_daemon_ready(&layout, Duration::from_secs(5));
+
+    let old_daemon = daemon_pid(&layout);
+    send_sigkill(old_daemon);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_exists(old_daemon) {
+        assert!(
+            Instant::now() < deadline,
+            "the killed daemon did not disappear within the timeout"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Not the scenario under test: let the now-orphaned first proxy exit on
+    // its own (its daemon connection just died under it) before moving on.
+    drop(stdin1);
+    let _ = wait_for_exit(&mut proxy1, Duration::from_secs(20));
+
+    let mut proxy2 = spawn_proxy(&home, &[("LOCAL_RAG_SESSION_ID", "test-session-restart-2")]);
+    let mut stdin2 = proxy2.stdin.take().expect("proxy stdin");
+    let stdout2 = BufReader::new(proxy2.stdout.take().expect("proxy stdout"));
+    write_line(
+        &mut stdin2,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    let (stdout2, line) = read_line(stdout2, Duration::from_secs(20));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(
+        response["result"]["serverInfo"]["name"], "local-rag",
+        "a fresh proxy must recover by spawning a brand-new daemon: {response}"
+    );
+    let _ = stdout2;
+
+    wait_until_daemon_ready(&layout, Duration::from_secs(5));
+    let new_daemon = daemon_pid(&layout);
+    assert_ne!(
+        new_daemon, old_daemon,
+        "a genuinely new daemon process must have been spawned"
+    );
+
+    drop(stdin2);
+    let status = wait_for_exit(&mut proxy2, Duration::from_secs(20));
+    assert!(status.success(), "{status:?}");
 
     cleanup_daemon(&layout, Duration::from_secs(20));
 }
