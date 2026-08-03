@@ -17,6 +17,15 @@ spec 02 §6; 12; 11 §6; 14 §6.
   only hard-delete path and rewrites audit refs to non-sensitive tombstones transactionally.
 - **Тесты:** scope isolation, payload expired export, purge memory/session/all authorization UX,
   crash rollback, no orphan FK/private text in audit, retract remains non-delete.
+- **Добавлено D-025 (T15-08):** эта карточка владеет и CLI-проводкой, не только доменным
+  результатом — `local-rag inspect <observation|memory|generation> <id>`, `local-rag export
+  [--scope …]`, `local-rag purge [--memory <id>|--session <id>|--all]` (spec 11 §6), включая
+  карточки T15-08's собственные тесты «destructive purge requires explicit selector/confirmation»
+  и «expected_version surfaced» для этих трёх команд. T15-08 намеренно не построила их: у них не
+  было домена, за который можно было бы зацепиться (grep на `purge`/`tombstone`/`audit_ref`/
+  `export` — ноль совпадений на момент T15-08). Wiring следует установленному в T15-07/T15-08
+  паттерну `crates/local-rag/src/cli/` (hand-rolled `std::env::args()`, module-per-concern,
+  `resolve_layout_and_config()`, никогда `store.lock`).
 
 ## T16-03 — Doctor/rebuild/degraded diagnostics
 
@@ -24,6 +33,12 @@ spec 02 §6; 12; 11 §6; 14 §6.
   diagnostics expose exact validation reason and actionable typed error.
 - **Тесты:** seeded fault per diagnostic, dry/no mutation checks, dense/FTS/cache deletion
   recovery solely from state, both legs unavailable, repeated rebuild.
+- **Добавлено D-025 (T15-08):** эта карточка владеет и CLI-проводкой `local-rag doctor` (spec
+  11 §6: «store lock, versions, heads, orphan artifacts»), не только доменным результатом —
+  T15-08 намеренно не построила её (никакого доменного кода для агрегированной проверки
+  lock/versions/heads/orphans/permissions не существовало на момент T15-08). `rebuild --fts/
+  --dense` уже реализован (T15-07, `cli/rebuild.rs`) и этой карточкой не затрагивается — она
+  добавляет только `doctor`'s собственную проверку и типизированную ошибку.
 
 ## T16-04 — Adversarial and ownership suite
 

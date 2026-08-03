@@ -3,7 +3,7 @@
 //! `version` is a diagnostic no-op; `serve` runs the daemon lifecycle (spec
 //! 02 §4, T15-01). The rest of the CLI surface — `status`/`stop`/`restart`/
 //! `init`, `index`/`reindex`/`watch`, `repo`/`worktree`, `rebuild` (spec 11
-//! §6) — lives in [`cli`] (T15-07).
+//! §6) — lives in [`cli`] (T15-07); `memory`/`gc`/`stats` are T15-08 (D-025).
 
 mod cli;
 
@@ -40,9 +40,12 @@ fn main() -> ExitCode {
         Some("repo") => cli::repo::run(std::env::args().skip(2)),
         Some("worktree") => cli::worktree::run(std::env::args().skip(2)),
         Some("rebuild") => cli::rebuild::run(std::env::args().skip(2)),
+        Some("memory") => cli::memory::run(std::env::args().skip(2)),
+        Some("gc") => cli::gc::run(std::env::args().skip(2)),
+        Some("stats") => cli::stats::run(std::env::args().skip(2)),
         _ => {
             eprintln!(
-                "usage: {BIN} version|serve|status|stop|restart|init|index|reindex|watch|repo|worktree|rebuild"
+                "usage: {BIN} version|serve|status|stop|restart|init|index|reindex|watch|repo|worktree|rebuild|memory|gc|stats"
             );
             ExitCode::from(2)
         }
