@@ -194,6 +194,49 @@ pub struct MigrationReport {
     pub store_version: u32,
 }
 
+/// The result of a compatible, drift-free version check (T16-03's own
+/// read-only [`diagnose_from_conn`], and [`run`]'s internal use of the same
+/// [`check_applied`] before it applies anything).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionReport {
+    /// The maximum applied version currently recorded in the store (`0` if
+    /// none — a brand new, never-migrated store).
+    pub store_version: u32,
+    /// The maximum version this binary knows how to apply.
+    pub binary_max_version: u32,
+    /// Versions in `migrations` not yet applied, ascending. Empty means the
+    /// store is fully up to date.
+    pub pending: Vec<u32>,
+}
+
+/// A read-only diagnosis of `state.sqlite`'s migration state (T16-03,
+/// `local-rag doctor`'s "versions" check) — never opens a writable
+/// connection, never bootstraps, never applies anything, unlike [`run`]
+/// (which [`StateDb::open`](crate::StateDb::open) always calls). See
+/// [`crate::state::StateDb::diagnose_versions`] for the caller that produces
+/// this without ever constructing a [`StateDb`](crate::StateDb).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum VersionDiagnosis {
+    /// No `state.sqlite` file exists at the path at all — a store that has
+    /// never been initialized, not a fault.
+    NotInitialized,
+    /// A file exists at the path, but `schema_migrations` does not — this
+    /// binary's own [`bootstrap`] creates that table (plus `store_settings`/
+    /// `migration_progress`) in the same transaction on every store's very
+    /// first [`run`], so its absence on an existing file means something
+    /// other than this runner created it (corruption, wrong file). Never
+    /// folded into `NotInitialized`.
+    MissingBookkeeping,
+    /// Compatible and drift-free — see [`VersionReport::pending`] for whether
+    /// there is anything left to apply.
+    Applied(VersionReport),
+    /// Incompatible or drifted — the same conditions [`run`] itself would
+    /// refuse on ([`MigrationError::IncompatibleStore`],
+    /// [`MigrationError::ChecksumDrift`], [`MigrationError::UnknownAppliedVersion`]).
+    Fault(MigrationError),
+}
+
 /// An error from the migration runner.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -342,41 +385,8 @@ pub fn run(
         bootstrap(conn)?;
 
         let applied_history = read_applied(conn)?;
-        let store_version = applied_history
-            .iter()
-            .map(|(v, _, _)| *v)
-            .max()
-            .unwrap_or(0);
-
-        // Compatibility: refuse a store newer than we support (spec 13 §3).
-        if store_version > binary_max {
-            return Err(MigrationError::IncompatibleStore {
-                store_version,
-                binary_max_version: binary_max,
-            });
-        }
-
-        // Drift / history: every already-applied version must exist in our set
-        // with a matching checksum (forward-only migrations are immutable once
-        // shipped).
-        for (version, name, found) in &applied_history {
-            match migrations.iter().find(|m| m.version == *version) {
-                Some(m) => {
-                    let expected = m.checksum();
-                    if expected != *found {
-                        return Err(MigrationError::ChecksumDrift {
-                            version: *version,
-                            name: name.clone(),
-                            expected,
-                            found: found.clone(),
-                        });
-                    }
-                }
-                None => {
-                    return Err(MigrationError::UnknownAppliedVersion { version: *version });
-                }
-            }
-        }
+        let report = check_applied(&applied_history, migrations)?;
+        let store_version = report.store_version;
 
         // `<root>/backups` — siblings of the lock/state files (used only by
         // destructive migrations, created on demand).
@@ -636,4 +646,94 @@ fn read_applied(conn: &Connection) -> Result<Vec<(u32, String, String)>, Migrati
         .map_err(MigrationError::Sqlite)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(MigrationError::Sqlite)
+}
+
+/// The read+compare half of [`run`] (spec 02 §6 `INCOMPATIBLE_STORE`/checksum
+/// drift), extracted so a caller that must never apply anything
+/// ([`diagnose_from_conn`]) shares one comparison with `run` instead of the
+/// two silently drifting apart.
+fn check_applied(
+    applied_history: &[(u32, String, String)],
+    migrations: &[Migration],
+) -> Result<VersionReport, MigrationError> {
+    let binary_max = migrations.last().map(|m| m.version).unwrap_or(0);
+    let store_version = applied_history
+        .iter()
+        .map(|(v, _, _)| *v)
+        .max()
+        .unwrap_or(0);
+
+    // Compatibility: refuse a store newer than we support (spec 13 §3).
+    if store_version > binary_max {
+        return Err(MigrationError::IncompatibleStore {
+            store_version,
+            binary_max_version: binary_max,
+        });
+    }
+
+    // Drift / history: every already-applied version must exist in our set
+    // with a matching checksum (forward-only migrations are immutable once
+    // shipped).
+    for (version, name, found) in applied_history {
+        match migrations.iter().find(|m| m.version == *version) {
+            Some(m) => {
+                let expected = m.checksum();
+                if expected != *found {
+                    return Err(MigrationError::ChecksumDrift {
+                        version: *version,
+                        name: name.clone(),
+                        expected,
+                        found: found.clone(),
+                    });
+                }
+            }
+            None => {
+                return Err(MigrationError::UnknownAppliedVersion { version: *version });
+            }
+        }
+    }
+
+    let pending = migrations
+        .iter()
+        .filter(|m| m.version > store_version)
+        .map(|m| m.version)
+        .collect();
+    Ok(VersionReport {
+        store_version,
+        binary_max_version: binary_max,
+        pending,
+    })
+}
+
+/// Whether `schema_migrations` exists and is queryable in `conn`. [`bootstrap`]
+/// creates it (plus `store_settings`/`migration_progress`) in one transaction
+/// on every store's very first [`run`], so its absence — or any other failure
+/// reading it, e.g. a file that is not a SQLite database at all — on an
+/// existing file is never this runner's own doing.
+fn schema_migrations_table_exists(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+        [],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Read-only version/compatibility diagnosis (T16-03, `local-rag doctor`) —
+/// never bootstraps, never applies anything; safe on a connection opened
+/// purely `SQLITE_OPEN_READ_ONLY`. See
+/// [`crate::state::StateDb::diagnose_versions`] for the caller that opens
+/// such a connection without ever going through [`run`].
+pub(crate) fn diagnose_from_conn(conn: &Connection, migrations: &[Migration]) -> VersionDiagnosis {
+    if !schema_migrations_table_exists(conn) {
+        return VersionDiagnosis::MissingBookkeeping;
+    }
+    let applied_history = match read_applied(conn) {
+        Ok(h) => h,
+        Err(e) => return VersionDiagnosis::Fault(e),
+    };
+    match check_applied(&applied_history, migrations) {
+        Ok(report) => VersionDiagnosis::Applied(report),
+        Err(e) => VersionDiagnosis::Fault(e),
+    }
 }

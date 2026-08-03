@@ -43,6 +43,40 @@ async fn state_pragmas_are_applied() {
     assert_eq!(busy_timeout, 5000);
 }
 
+/// D-027 (spec 12 §6 `[FIXED]` "files/segments 0600"): `state.sqlite` itself is
+/// created at `0600`, not left at the process umask's default. Re-opening an
+/// existing file widened by something else re-asserts `0600` too, the same
+/// idempotent re-assert `ensure_dir` already gives the managed directories.
+#[cfg(unix)]
+#[tokio::test]
+async fn state_db_open_creates_and_reasserts_state_sqlite_at_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+
+    let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let mode = std::fs::metadata(layout.state_db())
+        .expect("stat state.sqlite")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "freshly created state.sqlite is 0600");
+    drop(db);
+
+    std::fs::set_permissions(layout.state_db(), std::fs::Permissions::from_mode(0o644))
+        .expect("widen mode");
+    let db2 = StateDb::open(layout.state_db()).expect("reopen state.sqlite");
+    let mode = std::fs::metadata(layout.state_db())
+        .expect("stat state.sqlite")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "reopening re-asserts 0600");
+    drop(db2);
+}
+
 /// With `foreign_keys=ON`, a child referencing a missing parent is rejected and
 /// nothing is written (the transaction rolls back).
 #[tokio::test]

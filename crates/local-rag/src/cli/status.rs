@@ -16,7 +16,7 @@ use std::time::Duration;
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::process::pid_exists;
 
-use local_rag::daemon::{LIVENESS_PROBE_TIMEOUT_MS, StoreLockInfo};
+use local_rag::daemon::{LIVENESS_PROBE_TIMEOUT_MS, StoreLockFileState, read_store_lock_file};
 
 use super::{EXIT_USAGE, fail, resolve_layout_and_config};
 
@@ -108,11 +108,11 @@ impl StatusReport {
 /// to distinguish `starting`/`migrating` from a fully `running` `Normal`
 /// daemon.
 fn compute_status(layout: &StoreLayout) -> StatusReport {
-    let Ok(bytes) = std::fs::read(layout.store_lock()) else {
-        return StatusReport::NotRunning;
-    };
-    let Ok(info) = serde_json::from_slice::<StoreLockInfo>(&bytes) else {
-        return StatusReport::NotRunning;
+    let info = match read_store_lock_file(layout) {
+        StoreLockFileState::Absent | StoreLockFileState::Corrupt => {
+            return StatusReport::NotRunning;
+        }
+        StoreLockFileState::Parsed(info) => info,
     };
 
     if !info.ready {

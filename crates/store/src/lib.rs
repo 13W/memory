@@ -368,21 +368,22 @@ pub mod subjects;
 
 pub use cache::{
     BM25_DEFAULT_WEIGHTS, BatchingLastUsed, BatchingLastUsedEmbeddings, CACHE_SCHEMA_VERSION,
-    CacheDb, CacheOpenError, CacheOpenOutcome, CacheWriteError, CacheWriter, EmbeddingCacheEntry,
-    EmbeddingCacheMeta, EmbeddingCacheRow, EmbeddingDivergence, EmbeddingKey,
-    FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsDivergence, FtsMaterializeError,
-    FtsMaterializeOutcome, FtsOpenOutcome, FtsProjectionHeadRow, FtsRebuildError,
-    LEXICAL_SCHEMA_VERSION, LastUsedSink, LastUsedSinkEmbedding, LexicalHit, LexicalQuery,
-    MIN_CANDIDATE_DEPTH, NormalizedTextRow, SubjectKind, TOKENIZER_VERSION, ValidationDepth,
-    VectorLengthError, all_embedding_meta, candidate_depth, decode_vector_le, delete_embedding,
-    delete_normalized_text, document_frequencies, embeddings_for_subject_kind, encode_vector_le,
-    flush_last_used, flush_last_used_embeddings, fts_doc_occurrence_count, fts_doc_occurrence_ids,
-    fts_manifest_hash, fts_match_expression, fts_match_expression_from_terms, get_embedding,
-    get_normalized_text, indexed_document_count, insert_embedding, insert_normalized_text,
-    lexical_leg, materialize_fts, open_and_validate_fts, query_fts, read_fts_projection_head,
-    requires_index_unavailable, selective_terms, should_rebuild_synchronously, tokenize_identifier,
-    tokenize_path, tokenize_qualified_name, tokenize_signature, validate_fts_cheap,
-    validate_fts_strong, verify_cached_embedding, verify_cached_text,
+    CacheDb, CacheDiagnosis, CacheOpenError, CacheOpenOutcome, CacheWriteError, CacheWriter,
+    EmbeddingCacheEntry, EmbeddingCacheMeta, EmbeddingCacheRow, EmbeddingDivergence, EmbeddingKey,
+    FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsCheckOutcome, FtsDivergence,
+    FtsMaterializeError, FtsMaterializeOutcome, FtsOpenOutcome, FtsProjectionHeadRow,
+    FtsRebuildError, LEXICAL_SCHEMA_VERSION, LastUsedSink, LastUsedSinkEmbedding, LexicalHit,
+    LexicalQuery, MIN_CANDIDATE_DEPTH, NormalizedTextRow, SubjectKind, TOKENIZER_VERSION,
+    ValidationDepth, VectorLengthError, all_embedding_meta, candidate_depth, check_fts,
+    decode_vector_le, delete_embedding, delete_normalized_text, document_frequencies,
+    embeddings_for_subject_kind, encode_vector_le, flush_last_used, flush_last_used_embeddings,
+    fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash, fts_match_expression,
+    fts_match_expression_from_terms, get_embedding, get_normalized_text, indexed_document_count,
+    insert_embedding, insert_normalized_text, lexical_leg, materialize_fts, open_and_validate_fts,
+    query_fts, read_fts_projection_head, requires_index_unavailable, selective_terms,
+    should_rebuild_synchronously, tokenize_identifier, tokenize_path, tokenize_qualified_name,
+    tokenize_signature, validate_fts_cheap, validate_fts_strong, verify_cached_embedding,
+    verify_cached_text,
 };
 pub use code::{
     ALGO_VERSION, BlobOutcome, CONTEXT_VERSION, ContextInput, ContextSubject, DerivedContentBlob,
@@ -440,7 +441,10 @@ pub use memory::{
     reject_candidate, renew_lease, retry_run, run_once, stale_runs, transition_candidate,
     transition_memory_entry, transition_run, upsert_processing_cursor,
 };
-pub use migrate::{ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn};
+pub use migrate::{
+    ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn, VersionDiagnosis,
+    VersionReport,
+};
 pub use observation::{
     EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, NewObservationEnvelope,
     PayloadStatus, PayloadSweepError, PayloadSweepReport, TrustLevel, import_batch,

@@ -20,7 +20,7 @@
 
 pub mod perms;
 
-pub use perms::{ensure_dir, ensure_file_0600, verify_owner};
+pub use perms::{ExpectedKind, audit_path, ensure_dir, ensure_file_0600, verify_owner};
 
 use std::ffi::OsString;
 use std::fmt;
@@ -93,6 +93,19 @@ pub enum PathError {
         /// The kind that was required.
         expected: &'static str,
     },
+    /// `path` exists, is owned by us, and is the right kind, but its POSIX
+    /// mode is not the normative `0700`/`0600` (spec 12 §6). Read-only
+    /// finding — `local-rag doctor`'s permissions audit ([`perms::audit_path`],
+    /// T16-03) is the only producer; `ensure_dir`/`ensure_file_0600`
+    /// self-heal this instead of reporting it.
+    WrongMode {
+        /// The offending path.
+        path: PathBuf,
+        /// The normative mode (`0o700` for a directory, `0o600` for a file).
+        expected: u32,
+        /// The mode actually found.
+        found: u32,
+    },
 }
 
 impl PathError {
@@ -126,6 +139,15 @@ impl fmt::Display for PathError {
             PathError::UnexpectedType { path, expected } => {
                 write!(f, "{} exists but is not a {expected}", path.display())
             }
+            PathError::WrongMode {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{} has mode {found:04o}, expected {expected:04o}",
+                path.display()
+            ),
         }
     }
 }
@@ -384,6 +406,41 @@ impl StoreLayout {
             perms::ensure_dir(&dir)?;
         }
         Ok(())
+    }
+
+    /// Read-only permission/ownership audit of the store tree (spec 12 §6,
+    /// T16-03's `local-rag doctor`) — the same paths [`ensure`](Self::ensure)
+    /// creates/re-asserts, plus `store.lock`/`state.sqlite`/`cache.sqlite`
+    /// (files owned by later tasks, checked here if and only if they already
+    /// exist). Unlike `ensure`, this never creates or chmods anything — a
+    /// path that does not exist yet is silently skipped (its absence is a
+    /// different diagnostic's business: versions/cache-binding/orphans, not
+    /// permissions), not reported as a finding.
+    pub fn audit_permissions(&self) -> Vec<PathError> {
+        let dirs = [
+            self.root.clone(),
+            self.projection_dir(),
+            self.spool_dir(),
+            self.models_dir(),
+            self.run_dir(),
+            self.logs_dir(),
+            self.quarantine_dir(),
+            self.backups_dir(),
+        ];
+        let files = [
+            self.store_lock(),
+            self.migration_lock(),
+            self.state_db(),
+            self.cache_db(),
+        ];
+        dirs.iter()
+            .filter_map(|p| perms::audit_path(p, ExpectedKind::Dir))
+            .chain(
+                files
+                    .iter()
+                    .filter_map(|p| perms::audit_path(p, ExpectedKind::File)),
+            )
+            .collect()
     }
 
     /// The MCP endpoint for this store (spec 02 §2.1): a unix-domain socket on
@@ -712,5 +769,83 @@ mod tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{} is 0700", dir.display());
         }
+    }
+
+    #[test]
+    fn audit_permissions_is_empty_on_a_freshly_ensured_tree() {
+        use local_rag_test_support::TempHome;
+
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+
+        let findings = layout.audit_permissions();
+        assert!(
+            findings.is_empty(),
+            "a freshly ensured tree has no findings, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn audit_permissions_skips_files_that_do_not_exist_yet() {
+        use local_rag_test_support::TempHome;
+
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        // `state.sqlite`/`cache.sqlite`/`store.lock`/`migration.lock` are never
+        // created by `ensure()` — their absence must not be reported.
+        assert!(!layout.state_db().exists());
+        assert!(!layout.cache_db().exists());
+        assert!(!layout.store_lock().exists());
+        assert!(!layout.migration_lock().exists());
+
+        let findings = layout.audit_permissions();
+        assert!(
+            findings.is_empty(),
+            "absent files are not permission findings, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn audit_permissions_finds_a_widened_managed_directory() {
+        use local_rag_test_support::TempHome;
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        std::fs::set_permissions(layout.spool_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("widen spool_dir mode");
+
+        let findings = layout.audit_permissions();
+        assert_eq!(
+            findings.len(),
+            1,
+            "exactly the widened dir, got {findings:?}"
+        );
+        match &findings[0] {
+            PathError::WrongMode {
+                path,
+                expected,
+                found,
+            } => {
+                assert_eq!(path, &layout.spool_dir());
+                assert_eq!(*expected, 0o700);
+                assert_eq!(*found, 0o755);
+            }
+            other => panic!("expected WrongMode, got {other:?}"),
+        }
+
+        // Read-only: the widened mode is still there after the audit.
+        let mode = std::fs::metadata(layout.spool_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "audit_permissions must never fix what it finds"
+        );
     }
 }

@@ -38,15 +38,16 @@ pub use fts_query::{
     document_frequencies, fts_match_expression, fts_match_expression_from_terms,
     indexed_document_count, lexical_leg, query_fts, selective_terms,
 };
-pub use open::{CACHE_SCHEMA_VERSION, CacheOpenError, CacheOpenOutcome};
+pub use open::{CACHE_SCHEMA_VERSION, CacheDiagnosis, CacheOpenError, CacheOpenOutcome};
 pub use text::{
     BatchingLastUsed, LastUsedSink, NormalizedTextRow, delete_normalized_text, flush_last_used,
     get_normalized_text, insert_normalized_text, verify_cached_text,
 };
 pub use validate::{
-    FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsDivergence, FtsOpenOutcome,
-    FtsRebuildError, ValidationDepth, open_and_validate_fts, requires_index_unavailable,
-    should_rebuild_synchronously, validate_fts_cheap, validate_fts_strong,
+    FTS_SYNC_REBUILD_OCCURRENCE_THRESHOLD, FtsAvailability, FtsCheckOutcome, FtsDivergence,
+    FtsOpenOutcome, FtsRebuildError, ValidationDepth, check_fts, open_and_validate_fts,
+    requires_index_unavailable, should_rebuild_synchronously, validate_fts_cheap,
+    validate_fts_strong,
 };
 pub use writer::{CacheWriteError, CacheWriter};
 
@@ -154,6 +155,27 @@ impl CacheDb {
     /// pipeline (spec 02 §5); read-only cross-DB `ATTACH` is permitted (03 §1.4).
     pub fn open_read(&self) -> Result<Connection, CacheOpenError> {
         open::open_cache_read_only(&self.path)
+    }
+
+    /// Read-only diagnosis of `cache.sqlite`'s binding at `path` (T16-03,
+    /// `local-rag doctor`'s own check) — never constructs a [`CacheDb`], which
+    /// would rebuild an incompatible/corrupt cache as a side effect of opening
+    /// ([`CacheDb::open_with_capacity`]'s own doc says so outright).
+    pub fn diagnose_binding(path: &Path, expected_store_instance_uuid: &str) -> CacheDiagnosis {
+        if !path.exists() {
+            return CacheDiagnosis::NotInitialized;
+        }
+        open::diagnose_binding(path, expected_store_instance_uuid)
+    }
+
+    /// Open a fresh **read-only** connection to `cache.sqlite` at `path`,
+    /// without constructing a [`CacheDb`] (T16-03, `local-rag doctor`'s
+    /// FTS-heads check). The caller is responsible for having already
+    /// confirmed the binding is healthy ([`CacheDb::diagnose_binding`]
+    /// returning [`CacheDiagnosis::Bound`]) — this only opens, it validates
+    /// nothing itself.
+    pub fn open_read_only(path: &Path) -> Result<Connection, CacheOpenError> {
+        open::open_cache_read_only(path)
     }
 
     /// Whether this cache was created, reused, or recreated at open time

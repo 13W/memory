@@ -92,4 +92,23 @@ impl StateDb {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Read-only version/compatibility diagnosis for the `state.sqlite` at
+    /// `path` (T16-03, `local-rag doctor`'s "versions" check) — never
+    /// constructs a [`StateDb`], which would silently apply any
+    /// pending-but-compatible migration as a side effect of opening (spec 02
+    /// §4.1's own open → migrate → serve ordering, via [`crate::migrate::run`]).
+    /// `NotInitialized` if no file exists at `path` at all, checked before any
+    /// connection is opened, so a brand-new store is never reported as a
+    /// fault.
+    pub fn diagnose_versions(
+        path: &Path,
+        migrations: &[crate::migrate::Migration],
+    ) -> Result<crate::migrate::VersionDiagnosis, OpenError> {
+        if !path.exists() {
+            return Ok(crate::migrate::VersionDiagnosis::NotInitialized);
+        }
+        let conn = open::open_state_read_only(path)?;
+        Ok(crate::migrate::diagnose_from_conn(&conn, migrations))
+    }
 }

@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
+use local_rag_core::paths::{PathError, ensure_file_0600};
+
 /// `busy_timeout` backstop in milliseconds (spec 03 §2). The real serialization
 /// is the write queue; this only guards against transient WAL contention.
 const BUSY_TIMEOUT_MS: u64 = 5000;
@@ -30,6 +32,9 @@ pub enum OpenError {
     /// incompatible/newer store, checksum drift, a lock failure, or a failing
     /// migration. Boxed to keep [`OpenError`] small.
     Migration(Box<crate::migrate::MigrationError>),
+    /// Creating/verifying `state.sqlite` as a private `0600` file owned by us
+    /// failed (D-027, spec 12 §6).
+    Path(PathError),
 }
 
 impl From<rusqlite::Error> for OpenError {
@@ -50,6 +55,7 @@ impl fmt::Display for OpenError {
             }
             OpenError::Spawn(e) => write!(f, "could not spawn the state writer thread: {e}"),
             OpenError::Migration(e) => write!(f, "state store migration failed: {e}"),
+            OpenError::Path(e) => write!(f, "state.sqlite permission error: {e}"),
         }
     }
 }
@@ -61,6 +67,7 @@ impl std::error::Error for OpenError {
             OpenError::JournalMode(_) => None,
             OpenError::Spawn(e) => Some(e),
             OpenError::Migration(e) => Some(e),
+            OpenError::Path(e) => Some(e),
         }
     }
 }
@@ -71,7 +78,17 @@ impl std::error::Error for OpenError {
 /// Crate-private on purpose: the only writable connection is the one the writer
 /// task owns. No writable [`Connection`] is exposed on the public API (spec 02
 /// §5: "direct write connections outside the queues are forbidden").
+///
+/// D-027 (spec 12 §6 `[FIXED]` "files/segments 0600"): [`ensure_file_0600`]
+/// runs first, exactly like every other managed file this workspace creates
+/// (`store.lock`, spool segments, migration backups) — before this fix,
+/// `state.sqlite` was created by SQLite's own default `open()` with no
+/// explicit mode at all, so it ended up at the process umask's default
+/// (typically `0644`), never `0600`. Idempotent: a pre-existing file is
+/// owner-verified and re-asserted to `0600` on every open, the same
+/// re-assert `ensure_dir` already does for the managed directories.
 pub(super) fn open_state_rw(path: &Path) -> Result<Connection, OpenError> {
+    ensure_file_0600(path).map_err(OpenError::Path)?;
     // Default rusqlite flags: READ_WRITE | CREATE | URI | NO_MUTEX.
     let conn = Connection::open(path)?;
     apply_state_pragmas(&conn)?;

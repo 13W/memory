@@ -154,6 +154,36 @@ async fn cache_pragmas_are_applied() {
     assert_eq!(busy_timeout, 5000);
 }
 
+/// D-027 (spec 12 §6 `[FIXED]` "files/segments 0600"): `cache.sqlite` itself is
+/// created at `0600`, not left at the process umask's default. Mirrors
+/// `crates/store/tests/state.rs`'s identical regression for `state.sqlite`.
+#[cfg(unix)]
+#[tokio::test]
+async fn cache_db_open_creates_and_reasserts_cache_sqlite_at_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_home, layout) = temp_store();
+    let db = open_cache(&layout, UUID_A, 8);
+    let mode = std::fs::metadata(layout.cache_db())
+        .expect("stat cache.sqlite")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "freshly created cache.sqlite is 0600");
+    db.close();
+
+    std::fs::set_permissions(layout.cache_db(), std::fs::Permissions::from_mode(0o644))
+        .expect("widen mode");
+    let db2 = open_cache(&layout, UUID_A, 8);
+    let mode = std::fs::metadata(layout.cache_db())
+        .expect("stat cache.sqlite")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "reopening re-asserts 0600");
+    db2.close();
+}
+
 /// A first open creates and binds the cache; a matching reopen (same store UUID,
 /// same schema version) reuses it untouched — rows and binding are preserved.
 #[tokio::test]

@@ -32,6 +32,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
+use local_rag_core::paths::{PathError, ensure_file_0600};
+
 /// `busy_timeout` backstop in milliseconds (spec 03 §4). As with state, the real
 /// serialization is the write queue; this only guards transient WAL contention.
 const BUSY_TIMEOUT_MS: u64 = 5000;
@@ -167,6 +169,9 @@ pub enum CacheOpenError {
     /// Removing a stale cache file (`cache.sqlite`/`-wal`/`-shm`) while rebuilding
     /// failed for a reason other than "not found".
     Recreate(io::Error),
+    /// Creating/verifying `cache.sqlite` as a private `0600` file owned by us
+    /// failed (D-027, spec 12 §6).
+    Path(PathError),
 }
 
 impl From<rusqlite::Error> for CacheOpenError {
@@ -192,6 +197,7 @@ impl fmt::Display for CacheOpenError {
                     "could not remove a stale cache file while rebuilding: {e}"
                 )
             }
+            CacheOpenError::Path(e) => write!(f, "cache.sqlite permission error: {e}"),
         }
     }
 }
@@ -203,6 +209,7 @@ impl std::error::Error for CacheOpenError {
             CacheOpenError::JournalMode(_) => None,
             CacheOpenError::Spawn(e) => Some(e),
             CacheOpenError::Recreate(e) => Some(e),
+            CacheOpenError::Path(e) => Some(e),
         }
     }
 }
@@ -232,7 +239,17 @@ pub enum CacheOpenOutcome {
 /// Crate-private on purpose: the only writable connection is the one the cache
 /// writer task owns. No writable [`Connection`] is exposed on the public API
 /// (spec 02 §5: "direct write connections outside the queues are forbidden").
+///
+/// D-027 (spec 12 §6 `[FIXED]` "files/segments 0600"): [`ensure_file_0600`]
+/// runs first, the same fix [`super::super::state::open`]'s `open_state_rw`
+/// carries for `state.sqlite` — before this fix, `cache.sqlite` was created
+/// by SQLite's own default `open()` at the process umask's default mode
+/// (typically `0644`), never `0600`. Idempotent, and safe on the rebuild path
+/// too: [`recreate`] unlinks any stale file first, so this always either
+/// creates a fresh `0600` file or re-asserts the mode on one that (rarely)
+/// survived recreation.
 pub(super) fn open_cache_rw(path: &Path) -> Result<Connection, CacheOpenError> {
+    ensure_file_0600(path).map_err(CacheOpenError::Path)?;
     // Default rusqlite flags: READ_WRITE | CREATE | URI | NO_MUTEX.
     let conn = Connection::open(path)?;
     apply_cache_pragmas(&conn)?;
@@ -359,6 +376,57 @@ fn read_binding(conn: &Connection) -> Option<(String, u32)> {
         .ok()?;
     let version = version_text.parse::<u32>().ok()?;
     Some((uuid, version))
+}
+
+/// A read-only diagnosis of `cache.sqlite`'s binding (T16-03, `local-rag
+/// doctor`'s own check) — never opens a writable connection, never rebuilds,
+/// unlike [`open_and_bind`] (which [`CacheDb::open`](crate::CacheDb::open)
+/// always calls, and whose own doc says outright that it "rebuilds an
+/// incompatible/corrupt cache before the writer exists"). Mirrors
+/// [`inspect_existing`]'s own "any of these paths means rebuild" reasoning,
+/// just without ever removing/recreating the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacheDiagnosis {
+    /// No `cache.sqlite` file exists at the path at all.
+    NotInitialized,
+    /// A file exists, but it cannot be opened or its binding cannot be read
+    /// (corrupt file, missing `cache_meta` table/rows, unparsable version —
+    /// every case [`read_binding`] itself collapses into `None`).
+    Unreadable,
+    /// Bound to a different store than expected.
+    WrongBinding { found: String },
+    /// Bound to this store, but at a `cache_schema_version` this binary does
+    /// not understand (the cache is never migrated, spec 13 §3 — an
+    /// incompatible version is always "rebuild", never "upgrade in place").
+    IncompatibleSchema { found: u32, binary: u32 },
+    /// Bound to this store, at this binary's schema version.
+    Bound,
+}
+
+/// Read-only version of [`inspect_existing`]'s binding check — reports
+/// instead of deciding "reuse or rebuild". Assumes `path` exists (the caller,
+/// [`crate::CacheDb::diagnose_binding`], checks that first and returns
+/// [`CacheDiagnosis::NotInitialized`] itself — the same split
+/// [`crate::state::StateDb::diagnose_versions`]/[`crate::migrate::diagnose_from_conn`]
+/// already use).
+pub(crate) fn diagnose_binding(path: &Path, expected_store_instance_uuid: &str) -> CacheDiagnosis {
+    let Ok(conn) = open_cache_read_only(path) else {
+        return CacheDiagnosis::Unreadable;
+    };
+    match read_binding(&conn) {
+        None => CacheDiagnosis::Unreadable,
+        Some((uuid, _)) if uuid != expected_store_instance_uuid => {
+            CacheDiagnosis::WrongBinding { found: uuid }
+        }
+        Some((_, version)) if version != CACHE_SCHEMA_VERSION => {
+            CacheDiagnosis::IncompatibleSchema {
+                found: version,
+                binary: CACHE_SCHEMA_VERSION,
+            }
+        }
+        Some(_) => CacheDiagnosis::Bound,
+    }
 }
 
 /// Create the cache schema (`cache_meta`, `normalized_text_cache`, `fts_doc`,

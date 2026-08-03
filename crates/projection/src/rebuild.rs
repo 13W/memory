@@ -52,7 +52,7 @@ use crate::contract::{
 use crate::expected::expected_points;
 use crate::identity::{head as build_head, manifest_hash};
 use crate::switch::VectorSource;
-use crate::validate::{Divergence, validate};
+use crate::validate::{Divergence, validate, validate_row_only};
 
 /// Quarantined shards are kept for at most this many rebuild cycles for
 /// diagnostics, then deleted (spec 05 §8 `[SPEC]`).
@@ -429,35 +429,59 @@ async fn rebuild(
     })
 }
 
-/// Validate-on-open (spec 05 §6): run on every shard open (daemon start, LRU
-/// re-open, post-crash) before the shard may serve any search. Repairs via
-/// [`rebuild`] on any divergence.
+/// The result of [`check_dense`] — the read-only half of [`open_and_validate`],
+/// with no repair attempted or implied.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DenseCheckOutcome {
+    /// No switch has ever completed for this worktree — nothing to validate
+    /// yet; the shard is not touched.
+    NoActiveTuple,
+    /// Every checked predicate passed; the shard is trustworthy.
+    Valid,
+    /// A divergence was found (mirrors [`open_and_validate`]'s own decision to
+    /// call [`rebuild`], minus actually calling it).
+    Divergent {
+        /// Why the shard was judged untrustworthy.
+        cause: RebuildCause,
+        /// The active tuple the divergence was evaluated against.
+        active_generation_id: Uuid,
+        active_model_space_id: Uuid,
+    },
+}
+
+/// Read-only validate-on-open (spec 05 §6) — the read+compare half
+/// [`open_and_validate`] itself uses before deciding whether to repair.
+/// Extracted so a caller that must never mutate (`local-rag doctor`, T16-03)
+/// can ask "is this shard valid, and why not" without risking the
+/// destructive [`rebuild`] call `open_and_validate` makes on any divergence.
 ///
-/// Returns [`OpenOutcome::NoActiveTuple`] without touching the shard when no
-/// switch has ever completed for this worktree (bootstrap).
-#[allow(clippy::too_many_arguments)]
-pub async fn open_and_validate(
-    db: &StateDb,
+/// Row-only predicates ([`validate_row_only`] — `NotClean`/
+/// `ActiveProjectedMismatch`) are checked **before** `shard_dir` is even
+/// looked at: if one already fires, the shard is never touched at all, which
+/// matters because `store.open` (e.g. `BruteForceShard::open`) creates the
+/// shard directory as a side effect when it is missing. Only once the
+/// row-only checks pass does this function check whether `shard_dir` exists;
+/// if it does not, that is reported as [`Divergence::HeadMissing`] — provably
+/// the same outcome a real `store.open` + [`validate`] would produce on an
+/// empty, headless shard, since every predicate before `HeadMissing` has
+/// already passed by construction — without ever calling `store.open` and
+/// thus without ever creating the directory.
+pub fn check_dense(
+    state_read: &local_rag_store::rusqlite::Connection,
     store: &dyn ProjectionStore,
     shard_dir: &Path,
-    quarantine_dir: &Path,
     shard_params: ShardParams,
     worktree_id: Uuid,
-    vectors: &(dyn VectorSource + Send + Sync),
-    uuids: &(dyn UuidSource + Send + Sync),
-    now_ms: i64,
-) -> Result<OpenOutcome, RebuildError> {
-    let read = db.open_read().map_err(RebuildError::Open)?;
-    let row = projection_state(&read, &worktree_id.to_string())
+) -> Result<DenseCheckOutcome, RebuildError> {
+    let row = projection_state(state_read, &worktree_id.to_string())
         .map_err(RebuildError::Sqlite)?
         .ok_or(RebuildError::UnknownWorktree)?;
-    drop(read);
 
     let (Some(active_generation_id), Some(active_model_space_id)) = (
         row.active_generation_id.as_deref(),
         row.active_model_space_id.as_deref(),
     ) else {
-        return Ok(OpenOutcome::NoActiveTuple);
+        return Ok(DenseCheckOutcome::NoActiveTuple);
     };
     // Written exclusively by `switch`/`rebuild` themselves as `Uuid::to_string()`
     // — never external input, so a parse failure here is our own corruption,
@@ -468,6 +492,22 @@ pub async fn open_and_validate(
     let active_model_space_id: Uuid = active_model_space_id
         .parse()
         .expect("stored active_model_space_id is always a UUID minted by switch/rebuild");
+
+    if let Some(divergence) = validate_row_only(&row) {
+        return Ok(DenseCheckOutcome::Divergent {
+            cause: RebuildCause::Divergent(divergence),
+            active_generation_id,
+            active_model_space_id,
+        });
+    }
+
+    if !shard_dir.exists() {
+        return Ok(DenseCheckOutcome::Divergent {
+            cause: RebuildCause::Divergent(Divergence::HeadMissing),
+            active_generation_id,
+            active_model_space_id,
+        });
+    }
 
     let cause = match store.open(shard_dir, shard_params) {
         Err(_) => Some(RebuildCause::Unopenable),
@@ -495,9 +535,46 @@ pub async fn open_and_validate(
         }
     };
 
-    match cause {
-        None => Ok(OpenOutcome::Valid),
-        Some(cause) => {
+    Ok(match cause {
+        None => DenseCheckOutcome::Valid,
+        Some(cause) => DenseCheckOutcome::Divergent {
+            cause,
+            active_generation_id,
+            active_model_space_id,
+        },
+    })
+}
+
+/// Validate-on-open (spec 05 §6): run on every shard open (daemon start, LRU
+/// re-open, post-crash) before the shard may serve any search. Repairs via
+/// [`rebuild`] on any divergence.
+///
+/// Returns [`OpenOutcome::NoActiveTuple`] without touching the shard when no
+/// switch has ever completed for this worktree (bootstrap).
+#[allow(clippy::too_many_arguments)]
+pub async fn open_and_validate(
+    db: &StateDb,
+    store: &dyn ProjectionStore,
+    shard_dir: &Path,
+    quarantine_dir: &Path,
+    shard_params: ShardParams,
+    worktree_id: Uuid,
+    vectors: &(dyn VectorSource + Send + Sync),
+    uuids: &(dyn UuidSource + Send + Sync),
+    now_ms: i64,
+) -> Result<OpenOutcome, RebuildError> {
+    let read = db.open_read().map_err(RebuildError::Open)?;
+    let outcome = check_dense(&read, store, shard_dir, shard_params, worktree_id)?;
+    drop(read);
+
+    match outcome {
+        DenseCheckOutcome::NoActiveTuple => Ok(OpenOutcome::NoActiveTuple),
+        DenseCheckOutcome::Valid => Ok(OpenOutcome::Valid),
+        DenseCheckOutcome::Divergent {
+            cause,
+            active_generation_id,
+            active_model_space_id,
+        } => {
             let outcome = rebuild(
                 db,
                 store,
