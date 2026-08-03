@@ -1,0 +1,27 @@
+{
+  "name": "@13w/local-rag",
+  "version": "0.0.0",
+  "description": "npm launcher for local-rag: resolves the platform-specific native binaries and runs the stdio MCP proxy.",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "bin": {
+    "local-rag-mcp": "bin/local-rag-mcp.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "@13w/local-rag-darwin-arm64": "0.0.0",
+    "@13w/local-rag-darwin-x64": "0.0.0",
+    "@13w/local-rag-linux-x64": "0.0.0",
+    "@13w/local-rag-linux-arm64": "0.0.0",
+    "@13w/local-rag-win32-x64": "0.0.0"
+  }
+}

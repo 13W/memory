@@ -29,4 +29,9 @@ quarantine/
 # OS cruft
 .DS_Store
 
+# npm build/test artifacts (T17-01) — node_modules is never installed in the
+# checkout itself; *.tgz is a stray non-dry-run `npm pack` from manual testing.
+npm/**/node_modules/
+npm/**/*.tgz
+
 # NOTE: Cargo.lock IS committed (workspace with binaries / dependency policy).
