@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/local-rag local-rag-hook spool-write 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/local-rag local-rag-hook spool-write 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/local-rag local-rag-hook spool-write 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/local-rag local-rag-hook spool-write 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/local-rag local-rag-hook spool-write 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/local-rag local-rag-hook spool-write 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/local-rag local-rag-hook spool-write 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

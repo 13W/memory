@@ -1,0 +1,14 @@
+{
+  "name": "local-rag",
+  "owner": {
+    "name": "13w"
+  },
+  "description": "Persistent memory, hybrid code search and spool-only observation capture for Claude Code.",
+  "plugins": [
+    {
+      "name": "local-rag",
+      "source": "./plugin",
+      "description": "Persistent memory, hybrid code search and spool-only observation capture for Claude Code."
+    }
+  ]
+}

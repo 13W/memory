@@ -1,11 +1,12 @@
 {
   "name": "@13w/local-rag",
   "version": "0.0.0",
-  "description": "npm launcher for local-rag: resolves the platform-specific native binaries and runs the stdio MCP proxy.",
+  "description": "npm launcher for local-rag: resolves the platform-specific native binaries and runs the stdio MCP proxy or the ingestion hook writer.",
   "license": "UNLICENSED",
   "type": "commonjs",
   "bin": {
-    "local-rag-mcp": "bin/local-rag-mcp.js"
+    "local-rag-mcp": "bin/local-rag-mcp.js",
+    "local-rag-hook": "bin/local-rag-hook.js"
   },
   "files": [
     "bin",

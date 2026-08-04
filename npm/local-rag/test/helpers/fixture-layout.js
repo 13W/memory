@@ -48,20 +48,21 @@ function writePlatformPackageAt(packageDir, packageName, opts = {}) {
  * `launcherDir`, so subprocess-tier tests can spawn a genuine, standalone
  * copy of `bin/local-rag-mcp.js` against a fixture tree instead of the real
  * checkout (which has no `node_modules` of its own to resolve against).
- * `bin/local-rag-mcp.js`'s own `require("../src/...")` calls stay correct
- * after the copy because both directories move together.
+ * Every `bin/*.js` entrypoint's own `require("../src/...")` calls stay
+ * correct after the copy because both directories move together; copying
+ * the whole `bin/` directory (not one named file) means a future new
+ * entrypoint needs no change here, mirroring `package.json`'s own
+ * `files: ["bin", "src"]` allowlist.
  *
  * @returns {string} absolute path to the copied `bin/local-rag-mcp.js`
  */
 function writeLauncherPackageAt(launcherDir) {
   fs.mkdirSync(launcherDir, { recursive: true });
   fs.cpSync(path.join(REAL_LAUNCHER_ROOT, "src"), path.join(launcherDir, "src"), { recursive: true });
-  fs.mkdirSync(path.join(launcherDir, "bin"), { recursive: true });
-  fs.copyFileSync(
-    path.join(REAL_LAUNCHER_ROOT, "bin", "local-rag-mcp.js"),
-    path.join(launcherDir, "bin", "local-rag-mcp.js"),
-  );
-  fs.chmodSync(path.join(launcherDir, "bin", "local-rag-mcp.js"), 0o755);
+  fs.cpSync(path.join(REAL_LAUNCHER_ROOT, "bin"), path.join(launcherDir, "bin"), { recursive: true });
+  for (const name of fs.readdirSync(path.join(launcherDir, "bin"))) {
+    fs.chmodSync(path.join(launcherDir, "bin", name), 0o755);
+  }
   fs.copyFileSync(
     path.join(REAL_LAUNCHER_ROOT, "package.json"),
     path.join(launcherDir, "package.json"),

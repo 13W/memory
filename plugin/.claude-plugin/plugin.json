@@ -1,0 +1,8 @@
+{
+  "name": "local-rag",
+  "description": "Persistent memory, hybrid code search and spool-only observation capture for Claude Code.",
+  "version": "0.0.0",
+  "author": {
+    "name": "13w"
+  }
+}
