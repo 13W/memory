@@ -48,6 +48,13 @@ cheaper and more complete than re-searching for a file you already located. proj
 orients in an unfamiliar repository: a 3-level directory tree with recursive file/unit counts, \
 likely entry points, and the most-imported module specifiers.
 
+Working loop: recall before you act. Call recall \u{2014} termless at session start, with a query \
+once one exists \u{2014} to surface durable facts, decisions, and conventions already known about \
+this project, then search_code to find the actual code. Think through both, act (edit, run, \
+verify), and when you learn something durable \u{2014} a decision, a convention, a fact worth \
+keeping \u{2014} call remember so a future session does not rediscover it. \
+RECALL \u{2192} SEARCH_CODE \u{2192} THINK \u{2192} ACT \u{2192} REMEMBER.
+
 Modes: hybrid (default) fuses BM25 with dense vector search — use it unless you have a reason \
 not to. lexical is exact-token full-text: identifiers, string literals, error messages, \
 anything you can spell. code is dense-only: paraphrases and \"the code that does X\" when you \
@@ -132,5 +139,20 @@ mod tests {
         let params = serde_json::json!({"protocolVersion": "2025-03-26"});
         let result = initialize_result(Some(&params));
         assert_eq!(result["protocolVersion"], "2025-03-26");
+    }
+
+    /// spec 11 (T17-02, `[SPEC: keep v1 mechanism]`): "the RECALL → SEARCH_CODE
+    /// → THINK → ACT → REMEMBER protocol is delivered via MCP server
+    /// instructions at handshake" — this asserts the delivery, not just the
+    /// existence of the `recall`/`remember` tools elsewhere in the catalog.
+    #[test]
+    fn instructions_deliver_the_recall_search_code_think_act_remember_cycle() {
+        assert!(SERVER_INSTRUCTIONS.contains("recall"));
+        assert!(SERVER_INSTRUCTIONS.contains("remember"));
+        assert!(
+            SERVER_INSTRUCTIONS.contains(
+                "RECALL \u{2192} SEARCH_CODE \u{2192} THINK \u{2192} ACT \u{2192} REMEMBER"
+            )
+        );
     }
 }

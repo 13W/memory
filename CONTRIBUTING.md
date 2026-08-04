@@ -276,7 +276,11 @@ its own separate Cargo workspace:
   npm/pnpm/yarn layout already targets, not a hand-rolled `node_modules` walk) and execs the
   native `local-rag-proxy` in place (`stdio: 'inherit'`), forwarding `SIGINT`/`SIGTERM`
   (`src/lifecycle.js`) 1:1 to it — never `detached`, the inverse of `crates/local-rag-proxy/src/
-  connect.rs::spawn_detached_daemon`'s own process-group isolation.
+  connect.rs::spawn_detached_daemon`'s own process-group isolation. T17-02 adds a second
+  entrypoint, `bin/local-rag-hook.js`, for the ingestion hook path — it must **always** exit 0
+  (fail-open, unlike the MCP launcher) and best-effort refreshes a direct-exec cache symlink
+  under `${CLAUDE_PLUGIN_DATA}` (`src/hook-cache.js`) so a Claude Code plugin's hook commands can
+  skip Node/npx entirely on the steady-state path — see `## Claude Code plugin` below.
 - `npm/local-rag-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}/` — the five
   `optionalDependencies` platform packages (`os`/`cpu` fields select the right one at install
   time). `win32-arm64` is deferred `[FIXED]`, spec 13 §1 — no sixth package.
@@ -300,6 +304,53 @@ Node) is the one host tool `test/package-contents.test.js` needs, purely locally
 Not yet wired into `cargo xtask ci` / `.github/workflows/ci.yml` — that file's own comment already
 earmarks "additional platform targets are added by the distribution work (T17)"; running the npm
 suite locally is a manual step for anyone touching `npm/` until T17-03 adds real CI coverage.
+
+## Claude Code plugin (`plugin/`, `.claude-plugin/`)
+
+T17-02's plugin registration (spec 11 §3.1, spec 13 §1-2), a real Claude Code plugin/marketplace
+pair, not a stub — every manifest here is verified against the actual `claude` CLI, not a
+reimplemented schema check:
+
+- `.claude-plugin/marketplace.json` — repo root (required location for `claude plugin marketplace
+  add <this-repo>`); one entry, `"source": "./plugin"`.
+- `plugin/.claude-plugin/plugin.json` — the plugin manifest (`name`, `version`, `author`; hooks/
+  MCP config stay on their default locations, `hooks/hooks.json`/`.mcp.json`, not duplicated
+  explicitly).
+- `plugin/hooks/hooks.json` — the seven spec 11 §3.1 `[FIXED]` events (`SessionStart`,
+  `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop`, `SessionEnd`),
+  every one the identical shell-form command: exec a cached direct path under
+  `${CLAUDE_PLUGIN_DATA}` if the previous run populated it, else fall back to
+  `npx --yes --package=@13w/local-rag local-rag-hook spool-write`, else `true` — the trailing
+  `|| true` is load-bearing: spec 11 §3.1's "always exit 0" is a `[FIXED]` contract on the whole
+  command a `hooks.json` entry invokes, not just the native binary once it is running, so it must
+  hold even when both the cache and `npx` fail (e.g. first run, offline).
+- `plugin/.mcp.json` — the `local-rag` MCP server, `npx --yes --package=@13w/local-rag
+  local-rag-mcp` (verified empirically: `npx <pkg> <bin-name>` — without `--package=`/`--yes` —
+  does **not** select a non-default bin from a multi-bin package; `--package=` is the form that
+  actually works).
+- `plugin/bin/local-rag-hook.js`'s own cache write is what makes the hooks.json fast path
+  possible: after the first (necessarily slower, `npx`-mediated) bootstrap run, every subsequent
+  hook invocation execs the native binary directly — a real measurement against the cargo-built
+  binary lands around p50 ≈ 5ms / p95 ≈ 6ms, comfortably under spec 13 §1's <50ms budget
+  (`plugin/test/cold-start.test.js`).
+
+Run the suite: `node --test plugin/test/*.test.js` (same explicit-glob reasoning as `npm/`'s own
+section above). Three tiers: pure JSON/logic checks (always run); real cargo-built
+`target/debug/local-rag-hook`-backed end-to-end checks (`no-writes-in-sample-repo.test.js`,
+`cold-start.test.js` — skip with a named reason if that binary is not built, `cargo build -p
+local-rag-hook`); real `claude` CLI checks (`manifest-validate.test.js`,
+`install-uninstall.test.js`, both gated on `claude` being on `PATH`). All `claude`-CLI-mutating
+round trips (`marketplace add`/`install`/`uninstall`/`details`) live in one file
+(`install-uninstall.test.js`) deliberately — Node's test runner parallelizes across files, and
+concurrent `claude` invocations against the same source repo path raced when split across files;
+tests within one file run sequentially by default, which avoids it. Every mutating round trip runs
+under an isolated `CLAUDE_CONFIG_DIR` (a real, respected env var — this project's own dev sessions
+run under one), the same isolation idiom `LOCAL_RAG_HOME` gives every Rust test here.
+
+Windows: the `${CLAUDE_PLUGIN_DATA}` symlink cache and the hooks.json shell-form command are not
+verified on Windows in this task (current CI is Ubuntu-only; the platform matrix is T17-03) — the
+same named, scoped deferral pattern the daemon's own Windows named-pipe gap already used (group
+16). The fallback path (`npx`) still runs correctly there; only the <50ms fast path is unverified.
 
 ## Committing
 

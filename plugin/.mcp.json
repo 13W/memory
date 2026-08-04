@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "local-rag": {
+      "command": "npx",
+      "args": ["--yes", "--package=@13w/local-rag", "local-rag-mcp"]
+    }
+  }
+}
