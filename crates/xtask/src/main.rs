@@ -449,12 +449,18 @@ fn ensure_nextest_available() -> Result<(), String> {
 // fault matrix seams + inspect/corrupt controls, spec 05 §10, T07-01),
 // `local-rag-search` (forwards to `local-rag-projection/failpoints` so
 // `projection.switch.before_commit` fires under a concurrent search load,
-// T09-04's `switch_failpoint_load.rs`), and `local-rag` (T15-01: the
+// T09-04's `switch_failpoint_load.rs`), `local-rag` (T15-01: the
 // `LOCAL_RAG_TEST_RESUME_DELAY_MS` startup-resume pause knob
 // `tests/serve_subprocess.rs`'s SIGTERM-at-safe-points scenario needs, spec
-// 02 §4.3). Each `--features failpoints` lane also runs `test --doc`:
-// `cargo nextest` never runs doctests, so that coverage would otherwise
-// silently disappear.
+// 02 §4.3 — also, T17-04, the `LOCAL_RAG_TEST_FAKE_DAEMON_VERSION`/
+// `LOCAL_RAG_TEST_MAX_SCHEMA_VERSION` env-var overrides a real cross-binary-
+// version upgrade test needs), and `local-rag-proxy` (T17-04: forwards to
+// `local-rag/failpoints` on its `local-rag` dev-dependency for that same
+// cross-binary-version upgrade test, `tests/subprocess.rs`). Each
+// `--features failpoints` lane also runs `test --doc`: `cargo nextest` never
+// runs doctests, so that coverage would otherwise silently disappear — except
+// `local-rag-proxy`, which is bin-only (no `src/lib.rs`, unlike every other
+// crate here) and so has no library target for `test --doc` to run against.
 const ROOT_FMT: &[Argv] = &[&["fmt", "--all", "--check"]];
 const ROOT_CLIPPY: &[Argv] = &[&[
     "clippy",
@@ -576,6 +582,20 @@ const LOCAL_RAG_CLIPPY_FAILPOINTS: &[Argv] = &[&[
     "clippy",
     "-p",
     "local-rag",
+    "--all-targets",
+    "--features",
+    "failpoints",
+    "--",
+    "-D",
+    "warnings",
+]];
+// `local-rag-proxy` (T17-04): forwards to `local-rag/failpoints` on its
+// `local-rag` dev-dependency, gating the real cross-binary-version upgrade
+// test in `tests/subprocess.rs`.
+const PROXY_CLIPPY_FAILPOINTS: &[Argv] = &[&[
+    "clippy",
+    "-p",
+    "local-rag-proxy",
     "--all-targets",
     "--features",
     "failpoints",
@@ -731,6 +751,17 @@ const ROOT_TEST_CHAIN: &[Argv] = &[
         "--features",
         "failpoints",
     ],
+    &[
+        "nextest",
+        "run",
+        "-p",
+        "local-rag-proxy",
+        "--features",
+        "failpoints",
+    ],
+    // No `test --doc -p local-rag-proxy`: unlike every other crate in this
+    // chain, `local-rag-proxy` is bin-only (no `src/lib.rs`), so there is no
+    // library target for `cargo test --doc` to run against.
 ];
 
 // The dense-backend spike (T10-01) is a SEPARATE workspace with its own
@@ -872,6 +903,10 @@ fn ci_jobs() -> Vec<Job<&'static [Argv]>> {
         Job {
             name: "local-rag:clippy-failpoints",
             payload: LOCAL_RAG_CLIPPY_FAILPOINTS,
+        },
+        Job {
+            name: "proxy:clippy-failpoints",
+            payload: PROXY_CLIPPY_FAILPOINTS,
         },
         Job {
             name: "spike:clippy-harness",

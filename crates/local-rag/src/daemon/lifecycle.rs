@@ -455,6 +455,12 @@ impl DaemonHandle {
     }
 }
 
+/// D-030: the outcome of every session resumed here is reported, not
+/// discarded — a stalled or failed session (spec 11 §4 `[FIXED concern]`: "a
+/// newer hook binary writing a newer format than the running daemon supports
+/// is a reportable incompatibility, not silent loss") is written to stderr
+/// immediately, and is independently re-derivable later via
+/// `local_rag_store::diagnose_spool_tail` (wired into `local-rag doctor`).
 async fn spawn_spool_resume(
     db: Arc<StateDb>,
     layout: StoreLayout,
@@ -463,7 +469,20 @@ async fn spawn_spool_resume(
     now_ms: i64,
     payload_ttl_hours: u64,
 ) {
-    resume_spool_import(&db, &layout, &*uuids, &jobs, now_ms, payload_ttl_hours).await;
+    let results =
+        resume_spool_import(&db, &layout, &*uuids, &jobs, now_ms, payload_ttl_hours).await;
+    for (session_id, outcome) in results {
+        match outcome {
+            Ok(outcome) => {
+                if let Some(reason) = outcome.stalled_on {
+                    eprintln!("local-rag: spool session {session_id} stalled on import: {reason}");
+                }
+            }
+            Err(e) => {
+                eprintln!("local-rag: spool session {session_id} failed to import: {e}");
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -18,6 +18,7 @@
 
 #![cfg(unix)]
 
+use std::io::Read;
 #[cfg(feature = "failpoints")]
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Stdio};
@@ -109,6 +110,47 @@ fn write_spool_segment(layout: &StoreLayout, session_id: &str) {
     let mut bytes = encode_segment_header().to_vec();
     bytes.extend_from_slice(&encode_frame(&frame).expect("under the frame cap"));
     std::fs::write(session_dir.join("000001.seg"), bytes).expect("write segment");
+}
+
+/// D-030 / T17-04: a genuinely corrupt spool segment on disk before startup
+/// (spec 11 §4 `[FIXED concern]`: "a newer hook binary writing a newer
+/// format... is a reportable incompatibility, not silent loss") is reported
+/// on the real daemon's stderr by its startup resume pass, not silently
+/// dropped — before this fix, `spawn_spool_resume`'s result was discarded
+/// unread (`daemon/lifecycle.rs`). `DaemonHandle::shutdown` awaits every
+/// `resume_handles` entry before exiting (see the `sigterm_during_a_resume_
+/// job...` test above for the same guarantee), so sending `SIGTERM` right
+/// after readiness and then reading stderr after a clean exit reliably
+/// observes whatever the resume pass reported.
+#[test]
+fn a_stalled_spool_session_is_reported_on_stderr_not_silently_dropped() {
+    let (home, layout) = open_layout();
+
+    let stalled_dir = layout.spool_session("stalled-session");
+    std::fs::create_dir_all(&stalled_dir).expect("mkdir stalled session");
+    // 16 zero bytes: exactly HEADER_LEN (never `Truncated`), but the magic
+    // does not match — genuine corruption, not a normal in-progress write.
+    std::fs::write(stalled_dir.join("000001.seg"), [0u8; 16]).expect("write corrupt header");
+
+    let mut child = spawn_serve(&home, &[]);
+    wait_until_ready(&layout, Duration::from_secs(20));
+
+    send_sigterm(child.id());
+    let status = wait_for_exit(&mut child, Duration::from_secs(20));
+    assert!(status.success(), "must exit cleanly: {status:?}");
+
+    let mut stderr_buf = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr was piped")
+        .read_to_end(&mut stderr_buf)
+        .expect("read stderr");
+    let stderr = String::from_utf8_lossy(&stderr_buf);
+    assert!(
+        stderr.contains("stalled-session") && stderr.contains("stalled on import"),
+        "stderr must report the stall, not silently drop it: {stderr}"
+    );
 }
 
 /// Send a real `SIGTERM` (not `SIGKILL` — `std::process::Child::kill` is

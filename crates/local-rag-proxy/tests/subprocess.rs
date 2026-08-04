@@ -20,6 +20,36 @@ use local_rag_protocol::{
 };
 use local_rag_test_support::TempHome;
 
+/// Locate the real `local-rag` binary next to this integration test binary.
+///
+/// `env!("CARGO_BIN_EXE_local-rag")` is **not** set for another package's
+/// binary just because it is a dev-dependency (verified empirically — same
+/// finding `local-rag-hook/tests/recall_rpc.rs::local_rag_binary_path`'s own
+/// doc comment already recorded for the identical `local-rag = {path}`
+/// dev-dependency pattern). Instead, mirror
+/// `local-rag-proxy::connect::resolve_daemon_binary_path`'s own trick — a
+/// cargo test binary lives at `target/<profile>/deps/<name>-<hash>`, and a
+/// regular binary target lives one directory up, at
+/// `target/<profile>/<name>` — the same "ships side by side" layout spec 13
+/// §1 describes for the real npm-packaged distribution.
+///
+/// Only used by the `failpoints`-gated cross-binary-version upgrade test
+/// below — `#[cfg]`-gated the same way so a plain `cargo test -p
+/// local-rag-proxy` (no `--features failpoints`) does not trip `dead_code`.
+#[cfg(feature = "failpoints")]
+fn local_rag_binary_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let deps_dir = exe.parent().expect("deps dir");
+    let profile_dir = deps_dir.parent().expect("profile dir");
+    let candidate = profile_dir.join("local-rag");
+    assert!(
+        candidate.is_file(),
+        "expected a sibling local-rag binary at {candidate:?} (built via this package's own \
+         local-rag dev-dependency)"
+    );
+    candidate
+}
+
 fn open_layout(home: &TempHome) -> StoreLayout {
     let layout = StoreLayout::new(home.join("local-rag"));
     layout.ensure().expect("ensure store tree");
@@ -507,6 +537,233 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
     drop(stdin2);
     let status = wait_for_exit(&mut proxy2, Duration::from_secs(20));
     assert!(status.success(), "{status:?}");
+
+    cleanup_daemon(&layout, Duration::from_secs(20));
+}
+
+// ---------------------------------------------------------------------
+// T17-04: proxy-side spool `format_version` compatibility warning
+// (spec 11 §4 `[FIXED concern]`).
+// ---------------------------------------------------------------------
+
+/// A minimal, blocking fake daemon: binds `socket_path`, answers one
+/// connection with a `Welcome` whose `daemon_version` **matches** this
+/// workspace's real build (so `establish_session` never enters the upgrade
+/// loop) but whose `spool_max_format_version` is `spool_max_format_version`
+/// — then answers exactly one relayed MCP request with a trivial, valid
+/// `Response`, so a test can prove the real relay loop still runs a clean
+/// JSON-RPC round trip on stdout alongside whatever this proxy prints to
+/// stderr about the mismatch.
+fn spawn_fake_daemon_with_spool_version(
+    socket_path: std::path::PathBuf,
+    spool_max_format_version: u16,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+        let (stream, _) = listener.accept().expect("accept fake daemon connection");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+        let mut writer = stream;
+
+        let mut hello_line = String::new();
+        reader.read_line(&mut hello_line).expect("read HELLO");
+
+        let welcome = Message::Welcome(Welcome {
+            proto: local_rag_protocol::PROTO_VERSION,
+            daemon_version: local_rag_core::VERSION.to_string(),
+            store_instance_uuid: "fake-instance".to_string(),
+            capabilities: Vec::new(),
+            mcp_passthrough_version: MCP_PASSTHROUGH_VERSION,
+            spool_max_format_version,
+            mode: "normal".to_string(),
+        });
+        let bytes = encode_message(&welcome).expect("encode WELCOME");
+        writer.write_all(&bytes).expect("write WELCOME");
+
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read relayed request");
+        let response = Message::Response(local_rag_protocol::ResponseEnvelope {
+            mcp: serde_json::value::RawValue::from_string(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.to_string(),
+            )
+            .expect("valid raw json"),
+        });
+        let bytes = encode_message(&response).expect("encode Response");
+        writer.write_all(&bytes).expect("write Response");
+    })
+}
+
+/// A daemon advertising a `spool_max_format_version` older than this
+/// release's own compiled `local_rag_core::spool::FORMAT_VERSION` produces a
+/// stderr warning naming both versions, while stdout carries only the real
+/// JSON-RPC response — never corrupted by the warning (spec 11 §4 `[FIXED
+/// concern]`, the proxy-side half T15-02's own as-built note named as
+/// remaining later work).
+#[test]
+fn a_daemon_advertising_an_older_spool_format_produces_a_stderr_warning_and_never_touches_stdout() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    // `0` is always older than any real `FORMAT_VERSION` (currently `1`),
+    // without hardcoding today's exact value in the test.
+    let fake = spawn_fake_daemon_with_spool_version(layout.socket_path(), 0);
+
+    let mut proxy = spawn_proxy(
+        &home,
+        &[("LOCAL_RAG_SESSION_ID", "test-session-spool-warning")],
+    );
+    let mut stdin = proxy.stdin.take().expect("proxy stdin");
+    let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
+
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    // stdout carries exactly the fake daemon's response and nothing else —
+    // proving the warning never touched the JSON-RPC stream.
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(response["result"]["ok"], serde_json::json!(true));
+    let _ = stdout;
+
+    drop(stdin);
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(20));
+    assert!(
+        status.success(),
+        "proxy must exit 0 once stdin closes: {status:?}"
+    );
+
+    let mut stderr_buf = Vec::new();
+    proxy
+        .stderr
+        .take()
+        .expect("proxy stderr")
+        .read_to_end(&mut stderr_buf)
+        .expect("read stderr");
+    let stderr = String::from_utf8_lossy(&stderr_buf);
+    assert!(stderr.contains("spool format versions"), "{stderr}");
+    assert!(
+        stderr.contains(&local_rag_core::spool::FORMAT_VERSION.to_string()),
+        "{stderr}"
+    );
+    assert!(stderr.contains('0'), "{stderr}");
+
+    fake.join().expect("fake daemon thread panicked");
+}
+
+// ---------------------------------------------------------------------
+// T17-04: a genuine cross-binary-version upgrade, with a real migration
+// running on the new side (spec 13 §4's upgrade flow, end to end).
+// ---------------------------------------------------------------------
+
+/// A real, three-process upgrade: an "old daemon" is a genuinely compiled
+/// `local-rag serve`, configured via T17-04's `failpoints`-gated env-var
+/// overrides (`main.rs::test_daemon_version_override`,
+/// `local_rag_store::state::migration_set_for_this_open`'s equivalent) to
+/// answer a fake, mismatched `daemon_version` and to migrate the store only
+/// through a **restricted** schema version — standing in for "an older
+/// release" without a second historical binary or machine (none is
+/// available here: no network, no second checkout). A **clean-environment**
+/// real proxy then drives the real `establish_session` upgrade loop against
+/// it: `SHUTDOWN_REQUEST` → the old daemon drains and exits → a **second**,
+/// unrestricted real `local-rag serve` process is spawned (inheriting the
+/// proxy's own clean environment, not the old daemon's) → a real MCP
+/// handshake completes against it. The real-migration proof is a subsequent
+/// `local-rag doctor --json` (also clean environment) against the same
+/// on-disk store: `store_version` must have advanced past the old daemon's
+/// restricted cap with nothing left pending — proof the *second* process
+/// genuinely migrated what the *first* process left behind, not merely that
+/// the protocol-level handshake retried.
+///
+/// Gated on `failpoints`: run via
+/// `cargo test -p local-rag-proxy --features failpoints`.
+#[test]
+#[cfg(feature = "failpoints")]
+fn a_real_older_daemon_binary_drains_and_a_real_new_daemon_migrates_the_store_to_head() {
+    const OLD_DAEMON_MAX_SCHEMA_VERSION: &str = "8";
+
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    let mut old_daemon_cmd = home.command(local_rag_binary_path());
+    old_daemon_cmd.arg("serve");
+    old_daemon_cmd.env("LOCAL_RAG_TEST_FAKE_DAEMON_VERSION", "0.0.0-legacy");
+    old_daemon_cmd.env(
+        "LOCAL_RAG_TEST_MAX_SCHEMA_VERSION",
+        OLD_DAEMON_MAX_SCHEMA_VERSION,
+    );
+    old_daemon_cmd.stdin(Stdio::null());
+    old_daemon_cmd.stdout(Stdio::piped());
+    old_daemon_cmd.stderr(Stdio::piped());
+    let mut old_daemon = old_daemon_cmd.spawn().expect("spawn old daemon");
+    wait_until_daemon_ready(&layout, Duration::from_secs(20));
+
+    // The real proxy, with a CLEAN environment (no override vars): its own
+    // compiled `local_rag_core::VERSION` differs from "0.0.0-legacy",
+    // triggering the real upgrade flow.
+    let mut proxy = spawn_proxy(
+        &home,
+        &[("LOCAL_RAG_SESSION_ID", "test-session-cross-binary-upgrade")],
+    );
+    let mut stdin = proxy.stdin.take().expect("proxy stdin");
+    let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
+
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    // Generous budget: pays for the old daemon's drain *and* a real new
+    // daemon spawn+migration.
+    let (stdout, line) = read_line(stdout, Duration::from_secs(30));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(
+        response["result"]["serverInfo"]["name"], "local-rag",
+        "the proxy must complete the handshake against the newly spawned daemon: {response}"
+    );
+    let _ = stdout;
+
+    let old_status = wait_for_exit(&mut old_daemon, Duration::from_secs(20));
+    assert!(
+        old_status.success(),
+        "the old daemon must drain and exit cleanly on SHUTDOWN_REQUEST: {old_status:?}"
+    );
+
+    wait_until_daemon_ready(&layout, Duration::from_secs(5));
+    drop(stdin);
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(20));
+    assert!(status.success(), "proxy must exit 0: {status:?}");
+
+    // Real-migration proof: a clean-environment `local-rag doctor --json`
+    // against the same on-disk store.
+    let mut doctor_cmd = home.command(local_rag_binary_path());
+    doctor_cmd.args(["doctor", "--json"]);
+    doctor_cmd.stdin(Stdio::null());
+    doctor_cmd.stdout(Stdio::piped());
+    doctor_cmd.stderr(Stdio::piped());
+    let doctor_output = doctor_cmd.output().expect("run local-rag doctor");
+    let report: serde_json::Value =
+        serde_json::from_slice(&doctor_output.stdout).expect("valid doctor json");
+    assert_eq!(
+        report["versions"]["state"], "applied",
+        "the store must be fully migrated, not left pending: {report}"
+    );
+    assert_eq!(
+        report["versions"]["pending"],
+        serde_json::json!([]),
+        "{report}"
+    );
+    let store_version = report["versions"]["store_version"]
+        .as_u64()
+        .expect("store_version is a number");
+    let old_cap: u64 = OLD_DAEMON_MAX_SCHEMA_VERSION.parse().unwrap();
+    assert!(
+        store_version > old_cap,
+        "the new daemon must have genuinely migrated past the old daemon's own \
+         restricted cap ({old_cap}), not merely re-served the same version: {report}"
+    );
 
     cleanup_daemon(&layout, Duration::from_secs(20));
 }

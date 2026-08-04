@@ -21,12 +21,14 @@
 //! `migrate:after_backup` seam), and the parent resumes it.
 
 use std::path::Path;
-use std::time::Duration;
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::migrate::{Migration, MigrationError, MigrationStep, run};
 use local_rag_store::rusqlite::{self, Connection, Transaction};
-use local_rag_test_support::{Action, TempHome};
+use local_rag_test_support::Action;
+
+mod support;
+use support::{raw_conn, temp_store};
 
 // ---- synthetic migrations ---------------------------------------------------
 
@@ -140,26 +142,6 @@ const DESTRUCTIVE_SQL_V2: Migration =
 const DESTRUCTIVE_SQL_SET: &[Migration] = &[SEED_V1, DESTRUCTIVE_SQL_V2];
 
 // ---- helpers ----------------------------------------------------------------
-
-/// A temp store with an ensured tree; returns the home (kept alive for cleanup)
-/// and its [`StoreLayout`].
-fn temp_store() -> (TempHome, StoreLayout) {
-    let home = TempHome::new().expect("temp home");
-    let layout = StoreLayout::new(home.join("local-rag"));
-    layout.ensure().expect("ensure store tree");
-    (home, layout)
-}
-
-/// A raw read-write connection with the durability pragmas that matter for the
-/// crash model (WAL + `synchronous=FULL`).
-fn raw_conn(path: &Path) -> Connection {
-    let conn = Connection::open(path).expect("open state db");
-    conn.busy_timeout(Duration::from_secs(5))
-        .expect("busy_timeout");
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-        .expect("pragmas");
-    conn
-}
 
 /// Create the append-only scaffolding table the marker steps write to.
 fn seed_markers(conn: &Connection) {

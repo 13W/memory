@@ -44,7 +44,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Transaction;
+use rusqlite::{Connection, Transaction};
 
 use local_rag_core::hash::sha256_hex;
 use local_rag_core::identity::UuidSource;
@@ -280,45 +280,36 @@ fn segment_path(session_dir: &Path, seq: u32) -> PathBuf {
     session_dir.join(format!("{seq:06}.seg"))
 }
 
-/// Read, decode, and import as much of `session_id`'s un-imported spool tail
-/// as is currently available, in one transaction, then (best-effort, outside
-/// the transaction) delete fully-consumed prior segment files.
+/// Decode as much of `session_id`'s un-imported spool tail as is currently
+/// available, starting from `(start_segment_seq, start_offset)`, without
+/// touching the database or the filesystem beyond reading segment files.
 ///
-/// Reads the current cursor (absent ⇒ start at segment 1, offset 0), then
-/// walks forward: decodes frames from the current segment starting at the
-/// cursor's offset; on a clean end of that segment's data, continues into the
+/// Walks forward: decodes frames from the current segment starting at the
+/// given offset; on a clean end of that segment's data, continues into the
 /// next segment file if it already exists on disk, otherwise stops (nothing
 /// more to read yet); stops at a torn tail or a truncated header (both
 /// normal — the writer has not finished this frame/segment yet) or at genuine
 /// corruption (bad magic, an unsupported format version, a bad CRC/length/
-/// UTF-8/shape — reported via `stalled_on`, cursor left just before it, never
-/// silently skipped past). Every observation decoded across however many
-/// segments this pass covers is imported in one [`import_batch`] call, and
-/// `observation_id`s are minted before that call (keeping entropy out of the
-/// write path).
-pub async fn import_session_tail(
-    db: &StateDb,
-    layout: &StoreLayout,
-    session_id: &str,
-    request_root: &RequestRoot,
-    uuids: &(dyn UuidSource + Send + Sync),
-    now_ms: i64,
-    payload_ttl_hours: u64,
-) -> Result<ImportOutcome, ImportError> {
-    let (start_segment_seq, start_offset) = {
-        let read = db.open_read().map_err(ImportError::Open)?;
-        read_cursor(&read, session_id).map_err(ImportError::Sqlite)?
-    }
-    .unwrap_or((1, 0));
-
-    let session_dir = layout.spool_session(session_id);
+/// UTF-8/shape — returned as `stalled_on`, never silently skipped past).
+///
+/// Shared by [`import_session_tail`] (which additionally writes what this
+/// decodes and advances the cursor) and [`diagnose_spool_tail`] (read-only,
+/// discards the decoded observations) so the two can never disagree about
+/// what counts as a stall (spec 11 §4 `[FIXED concern]`: "a newer hook binary
+/// writing a newer format... is a reportable incompatibility, not silent
+/// loss").
+fn decode_pending_tail(
+    session_dir: &Path,
+    start_segment_seq: u32,
+    start_offset: u64,
+) -> std::io::Result<(Vec<DecodedObservation>, u32, u64, Option<String>)> {
     let mut segment_seq = start_segment_seq;
     let mut offset = start_offset;
     let mut observations: Vec<DecodedObservation> = Vec::new();
     let mut stalled_on: Option<String> = None;
 
     loop {
-        let seg_path = segment_path(&session_dir, segment_seq);
+        let seg_path = segment_path(session_dir, segment_seq);
         if !seg_path.exists() {
             break; // Nothing more to read yet.
         }
@@ -342,7 +333,7 @@ pub async fn import_session_tail(
 
         match decoded.stop_reason {
             StopReason::EndOfInput => {
-                if segment_path(&session_dir, segment_seq + 1).exists() {
+                if segment_path(session_dir, segment_seq + 1).exists() {
                     segment_seq += 1;
                     offset = 0;
                     continue;
@@ -356,6 +347,38 @@ pub async fn import_session_tail(
             }
         }
     }
+
+    Ok((observations, segment_seq, offset, stalled_on))
+}
+
+/// Read, decode, and import as much of `session_id`'s un-imported spool tail
+/// as is currently available, in one transaction, then (best-effort, outside
+/// the transaction) delete fully-consumed prior segment files.
+///
+/// Reads the current cursor (absent ⇒ start at segment 1, offset 0), then
+/// decodes as much of the tail as is available (see
+/// [`decode_pending_tail`]). Every observation decoded across however many
+/// segments this pass covers is imported in one [`import_batch`] call, and
+/// `observation_id`s are minted before that call (keeping entropy out of the
+/// write path).
+pub async fn import_session_tail(
+    db: &StateDb,
+    layout: &StoreLayout,
+    session_id: &str,
+    request_root: &RequestRoot,
+    uuids: &(dyn UuidSource + Send + Sync),
+    now_ms: i64,
+    payload_ttl_hours: u64,
+) -> Result<ImportOutcome, ImportError> {
+    let (start_segment_seq, start_offset) = {
+        let read = db.open_read().map_err(ImportError::Open)?;
+        read_cursor(&read, session_id).map_err(ImportError::Sqlite)?
+    }
+    .unwrap_or((1, 0));
+
+    let session_dir = layout.spool_session(session_id);
+    let (observations, segment_seq, offset, stalled_on) =
+        decode_pending_tail(&session_dir, start_segment_seq, start_offset)?;
 
     let report =
         if observations.is_empty() && segment_seq == start_segment_seq && offset == start_offset {
@@ -421,6 +444,32 @@ pub async fn import_session_tail(
         final_committed_offset: offset,
         stalled_on,
     })
+}
+
+/// Read-only re-derivation of [`import_session_tail`]'s `stalled_on` signal
+/// for `session_id`: does not import anything and does not advance the
+/// cursor, so it may be called at any time (e.g. from a `doctor` diagnostic)
+/// without racing or interfering with a real import pass.
+///
+/// T17-04: this is the diagnostic half of spec 11 §4's `[FIXED concern]` — "a
+/// newer hook binary writing a newer format than the running daemon supports
+/// is a reportable incompatibility, not silent loss" — closing D-030, where
+/// the real importer's `stalled_on` result was computed but then discarded
+/// unread by its only caller. Shares [`decode_pending_tail`] with the real
+/// importer so this can never report a different answer than a real import
+/// pass would.
+pub fn diagnose_spool_tail(
+    read: &Connection,
+    layout: &StoreLayout,
+    session_id: &str,
+) -> Result<Option<String>, ImportError> {
+    let (start_segment_seq, start_offset) = read_cursor(read, session_id)
+        .map_err(ImportError::Sqlite)?
+        .unwrap_or((1, 0));
+    let session_dir = layout.spool_session(session_id);
+    let (_observations, _segment_seq, _offset, stalled_on) =
+        decode_pending_tail(&session_dir, start_segment_seq, start_offset)?;
+    Ok(stalled_on)
 }
 
 /// Every session with a spool directory under `layout`'s `spool/` root (T13-05:

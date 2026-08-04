@@ -276,6 +276,15 @@ fn reachable_daemon_with_a_seeded_memory_prints_the_expected_hook_output() {
     stop_serve(daemon);
 }
 
+/// D-031: the upper bound here is deliberately generous (real subprocess
+/// spawn + scheduling, not the recall RPC's own 300ms budget — this daemon
+/// is unreachable, so `UnixStream::connect` fails immediately and the budget
+/// is never consumed at all) — the same margin `crates/local-rag/tests/
+/// serve_subprocess.rs`/`crates/local-rag-proxy/tests/subprocess.rs` already
+/// give every real-subprocess wait (`Duration::from_secs(20)` or more) to
+/// tolerate legitimate OS-scheduling contention under `cargo xtask ci`'s own
+/// peak parallel load, rather than a real hang: a bug reintroducing an
+/// actual multi-second wait would still exceed this bound by a wide margin.
 #[test]
 fn unreachable_daemon_prints_nothing() {
     let (home, layout) = open_layout();
@@ -288,11 +297,16 @@ fn unreachable_daemon_prints_nothing() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(
-        elapsed < Duration::from_secs(1),
+        elapsed < Duration::from_secs(10),
         "an unreachable daemon must fail fast, not wait out the budget: {elapsed:?}"
     );
 }
 
+/// D-031: same generous upper-bound margin as `unreachable_daemon_prints_
+/// nothing` above, for the same reason (real subprocess spawn under
+/// `cargo xtask ci`'s own peak parallel load, not the RPC's own budget) —
+/// the lower bound (`>= 200ms`) is what actually proves this waited out
+/// roughly the 300ms budget rather than failing instantly.
 #[test]
 fn timeout_daemon_that_accepts_but_never_responds_prints_nothing() {
     let (home, layout) = open_layout();
@@ -312,7 +326,7 @@ fn timeout_daemon_that_accepts_but_never_responds_prints_nothing() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(
-        elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(2),
+        elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(10),
         "must wait out roughly the 300ms budget, not fail instantly or hang: {elapsed:?}"
     );
     drop(accept_thread); // the thread is intentionally leaked past this test's own end

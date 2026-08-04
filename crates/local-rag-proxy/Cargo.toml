@@ -47,16 +47,34 @@ libc = "0.2"
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
 # Dev-only, not a runtime dependency of the shipped proxy binary (see this
-# crate's own `main.rs` doc on holding no project state): needed only so
+# crate's own `main.rs` doc on holding no project state): needed so
 # `tests/subprocess.rs`'s real end-to-end scenarios can spawn a genuine
-# `local-rag serve` via `env!("CARGO_BIN_EXE_local-rag")` — Cargo only
-# builds another package's binary targets and exposes that env var for a
-# test when the package is a (dev-)dependency of the crate under test.
+# `local-rag serve` binary, built as part of this workspace test build.
+# `env!("CARGO_BIN_EXE_local-rag")` does NOT resolve it, despite that being
+# the pattern for the *current* package's own binaries elsewhere in this
+# workspace — Cargo does not set `CARGO_BIN_EXE_<name>` for another
+# package's binary just because it is a (dev-)dependency (verified
+# empirically, T17-04; corrected here — `local-rag-hook/tests/recall_rpc.rs`
+# already documents the identical finding). `tests/subprocess.rs`'s own
+# `local_rag_binary_path()` instead locates the binary next to the test
+# binary itself (`target/<profile>/<name>`, one directory up from
+# `target/<profile>/deps/`), the same "ships side by side" layout spec 13 §1
+# describes and `connect::resolve_daemon_binary_path` relies on at runtime.
 local-rag = { path = "../local-rag" }
 # `test-util`: paused virtual time (`start_paused`/`advance`) for the
 # connect-backoff and 30s-upgrade-timeout tests — the only deterministic,
 # non-wall-clock way to exercise real `tokio::time::sleep`/`timeout`.
 tokio = { version = "1", default-features = false, features = ["test-util"] }
+
+[features]
+# T17-04: no test-only code of this crate's own is gated by this — it exists
+# purely to forward into the dev-dependency `local-rag`'s identical
+# `failpoints` feature (which gates its `daemon_version`/migration-set
+# env-var overrides), so `tests/subprocess.rs`'s cross-binary-version upgrade
+# test can spawn a real `local-rag serve` process configured to behave like
+# "an old daemon". Off by default, so a plain `cargo test -p local-rag-proxy`
+# is unaffected.
+failpoints = ["local-rag/failpoints"]
 
 [lints]
 workspace = true

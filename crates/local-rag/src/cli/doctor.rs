@@ -67,6 +67,25 @@ pub struct DoctorReport {
     pub cache_binding: Result<CacheDiagnosis, String>,
     pub orphans: OrphansFinding,
     pub heads: HeadsFinding,
+    pub spool: SpoolFinding,
+}
+
+/// D-030: every known spool session's stalled-import diagnostic (spec 11 §4
+/// `[FIXED concern]`: "a newer hook binary writing a newer format than the
+/// running daemon supports is a reportable incompatibility, not silent
+/// loss") — read-only, independent of the real import path
+/// (`local_rag_store::diagnose_spool_tail`).
+pub enum SpoolFinding {
+    Skipped { reason: String },
+    Checked(Vec<SpoolSessionFinding>),
+}
+
+pub struct SpoolSessionFinding {
+    pub session_id: String,
+    /// `Ok(None)` = healthy; `Ok(Some(reason))` = genuinely stalled on
+    /// import (never silently retried); `Err(_)` = the diagnostic itself
+    /// could not run.
+    pub stalled_on: Result<Option<String>, String>,
 }
 
 pub enum OrphansFinding {
@@ -148,7 +167,11 @@ impl DoctorReport {
                 )
             })
         );
-        lock_ok && permissions_ok && versions_ok && cache_ok && orphans_ok && heads_ok
+        let spool_ok = matches!(
+            &self.spool,
+            SpoolFinding::Checked(list) if list.iter().all(|s| matches!(s.stalled_on, Ok(None)))
+        );
+        lock_ok && permissions_ok && versions_ok && cache_ok && orphans_ok && heads_ok && spool_ok
     }
 }
 
@@ -223,7 +246,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
             orphans: OrphansFinding::Skipped {
                 reason: reason.clone(),
             },
-            heads: HeadsFinding::Skipped { reason },
+            heads: HeadsFinding::Skipped {
+                reason: reason.clone(),
+            },
+            spool: SpoolFinding::Skipped { reason },
         };
     }
 
@@ -239,7 +265,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 orphans: OrphansFinding::Skipped {
                     reason: reason.clone(),
                 },
-                heads: HeadsFinding::Skipped { reason },
+                heads: HeadsFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                spool: SpoolFinding::Skipped { reason },
             };
         }
     };
@@ -255,7 +284,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 orphans: OrphansFinding::Skipped {
                     reason: reason.clone(),
                 },
-                heads: HeadsFinding::Skipped { reason },
+                heads: HeadsFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                spool: SpoolFinding::Skipped { reason },
             };
         }
     };
@@ -268,6 +300,7 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
 
     let orphans = build_orphans(&state, layout);
     let heads = build_heads(&read, layout, &cache_binding, worktree_filter);
+    let spool = build_spool(&read, layout);
 
     DoctorReport {
         lock,
@@ -276,7 +309,36 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
         cache_binding,
         orphans,
         heads,
+        spool,
     }
+}
+
+/// Every known spool session's stalled-import diagnostic, read-only
+/// (D-030). Built alongside orphans/heads, under the same "only once the
+/// store is fully migrated" discipline this module's doc comment already
+/// gives them — `spool_import_cursor` (T13-04, migration 7) is guaranteed
+/// present by that point.
+fn build_spool(read: &rusqlite::Connection, layout: &StoreLayout) -> SpoolFinding {
+    let sessions = match local_rag_store::known_spool_sessions(layout) {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            return SpoolFinding::Skipped {
+                reason: format!("could not list spool sessions: {e}"),
+            };
+        }
+    };
+    let findings = sessions
+        .into_iter()
+        .map(|session_id| {
+            let stalled_on = local_rag_store::diagnose_spool_tail(read, layout, &session_id)
+                .map_err(|e| e.to_string());
+            SpoolSessionFinding {
+                session_id,
+                stalled_on,
+            }
+        })
+        .collect();
+    SpoolFinding::Checked(findings)
 }
 
 fn describe_versions_blocker(versions: &Result<VersionDiagnosis, String>) -> String {
@@ -511,6 +573,24 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         ),
     };
 
+    let spool = match &report.spool {
+        SpoolFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
+        SpoolFinding::Checked(list) => serde_json::Value::Array(
+            list.iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "session_id": s.session_id,
+                        "stalled_on": match &s.stalled_on {
+                            Ok(None) => serde_json::Value::Null,
+                            Ok(Some(reason)) => serde_json::Value::String(reason.clone()),
+                            Err(e) => serde_json::json!({"error": e}),
+                        },
+                    })
+                })
+                .collect(),
+        ),
+    };
+
     serde_json::json!({
         "clean": report.is_clean(),
         "lock": lock,
@@ -519,6 +599,7 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         "cache_binding": cache_binding,
         "orphans": orphans,
         "heads": heads,
+        "spool": spool,
     })
 }
 
@@ -625,6 +706,24 @@ fn print_human(report: &DoctorReport) {
                         ""
                     }
                 );
+            }
+        }
+    }
+
+    match &report.spool {
+        SpoolFinding::Skipped { reason } => println!("spool: skipped ({reason})"),
+        SpoolFinding::Checked(list) if list.is_empty() => {
+            println!("spool: no sessions")
+        }
+        SpoolFinding::Checked(list) => {
+            for s in list {
+                match &s.stalled_on {
+                    Ok(None) => println!("spool: {} ok", s.session_id),
+                    Ok(Some(reason)) => {
+                        println!("spool: {} STALLED: {reason}", s.session_id)
+                    }
+                    Err(e) => println!("spool: {} error: {e}", s.session_id),
+                }
             }
         }
     }

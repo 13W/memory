@@ -24,6 +24,35 @@ use rusqlite::Connection;
 /// growth. Queue depth is a metric (spec 02 §5); tune later against real load.
 pub const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 64;
 
+/// T17-04: a test-only override truncating the migration set `open_with_capacity`
+/// applies — never compiled into a release/distribution build (`failpoints`
+/// is off by default; see this crate's `Cargo.toml`).
+///
+/// `crate::migrate::ALL` is a compile-time constant, so there is no way to
+/// make one compiled binary behave like an older release's smaller migration
+/// set at runtime otherwise. Paired with `local-rag`'s own
+/// `test_daemon_version_override` (`main.rs`, gated by the same feature, read
+/// via the same env-var-hand-off convention — this must survive a real
+/// `Command::spawn` process boundary, so an env var, not the in-process
+/// `Failpoints` registry), a real compiled `local-rag serve` process can stand
+/// in for "an old daemon on an old schema" in
+/// `local-rag-proxy/tests/subprocess.rs`'s cross-binary-version upgrade test.
+#[cfg(feature = "failpoints")]
+fn migration_set_for_this_open() -> &'static [crate::migrate::Migration] {
+    if let Ok(raw) = std::env::var("LOCAL_RAG_TEST_MAX_SCHEMA_VERSION")
+        && let Ok(n) = raw.parse::<usize>()
+        && n <= crate::migrate::ALL.len()
+    {
+        return &crate::migrate::ALL[..n];
+    }
+    crate::migrate::ALL
+}
+
+#[cfg(not(feature = "failpoints"))]
+fn migration_set_for_this_open() -> &'static [crate::migrate::Migration] {
+    crate::migrate::ALL
+}
+
 /// A handle to the canonical `state.sqlite` store.
 ///
 /// Owns the [`StateWriter`] (the single write path) and hands out read-only
@@ -63,7 +92,7 @@ impl StateDb {
         let lock_path = path.with_file_name("migration.lock");
         crate::migrate::run(
             &mut conn,
-            crate::migrate::ALL,
+            migration_set_for_this_open(),
             &lock_path,
             crate::clock::system_now_ms(),
         )

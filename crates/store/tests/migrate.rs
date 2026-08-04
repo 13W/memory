@@ -7,9 +7,7 @@
 //! literal for byte-stable `applied_at`, and — for concurrency — a
 //! [`std::sync::Barrier`] gate instead of any wall-clock sleep.
 
-use std::path::Path;
 use std::sync::{Arc, Barrier};
-use std::time::Duration;
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::migrate::{Migration, MigrationError, run};
@@ -18,6 +16,9 @@ use local_rag_store::{
     StateDb, VersionDiagnosis, create_repository, rusqlite, worktree_state_clocks,
 };
 use local_rag_test_support::TempHome;
+
+mod support;
+use support::{raw_conn, temp_store};
 
 // Synthetic migrations. Each creates a distinct table so "applied" is
 // observable. `M1B` collides with `M1`'s version but carries different SQL (a
@@ -33,26 +34,6 @@ const M1B: Migration = Migration::sql(1, "one", "CREATE TABLE t1_altered (x INTE
 const SET_12: &[Migration] = &[M1, M2];
 const SET_123: &[Migration] = &[M1, M2, M3];
 const SET_1234: &[Migration] = &[M1, M2, M3, M4];
-
-/// A temp store with an ensured tree; returns the home (kept alive for cleanup)
-/// and its [`StoreLayout`].
-fn temp_store() -> (TempHome, StoreLayout) {
-    let home = TempHome::new().expect("temp home");
-    let layout = StoreLayout::new(home.join("local-rag"));
-    layout.ensure().expect("ensure store tree");
-    (home, layout)
-}
-
-/// A raw read-write connection to `path` (WAL + busy timeout), standing in for
-/// the connection `StateDb::open` would hand the runner.
-fn raw_conn(path: &Path) -> Connection {
-    let conn = Connection::open(path).expect("open state db");
-    conn.busy_timeout(Duration::from_secs(5))
-        .expect("busy_timeout");
-    conn.execute_batch("PRAGMA journal_mode=WAL;")
-        .expect("enable WAL");
-    conn
-}
 
 /// All `schema_migrations` rows as `(version, name, checksum, applied_at)`.
 fn migration_rows(conn: &Connection) -> Vec<(u32, String, String, i64)> {

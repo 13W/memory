@@ -18,8 +18,8 @@ use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
     DecodedObservation, DedupClass, ImportError, RequestRoot, StateDb, WorktreeKind,
-    WorktreeRootFacts, create_repository, create_worktree, import_batch, import_session_tail,
-    observe_worktree_path,
+    WorktreeRootFacts, create_repository, create_worktree, diagnose_spool_tail, import_batch,
+    import_session_tail, observe_worktree_path,
 };
 use local_rag_test_support::TempHome;
 
@@ -839,4 +839,61 @@ async fn import_batch_flags_neither_for_an_ordinary_batch() {
 
     assert!(!report.saw_stop);
     assert!(!report.saw_session_end);
+}
+
+/// D-030: [`diagnose_spool_tail`] must report exactly the same `stalled_on`
+/// signal a real [`import_session_tail`] pass would, without ever creating a
+/// `spool_import_cursor` row of its own — the whole point of the read-only
+/// diagnostic is that it can be called freely (e.g. from `local-rag doctor`)
+/// without racing or interfering with a real import pass.
+#[tokio::test]
+async fn diagnose_spool_tail_matches_import_session_tail_without_advancing_the_cursor() {
+    let (_home, layout, db) = open_state();
+    let session_dir = layout.spool_session("corrupt-session");
+    fs::create_dir_all(&session_dir).expect("session dir");
+    // 16 zero bytes: exactly HEADER_LEN (never `Truncated`), but the magic
+    // does not match — genuine corruption, not a normal in-progress write.
+    fs::write(session_dir.join("000001.seg"), [0u8; 16]).expect("write corrupt header");
+
+    let uuids = SeqUuidV7::new();
+    let request_root = RequestRoot::default();
+    let outcome = import_session_tail(
+        &db,
+        &layout,
+        "corrupt-session",
+        &request_root,
+        &uuids,
+        1_000,
+        72,
+    )
+    .await
+    .expect("a stall is reported, not a hard error");
+    let real_stalled_on = outcome
+        .stalled_on
+        .expect("a bad-magic header stalls the real importer");
+    assert!(real_stalled_on.contains("magic"), "{real_stalled_on}");
+
+    let read = db.open_read().expect("read conn");
+    let diagnosed = diagnose_spool_tail(&read, &layout, "corrupt-session")
+        .expect("diagnosis runs cleanly")
+        .expect("diagnosis agrees the session is stalled");
+    assert_eq!(
+        diagnosed, real_stalled_on,
+        "diagnose_spool_tail must report exactly what the real importer found"
+    );
+
+    // Read-only: repeated diagnosis never creates a cursor row for a session
+    // whose only pass so far stalled before decoding anything.
+    diagnose_spool_tail(&read, &layout, "corrupt-session").expect("diagnose again");
+    let cursor_rows: i64 = read
+        .query_row(
+            "SELECT count(*) FROM spool_import_cursor WHERE session_id = 'corrupt-session'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query spool_import_cursor");
+    assert_eq!(
+        cursor_rows, 0,
+        "a session that stalled before decoding anything must have no cursor row"
+    );
 }

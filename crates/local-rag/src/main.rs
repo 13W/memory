@@ -24,6 +24,31 @@ use local_rag_store::{DEFAULT_WRITE_QUEUE_CAPACITY, LEASE_DURATION_MS, LEASE_REN
 
 const BIN: &str = "local-rag";
 
+/// T17-04: a test-only override for the `daemon_version` this process
+/// advertises in `WELCOME` — never compiled into a release/distribution
+/// build (`failpoints` is off by default; see this crate's `Cargo.toml`).
+///
+/// `local_rag_core::VERSION` is `env!("CARGO_PKG_VERSION")`, fixed at compile
+/// time — there is no way to make one compiled binary answer with a genuinely
+/// different version at runtime otherwise. This exists so a real compiled
+/// `local-rag serve` process can stand in for "an old daemon" in
+/// `local-rag-proxy/tests/subprocess.rs`'s cross-binary-version upgrade test,
+/// without a second historical binary or machine (none is available: no
+/// network, no second checkout). Mirrors the env-var hand-off
+/// `daemon::resume::test_resume_pause` already uses for the same class of
+/// problem (a child process configuring itself before doing anything else).
+#[cfg(feature = "failpoints")]
+fn test_daemon_version_override() -> Option<String> {
+    std::env::var("LOCAL_RAG_TEST_FAKE_DAEMON_VERSION")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(feature = "failpoints"))]
+fn test_daemon_version_override() -> Option<String> {
+    None
+}
+
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("version" | "--version" | "-V") => {
@@ -102,7 +127,8 @@ async fn serve() -> ExitCode {
 
     let opts = StartOptions {
         layout,
-        daemon_version: local_rag_core::VERSION.to_string(),
+        daemon_version: test_daemon_version_override()
+            .unwrap_or_else(|| local_rag_core::VERSION.to_string()),
         now_ms,
         uuids: Arc::new(SystemUuidV7),
         write_queue_capacity: DEFAULT_WRITE_QUEUE_CAPACITY,
