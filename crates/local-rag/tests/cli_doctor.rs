@@ -646,6 +646,70 @@ async fn both_legs_unavailable_is_flagged_when_dense_and_fts_are_both_broken() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Spool section (D-030)
+// ---------------------------------------------------------------------------
+
+/// A genuinely corrupt spool segment (spec 11 §4 `[FIXED concern]`: "a newer
+/// hook binary writing a newer format... is a reportable incompatibility, not
+/// silent loss") is surfaced by `doctor`, distinctly from a healthy session,
+/// and every other section still runs normally (the fix this test guards
+/// against is D-030: the daemon's own startup resume pass used to compute
+/// this exact signal and then discard it unread).
+#[tokio::test]
+async fn spool_stall_is_reported_alongside_a_healthy_session() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        // Bring cache binding / code_raw representation to a clean state so
+        // the spool section is the *only* thing that can make this unclean.
+        seed_bare_worktree(&state, &layout, 1).await;
+    }
+
+    let healthy_dir = layout.spool_session("healthy-session");
+    std::fs::create_dir_all(&healthy_dir).expect("mkdir healthy session");
+    std::fs::write(
+        healthy_dir.join("000001.seg"),
+        local_rag_core::spool::encode_segment_header(),
+    )
+    .expect("write a well-formed, empty segment");
+
+    let stalled_dir = layout.spool_session("stalled-session");
+    std::fs::create_dir_all(&stalled_dir).expect("mkdir stalled session");
+    // 16 zero bytes: exactly HEADER_LEN (never `Truncated`), but the magic
+    // does not match — genuine corruption, not a normal in-progress write.
+    std::fs::write(stalled_dir.join("000001.seg"), [0u8; 16]).expect("write corrupt header");
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("spool: healthy-session ok"), "{text}");
+    assert!(text.contains("spool: stalled-session STALLED"), "{text}");
+    assert!(text.contains("magic"), "{text}");
+    // Every other section genuinely ran and is clean — this is a spool-only
+    // fault, not a knock-on effect of some other section skipping.
+    assert!(text.contains("versions: up to date"), "{text}");
+    assert!(text.contains("cache: bound"), "{text}");
+    assert!(!text.contains("orphans: skipped"), "{text}");
+    assert!(!text.contains("heads: skipped"), "{text}");
+
+    let json_output = run_cli(&home, &["doctor", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&json_output.stdout).expect("valid json");
+    assert_eq!(value["clean"], serde_json::json!(false));
+    let spool = value["spool"].as_array().expect("spool is a json array");
+    assert_eq!(spool.len(), 2);
+    let stalled = spool
+        .iter()
+        .find(|s| s["session_id"] == "stalled-session")
+        .expect("stalled-session present");
+    assert!(stalled["stalled_on"].is_string(), "{stalled:?}");
+    let healthy = spool
+        .iter()
+        .find(|s| s["session_id"] == "healthy-session")
+        .expect("healthy-session present");
+    assert!(healthy["stalled_on"].is_null(), "{healthy:?}");
+}
+
 /// Real end-to-end runs through the compiled binary with the real default
 /// model — see `tests/cli_rebuild.rs`'s own `with_real_model` module doc for
 /// why this is env-gated: the real dense recovery path (`rebuild --dense`)

@@ -385,6 +385,35 @@ time, not by the proxy at connect time — a proxy-side comparison and a reporte
 for it remain later work, tracked wherever `local-rag-hook`'s own version relationship to a
 running daemon is next addressed.
 
+As-built note (D-030/T17-04, `[SPEC]`). The daemon-side half of "reportable... not silent loss"
+had a real gap: `local_rag_store::observation::import_session_tail`'s `stalled_on` result (set the
+moment `HeaderError::UnsupportedFormatVersion`/`BadMagic`/any other header decode failure is hit)
+was computed correctly at every startup resume pass, but its only caller
+(`crates/local-rag/src/daemon/lifecycle.rs::spawn_spool_resume`) awaited it and discarded the
+`Result` without reading it — a stalled session produced no log line, no `doctor` finding, nothing
+an operator could see. Fixed two ways, both without touching the decode logic itself: (a)
+`spawn_spool_resume` now reports every non-empty `stalled_on`/`Err` to stderr as it happens; (b) a
+new read-only `local_rag_store::diagnose_spool_tail(read, layout, session_id)` — sharing its
+decode-walk with `import_session_tail` via a private `decode_pending_tail` helper so the two can
+never disagree — re-derives the same signal on demand without importing anything or advancing the
+cursor, wired into `local-rag doctor`'s report as a new `spool` section (one line per known
+session: `ok` / `STALLED: <reason>` / `error: <reason>`), so an operator can check for this at any
+time, not only by reading a startup log after the fact.
+
+As-built note (T17-04, `[SPEC]`). The proxy-side comparison the T15-02 note above named as
+remaining later work is now in place: `local-rag-proxy::handshake::check_spool_format_compatibility`
+is a pure predicate comparing `Welcome.spool_max_format_version` (what the connected daemon can
+import) against `local_rag_core::spool::FORMAT_VERSION` as *this proxy's own compiled build*
+(read, not this daemon's binary) — the same crate constant the sibling `local-rag-hook` shipped in
+this release was compiled with, since both binaries in one release always share it. `None` unless
+the daemon is genuinely behind (`daemon_max < compiled`); a daemon at or ahead of this release's
+hook is always fine. Wired into `main.rs` immediately after the existing `mode != "normal"`
+degraded-mode check, with the identical stdout/stderr discipline that check already established
+(stdout carries only the raw MCP JSON-RPC stream; every diagnostic goes to stderr) — a real
+end-to-end test (`local-rag-proxy/tests/subprocess.rs::a_daemon_advertising_an_older_spool_format_
+produces_a_stderr_warning_and_never_touches_stdout`) proves a real relayed MCP round trip still
+lands cleanly on stdout while the warning appears only on stderr.
+
 ## 5. `additionalContext` format `[SPEC, deterministic per v1 contract]`
 
 Empty recall ⇒ **no output at all** `[FIXED]`. Otherwise:

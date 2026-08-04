@@ -123,6 +123,49 @@ async fn wait_for_close<R: AsyncBufRead + Unpin>(
         .map_err(|_| ProxyError::UpgradeTimedOut)
 }
 
+/// T17-04: this proxy's sibling `local-rag-hook` (same release, same compiled
+/// `local_rag_core::spool::FORMAT_VERSION`) could write a spool segment the
+/// connected daemon's advertised `Welcome.spool_max_format_version` cannot
+/// yet import (spec 11 §4 `[FIXED concern]`: "a newer hook binary writing a
+/// newer format than the running daemon supports is a reportable
+/// incompatibility, not silent loss" — the proxy-side half of this the
+/// T15-02 as-built note named as remaining later work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpoolFormatWarning {
+    /// What this proxy's sibling hook would write (`FORMAT_VERSION`).
+    pub compiled_format_version: u16,
+    /// What the connected daemon advertised it can import.
+    pub daemon_max_format_version: u16,
+}
+
+impl std::fmt::Display for SpoolFormatWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the connected daemon supports spool format versions up to {}, but this \
+             release's local-rag-hook writes format version {} — spool segments it \
+             captures may not import until the daemon is upgraded",
+            self.daemon_max_format_version, self.compiled_format_version
+        )
+    }
+}
+
+/// `None` unless this proxy's sibling hook could write a spool format the
+/// connected daemon cannot yet import. Direction matters:
+/// `daemon_max_format_version < compiled_format_version` means an
+/// already-upgraded hook could produce bytes an as-yet-un-upgraded daemon
+/// will stall on; `daemon_max_format_version >= compiled_format_version` is
+/// always fine (the daemon is at least as capable as this release's hook).
+pub fn check_spool_format_compatibility(
+    compiled_format_version: u16,
+    daemon_max_format_version: u16,
+) -> Option<SpoolFormatWarning> {
+    (compiled_format_version > daemon_max_format_version).then_some(SpoolFormatWarning {
+        compiled_format_version,
+        daemon_max_format_version,
+    })
+}
+
 /// A live, version-matched session: the split UDS connection plus the
 /// WELCOME the daemon answered with.
 pub struct EstablishedSession {
@@ -313,5 +356,23 @@ mod tests {
         let result =
             wait_for_close(&mut reader, Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS)).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn matching_versions_produce_no_warning() {
+        assert_eq!(check_spool_format_compatibility(1, 1), None);
+    }
+
+    #[test]
+    fn a_daemon_ahead_of_this_release_produces_no_warning() {
+        assert_eq!(check_spool_format_compatibility(1, 2), None);
+    }
+
+    #[test]
+    fn a_daemon_behind_this_release_produces_a_warning_naming_both_versions() {
+        let warning = check_spool_format_compatibility(2, 1)
+            .expect("a hook newer than the daemon supports must warn");
+        assert_eq!(warning.compiled_format_version, 2);
+        assert_eq!(warning.daemon_max_format_version, 1);
     }
 }

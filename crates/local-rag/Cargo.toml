@@ -84,7 +84,15 @@ local-rag-test-support = { path = "../test-support" }
 # machinery would add ceremony without benefit). Off by default → zero-cost;
 # the release/distribution build never compiles it in, mirroring
 # `local-rag-hook`'s identical `failpoints` feature.
-failpoints = []
+#
+# T17-04: also forwards to `local-rag-store/failpoints`, which gates this
+# crate's own `daemon_version`/migration-set env-var overrides (see
+# `main.rs::test_daemon_version_override`, `local-rag-store`'s
+# `state::test_migration_set_override`) — a real compiled `local-rag serve`
+# process configured two ways stands in for "two binary versions" in the
+# cross-binary-version upgrade test (`local-rag-proxy/tests/subprocess.rs`),
+# since there is no real second historical binary/machine available.
+failpoints = ["local-rag-store/failpoints"]
 
 [lints]
 workspace = true

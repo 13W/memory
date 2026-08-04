@@ -85,6 +85,40 @@ Goal: not "zero migrations" but "never re-key fundamental identity again". From 
 - v1 → v2 data migration: **[OPEN]** (migrate v1 memory vs clean start) — decided before GA,
   not before MVP.
 
+As-built note (T17-04, `[OPEN]` — still open; boundary made explicit, not resolved). No v1
+memory-store schema reader/importer exists in this codebase, and this task adds none: T00-01's
+v1 fixtures are behavioral test fixtures only (`input tree / event stream / query → expected
+behavior`), never a live data source (CLAUDE.md: this is a greenfield rewrite — "do not assume
+production code... legacy fixtures exist"). **v0/MVP ships clean-start only** — a v1→v2 upgrade
+starts with an empty memory store; there is no automatic or documented manual data-migration
+path in this release. This is a deliberate MVP/GA scope boundary, not a silently dropped
+requirement: *whether* GA ships a real v1 importer (versus formally making clean-start
+permanent) remains the actual open product decision, tracked as a pre-GA release-gate item
+alongside O2/O6 (see G17: "O2/O6 remaining values resolved by evidence or release blocked").
+
+As-built note (T17-04, `[SPEC]`). "Migration tests run on fixture stores of every prior
+released schema version" resolved to fixtures **built on the fly**, not committed `.sqlite`
+binaries (CLAUDE.md forbids committing generated stores): `crates/store/tests/support/
+mod.rs::build_store_at_version(layout, n, now_ms)` migrates a fresh store through
+`local_rag_store::migrate::ALL[..n]` only. This is trustworthy specifically because
+`Migration::checksum` freezes each entry's SQL once shipped — `&ALL[..n]` for a historical
+`n` is byte-identical to what the real release at that version produced, not a second,
+separately-maintained encoding of it. `crates/store/tests/migrate_fixtures.rs` drives every
+`n` in `1..=ALL.len()` through the real forward chain to head (plus a real seeded row
+surviving the whole chain), and carries a tripwire asserting every released migration is
+still simple (non-destructive, no Rust steps) — true as of this writing, so no real
+migration has ever exercised the checkpoint/backup machinery; that machinery is proven
+generically instead, against synthetic complex migrations
+(`crates/store/tests/migrate_resumable.rs`, T01-04). The restore mechanic described above
+("rollback = restore + old binary") is likewise proven end to end against a synthetic
+destructive set for the same reason —
+`crates/store/tests/migrate_restore.rs::restoring_a_pre_destructive_backup_recovers_the_old_binarys_data`
+copies a `VACUUM INTO` backup back over `state.sqlite`, reopens with a migration set
+restricted to the pre-upgrade version (standing in for "the previous binary"), and confirms
+both that the data is recovered with no `IncompatibleStore` refusal and that the restored
+store still forward-migrates cleanly afterward (an operator's restore does not strand the
+store off the upgrade path).
+
 ## 4. Upgrade flow `[SPEC]`
 
 New binary via npm → next proxy spawn detects version mismatch → `SHUTDOWN_REQUEST` to old
@@ -103,3 +137,20 @@ next to this proxy at that moment, which npm's own package swap is what makes ne
 `MAX_UPGRADE_ROUNDS = 2`, so a daemon that keeps answering with a mismatched version (a
 misconfigured install, not a normal one-shot upgrade) surfaces as `ProxyError::
 UpgradeLoopExceeded` rather than looping forever.
+
+As-built note (T17-04, `[SPEC]`). D-026 (spec 11 §4/`DEVIATIONS.md`) already proved the upgrade
+loop itself end to end with two real processes, but every existing scenario there starts from a
+fresh, empty store, so none of them exercised "the new side actually migrates something the old
+side left behind" — only that the protocol handshake retries and converges. Closed by
+`local-rag-proxy/tests/subprocess.rs::a_real_older_daemon_binary_drains_and_a_real_new_daemon_
+migrates_the_store_to_head`, gated on `--features failpoints`: a real, older-standing-in `local-rag
+serve` process (configured via the new `LOCAL_RAG_TEST_FAKE_DAEMON_VERSION`/`LOCAL_RAG_TEST_MAX_
+SCHEMA_VERSION` env-var overrides — `main.rs::test_daemon_version_override`,
+`local_rag_store::state::migration_set_for_this_open`, both feature-gated off by default, zero
+effect on a release build) answers a mismatched `daemon_version` and migrates only through a
+restricted schema version; a clean-environment real proxy drives the real upgrade loop against it,
+and a clean-environment `local-rag doctor --json` afterward proves `store_version` genuinely
+advanced past the old process's own cap with nothing left pending. This is honestly one compiled
+artifact configured two ways, not a second historical binary — there is no real second release or
+machine available (no network, no second checkout) — documented as such in the test's own doc
+comment.

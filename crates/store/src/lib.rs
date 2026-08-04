@@ -447,8 +447,9 @@ pub use migrate::{
 };
 pub use observation::{
     EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, NewObservationEnvelope,
-    PayloadStatus, PayloadSweepError, PayloadSweepReport, TrustLevel, import_batch,
-    import_session_tail, insert_envelope, known_spool_sessions, run_payload_ttl_sweep,
+    PayloadStatus, PayloadSweepError, PayloadSweepReport, TrustLevel, diagnose_spool_tail,
+    import_batch, import_session_tail, insert_envelope, known_spool_sessions,
+    run_payload_ttl_sweep,
 };
 pub use privacy::{
     EvidenceSummary, MemoryInspection, ObservationInspection, PurgeAllPreview, PurgeAllReport,

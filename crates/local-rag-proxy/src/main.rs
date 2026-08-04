@@ -21,7 +21,7 @@ use local_rag_core::identity::{SystemUuidV7, UuidSource};
 use local_rag_core::paths::{StoreLayout, SystemEnv};
 use local_rag_protocol::RequestContext;
 
-use handshake::{establish_session, resolve_session_params};
+use handshake::{check_spool_format_compatibility, establish_session, resolve_session_params};
 
 const BIN: &str = "local-rag-proxy";
 
@@ -121,6 +121,12 @@ async fn run() -> u8 {
             "{BIN}: the daemon is running in degraded mode: {}",
             session.welcome.mode
         );
+    }
+    if let Some(warning) = check_spool_format_compatibility(
+        local_rag_core::spool::FORMAT_VERSION,
+        session.welcome.spool_max_format_version,
+    ) {
+        eprintln!("{BIN}: {warning}");
     }
 
     let context = RequestContext {
