@@ -38,6 +38,34 @@ not rewritten (`CLAUDE.md`: prior evidence is never edited after the fact).
 - checksum/manifest + atomic model download (10 §5);
 - ORT bundling settled before the final CI matrix.
 
+As-built note (T17-03, `[SPEC]`). "Settled" resolved to: each platform package's `bin/` directory
+carries one extra flat file, `libonnxruntime.dylib`/`libonnxruntime.so` (no `win32` entry — see
+below), sitting next to the three product binaries with no manifest of its own —
+`crates/models/src/onnx.rs::bundled_ort_dylib_path` looks for it there, by the running
+executable's own directory, mirroring `local-rag-proxy::connect::resolve_daemon_binary_path`'s
+existing convention exactly. Resolution order at process start: an explicit `ORT_DYLIB_PATH`
+first, else the bundled file, else a typed `OnnxError::Runtime` — never `ort`'s own implicit
+default search, which a corrective finding (`DEVIATIONS.md` D-028) showed can hang the calling
+thread indefinitely instead of erroring when nothing is found. The bundled file itself comes from
+ONNX Runtime's own official release archives, pinned by exact URL and SHA-256 per platform
+(`crates/xtask/src/dist_ort.rs::ORT_ASSETS`, fetched via `cargo xtask dist-ort`) — the same
+verify-before-trust shape 10 §5's model-weight installer already uses, applied to a build/release
+tool rather than a runtime command. `darwin-arm64`/`linux-x64`/`linux-arm64` pin the same ONNX
+Runtime release this project's own G11 gate already validated end to end (v1.27.0); `darwin-x64`
+pins the older v1.20.0 specifically, because Microsoft stopped shipping prebuilt Intel-Mac
+binaries as of v1.27.0 and v1.20.0 is the newest tag that still has one. Verification reached in
+this environment (macOS arm64, no Docker/QEMU, no real Windows or Intel-Mac host — `DEVIATIONS.md`
+D-029): checksum-verified for all four reachable platforms; full real inference (indexing a real
+fixture end to end through the bundled library, a real cold-spawn MCP handshake) verified natively
+on `darwin-arm64`; on `darwin-x64`, only reachable here through Rosetta emulation, the pinned
+v1.20.0 library is unsigned and failed to load under that emulation — the watchdog fix (D-028)
+turns that into a clean, bounded error rather than a hang, but does not establish whether the same
+binary loads correctly on real Intel Mac hardware, which this environment cannot test;
+`linux-x64`/`linux-arm64` are structurally verified only (correct ELF format/architecture via
+`file`), not executed. `win32-x64`/`win32-arm64` ship no bundled runtime at all: `cargo-zigbuild`
+does not support Windows targets, so this machine has no reachable build to bundle one into
+(D-029) — the platform package's `bin/` stays without a runtime until a real Windows build exists.
+
 ## 3. Migration framework `[FIXED]`
 
 Goal: not "zero migrations" but "never re-key fundamental identity again". From day one:

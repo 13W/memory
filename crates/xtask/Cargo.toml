@@ -30,5 +30,11 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
 ] }
 
+[dev-dependencies]
+# `dist_ort`'s own tests build a real, throwaway `.tgz` fixture under an
+# isolated temp root — the same isolation `crates/models`'s installer tests
+# use, not a bespoke one.
+local-rag-test-support = { path = "../test-support" }
+
 [lints]
 workspace = true

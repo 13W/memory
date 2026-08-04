@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+
+# T17-03: one of the three product binaries dist actually ships (spec 13 §1).
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 local-rag-core = { path = "../core" }
