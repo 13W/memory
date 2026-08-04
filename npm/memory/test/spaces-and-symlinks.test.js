@@ -23,12 +23,12 @@ test("resolution works when the whole install tree lives under a path containing
   assert.match(root, / /, "sanity: the fixture root really does contain a space");
 
   const { launcherBinFile, packageDirs } = buildFlatLayout(root, [
-    { name: "@13w/local-rag-linux-x64", platform: "linux", cpu: "x64" },
+    { name: "@13w/memory-linux-x64", platform: "linux", cpu: "x64" },
   ]);
 
   const result = resolvePlatformPackage(launcherBinFile, { platform: "linux", arch: "x64" });
   assert.equal(result.ok, true);
-  assert.equal(result.packageDir, packageDirs["@13w/local-rag-linux-x64"]);
+  assert.equal(result.packageDir, packageDirs["@13w/memory-linux-x64"]);
 
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -38,7 +38,7 @@ test("spawning the launcher under a spaced path works with no shell/quoting invo
   const fakeBinarySrc = fs.readFileSync(path.join(__dirname, "helpers", "fake-binary.js"), "utf8");
   const { launcherBinFile } = buildFlatLayout(root, [
     {
-      name: `@13w/local-rag-${process.platform}-${process.arch}`,
+      name: `@13w/memory-${process.platform}-${process.arch}`,
       platform: process.platform,
       cpu: process.arch,
       binaryContents: { "local-rag-proxy": fakeBinarySrc },
@@ -60,11 +60,11 @@ test("spawning the launcher under a spaced path works with no shell/quoting invo
 test("resolution works when the launcher's own install location is itself reached only via a symlink (not just the platform package)", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "lr-symlink-launcher-")));
 
-  const realLauncherDir = path.join(root, "real-store", "local-rag");
+  const realLauncherDir = path.join(root, "real-store", "memory");
   writeLauncherPackageAt(realLauncherDir);
 
-  const platformDir = path.join(root, "real-store", "local-rag-linux-x64");
-  writePlatformPackageAt(platformDir, "@13w/local-rag-linux-x64", { platform: "linux", cpu: "x64" });
+  const platformDir = path.join(root, "real-store", "memory-linux-x64");
+  writePlatformPackageAt(platformDir, "@13w/memory-linux-x64", { platform: "linux", cpu: "x64" });
 
   // The launcher's own private node_modules resolves the platform package
   // through a symlink (pnpm-shaped), AND the launcher itself is reached
@@ -72,11 +72,11 @@ test("resolution works when the launcher's own install location is itself reache
   fs.mkdirSync(path.join(realLauncherDir, "node_modules", "@13w"), { recursive: true });
   fs.symlinkSync(
     platformDir,
-    path.join(realLauncherDir, "node_modules", "@13w", "local-rag-linux-x64"),
+    path.join(realLauncherDir, "node_modules", "@13w", "memory-linux-x64"),
     "dir",
   );
 
-  const topLevelLink = path.join(root, "node_modules", "@13w", "local-rag");
+  const topLevelLink = path.join(root, "node_modules", "@13w", "memory");
   fs.mkdirSync(path.dirname(topLevelLink), { recursive: true });
   fs.symlinkSync(realLauncherDir, topLevelLink, "dir");
 
@@ -91,18 +91,18 @@ test("resolution works when the launcher's own install location is itself reache
 test("a symlinked launcher location combined with a spaced path resolves correctly (both edge cases at once)", () => {
   const root = mkSpacedTmpRoot();
 
-  const realLauncherDir = path.join(root, "actual location", "local-rag");
+  const realLauncherDir = path.join(root, "actual location", "memory");
   writeLauncherPackageAt(realLauncherDir);
-  const platformDir = path.join(root, "actual location", "local-rag-darwin-arm64");
-  writePlatformPackageAt(platformDir, "@13w/local-rag-darwin-arm64", { platform: "darwin", cpu: "arm64" });
+  const platformDir = path.join(root, "actual location", "memory-darwin-arm64");
+  writePlatformPackageAt(platformDir, "@13w/memory-darwin-arm64", { platform: "darwin", cpu: "arm64" });
   fs.mkdirSync(path.join(realLauncherDir, "node_modules", "@13w"), { recursive: true });
   fs.symlinkSync(
     platformDir,
-    path.join(realLauncherDir, "node_modules", "@13w", "local-rag-darwin-arm64"),
+    path.join(realLauncherDir, "node_modules", "@13w", "memory-darwin-arm64"),
     "dir",
   );
 
-  const link = path.join(root, "linked (install)", "local-rag");
+  const link = path.join(root, "linked (install)", "memory");
   fs.mkdirSync(path.dirname(link), { recursive: true });
   fs.symlinkSync(realLauncherDir, link, "dir");
 

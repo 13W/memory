@@ -1,7 +1,7 @@
 "use strict";
 
 // Card requirement: "paths per platform" — specific to the new
-// `npm/local-rag/src/hook-cache.js` layer this task adds (T17-01's own
+// `npm/memory/src/hook-cache.js` layer this task adds (T17-01's own
 // `resolve.js` per-platform resolution is already covered by its own
 // suite; this does not duplicate that).
 
@@ -11,8 +11,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { refreshCache, cachedHookPath } = require("../../npm/local-rag/src/hook-cache.js");
-const { SUPPORTED_PLATFORMS } = require("../../npm/local-rag/src/platform.js");
+const { refreshCache, cachedHookPath } = require("../../npm/memory/src/hook-cache.js");
+const { SUPPORTED_PLATFORMS } = require("../../npm/memory/src/platform.js");
 
 for (const key of SUPPORTED_PLATFORMS) {
   const platform = key.split("-").slice(0, -1).join("-");

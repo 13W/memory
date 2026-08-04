@@ -15,8 +15,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const { buildFlatLayout } = require("../../npm/local-rag/test/helpers/fixture-layout.js");
-const { cachedHookPath } = require("../../npm/local-rag/src/hook-cache.js");
+const { buildFlatLayout } = require("../../npm/memory/test/helpers/fixture-layout.js");
+const { cachedHookPath } = require("../../npm/memory/src/hook-cache.js");
 const { nativeHookBinaryPath } = require("./helpers/native-hook-binary.js");
 const { prepareSpoolDir } = require("./helpers/store-fixture.js");
 
@@ -33,9 +33,9 @@ test(
     const platformKey = `${process.platform}-${process.arch}`;
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "lr-plugin-coldstart-")));
     const { launcherBinFile, packageDirs } = buildFlatLayout(root, [
-      { name: `@13w/local-rag-${platformKey}`, platform: process.platform, cpu: process.arch },
+      { name: `@13w/memory-${platformKey}`, platform: process.platform, cpu: process.arch },
     ]);
-    const hookStubPath = path.join(packageDirs[`@13w/local-rag-${platformKey}`], "bin", "local-rag-hook");
+    const hookStubPath = path.join(packageDirs[`@13w/memory-${platformKey}`], "bin", "local-rag-hook");
     fs.rmSync(hookStubPath);
     fs.symlinkSync(nativeBin, hookStubPath);
     const hookJsFile = path.join(path.dirname(launcherBinFile), "local-rag-hook.js");

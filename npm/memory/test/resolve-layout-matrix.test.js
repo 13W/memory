@@ -13,7 +13,7 @@ const { resolvePlatformPackage } = require("../src/resolve.js");
 const { buildFlatLayout, buildNestedLayout, buildPnpmLayout } = require("./helpers/fixture-layout.js");
 const { mkTmpRoot } = require("./helpers/tmp.js");
 
-const PLATFORM_PACKAGE = { name: "@13w/local-rag-linux-x64", platform: "linux", cpu: "x64" };
+const PLATFORM_PACKAGE = { name: "@13w/memory-linux-x64", platform: "linux", cpu: "x64" };
 
 const LAYOUTS = [
   {
@@ -40,8 +40,8 @@ for (const { label, build } of LAYOUTS) {
     const result = resolvePlatformPackage(launcherBinFile, { platform: "linux", arch: "x64" });
     assert.equal(result.ok, true, `expected linux-x64 to resolve under the ${label} layout`);
     assert.equal(result.key, "linux-x64");
-    assert.equal(result.packageName, "@13w/local-rag-linux-x64");
-    assert.equal(result.packageDir, packageDirs["@13w/local-rag-linux-x64"]);
+    assert.equal(result.packageName, "@13w/memory-linux-x64");
+    assert.equal(result.packageDir, packageDirs["@13w/memory-linux-x64"]);
     assert.ok(
       fs.existsSync(require("node:path").join(result.packageDir, "bin", "local-rag-proxy")),
       "the resolved package dir must contain the product binaries",
@@ -67,13 +67,13 @@ test("the pnpm layout's platform package genuinely lives behind a real symlink c
     launcherDir,
     "node_modules",
     "@13w",
-    "local-rag-linux-x64",
+    "memory-linux-x64",
   );
   assert.ok(fs.lstatSync(launcherPrivateLink).isSymbolicLink());
 
   const result = resolvePlatformPackage(launcherBinFile, { platform: "linux", arch: "x64" });
   assert.equal(result.ok, true);
-  assert.equal(result.packageDir, packageDirs["@13w/local-rag-linux-x64"]);
+  assert.equal(result.packageDir, packageDirs["@13w/memory-linux-x64"]);
 
   fs.rmSync(root, { recursive: true, force: true });
 });

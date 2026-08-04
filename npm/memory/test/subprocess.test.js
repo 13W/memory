@@ -27,7 +27,7 @@ const { waitUntil, pidIsAlive, waitForStdoutLine } = require("./helpers/proc.js"
 
 const FAKE_BINARY_SRC = fs.readFileSync(path.join(__dirname, "helpers", "fake-binary.js"), "utf8");
 const HOST_KEY = platformKey(); // real host's own platform-arch, e.g. "darwin-arm64"
-const HOST_PACKAGE_NAME = `@13w/local-rag-${HOST_KEY}`;
+const HOST_PACKAGE_NAME = `@13w/memory-${HOST_KEY}`;
 
 /** Builds a fixture whose `local-rag-proxy` binary is the real fake-binary.js script. */
 function buildHostLayout(root, opts = {}) {

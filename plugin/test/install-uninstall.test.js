@@ -55,28 +55,28 @@ test(
       let r = runClaude(["plugin", "marketplace", "add", REPO_ROOT], configDir);
       assert.equal(r.status, 0, `marketplace add: ${r.stdout}\n${r.stderr}`);
 
-      r = runClaude(["plugin", "install", "local-rag@local-rag", "-s", "local"], configDir);
+      r = runClaude(["plugin", "install", "memory@memory", "-s", "local"], configDir);
       assert.equal(r.status, 0, `install: ${r.stdout}\n${r.stderr}`);
 
       r = runClaude(["plugin", "list", "--json"], configDir);
       assert.equal(r.status, 0, `list: ${r.stdout}\n${r.stderr}`);
       const installed = JSON.parse(r.stdout);
       assert.equal(installed.length, 1);
-      assert.equal(installed[0].id, "local-rag@local-rag");
+      assert.equal(installed[0].id, "memory@memory");
       assert.equal(installed[0].enabled, true);
       assert.equal(installed[0].scope, "local");
 
       // Card requirement "exact hooks list", verified against the real
       // installed plugin (not just a JSON-file parse) — same install
       // session, no second marketplace add/install round trip needed.
-      r = runClaude(["plugin", "details", "local-rag@local-rag"], configDir);
+      r = runClaude(["plugin", "details", "memory@memory"], configDir);
       assert.equal(r.status, 0, `details: ${r.stdout}\n${r.stderr}`);
       assert.match(r.stdout, /Hooks \(7\)/);
       for (const event of SPEC_11_3_1_EVENTS) {
         assert.match(r.stdout, new RegExp(event), `expected ${event} in claude plugin details output`);
       }
 
-      r = runClaude(["plugin", "uninstall", "local-rag@local-rag", "-s", "local", "-y"], configDir);
+      r = runClaude(["plugin", "uninstall", "memory@memory", "-s", "local", "-y"], configDir);
       assert.equal(r.status, 0, `uninstall: ${r.stdout}\n${r.stderr}`);
 
       r = runClaude(["plugin", "list", "--json"], configDir);
@@ -96,9 +96,9 @@ test(
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "lr-plugin-cfg-nowrite-"));
     try {
       runClaude(["plugin", "marketplace", "add", REPO_ROOT], configDir);
-      runClaude(["plugin", "install", "local-rag@local-rag", "-s", "local"], configDir);
-      runClaude(["plugin", "details", "local-rag@local-rag"], configDir);
-      runClaude(["plugin", "uninstall", "local-rag@local-rag", "-s", "local", "-y"], configDir);
+      runClaude(["plugin", "install", "memory@memory", "-s", "local"], configDir);
+      runClaude(["plugin", "details", "memory@memory"], configDir);
+      runClaude(["plugin", "uninstall", "memory@memory", "-s", "local", "-y"], configDir);
     } finally {
       fs.rmSync(configDir, { recursive: true, force: true });
     }

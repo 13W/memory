@@ -15,7 +15,7 @@ function tmpRoot() {
 test("every one of the five supported platforms resolves to its own distinct package", () => {
   const root = tmpRoot();
   const platformPackages = SUPPORTED_PLATFORMS.map((key) => ({
-    name: `@13w/local-rag-${key}`,
+    name: `@13w/memory-${key}`,
     platform: key.split("-").slice(0, -1).join("-"),
     cpu: key.split("-").at(-1),
   }));
@@ -27,7 +27,7 @@ test("every one of the five supported platforms resolves to its own distinct pac
     const result = resolvePlatformPackage(launcherBinFile, { platform, arch });
     assert.equal(result.ok, true, `expected ${key} to resolve`);
     assert.equal(result.key, key);
-    assert.equal(result.packageDir, packageDirs[`@13w/local-rag-${key}`]);
+    assert.equal(result.packageDir, packageDirs[`@13w/memory-${key}`]);
     assert.ok(!seenDirs.has(result.packageDir), `${key} must not reuse another platform's dir`);
     seenDirs.add(result.packageDir);
   }

@@ -14,6 +14,20 @@ One native service binary, no mandatory external daemons; model assets delivered
   (stdio MCP proxy), `local-rag-hook` (spool writer). Single binary with argv0/subcommand
   multiplexing is acceptable; hooks path must be exec-fast (<50 ms cold `[SPEC]`).
 
+As-built note (T17-03, `[SPEC]`). The npm scope stays `@13w`, but the launcher and platform
+package **names** are `@13w/memory` / `@13w/memory-{darwin-arm64,darwin-x64,linux-x64,
+linux-arm64,win32-x64}` — an owner decision made when `cargo dist generate` needed a real
+`repository` URL, at which point the GitHub repository was created as `13W/memory` (public;
+`13W/local-rag` could not be created — the account hit GitHub's own "Trade controls restricted
+owner" account-level restriction on **private** repo creation specifically, resolved by creating
+a public repo instead) and the npm/plugin identity was renamed to match in the same pass. Product
+binary names, crate names, the `local-rag` CLI command, and every `LOCAL_RAG_*` env var /
+on-disk store path are **not** part of this rename — see `npm/memory/` and `plugin/`
+(`.claude-plugin/marketplace.json`, `plugin/.claude-plugin/plugin.json`) for the exact as-built
+names. Historical evidence in `docs/implementation-plan/PROGRESS.md` for T17-01/T17-02 still cites
+`@13w/local-rag*`, correctly, as that was the real name at the time those tasks executed — it is
+not rewritten (`CLAUDE.md`: prior evidence is never edited after the fact).
+
 ## 2. Launcher requirements (verified by packaging tests) `[FIXED list]`
 
 - signal forwarding + reliable termination of the stdio child; CTRL-C / SIGTERM correctness;
