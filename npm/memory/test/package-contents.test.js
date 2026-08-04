@@ -18,12 +18,12 @@ const { execFileSync } = require("node:child_process");
 const REPO_NPM_DIR = path.resolve(__dirname, "..", "..");
 
 const PACKAGES = [
-  { dir: "local-rag", expectedFiles: ["package.json", "bin/local-rag-mcp.js", "src/resolve.js"] },
-  { dir: "local-rag-darwin-arm64", expectedFiles: ["package.json"] },
-  { dir: "local-rag-darwin-x64", expectedFiles: ["package.json"] },
-  { dir: "local-rag-linux-x64", expectedFiles: ["package.json"] },
-  { dir: "local-rag-linux-arm64", expectedFiles: ["package.json"] },
-  { dir: "local-rag-win32-x64", expectedFiles: ["package.json"] },
+  { dir: "memory", expectedFiles: ["package.json", "bin/local-rag-mcp.js", "src/resolve.js"] },
+  { dir: "memory-darwin-arm64", expectedFiles: ["package.json"] },
+  { dir: "memory-darwin-x64", expectedFiles: ["package.json"] },
+  { dir: "memory-linux-x64", expectedFiles: ["package.json"] },
+  { dir: "memory-linux-arm64", expectedFiles: ["package.json"] },
+  { dir: "memory-win32-x64", expectedFiles: ["package.json"] },
 ];
 
 const DECOY_FILES = [
@@ -100,7 +100,7 @@ for (const { dir, expectedFiles } of PACKAGES) {
 }
 
 test("the launcher's own README.md is not required for the launcher to run, but is still packed if present (informational, not a decoy)", () => {
-  const realDir = path.join(REPO_NPM_DIR, "local-rag");
+  const realDir = path.join(REPO_NPM_DIR, "memory");
   const copy = preparePackageCopy(realDir);
   const files = packedFileList(copy);
   // README.md is npm's own always-included file regardless of `files` —

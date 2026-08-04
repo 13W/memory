@@ -1,7 +1,7 @@
 {
-  "name": "@13w/local-rag-linux-x64",
+  "name": "@13w/memory-linux-x64",
   "version": "0.0.0",
-  "description": "local-rag native binaries for linux-x64. Not meant to be installed directly — install @13w/local-rag instead.",
+  "description": "local-rag native binaries for linux-x64. Not meant to be installed directly — install @13w/memory instead.",
   "license": "UNLICENSED",
   "os": ["linux"],
   "cpu": ["x64"],

@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "local-rag": {
+    "memory": {
       "command": "npx",
-      "args": ["--yes", "--package=@13w/local-rag", "local-rag-mcp"]
+      "args": ["--yes", "--package=@13w/memory", "local-rag-mcp"]
     }
   }
 }

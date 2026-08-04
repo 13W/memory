@@ -25,10 +25,10 @@ function platformKey(platform = process.platform, arch = process.arch) {
 
 /**
  * @param {string} key e.g. "darwin-arm64"
- * @returns {string} e.g. "@13w/local-rag-darwin-arm64"
+ * @returns {string} e.g. "@13w/memory-darwin-arm64"
  */
 function platformPackageName(key) {
-  return `@13w/local-rag-${key}`;
+  return `@13w/memory-${key}`;
 }
 
 /** @param {string} key @returns {boolean} */

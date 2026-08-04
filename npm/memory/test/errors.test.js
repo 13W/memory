@@ -27,7 +27,7 @@ test("deferred-platform error explicitly calls out win32-arm64 as planned but un
     ok: false,
     reason: "deferred",
     key: "win32-arm64",
-    packageName: "@13w/local-rag-win32-arm64",
+    packageName: "@13w/memory-win32-arm64",
   });
   assert.match(msg, /win32-arm64/);
   assert.match(msg, /planned but not yet available/);
@@ -38,12 +38,12 @@ test("missing-package error names the exact package and gives an actionable fix"
     ok: false,
     reason: "not-installed",
     key: "linux-x64",
-    packageName: "@13w/local-rag-linux-x64",
+    packageName: "@13w/memory-linux-x64",
   });
-  assert.match(msg, /"@13w\/local-rag-linux-x64"/);
+  assert.match(msg, /"@13w\/memory-linux-x64"/);
   assert.match(msg, /linux-x64/);
   assert.match(msg, /--omit=optional/);
-  assert.match(msg, /npm install @13w\/local-rag-linux-x64 --save-optional/);
+  assert.match(msg, /npm install @13w\/memory-linux-x64 --save-optional/);
 });
 
 test("formatMissingPlatformError dispatches on reason", () => {
@@ -57,13 +57,13 @@ test("formatMissingPlatformError dispatches on reason", () => {
     ok: false,
     reason: "deferred",
     key: "win32-arm64",
-    packageName: "@13w/local-rag-win32-arm64",
+    packageName: "@13w/memory-win32-arm64",
   });
   const notInstalled = formatMissingPlatformError({
     ok: false,
     reason: "not-installed",
     key: "linux-x64",
-    packageName: "@13w/local-rag-linux-x64",
+    packageName: "@13w/memory-linux-x64",
   });
   assert.equal(
     unsupported,
@@ -75,7 +75,7 @@ test("formatMissingPlatformError dispatches on reason", () => {
       ok: false,
       reason: "deferred",
       key: "win32-arm64",
-      packageName: "@13w/local-rag-win32-arm64",
+      packageName: "@13w/memory-win32-arm64",
     }),
   );
   assert.equal(
@@ -84,7 +84,7 @@ test("formatMissingPlatformError dispatches on reason", () => {
       ok: false,
       reason: "not-installed",
       key: "linux-x64",
-      packageName: "@13w/local-rag-linux-x64",
+      packageName: "@13w/memory-linux-x64",
     }),
   );
 });

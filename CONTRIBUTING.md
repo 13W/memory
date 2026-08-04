@@ -270,7 +270,7 @@ T17-01's six npm packages (spec 13 §1), parallel to `crates/` rather than insid
 self-contained subtree with different tooling, the same pattern `spike/` already established for
 its own separate Cargo workspace:
 
-- `npm/local-rag/` — `@13w/local-rag`, the thin JS launcher (`bin/local-rag-mcp.js`, glue only)
+- `npm/memory/` — `@13w/memory`, the thin JS launcher (`bin/local-rag-mcp.js`, glue only)
   that resolves the caller's platform package (`src/resolve.js`, `require.resolve`/
   `createRequire`-based — the same hoisting-aware algorithm every package manager's
   npm/pnpm/yarn layout already targets, not a hand-rolled `node_modules` walk) and execs the
@@ -281,17 +281,17 @@ its own separate Cargo workspace:
   (fail-open, unlike the MCP launcher) and best-effort refreshes a direct-exec cache symlink
   under `${CLAUDE_PLUGIN_DATA}` (`src/hook-cache.js`) so a Claude Code plugin's hook commands can
   skip Node/npx entirely on the steady-state path — see `## Claude Code plugin` below.
-- `npm/local-rag-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}/` — the five
+- `npm/memory-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}/` — the five
   `optionalDependencies` platform packages (`os`/`cpu` fields select the right one at install
   time). `win32-arm64` is deferred `[FIXED]`, spec 13 §1 — no sixth package.
 - In this checkout, every platform package ships `package.json`/`README.md` only — `bin/` (the
   three product binaries `local-rag`/`local-rag-proxy`/`local-rag-hook`) is populated by T17-03's
   release build, not committed here. T17-01's own tests never depend on a real compiled binary:
-  they build synthetic fixture trees (`npm/local-rag/test/helpers/fixture-layout.js`) standing in
+  they build synthetic fixture trees (`npm/memory/test/helpers/fixture-layout.js`) standing in
   for npm-flat, npm-nested, and pnpm-symlinked installs, and a scriptable stand-in
   (`test/helpers/fake-binary.js`) for `local-rag-proxy` in the real-subprocess signal tests.
 
-Run the suite: `cd npm/local-rag && node --test test/*.test.js` — **not** bare `node --test`
+Run the suite: `cd npm/memory && node --test test/*.test.js` — **not** bare `node --test`
 (Node's default test-file discovery treats every `.js` file under a directory named `test` as a
 test file, which would try to run `test/helpers/fake-binary.js` itself and hang forever in its
 own `setInterval`; the explicit glob scopes discovery to the top-level `*.test.js` files only).
@@ -320,11 +320,11 @@ reimplemented schema check:
   `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop`, `SessionEnd`),
   every one the identical shell-form command: exec a cached direct path under
   `${CLAUDE_PLUGIN_DATA}` if the previous run populated it, else fall back to
-  `npx --yes --package=@13w/local-rag local-rag-hook spool-write`, else `true` — the trailing
+  `npx --yes --package=@13w/memory local-rag-hook spool-write`, else `true` — the trailing
   `|| true` is load-bearing: spec 11 §3.1's "always exit 0" is a `[FIXED]` contract on the whole
   command a `hooks.json` entry invokes, not just the native binary once it is running, so it must
   hold even when both the cache and `npx` fail (e.g. first run, offline).
-- `plugin/.mcp.json` — the `local-rag` MCP server, `npx --yes --package=@13w/local-rag
+- `plugin/.mcp.json` — the `memory` MCP server, `npx --yes --package=@13w/memory
   local-rag-mcp` (verified empirically: `npx <pkg> <bin-name>` — without `--package=`/`--yes` —
   does **not** select a non-default bin from a multi-bin package; `--package=` is the form that
   actually works).

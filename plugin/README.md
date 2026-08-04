@@ -1,13 +1,13 @@
-# local-rag (Claude Code plugin)
+# memory (Claude Code plugin)
 
-Registers the `local-rag` MCP server (persistent memory, hybrid code search) and the seven
+Registers the `memory` MCP server (persistent memory, hybrid code search) and the seven
 ingestion hook events (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`,
 `Stop`, `SubagentStop`, `SessionEnd`) that durably capture observations for local-rag's memory
 pipeline.
 
-Both the MCP server and the hook writer are invoked through `npx --package=@13w/local-rag`, which
-resolves the platform-specific native binaries published by the `@13w/local-rag` npm package (see
-`npm/local-rag/` in this repository). This plugin ships no compiled code itself — only
+Both the MCP server and the hook writer are invoked through `npx --package=@13w/memory`, which
+resolves the platform-specific native binaries published by the `@13w/memory` npm package (see
+`npm/memory/` in this repository). This plugin ships no compiled code itself — only
 configuration.
 
 The hook command caches a direct symlink to the resolved native binary under
@@ -19,4 +19,4 @@ own store (outside the project directory) and never touch `.claude/rules/` or an
 project-local file.
 
 See `docs/specification/11-interfaces.md` §3 and `docs/specification/13-distribution-and-migrations.md`
-§1-2 in the local-rag-v2 repository for the full normative behavior.
+§1-2 in this repository for the full normative behavior.

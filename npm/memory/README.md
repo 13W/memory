@@ -1,4 +1,4 @@
-# @13w/local-rag
+# @13w/memory
 
 Thin npm launcher for `local-rag` — a local, co-located MCP service for Claude Code (persistent
 memory, hybrid semantic code search, spool-only observation capture).
@@ -11,5 +11,5 @@ binary this package exposes resolves that platform package at run time and execs
 If your platform is unsupported, or the matching platform package failed to install, running
 `local-rag-mcp` prints an actionable diagnostic instead of a stack trace.
 
-See `docs/specification/13-distribution-and-migrations.md` in the local-rag-v2 repository for the
-full packaging specification.
+See `docs/specification/13-distribution-and-migrations.md` in this repository for the full
+packaging specification.

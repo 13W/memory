@@ -1,8 +1,8 @@
-# @13w/local-rag-win32-x64
+# @13w/memory-darwin-x64
 
-Native `local-rag`/`local-rag-proxy`/`local-rag-hook` binaries for win32-x64 (Windows).
+Native `local-rag`/`local-rag-proxy`/`local-rag-hook` binaries for darwin-x64 (macOS, Intel).
 
-Do not install this package directly — install `@13w/local-rag` instead; it pulls this package in
+Do not install this package directly — install `@13w/memory` instead; it pulls this package in
 automatically as an `optionalDependency` on a matching host and resolves it at run time.
 
 Ships no model weights (see `docs/adr/0004-default-embedding-model.md`,

@@ -10,7 +10,7 @@ const path = require("node:path");
 const DEFAULT_BINARIES = Object.freeze(["local-rag", "local-rag-proxy", "local-rag-hook"]);
 const REAL_LAUNCHER_ROOT = path.resolve(__dirname, "..", "..");
 
-/** "@13w/local-rag-darwin-arm64" -> "local-rag-darwin-arm64" */
+/** "@13w/memory-darwin-arm64" -> "memory-darwin-arm64" */
 function shortName(fullName) {
   return fullName.split("/")[1];
 }
@@ -81,7 +81,7 @@ function writeLauncherPackageAt(launcherDir) {
  */
 function buildFlatLayout(root, platformPackages) {
   const scope = path.join(root, "node_modules", "@13w");
-  const launcherBinFile = writeLauncherPackageAt(path.join(scope, "local-rag"));
+  const launcherBinFile = writeLauncherPackageAt(path.join(scope, "memory"));
   const packageDirs = {};
   for (const p of platformPackages) {
     const dir = path.join(scope, shortName(p.name));
@@ -102,7 +102,7 @@ function buildFlatLayout(root, platformPackages) {
  * @returns {{launcherBinFile: string, packageDirs: Record<string,string>}}
  */
 function buildNestedLayout(root, platformPackages) {
-  const launcherDir = path.join(root, "node_modules", "@13w", "local-rag");
+  const launcherDir = path.join(root, "node_modules", "@13w", "memory");
   const launcherBinFile = writeLauncherPackageAt(launcherDir);
   const nestedScope = path.join(launcherDir, "node_modules", "@13w");
   const packageDirs = {};
@@ -134,10 +134,10 @@ function buildPnpmLayout(root, platformPackages) {
   const store = path.join(root, "node_modules", ".pnpm");
   const launcherRealDir = path.join(
     store,
-    "@13w+local-rag@0.0.0",
+    "@13w+memory@0.0.0",
     "node_modules",
     "@13w",
-    "local-rag",
+    "memory",
   );
   writeLauncherPackageAt(launcherRealDir);
 
@@ -153,7 +153,7 @@ function buildPnpmLayout(root, platformPackages) {
     packageDirs[p.name] = realDir;
   }
 
-  const topLevelLink = path.join(root, "node_modules", "@13w", "local-rag");
+  const topLevelLink = path.join(root, "node_modules", "@13w", "memory");
   fs.mkdirSync(path.dirname(topLevelLink), { recursive: true });
   fs.symlinkSync(launcherRealDir, topLevelLink, "dir");
 
