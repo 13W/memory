@@ -46,6 +46,11 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"
 publish = false
+# T17-03: required by `cargo dist generate` to emit a GitHub Actions release
+# workflow (release-artifact download URLs, badge links). The repo is public
+# — GitHub's own "Trade controls restricted owner" account-level restriction
+# blocked *private* repo creation specifically; public succeeded.
+repository = "https://github.com/13W/memory"
 
 # Centralized lints; each crate opts in via `[lints] workspace = true`.
 [workspace.lints.rust]
@@ -53,3 +58,8 @@ unsafe_code = "warn"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

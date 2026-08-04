@@ -115,6 +115,38 @@ report carries no `baseline`/`diff` fields, and the gate
 (`fixtures/memory/baseline/thresholds.json`) is a floor on the one real run that
 exists, not a regression budget.
 
+## ONNX Runtime bundling (`cargo xtask dist-ort`)
+
+T17-03's platform packages ship a copy of the ONNX Runtime shared library next
+to each product binary (`crates/models/src/onnx.rs`'s `bundled_ort_dylib_path`
+resolves it there before falling back to `ORT_DYLIB_PATH`). Fetching and
+verifying it is a **separate** command and deliberately *not* part of
+`cargo xtask ci`: it needs the network.
+
+```
+cargo xtask dist-ort --platform darwin-arm64|darwin-x64|linux-x64|linux-arm64|all --out <dir>
+```
+
+Downloads the platform's pinned ONNX Runtime release archive (`crates/xtask/
+src/dist_ort.rs::ORT_ASSETS` — exact URL and SHA-256 per platform, the same
+verify-before-trust shape `crates/models::install` uses for model weights),
+verifies the archive digest, extracts the one real (non-symlink) shared
+library file via the system `tar`, and copies it to `<dir>/libonnxruntime.
+{dylib,so}`. Re-running it reuses an already-downloaded, still-matching
+archive rather than re-fetching. `win32-x64`/`win32-arm64` are not in the
+catalog: `cargo-zigbuild` does not support Windows targets at all (verified
+against its own documentation), so this machine has no reachable Windows
+build to bundle a runtime into — see `docs/implementation-plan/DEVIATIONS.md`
+D-029. `darwin-x64` pins ONNX Runtime v1.20.0 rather than the v1.27.0 the
+other three platforms use: Microsoft dropped prebuilt Intel-Mac binaries as of
+v1.27.0, and v1.20.0 is the newest tag that still ships one — see
+`ORT_ASSETS`'s own doc comment for detail, including why that binary's
+loading behavior could only be partially verified in this environment.
+
+Everything *scored* — the catalog's own shape, the digest-mismatch and cache-
+reuse paths, real tar extraction against a locally-built fixture archive — is
+ordinary `cargo test -p xtask` and therefore does run in `ci`.
+
 ## Toolchain / MSRV
 
 - Pinned toolchain: **1.96.1** via `rust-toolchain.toml` (components `rustfmt`,

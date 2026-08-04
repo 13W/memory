@@ -15,8 +15,14 @@
 //! `cargo xtask memory-bench` runs the memory-router benchmark (spec 08 §7,
 //! T14-07). Also **not** part of `ci`: it needs the installed GGUF weights
 //! and the `llama-cpp-2` toolchain (ADR-0006).
+//!
+//! `cargo xtask dist-ort` fetches and verifies the pinned ONNX Runtime shared
+//! library per reachable platform (T17-03, see [`dist_ort`]). Also **not**
+//! part of `ci`: it needs the network and writes into a caller-chosen release
+//! output directory.
 
 mod bench;
+mod dist_ort;
 mod memory_bench;
 
 use std::collections::VecDeque;
@@ -30,8 +36,9 @@ fn main() -> ExitCode {
         Some("ci") => run_ci(),
         Some("bench") => run_bench(),
         Some("memory-bench") => run_memory_bench(),
+        Some("dist-ort") => dist_ort::run(),
         other => {
-            eprintln!("usage: cargo xtask <ci|bench|memory-bench>");
+            eprintln!("usage: cargo xtask <ci|bench|memory-bench|dist-ort>");
             eprintln!("unknown task: {}", other.unwrap_or("<none>"));
             ExitCode::from(2)
         }

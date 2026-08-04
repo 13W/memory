@@ -18,15 +18,25 @@
 //!
 //! # Runtime requirements
 //!
-//! Loading a session needs the ONNX Runtime shared library on the host. Where it
-//! comes from per platform package is T17-03's "ORT bundling before the final CI
-//! matrix"; until then `ort` resolves it from `ORT_DYLIB_PATH` or the system
-//! loader path, and its absence surfaces as a typed
-//! [`OnnxError::Runtime`] rather than a panic.
+//! Loading a session needs the ONNX Runtime shared library on the host.
+//! [`ensure_ort_initialized`] resolves it, once per process: an explicit
+//! `ORT_DYLIB_PATH` always wins, else a file bundled next to the running
+//! executable (T17-03) — the same flat, no-manifest convention
+//! `local-rag-proxy::connect::resolve_daemon_binary_path` uses to find its
+//! daemon. Either way this module calls `ort::init_from` on that path
+//! itself, on a watchdog thread; it never lets `ort` discover
+//! `ORT_DYLIB_PATH` on its own, and when neither an override nor a bundled
+//! file exists, [`OnnxEmbedder::open_dir`] returns a typed
+//! [`OnnxError::Runtime`] without calling into `ort` at all. See
+//! [`resolve_ort_source`]'s and [`ensure_ort_initialized`]'s doc comments
+//! for why both of those are load-bearing rather than defensive
+//! redundancy — `ort` 2.0.0-rc.12 can hang instead of erroring when its own
+//! lazy setup fails.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use local_rag_embed::{EmbedError, EmbedRequest, Embedder, Vector};
 use local_rag_store::RepresentationKey;
@@ -143,6 +153,14 @@ impl OnnxEmbedder {
             .map(|f| f.relative_path)
             .find(|p| p.ends_with(".onnx"))
             .unwrap_or("model_quantized.onnx");
+
+        // Checked here, immediately before the first `ort` API touch, not
+        // earlier: a directory with a bad `tokenizer.json` must still fail
+        // with `OnnxError::Tokenizer` regardless of whether a runtime is
+        // available, per `a_marked_directory_gets_past_the_gate_and_fails_
+        // on_the_asset_itself` (`crates/models/tests/onnx.rs`) — the gate
+        // this function passes through is the asset marker, not the runtime.
+        ensure_ort_initialized()?;
 
         let session = Session::builder()
             .and_then(|mut b| b.commit_from_file(dir.join(graph)))
@@ -261,6 +279,175 @@ impl Embedder for OnnxEmbedder {
     }
 }
 
+/// The bundled ONNX Runtime shared library's platform-specific file name —
+/// the name every platform's official release archive gives it.
+fn ort_dylib_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    }
+}
+
+/// Locate an ONNX Runtime shared library bundled next to `exe` — the same
+/// flat, no-manifest convention `local-rag-proxy::connect::
+/// resolve_daemon_binary_path` uses to find its daemon (one npm platform
+/// package / `target/{debug,release}` directory, no separate lookup path).
+///
+/// `None` when no such file sits beside `exe`: a dev build, `cargo test`, or
+/// a platform package that has not bundled a runtime. Callers treat that as
+/// "no bundled default", not an error — `ort`'s own resolution still applies.
+fn bundled_ort_dylib_path(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let candidate = dir.join(ort_dylib_file_name());
+    candidate.is_file().then_some(candidate)
+}
+
+/// Decide which ONNX Runtime shared library [`ensure_ort_initialized`]
+/// should explicitly load, given an explicit override (`ORT_DYLIB_PATH`,
+/// read by the caller so this stays a plain function to unit-test without
+/// touching process environment state) and the running executable's own
+/// path.
+///
+/// `Ok(path)` — `dylib_path_override` when set, else a runtime bundled next
+/// to `exe`. Either way the caller must go on to explicitly
+/// `ort::init_from(path)` **itself**, rather than leaving `ORT_DYLIB_PATH`
+/// to `ort`'s own env-var-driven lazy pickup inside `Session::builder()`:
+/// that indirection means the *first* `ort` API touch in the process — and
+/// therefore any hang inside it — happens somewhere this module does not
+/// control. See [`ensure_ort_initialized`]'s doc comment for why that
+/// distinction is load-bearing, not stylistic.
+///
+/// `Err` — neither is available. The message is raw (not yet wrapped in
+/// [`OnnxError::Runtime`]'s `Display`) — [`ensure_ort_initialized`] is the
+/// single place that applies that wrapping, so a caller never sees the
+/// "ONNX Runtime unavailable (ONNX Runtime unavailable (...))" double wrap a
+/// second `OnnxError::Runtime(err.to_string())` would produce.
+fn resolve_ort_source(
+    dylib_path_override: Option<&std::ffi::OsStr>,
+    exe: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(over) = dylib_path_override {
+        return Ok(PathBuf::from(over));
+    }
+    bundled_ort_dylib_path(exe).ok_or_else(|| {
+        format!(
+            "no ONNX Runtime found: ORT_DYLIB_PATH is unset and no {} sits beside {}",
+            ort_dylib_file_name(),
+            exe.display()
+        )
+    })
+}
+
+/// How long [`ensure_ort_initialized`] waits for `ort::init_from` before
+/// giving up on it as hung rather than merely slow. Real loads finish in
+/// well under a second — G11's own measured loads were 300–800ms — so this
+/// bound is generous on purpose, not tight.
+const ORT_INIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Point `ort` at `path`, once per process, before the first session is
+/// created (`ort::init_from`'s own contract: it "must be called before any
+/// other `ort` APIs are used") — or fail with a typed error before `ort` is
+/// touched at all when [`resolve_ort_source`] found nothing to point at.
+///
+/// Memoized in a `OnceLock` rather than `std::sync::Once`, because unlike a
+/// best-effort initializer this one has an outcome every caller after the
+/// first needs: `ort::init_from`/`Session::builder()` may only run once per
+/// process, so a later `OnnxEmbedder::open_dir` call must see the same
+/// success-or-error the first one produced, not silently retry and hit the
+/// same deadlock this function exists to avoid.
+///
+/// # Why the actual `ort::init_from` call runs on a watchdog thread
+///
+/// `ort` 2.0.0-rc.12's `load-dynamic` path does not fail fast when its setup
+/// fails for *any* reason — constructing its own "could not load" error
+/// re-enters the same `OnceLock` its lazy environment setup is already
+/// inside, and the thread deadlocks on `Once::call_once_force` waiting for
+/// itself. Confirmed twice, independently, sampling real builds: (1) no
+/// library findable anywhere (`ORT_DYLIB_PATH` unset, nothing bundled) —
+/// stuck in `ort::environment::current` → `ort::setup_api` →
+/// `ort::error::Error::new_internal`; (2) a real, correctly-fetched,
+/// checksum-verified `.dylib` that exists on disk but fails to `dlopen`
+/// (observed with T17-03's `darwin-x64` bundle — ONNX Runtime's own
+/// `osx-x86_64` release binaries are unsigned, and loading one under Rosetta
+/// on this Apple Silicon dev machine hit exactly this) — stuck inside
+/// `ort::init_from` itself, same `ort::error::Error::new_internal` →
+/// `try_init_inner` → `Once::call_once_force` → `queue::wait` shape one
+/// level deeper. Both are the same root cause (any setup failure's own
+/// error-reporting path is reentrant), not two different bugs, and nothing
+/// short of never calling into `ort` at all rules it out in general — a
+/// future ONNX Runtime build could fail to load for a reason neither of
+/// these two runs hit.
+///
+/// The only mitigation reachable from outside `ort`'s own source is a
+/// timeout: run the call on its own thread and stop waiting after
+/// [`ORT_INIT_TIMEOUT`]. On a timeout the spawned thread is abandoned
+/// (deliberately leaked, not joined or killed — Rust has no thread-kill, and
+/// the alternative is the caller hanging with it); [`ensure_ort_initialized`]
+/// only ever spawns one such thread per process, via the `OnceLock`, so the
+/// worst case is one permanently-blocked thread for the life of the daemon,
+/// which is a bounded, known cost — not the unbounded hang this replaces.
+fn ensure_ort_initialized() -> Result<(), OnnxError> {
+    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let dylib_path_override = std::env::var_os("ORT_DYLIB_PATH");
+        let exe = std::env::current_exe().map_err(|e| {
+            format!(
+                "could not resolve the running executable's own path to look \
+                 for a bundled ONNX Runtime: {e}"
+            )
+        })?;
+        let path = resolve_ort_source(dylib_path_override.as_deref(), &exe)?;
+        init_ort_with_timeout(path)
+    })
+    .clone()
+    .map_err(OnnxError::Runtime)
+}
+
+/// The watchdog-guarded call itself — see [`ensure_ort_initialized`]'s doc
+/// comment for why this cannot simply call `ort::init_from` inline.
+fn init_ort_with_timeout(path: PathBuf) -> Result<(), String> {
+    run_with_timeout(ORT_INIT_TIMEOUT, move || {
+        ort::init_from(&path)
+            .map(|builder| {
+                builder.commit();
+            })
+            .map_err(|e| format!("failed to load the ONNX Runtime at {}: {e}", path.display()))
+    })
+    .unwrap_or_else(|| {
+        Err(format!(
+            "loading the ONNX Runtime did not finish within {ORT_INIT_TIMEOUT:?} \
+             — treating it as hung rather than waiting forever (see \
+             `ensure_ort_initialized`'s doc comment for why `ort` itself \
+             cannot be trusted to report this as an error)"
+        ))
+    })
+}
+
+/// Run `f` on its own thread and wait up to `timeout` for it — `None` if it
+/// does not finish in time. The thread is not joined or killed on a timeout
+/// (Rust has no thread-kill); it is deliberately abandoned to keep running,
+/// which is only sound because every caller here treats a `None` as a
+/// terminal failure rather than something to retry, so at most one thread is
+/// ever leaked per [`ensure_ort_initialized`] call site.
+fn run_with_timeout<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Send failing (the receiver dropped, i.e. this already timed out) is
+    // exactly the case this discards — nothing is waiting to hear about it.
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let _ = tx.send(f());
+    });
+    if spawned.is_err() {
+        return None;
+    }
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Pick the graph output that carries the embedding.
 ///
 /// [`POOLED_OUTPUT`] wins whenever the graph declares it, **regardless of its
@@ -367,6 +554,101 @@ fn normalized(values: &[f32]) -> Vector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use local_rag_test_support::home::TempHome;
+
+    #[test]
+    fn no_bundled_dylib_beside_the_executable_resolves_to_none() {
+        // The common case for every dev build and `cargo test` binary: the
+        // executable has no runtime sitting next to it, and the resolver
+        // must say so rather than pointing at a file that doesn't exist.
+        let home = TempHome::new().expect("temp home");
+        let exe = home.join("local-rag");
+        std::fs::write(&exe, b"not a real binary").expect("write fake exe");
+        assert_eq!(bundled_ort_dylib_path(&exe), None);
+    }
+
+    #[test]
+    fn a_dylib_beside_the_executable_is_found_by_its_platform_name() {
+        let home = TempHome::new().expect("temp home");
+        let exe = home.join("local-rag");
+        std::fs::write(&exe, b"not a real binary").expect("write fake exe");
+        let dylib = home.join(ort_dylib_file_name());
+        std::fs::write(&dylib, b"not a real runtime").expect("write fake dylib");
+        assert_eq!(bundled_ort_dylib_path(&exe), Some(dylib));
+    }
+
+    #[test]
+    fn an_explicit_override_always_wins_over_a_bundled_file() {
+        let home = TempHome::new().expect("temp home");
+        let exe = home.join("local-rag");
+        std::fs::write(&exe, b"not a real binary").expect("write fake exe");
+        // Even with a bundled file sitting right there, an explicit
+        // `ORT_DYLIB_PATH` must not be second-guessed.
+        std::fs::write(home.join(ort_dylib_file_name()), b"bundled").expect("write bundled");
+
+        let override_value = std::ffi::OsStr::new("/somewhere/else/libonnxruntime.dylib");
+        assert_eq!(
+            resolve_ort_source(Some(override_value), &exe).expect("ok"),
+            PathBuf::from("/somewhere/else/libonnxruntime.dylib")
+        );
+    }
+
+    #[test]
+    fn no_override_falls_back_to_the_bundled_file_when_present() {
+        let home = TempHome::new().expect("temp home");
+        let exe = home.join("local-rag");
+        std::fs::write(&exe, b"not a real binary").expect("write fake exe");
+        let dylib = home.join(ort_dylib_file_name());
+        std::fs::write(&dylib, b"bundled").expect("write bundled");
+
+        assert_eq!(resolve_ort_source(None, &exe).expect("ok"), dylib);
+    }
+
+    #[test]
+    fn neither_an_override_nor_a_bundled_file_is_a_typed_error_not_a_hang() {
+        // The regression this guards: `ort` 2.0.0-rc.12 deadlocks trying to
+        // construct its own "library not found" error when `Session::
+        // builder()` runs without anything ever having been initialized
+        // first (see this function's doc comment for how that was
+        // confirmed). `open_dir` must never reach `Session::builder()` in
+        // this case — it must fail here, synchronously, with a message that
+        // names what was missing.
+        let home = TempHome::new().expect("temp home");
+        let exe = home.join("local-rag");
+        std::fs::write(&exe, b"not a real binary").expect("write fake exe");
+
+        let message = resolve_ort_source(None, &exe).expect_err("nothing to find");
+        assert!(message.contains("ORT_DYLIB_PATH"), "{message}");
+        assert!(message.contains(ort_dylib_file_name()), "{message}");
+    }
+
+    #[test]
+    fn run_with_timeout_returns_a_fast_result() {
+        let result = run_with_timeout(Duration::from_secs(5), || 6 * 7);
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn run_with_timeout_gives_up_on_a_hung_closure_without_waiting_for_it() {
+        // The regression this guards: `ort::init_from` can hang indefinitely
+        // (see `ensure_ort_initialized`'s doc comment) — this asserts the
+        // watchdog itself actually bounds the wait rather than trusting the
+        // closure to cooperate. The closure here blocks forever on purpose
+        // (an unfulfillable channel receive, not a sleep, so there is no way
+        // for it to return even if this were mistakenly given more time).
+        let started = std::time::Instant::now();
+        let (_never_sent, forever) = std::sync::mpsc::channel::<()>();
+        let result = run_with_timeout(Duration::from_millis(100), move || {
+            let _ = forever.recv();
+            "unreachable"
+        });
+        assert_eq!(result, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the watchdog must return near the timeout, not wait for the hung thread: {:?}",
+            started.elapsed()
+        );
+    }
 
     fn mask(rows: usize, cols: usize, keep: usize) -> Array2<i64> {
         let mut m = Array2::<i64>::zeros((rows, cols));
