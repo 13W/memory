@@ -40,10 +40,12 @@
 //!   the only per-generation anchor today; a precise `retired_at` is a possible
 //!   future migration, not needed now. `K` (last-K by number) needs no timestamp
 //!   and is the primary mechanism.
-//! - **`K` and `T` stay `[OPEN]` (O6).** They are read from
-//!   [`StorageConfig`](local_rag_core::config::StorageConfig) via
-//!   [`RetentionParams::from_storage_config`]; the current defaults (`K = 2`,
-//!   `T = 168 h`) are provisional, not normative.
+//! - **`K` and `T` are final v0/GA values (O6 resolved,
+//!   [ADR-0007](../../../docs/adr/0007-retention-k-t-final-values.md)).** They
+//!   are read from [`StorageConfig`](local_rag_core::config::StorageConfig)
+//!   via [`RetentionParams::from_storage_config`]; the defaults (`K = 2`,
+//!   `T = 168 h`) are the normative, decided answer, not placeholders — ADR-0007
+//!   records why they were adopted without usage telemetry.
 //!
 //! # Seams for not-yet-built subsystems
 //!
@@ -102,7 +104,8 @@ pub struct GenerationMeta {
 ///
 /// Kept separate from [`StorageConfig`](local_rag_core::config::StorageConfig) so
 /// the pure policy can be exercised with raw boundary values; build it from config
-/// with [`RetentionParams::from_storage_config`]. Both values are `[OPEN]` (O6).
+/// with [`RetentionParams::from_storage_config`]. Both values are final v0/GA
+/// defaults (O6 resolved, ADR-0007), not placeholders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionParams {
     /// `K`: keep the last `keep_last_k` `retiring` generations by number.
@@ -115,7 +118,8 @@ pub struct RetentionParams {
 impl RetentionParams {
     /// Read `K`/`T` from the `[storage]` config (spec 02 §3.1): `K` verbatim, `T`
     /// converted hours → milliseconds (saturating, so an absurd config can never
-    /// overflow). The config defaults are provisional (`[OPEN]` O6), not normative.
+    /// overflow). The config defaults are the final, normative v0/GA values (O6
+    /// resolved, ADR-0007), not provisional.
     pub fn from_storage_config(cfg: &StorageConfig) -> Self {
         let hours = i64::try_from(cfg.retired_generations_ttl_h).unwrap_or(i64::MAX);
         RetentionParams {

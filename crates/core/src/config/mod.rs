@@ -145,8 +145,11 @@ impl Default for DaemonConfig {
 
 /// `[storage]` section of `config.toml` (spec 02 §3.1).
 ///
-/// `retired_generations_keep`/`retired_generations_ttl_h` are `[OPEN]` in the
-/// spec; the values here are the spec's provisional defaults, not a closed answer.
+/// `retired_generations_keep`/`retired_generations_ttl_h` are final v0/GA
+/// values (O6 resolved by owner decision,
+/// [ADR-0007](../../../../docs/adr/0007-retention-k-t-final-values.md)), not
+/// placeholders — still ordinary, operator-overridable configuration, not
+/// hard-coded constants.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
@@ -154,9 +157,9 @@ pub struct StorageConfig {
     pub embedding_cache_budget_mb: u64,
     /// `observation_payload` TTL, hours.
     pub payload_ttl_hours: u64,
-    /// Retained retired generations, `K` (spec `[OPEN]`).
+    /// Retained retired generations, `K` (spec `[SPEC]`, ADR-0007).
     pub retired_generations_keep: u32,
-    /// Retired-generation TTL, `T` hours (spec `[OPEN]`).
+    /// Retired-generation TTL, `T` hours (spec `[SPEC]`, ADR-0007).
     pub retired_generations_ttl_h: u64,
 }
 

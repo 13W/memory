@@ -245,6 +245,30 @@ fn local_router_runtime_adr_is_well_formed() {
     );
 }
 
+#[test]
+fn retention_k_t_final_values_adr_is_well_formed() {
+    let path = adr_dir().join("0007-retention-k-t-final-values.md");
+    let adr = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for section in ["## Status", "## Context", "## Decision", "## Consequences"] {
+        assert!(
+            adr.contains(section),
+            "ADR-0007 must contain a `{section}` section"
+        );
+    }
+    assert!(
+        adr.contains("Accepted"),
+        "ADR-0007 must record an Accepted status"
+    );
+    assert!(
+        adr.contains("O6"),
+        "ADR-0007 must reference the open question O6 it resolves"
+    );
+    assert!(
+        adr.contains("X-001"),
+        "ADR-0007 must name the task that delivered this decision"
+    );
+}
+
 /// The ADR's measurement artifact must exist and stay machine-readable: the
 /// decision cites numbers, and a citation to a missing or unparsable file is not
 /// evidence.
