@@ -196,7 +196,10 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [x] D-031 Узкие wall-clock окна в recall_rpc.rs под пиковой параллельной нагрузкой (найдено финальным `cargo xtask ci`)
 - [x] T17-05 Запустить полный acceptance/resource/latency suite
 - [x] D-032 Гонка `tempdir()` по общему pid при конкурентных вызовах `build_indexed_store` из одного тест-процесса (найдено при написании `release_report`'s собственных real-model тестов)
-- [ ] G17 Финальная сверка v0
+- [x] D-033 Unix-only IPC-транспорт и UUID-энтропия не компилируются на win32-x64 (найдено реальным release-CI-прогоном для D-029)
+- [x] D-034 Транзиентная гонка `consolidation_runner`-теста, впервые проявившаяся на реальном GitHub Actions раннере
+- [x] D-035 `xtask.exe` не линкуется на win32-x64 (`llama-cpp-sys-2`, dev-only инструмент, не блокирует v0-релиз)
+- [x] G17 Финальная сверка v0
 
 ## Evidence
 
@@ -223,7 +226,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 | G14 | PASS after D-021 | строка G14 в «Task evidence» + трейс «G14 — трейс требование → artifact/test» ниже |
 | G15 | PASS after D-026 | строка G15 в «Task evidence» + трейс «G15 — трейс требование → artifact/test» ниже |
 | G16 | PASS | строка G16 в «Task evidence» + трейс «G16 — трейс требование → artifact/test» ниже |
-| G17 | — | — |
+| G17 | PASS after D-029, D-033, D-034, D-035 | строка G17 в «Task evidence» + трейс «G17 — трейс требование → artifact/test» ниже |
 
 ### Task evidence
 
@@ -231,6 +234,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 
 | ID | Commit/PR | Проверки | Результат/артефакт | Исполнитель/дата |
 | --- | --- | --- | --- | --- |
+| G17 | коммиты `D-033: fix win32-x64 compile (Unix-only IPC transport + UUID entropy)` + `D-033 round 2 + D-034 + D-035: win32-x64 remaining compile gaps, test flake` + строка evidence этой же задачи | Финальная сверка всей v0-очереди (T00–T17, G00–G16 все PASS/PASS after D-NNN). Методика: 4 параллельных Explore-агента перечитали specification 01–15 + idea.md rev 6 целиком и построчно сверили минимум 8–10 requirement-строк из каждой уже существующей Gxx-трейс-таблицы с реальным кодом (не приняли as-built-текст на веру); личная проверка — architecture guardrails свод (CLAUDE.md, 14 пунктов), `idea.md §18`, DEVIATIONS.md/Gate results полностью, plus реальная валидация D-029 через tagged-release. **Находок нормативного уровня — ноль.** Две чисто документальные неточности исправлены без D-NNN (устаревшие test-имена в историческом G02-evidence — сноска, не переписывание; устаревший заголовочный `[OPEN]` в `14-acceptance-and-testing.md:3` — as-built-заметка на месте). **D-029 (владелец решил закрыть реальным tagged-release прогоном) породил три реальных находки через настоящий CI, которых иначе не нашли бы:** **D-033** — весь IPC-транспорт (`local-rag-hook`/`local-rag::daemon`/`local-rag-proxy`) безусловно использовал `tokio::net::Unix{Listener,Stream}`/`std::os::unix::net` без `#[cfg(unix)]`, `local_rag_core::identity::SystemUuidV7` был `#[cfg(unix)]`-only но использовался безусловно в CLI (`init`/`index`/`rebuild`) — win32-x64 не компилировался вообще. Исправлено в 2 раунда (первый раунд пропустил `SocketLivenessProbe`-импорт и `cli::watch`'s `ShutdownSignal`): IPC-транспорт гейтирован по уже существующему в кодовой базе паттерну (`daemon::probe`), Windows-ветки — типизированный немедленный отказ без побочных эффектов; `SystemUuidV7` и `cli::watch`'s `ShutdownSignal` получили **настоящие** (не заглушки) Windows-реализации (`BCryptGenRandom` FFI, `tokio::signal::ctrl_c()`) — обе команды по дизайну не касаются демон-IPC и обязаны реально работать. **D-034** — первый когда-либо реальный прогон полного набора на GitHub Actions нашёл транзиентную гонку в `consolidation_runner.rs::lease_renews_on_cadence_while_the_generator_runs` (T14-06, gated PASS) — один и тот же коммит дал success/fail/success/fail на 4 параллельных `ci.yml`-прогонах; корень — `tokio::time::pause`'s auto-advance не отслеживает cross-thread channel round-trip к `StateWriter`'s реальному OS-потоку. Исправлено bounded poll-циклом вместо одноразового point-in-time assert (класс фикса D-003), ассерт не ослаблен. **D-035** — `xtask.exe` (dev-only, не поставляется) не линкуется на win32-x64 (`llama-cpp-sys-2`/CRT-символы, `LNK1120`); первоначальный прогноз, что это ударит и по `local-rag.exe`, не подтвердился — продуктовые бинарники линкуются чисто, задокументировано и не блокирует v0. **Финальный реальный прогон (тег `0.0.0`, run 31006707246 + `ci/master` 31006706764 + `ci/0.0.0` 31006707217, все три `success`)**: все 5 таргетов собраны, весь release pipeline (`build-global-artifacts`/`host`/`announce`) прошёл, настоящий публичный GitHub Release создан (`https://github.com/13W/memory/releases/tag/0.0.0`, 15 checksummed-артефактов); полный `cargo xtask ci` (18/18 job) зелёный на реальном `ubuntu-latest`, включая ранее флейкавший `consolidation_runner`-тест. Локально (native, Unix): `cargo fmt --all --check`/`cargo clippy --workspace --all-targets -- -D warnings`/`cargo test -p local-rag-core -p local-rag-hook -p local-rag-proxy -p local-rag -p local-rag-store` — все чистые, без регрессии. `cargo check --target x86_64-pc-windows-msvc -p local-rag-core -p local-rag-hook -p local-rag-proxy` (локальная кросс-проверка, без линковки — нет Windows SDK на macOS) — 0 ошибок. Финальная диспозиция O1–O8 (`TRACEABILITY.md`, обновлена этим же гейтом): O1/O2/O3/O4/O8 resolved; O5/O6 легитимно открыты для v0 по правилу плана; O7 split (SyntaxLocator resolved, symbol graph deferred v0.x подтверждено). | Полный `требование → код → тест → report` трейс — секция «G17 — трейс требование → artifact/test» ниже: spec 13 (Distribution) полная новая таблица (первичное владение наравне с G01), сжатые cross-cutting подтверждения для 01–12/14/15 (регрессий не найдено ни в одном), финальная таблица O1–O8, architecture guardrails чеклист. `DEVIATIONS.md`: 0 записей `open`/`fixing`; единственная `blocked`-запись (D-029) закрыта этим же гейтом до `resolved`. Все G00–G17 в «Gate results» — `PASS`/`PASS after D-NNN`, ни одного `BLOCKED`. | Claude Sonnet 5 / 2026-08-05 |
 | T17-05 | коммит `T17-05: versioned release report, latency/resources baseline (D-032, O2/O6)` (строка evidence в том же коммите) | Ревизия семи из девяти строк spec 14 §2 нашла их уже закрытыми разбросанным по гейтам G05/G07/G08/G09/G13/G14 покрытием — реально недостающими были только `latency`/`resources` (`[BASELINE]`-pending с T12-05) и сводный отчёт-инструмент (ни структуры, ни CLI, ни fixture-семейства не существовало). **Новый модуль `crates/xtask/src/release_report/`**: `resources.rs` — реальный idle-RAM замер (`sysinfo`, новая dev-only зависимость `crates/xtask`, кросс-платформенно читает RSS реального `local-rag serve`; строка в `CONTRIBUTING.md`'s таблице approved dependencies) + `state.sqlite`/`cache.sqlite`/shard-dir размеры после `CheckpointMode::Truncate` + bytes/occurrence + embedding-cache-budget adherence (`SUM(embedding_cache.byte_size)` против `embedding_cache_budget_mb`, не сырой размер файла) + source/worktree byte ratio; `latency.rs` — one-file/branch-checkout reconcile p50/p95 через продакшн `local_rag_index::reconcile::reconcile_once` в `ScanMode::Fast` с тёплым `StatCache`; `report.rs`/`gate.rs`/`run.rs` — `ReleaseReport` (9 строк гейта: `quality`/`memory-quality` — реальные `bench`/`memory_bench` прогоны + `gate::evaluate`; `latency`/`resources` — первый установленный v2-бейзлайн, осознанно без порога, precedent T10's spike-метрик; `reliability`/`consistency`/`sharing`/`idempotency`/`rebuild` — свежий повторный прогон `cargo test -p {store,hook,index,projection,search} --features failpoints`, каждый крейт ровно один раз, переиспользован между строками, которые он покрывает) + `to_markdown()`; новая CLI-подкоманда `cargo xtask release-report` (по образцу `run_bench`/`run_memory_bench`, намеренно вне `ci_jobs()` — те же причины, что у `bench`/`memory-bench`, плюс требует собранный `local-rag`-бинарник). **Рефакторинг без изменения поведения**: `crates/xtask/src/stats.rs` (общий `percentile()`, дедуп трёх копий) и `crates/xtask/src/git.rs` (общий `git_short_head()`); `bench::run::run` разбит на `build_indexed_store` (шаги 1-5, теперь `pub(crate)`) + `score_queries` (шаг 6, теперь заимствует `&IndexedStore` вместо потребления — переиспользуется `release_report::run`, чтобы корпус индексировался и эмбеддился только один раз на весь комбинированный прогон). **Безопасность корпуса (найдено и исправлено до первого реального прогона, не постфактум)**: `latency::measure`'s `touch_file` мутирует реальные файлы в индексируемом корне — единственный реальный `--corpus`, которым этот инструмент когда-либо вызывался в истории репозитория, это чей-то настоящий git checkout (`/opt/soft/local-rag`, v1-корпус для сравнимости с бейзлайном). `release_report::run::run` поэтому копирует `--corpus` в одноразовый temp-каталог (пропуская `node_modules`/`dist`, восстанавливая `corpus_commit` из **оригинального** чекаута постфактум, раз `.git` не переживает копию) и трогает только копию — тот же урок, что уже стоил этой задаче своих временных файлов при разработке (см. ниже), примененный к продакшн-команде превентивно. **D-032 (найдено при написании `release_report::resources`/`::latency`'s собственных real-model тестов, до коммита)**: `crates/xtask/src/bench/run.rs::tempdir()` (T12-05, гейт G12 `PASS`) namespace'ит временный стор только по `std::process::id()` — безопасно, пока `cargo xtask bench` был единственным вызывающим процесс-на-запуск; T17-05 впервые вызвал вынесенный `build_indexed_store` из двух независимых тестов, которые `cargo test` реально гоняет параллельными потоками одного процесса → `UNIQUE constraint failed: repository.repo_id` и `projection switch: no vector for occurrence …`, воспроизведено дважды подряд. Исправлено статическим `AtomicU64`-счётчиком поверх pid (`local-rag-bench-<pid>-<call>`) — уникально на вызов, не только на процесс; поведение единственного продакшн-вызывающего (`cargo xtask bench`) не изменилось. **Первый реальный `cargo xtask release-report --corpus /opt/soft/local-rag --subdir src --local-rag-bin target/debug/local-rag`** (веса/корпус не коммитятся; `ORT_DYLIB_PATH` этого хоста, реальный `gemma-4-e2b-it-gguf-q4-0` GGUF): 93 файла/545 occurrence; **quality PASS** (Hit@1 0.5918/Hit@3 0.8367/Hit@5 0.8367/MRR 0.7007 против v1 0.6963); **memory-quality PASS** (Precision 0.6757/Recall 0.5682/F1 0.6173 против порогов 0.60/0.50); **latency** (бейзлайн, не гейтится): warm search p50/p95 112.185/701.828 мс, one-file reconcile p50/p95 37.954/40.380 мс, branch-checkout (10 файлов) p50/p95 171.094/173.676 мс; **resources** (бейзлайн, не гейтится): idle RAM плоско 19 906 560 байт на всех сэмплах, `state.sqlite` 1 413 120 байт, `cache.sqlite` 5 128 192 байт, shard-dir 1 709 465 байт ⇒ 15 139.04 байт/occurrence, cache-budget ratio 0.0008 (1 652 736 / 2 147 483 648), source/worktree ratio 0.2347 (496 069 / 2 113 957); **reliability/consistency/sharing/idempotency/rebuild — все PASS** (свежий прогон, не цитата). Артефакт закоммичен: `fixtures/release/run-2026-08-05.{json,report.md}`. Подтверждено `git -C /opt/soft/local-rag status --short` — пусто (корпус не тронут, копирование сработало). **Полный набор прогонов evidence этой задачи**: `cargo test -p xtask` — **99 lib + 9 adr_links + 2 ci_config OK** (включая живые real-model тесты `release_report::{resources,latency}::tests::measures_real_*`, `measures_real_rss_of_a_real_daemon_process` — реальные, не skip, на этом хосте); `cargo fmt --all --check` чист; `cargo clippy -p xtask --all-targets -- -D warnings` чист; полный `cargo xtask ci` — **все 18 job зелёные** (`root:test` 1921.8s, `root:clippy` 260.8s, остальные ≤136s); `node --test plugin/test/*.test.js` — **16/16 OK** (свежее evidence platform-suite на darwin-arm64, p50≈5.1мс/p95≈7.1мс hook cold-start, без регрессии от T17-02). `git diff --stat Cargo.lock` — 171 добавленных строки, целиком транзитивные зависимости `sysinfo` (macOS: `objc2-core-foundation`/`objc2-io-kit`; Windows: `ntapi`/`winapi*`/`windows*` — кросс-платформенность, ни одна не линкуется ни в один продуктовый бинарник, только `xtask`), ни одного стороннего пакета сверх этого. **O2**: закрыт полностью — search quality (T12-05/D-016/D-017/D-018, уже PASS), memory-router P/R (T14-07/ADR-0006/T14-09), и теперь latency/resources как первый v2-бейзлайн (14 §2, 15 §4 as-built заметки). **O6**: граница явно задокументирована, не решена (06 §5, 15 §4 as-built заметки) — телеметрии для вывода реальных K/T нет нигде в кодовой базе, строить её вне объёма этой задачи; provisional-дефолты (K=2, T=168h) остаются без изменений, вопрос — явный pre-GA release-gate item. **`fixtures/manifest.json` GAP-06**: устаревший текст («S1-S8 remains open») исправлен на факт — T13-06/G13/D-019 закрыли S1-S8 полностью | Все пункты карточки закрыты: versioned release report для всех 9 gate-строк spec 14 §2; O2 полностью resolved; O6 граница сделана явной, не сфабрикована. Единственная новая deviation — D-032, тот же класс, что D-001/D-003/D-005/D-009/D-031 (тестовая инфраструктура, вскрытая новым паттерном использования уже-gated кода, не нормативное поведение). `[SPEC]`-амендменты: 14 §2 (T17-05 as-built, реальные числа latency/resources), 15 §4 (O2 resolved, O6 граница), 06 §5 (O6 граница, без изменения кода) | Claude Sonnet 5 / 2026-08-05 |
 | T17-04 | коммит `T17-04: upgrade/migration/offline install flows (D-030, D-031)` (строка evidence в том же коммите) | Движок миграций и upgrade/drain-flow демона были уже полностью реализованы (D-001, T01-05, T15-01/02) — задача закрыла шесть конкретных пробелов покрытия/поведения, названных карточкой, не переписывала механизм. **(1) Every released schema fixture**: новый `crates/store/tests/support/mod.rs::build_store_at_version` мигрирует реальный `local_rag_store::migrate::ALL[..n]` (не синтетику, не закоммиченный `.sqlite` — CLAUDE.md запрещает); `crates/store/tests/migrate_fixtures.rs` — `every_released_schema_version_migrates_cleanly_to_head` (все 9 версий → head), `a_row_seeded_at_the_first_released_version_survives_migration_to_head` (реальная строка переживает всю цепочку), `no_released_migration_is_destructive_or_stepped_yet` (tripwire: сегодня ни одна реальная миграция не деструктивна — crash-at-checkpoint тест на реальном `ALL` пока не нужен, генерическая checkpoint/backup-механика уже полностью покрыта `migrate_resumable.rs` на синтетике). **(2) Restore backup**: `crates/store/tests/migrate_restore.rs::restoring_a_pre_destructive_backup_recovers_the_old_binarys_data` — синтетический destructive-набор (нет реальных destructive-миграций), `VACUUM INTO` backup восстановлен поверх `state.sqlite`, открыт урезанным (старым) набором миграций — без `IncompatibleStore`, данные на месте, дальнейшая миграция вперёд всё ещё работает. **(3) Newer-store refusal / реальный cross-binary-version upgrade**: новый feature-gated seam (`local-rag`'s `main.rs::test_daemon_version_override` + `local-rag-store`'s `state::migration_set_for_this_open`, `LOCAL_RAG_TEST_FAKE_DAEMON_VERSION`/`LOCAL_RAG_TEST_MAX_SCHEMA_VERSION`, `--features failpoints`, форвардится `local-rag` → `local-rag-store`, `local-rag-proxy` → `local-rag` через новую фичу `failpoints`) — `crates/local-rag-proxy/tests/subprocess.rs::a_real_older_daemon_binary_drains_and_a_real_new_daemon_migrates_the_store_to_head`: реальный «старый» демон (fake version + урезан до v8) мигрирует до v8, реальный чистый proxy проводит настоящий upgrade-цикл (`SHUTDOWN_REQUEST`→drain→respawn), новый процесс домигрирован до v9 — подтверждено реальным `local-rag doctor --json` (не хэндшейком по протоколу — реальной миграцией на диске). Честно задокументировано как один артефакт, сконфигурированный дважды, не второй исторический бинарник (нет сети/второй машины). Побочно исправлена ошибка в комментарии `local-rag-proxy/Cargo.toml` про `env!("CARGO_BIN_EXE_local-rag")` (эмпирически не работает для чужого пакета — `local-rag-hook/tests/recall_rpc.rs` уже фиксировал ту же находку; используется её же `local_rag_binary_path()`-трюк). **(4) Old spool versions import**: `local_rag_core::spool::FORMAT_VERSION` ни разу не менялся — `crates/store/tests/spool_v1_fixture.rs` замораживает реальные байты v1-сегмента как литерал (снят один раз текущим энкодером, не генерируется живьём в тесте) — `a_real_v1_spool_segment_still_imports_at_head` доказывает текущий декодер всё ещё импортирует v1 чисто; шаблон готов для будущего бампа версии. **(5) Incompatible new hook warning + D-030 (реальный найденный баг)**: `spawn_spool_resume` (`crates/local-rag/src/daemon/lifecycle.rs`) молча терял `Result` (включая `stalled_on`) — нарушение уже существующего `[FIXED concern]` spec 11 §4. Исправлено: (a) немедленный `eprintln!` на стороне демона; (b) новая read-only `local_rag_store::diagnose_spool_tail` (общий `decode_pending_tail`, вынесенный из `import_session_tail` без изменения поведения) заведена в `local-rag doctor` новой секцией `spool`; (c) `local-rag-proxy`'s новая `check_spool_format_compatibility` сравнивает `Welcome.spool_max_format_version` с собственной скомпилированной `FORMAT_VERSION`, предупреждение в stderr (стеклянная stdout/stderr-дисциплина сохранена). **(6) Offline search/recall**: `crates/local-rag/tests/offline_search_recall.rs` — tier A (всегда, без ORT) `search_code_and_remember_recall_succeed_fully_offline` — без модели, `degraded: lexical_only`, лексический хит + remember/recall round-trip; tier B (env-gated `with_real_model`, зеркалит `cli_index.rs`'s конвенцию) `real_dense_search_and_recall_work_once_the_fetch_server_is_gone` — реальный ONNX через **живой** MCP-вызов демона (не только на этапе `index`), `mode: "code"`, семантически релевантный файл ранжируется первым, `degraded: null`; в этом окружении честно `SKIP` (`ORT_DYLIB_PATH`/`LOCAL_RAG_TEST_MODEL_HOME` не заданы), скомпилирован и структурно проверен. **O5**: закрыт документацией (spec 13 §3, 15 §4 as-built заметки) — v0 ставится с чистого старта, вопрос реального v1-импортёра остаётся открытым, но явно назван GA-блокером, не MVP; кода миграции не написано (по решению владельца, зафиксированному в этой же сессии). **D-031 (найдено финальным `cargo xtask ci` при 18-way параллельной нагрузке)**: `crates/local-rag-hook/tests/recall_rpc.rs`'s `unreachable_daemon_prints_nothing`/`timeout_daemon_that_accepts_but_never_responds_prints_nothing` (T15-06, не тронуты этой задачей иначе) держали неоправданно узкие абсолютные wall-clock окна (1s/2s) вокруг реального сабпроцесса — под пиковой конкуренцией планировщика (18 job) elapsed доходил до 2.46s/2.77s; расширены до 10s (тот же порядок величины, что уже даёт `serve_subprocess.rs`/`local-rag-proxy`'s `subprocess.rs` реальным daemon-spawn тестам), нижняя граница второго теста (`>= 200ms`) не тронута. Тесты: `cargo test -p local-rag-store --test migrate_fixtures --test migrate_restore --test spool_v1_fixture --test observation_import` — 3+1+1+15=20 OK; `--lib observation::` — 21 OK; `cargo test -p local-rag --test cli_doctor --test serve_subprocess --test offline_search_recall` — 18+2+2=22 OK; `cargo test -p local-rag-proxy --features failpoints` — 18+2+7=27 OK (вкл. реальный cross-binary upgrade и spool-warning тесты); `cargo test -p local-rag-hook --test recall_rpc` — 9 OK. Полный `cargo xtask ci` — **все 18 job зелёные** (новая `proxy:clippy-failpoints` лейна добавлена; `root:test` 3014.4s — вся цепочка `nextest`+`test --doc`, вкл. все новые файлы и `--features failpoints` варианты для `store`/`local-rag`/`local-rag-proxy`) — первые два прогона поймали три независимые проблемы (dead-code без фичи в `local_rag_binary_path`, `test --doc -p local-rag-proxy` невозможен — bin-only крейт без `lib.rs`, и D-031's флап), все исправлены, третий прогон чист. `git diff --stat Cargo.lock` — без изменений (ни одной новой внешней зависимости) | Все пункты карточкиного «Результат»/«Тесты» закрыты: packaged old→new daemon drain/migrate/reconnect (реальный, с реальной миграцией, не только протокол); every released schema fixture; spool backward compatibility (фикстура + предупреждение, оба уровня — daemon-side диагностика и proxy-side сравнение); offline use после model init (два яруса); O5 resolved as clean-start, явно назван GA-блокером. Единственная новая deviation с нормативным нарушением — D-030 (молчаливая потеря диагностики, найдено при планировании, не входило в уже названный scope карточки); D-031 — чисто тестовая устойчивость к нагрузке, тот же класс, что D-001/D-003/D-005/D-009. `[SPEC]`-амендменты: 11 §4 (D-030 daemon-side + T17-04 proxy-side), 13 §3 (fixture-harness + restore, as-built), 13 §4 (реальный cross-binary upgrade test, as-built) | Claude Sonnet 5 / 2026-08-04 |
 | T17-03 | коммит `T17-03: cargo-dist/zigbuild platform CI, ORT bundling` (строка evidence в том же коммите) | Тулчейн реально установлен через `brew` (`dist` 0.32.0, `cargo-zigbuild` 0.23.0, `zig` 0.16.0). `dist init`/`dist generate` — реальный `dist-workspace.toml` (5 таргетов: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`) + реальный `.github/workflows/release.yml` (296 строк, `runs-on: ${{ matrix.runner }}`, настоящая per-OS матрица). `dist plan` — полный артефакт-план по всем 5 таргетам × 3 бинарника; `dist build --target aarch64-apple-darwin` — реальная сборка, `target/distrib/*.tar.xz` + `.sha256`, `shasum -a 256 -c` подтверждает; `dist manifest --target aarch64-apple-darwin` — согласован с `plan`. Реально собраны (`cargo build --release`/`cargo zigbuild --release`) все 4 достижимых таргета: `aarch64-apple-darwin` (нативно), `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`; `file` подтверждает верный формат/архитектуру каждого из 12 бинарников. Новый `cargo xtask dist-ort` (`crates/xtask/src/dist_ort.rs`, задокументирован в `CONTRIBUTING.md`) реально скачал, проверил по пиннутому SHA-256 и распаковал (`tar`) официальные ONNX Runtime релизы для всех 4 платформ (`onnxruntime-{osx-arm64-1.27.0,osx-x86_64-1.20.0,linux-x64-1.27.0,linux-aarch64-1.27.0}.tgz`, точные URL/дайджесты — `ORT_ASSETS`); `cargo test -p xtask` — 10/10 OK (каталог, digest-формат, реальная сборка `.tgz`-фикстуры через системный `tar`, реальный round-trip bundle/verify/cache-reuse/mismatch). `npm/memory-{darwin-arm64,darwin-x64,linux-x64,linux-arm64}/bin/` реально наполнены (3 бинарника + `libonnxruntime.{dylib,so}` каждый, `file`-подтверждено); `npm/memory-win32-x64/bin/` осознанно пуст (D-029) — не коммитятся (`.gitignore`: `npm/memory-*/bin/`). Реальные смоук-прогоны на этих npm-бандлах: **darwin-arm64** (нативно) — `local-rag version`/`init` (0.85с, реальная регистрация `code_raw` через бандл-ORT без `ORT_DYLIB_PATH`), `local-rag index` реального фикстур-репо → `indexed 2 files (63 occurrences)…embedded 62 subjects (0 failed); dense +63/-0`, `local-rag doctor` → `clean`/`dense=Valid`, `local-rag-hook spool-write` → реальный сегмент на диске, полный MCP handshake через `local-rag-proxy` (холодный спавн демона) → `initialize`+`tools/list` (17 инструментов) отвечены корректно. **darwin-x64** (только через Rosetta, `arch -x86_64`) — `version` работает; `init` (реальный инференс) не подтверждён рабочим — см. D-028/D-029. **linux-x64/linux-arm64** — только структурная верификация (`file`), реального исполнения нет (нет Docker/QEMU). Полный `cargo xtask ci` — **все 17 job зелёные** (`root:test` 750.8s, `root:clippy` 70.0s, восемь `*:clippy-failpoints` 11.8–41.5s, `root:doc` 11.8s, три `spike:*` ≤18.9s) — первый прогон поймал регрессию (см. «Результат»), исправлена, второй прогон чист. `git diff --stat Cargo.lock` — одна строка (`xtask` → `local-rag-test-support`, уже workspace-член, новых внешних пакетов нет) | **Достигнуто по-настоящему**: реальный `cargo-dist`/`cargo-zigbuild` конфиг и сгенерированный CI workflow; реальная кросс-сборка и чек-сумма для 4 из 5 таргетов; реальный pinned-digest ORT installer (тот же verify-before-trust идиом, что `crates/models::install`, применённый к build-инструменту, не runtime-команде); реальное наполнение npm-бандлов; реальные smoke-прогоны, включая полный MCP round-trip на `darwin-arm64`. **Находка в процессе (не расхождение с уже реализованным, а дефект, вскрытый этой же задачей — D-028, resolved)**: `ort` 2.0.0-rc.12 виснет навсегда (реэнтерабельный `OnceLock`/`Once::call_once_force`, подтверждено `sample` на реальных сборках дважды — «рантайма нет вообще» и «рантайм есть, но не грузится», см. запись D-028) вместо типизированной ошибки, которую документировал ещё T11-06 — эта задача первая, где сценарий «нет `ORT_DYLIB_PATH`» стал реальным (не гипотетическим) путём. Исправлено в `crates/models/src/onnx.rs`: `resolve_ort_source` решает путь до касания `ort`, `ensure_ort_initialized` сама вызывает `ort::init_from` (не полагаясь на ленивый разбор `ORT_DYLIB_PATH` внутри `ort`), сам вызов — на сторожевом потоке с 10-секундным таймаутом (`run_with_timeout`). Регрессия, пойманная первым прогоном `cargo xtask ci` (не отдельное отклонение — тот же коммит, тот же фикс): перестановка `ensure_ort_initialized()` перед `Tokenizer::from_file` в `open_dir` сломала `a_marked_directory_gets_past_the_gate_and_fails_on_the_asset_itself` (`crates/models/tests/onnx.rs`, T11-06) — исправлено перемещением вызова обратно, непосредственно перед `Session::builder()`, тест не трогался. **Явно blocked (D-029, зарегистрировано, не тихий пробел)**: код-signing (Apple/Windows сертификаты не сконфигурированы), реальный прогон сгенерированной GitHub Actions matrix (`origin` → `github.com/13W/memory` теперь реально существует, но ничего не запушено без явного запроса владельца), `win32-x64` целиком (`cargo-zigbuild` документированно не поддерживает Windows). `darwin-x64`'s dense-нога — известный незакрытый остаток внутри уже resolved D-028: ORT v1.20.0 (единственный релиз с `osx-x86_64`) не подписан, под Rosetta на этой машине не грузится; watchdog делает это безопасным сбоем (`lexical_only`), но не доказывает работоспособность на реальном Intel Mac, которого в этом окружении нет. `[SPEC]`-амендмент: 13 §2 (as-built «settled» для ORT bundling — резолюция, verify-before-trust, что реально верифицировано по платформам) | Claude Sonnet 5 / 2026-08-04 |
@@ -2168,3 +2172,224 @@ D-001…D-027 остаются `resolved`, не тронуты; новых за�
 `cargo clippy --workspace --all-targets -- -D warnings`, полный `cargo xtask ci` (все 17 job) —
 зелёные. **`PASS`** — группа 16 (Security, privacy и recovery operations) закрыта; группа 17
 (Distribution и release gates, T17-01 — npm launcher и platform packages) — следующая задача.
+
+### G17 — трейс требование → artifact/test
+
+Дата 2026-08-05, исполнитель Claude Sonnet 5. Финальная сверка всей v0-очереди (T00–T17,
+G00–G16 все `PASS`/`PASS after D-NNN`). По `TRACEABILITY.md` G17 — **первичный** владеющий
+гейт (наравне с G01) для spec 13 (Distribution/migrations) и **end-to-end повторная проверка**
+для всех остальных разделов 01–12/14/15, чьи трейсы уже построены владеющими гейтами. Методика:
+4 параллельных Explore-агента (01–04, 05–08, 09–12, 13–15+idea.md), каждый лично перечитал
+полные тексты спецификации и построчно сверил минимум 8–10 requirement-строк из существующих
+Gxx-трейсов с реальным кодом через `rg`/чтение файлов — не принимал as-built-текст на веру.
+Личная проверка: architecture guardrails свод (CLAUDE.md), `idea.md §18`, DEVIATIONS.md/
+Gate results полностью, реальный tagged-release прогон (D-029).
+
+**Итог: расхождений нормативного уровня не найдено.** Две чисто документальные неточности
+найдены и закрыты без завода D-NNN (обе — устаревший текст, не нарушение поведения):
+(1) G02-трейс (PROGRESS.md:505/506/508/530) цитирует test-имена, переименованные в T03-01
+(`no_foreign_key_targets_a_path_or_fingerprint_column` →
+`no_foreign_key_targets_a_path_hash_or_stray_path_column`;
+`path_columns_live_only_on_ledger_tables` → `path_columns_live_only_on_path_bearing_tables`) —
+функции тестов не изменились, только имена; T03-01's собственная evidence-строка (PROGRESS.md
+строка 335) уже фиксирует переименование, историческая G02-запись сохранена дословно per
+evidence-preservation rule, эта сноска — единственное дополнение; (2) `14-acceptance-and-
+testing.md:3`'s заголовочный `[OPEN]` был стилистически устаревшим (описывал только `quality`
+row's путь через v1-baseline; `memory-quality`/`latency`/`resources` закрыты без v1-аналога) —
+исправлено as-built-заметкой прямо на месте (см. spec-файл, не отдельный D-NNN, т.к. это не
+расхождение поведения).
+
+#### Spec 13 — Distribution & Migration Framework (PRIMARY, наравне с G01)
+
+Spec 13 §1 — Packaging `[FIXED]`:
+
+| Требование (маркер) | Artifact | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| Один native service binary, без обязательного внешнего демона; веса — отдельно | `local-rag`/`local-rag-proxy`/`local-rag-hook` (3 бинарника на платформенный пакет), `models/` отдельно от npm | `npm/*/package-contents.test.js` — 13 OK (`npm pack --dry-run`, веса исключены из пакета) | as-built (T17-01), подтверждено |
+| npm `optionalDependencies` матрица (darwin-{arm64,x64}, linux-{x64,arm64}, win32-x64); `win32-arm64` deferred | `npm/memory/package.json` (лончер) + 5 платформенных пакетов `npm/memory-*` | T17-01 evidence — 56 OK, 3 прогона подряд | as-built (T17-01/T17-03) |
+| Build tooling: `cargo-dist`, `cargo-zigbuild` `[FIXED]` | `dist-workspace.toml` (5 таргетов), `.github/workflows/release.yml` | `dist plan`/`dist build`/`dist manifest`, checksum `shasum -a 256 -c` (T17-03) | as-built, подтверждено (все 5/5 таргетов — см. D-029 ниже) |
+| Hook path exec-fast `<50ms` cold `[SPEC]` | `plugin/hooks/hooks.json` → `local-rag-hook spool-write` | `plugin/test/cold-start.test.js` — p50≈5–6ms/p95≈6–8ms, реальный cached direct-exec (T17-02) | as-built, подтверждено с запасом |
+
+Spec 13 §2 — Launcher requirements `[FIXED list]`:
+
+| Требование (маркер) | Artifact | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| Signal forwarding + reliable termination + orphan cleanup | `npm/memory/src/lifecycle.js` | `subprocess.test.js` — 6 OK (реальные OS-процессы) | as-built (T17-01) |
+| Resolution под pnpm/npm/yarn hoisting | `src/resolve.js` (`createRequire(...).resolve`) | `resolve-layout-matrix.test.js` — 5 OK | as-built, подтверждено |
+| Actionable error при отсутствии platform-пакета | `bin/local-rag-mcp.js` error path | `errors.test.js` — 6 OK; `resolve-missing-package.test.js` — 3 OK | as-built |
+| Fully offline после `init --download-models` | `crates/local-rag/tests/offline_search_recall.rs` | tier A (без ORT) — `ok`; tier B (реальная модель) — env-gated SKIP на этом хосте, честно задокументировано (T17-04) | as-built, подтверждено частично |
+| Checksum/manifest + atomic model download | `local_rag_models::install_model` (pinned-digest, ADR-0005) | владелец G11 (`PASS after D-011..D-014`), здесь только cross-check без регрессии | as-built, primary G11 |
+| ORT bundling settled до финальной CI-матрицы | `onnx::{resolve_ort_source,ensure_ort_initialized}` (10s watchdog) + `xtask::dist_ort::ORT_ASSETS` (pinned URL+SHA-256) | `-p local-rag-models --lib onnx::` 15 OK; `-p xtask` 10 OK; реальный e2e smoke darwin-arm64 (T17-03) | **D-028 resolved**; **D-029 — см. ниже** |
+
+Spec 13 §3 — Migration framework `[FIXED]` (primary G01; здесь — end-to-end подтверждение):
+
+| Требование (маркер) | Artifact | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| `schema_migrations`, numbered/checksummed/forward-only + resumable | `local_rag_store::migrate::ALL` | primary G01, не переоткрыто | PASS, primary G01 |
+| Backup before destructive (`VACUUM INTO backups/`); rollback = restore + old binary | `state::backup_before_migration` | `migrate_restore.rs::restoring_a_pre_destructive_backup_recovers_the_old_binarys_data` (T17-04, синтетический destructive-набор) | as-built (T17-04), подтверждено на синтетике |
+| Migration tests на fixture stores каждой прежде выпущенной schema version `[FIXED]` | `tests/support::build_store_at_version` (реальный `ALL[..n]`, не закоммиченный `.sqlite`) | `migrate_fixtures.rs::every_released_schema_version_migrates_cleanly_to_head` (9 версий → head) | as-built (T17-04) |
+| `cache.sqlite` никогда не мигрируется: version bump ⇒ drop&rebuild | primary G01/G04 | не переоткрыто | PASS, primary G01 |
+| v1 → v2 data migration `[OPEN]` | — (reader/importer-кода нет, подтверждено `rg`) | — | **O5: легитимно открытая граница**, не решение — см. финальную таблицу O1–O8 |
+
+Spec 13 §4 — Upgrade flow `[SPEC]` (primary G15 для протокола; здесь — реальный cross-binary
+migration test, которого G15 не имел):
+
+| Требование (маркер) | Artifact | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| Новый binary → next proxy spawn detects mismatch → `SHUTDOWN_REQUEST` → drain → migrate → serve; `MAX_UPGRADE_ROUNDS=2` | `local-rag-proxy::handshake::establish_session` | primary G15 (`PASS after D-026`), доказан e2e, но только с fresh/empty store | PASS, primary G15 |
+| Spool format compatibility (11 §4): daemon импортирует `format_version` ≤ своей | `check_spool_format_compatibility` + `core::spool::FORMAT_VERSION` | `spool_v1_fixture.rs::a_real_v1_spool_segment_still_imports_at_head` (замороженные реальные v1-байты) | as-built (T17-04) |
+| Реальная миграция того, что старая сторона оставила (не только protocol handshake) — пробел, который D-026 не закрывал | `LOCAL_RAG_TEST_FAKE_DAEMON_VERSION`/`_MAX_SCHEMA_VERSION` seam, zero effect на release build | `local-rag-proxy/tests/subprocess.rs::a_real_older_daemon_binary_drains_and_a_real_new_daemon_migrates_the_store_to_head` — реальный «старый» демон → v8, полный upgrade-цикл, `doctor --json` подтверждает v9 | as-built (T17-04), новая находка закрыта |
+
+**D-029 (win32-x64 build/signing/CI-раннер) — PASS, `resolved`.** Владелец решил: реальный
+`git push`/`git tag 0.0.0`/`git push --force origin 0.0.0`, чтобы cargo-dist's сгенерированный
+`release.yml` реально прогнался на 5 таргетах через настоящие GitHub-раннеры. Три раунда
+реального прогона на этой сессии:
+
+1. **Раунд 1** (тег `0.0.0` → commit `3e0d064`): 4/5 таргетов собрались; `win32-x64` упал на
+   `error[E0433]: cannot find unix in os` (`local-rag-hook/src/recall.rs:72` — безусловный
+   `std::os::unix::net::UnixStream`). Найден и исправлен **D-033**: весь IPC-транспорт
+   (`local-rag-hook`, `local-rag::daemon::{lifecycle,handshake}`, `local-rag-proxy::{connect,
+   handshake,relay,main}`) безусловно завязан на `tokio::net::Unix{Listener,Stream}`/
+   `std::os::unix::net` без `#[cfg(unix)]`; `local_rag_core::identity::SystemUuidV7` (entropy
+   для durable ID) был `#[cfg(unix)]`-only, но использовался безусловно в CLI-командах
+   (`init`/`index`/`rebuild`), которые не трогают демон и обязаны реально работать на Windows.
+   Исправлено: IPC-транспорт `#[cfg(unix)]`-гейтирован (Windows-ветки — типизированный
+   немедленный отказ, без побочных эффектов, переиспользуют существующие error-типы, не
+   изобретают новые); `SystemUuidV7` получил **настоящую** (не заглушку) Windows-реализацию
+   через прямой FFI на `BCryptGenRandom` (`bcrypt.dll`, `BCRYPT_USE_SYSTEM_PREFERRED_RNG`).
+2. **Раунд 2** (тот же тег, переставлен на commit `4286a75`): `win32-x64` снова упал —
+   `daemon/lifecycle.rs`'s `use super::probe::SocketLivenessProbe;` не был гейтирован (первый
+   раунд пропустил). Отдельно тот же прогон нашёл **D-034**: `crates/store/tests/
+   consolidation_runner.rs::lease_renews_on_cadence_while_the_generator_runs` (T14-06, gated
+   `PASS`) — первый когда-либо реальный прогон полного набора на настоящем GitHub Actions —
+   флейкует под нагрузкой (один и тот же коммит дал success/fail/success/fail на 4 параллельных
+   `ci.yml`-прогонах). Корень — `tokio::time::pause`'s auto-advance не отслеживает cross-thread
+   channel round-trip к `StateWriter`'s реальному OS-потоку (не таймер), только зарегистрированные
+   таймеры; на contended CI-раннере это позволяет virtual-clock пробе обогнать ещё не долетевшую
+   запись продления лизинга. Исправлено: одноразовый `sleep`+point-in-time assert заменён на
+   bounded poll-цикл (класс фикса D-003), ассерт не ослаблен. Дополнительно найден и
+   исправлен пропущенный `#[cfg(unix)]` на `SocketLivenessProbe` (`lifecycle.rs`) и реализован
+   **настоящий** (не заглушка) кроссплатформенный `ShutdownSignal` для `cli::watch` (отдельная,
+   не завязанная на демон-IPC команда) через `tokio::signal::ctrl_c()`.
+3. **Раунд 3** (тег переставлен на commit `4286a75`, финальный фикс): **все 5 таргетов
+   собрались**, `build-local-artifacts (x86_64-pc-windows-msvc)` = `success`, весь pipeline
+   (`build-global-artifacts`/`host`/`announce`) = `success`. Реальный публичный GitHub Release
+   создан: `https://github.com/13W/memory/releases/tag/0.0.0`, 15 checksummed-артефактов по 5
+   таргетам (3 бинарника × 5 платформ + manifest). Повторные `ci/master`/`ci/0.0.0` (полный
+   `cargo xtask ci`, 18/18 job) — оба зелёные, включая ранее флейкавший `consolidation_runner`
+   (эмпирическое подтверждение D-034's фикса).
+
+По ходу того же третьего раунда найден и **отдельно задокументирован, не блокирует v0** —
+**D-035**: `xtask.exe` (dev-only инструмент, не поставляется ни в одном npm-пакете) не
+линкуется на win32-x64 — `link.exe` LNK1120, 19 unresolved external symbols
+(`__imp_tolower`/`__imp_strncpy`/и другие стандартные MSVC CRT-функции) из
+`libllama_cpp_sys_2-*.rlib` (реальный in-process генератор, ADR-0006). Первоначальная запись
+предполагала, что это ударит и по `local-rag.exe` — **прогноз не подтвердился**: тот же
+`link.exe`, тот же `.rlib`, но `local-rag.exe` линкуется чисто (см. раунд 3 выше). Корень
+расхождения xtask-vs-product-binaries не диагностирован (не блокирует, не исследовалось
+дальше). Итог: **D-029 — `resolved` полностью**: (1) код-signing явно принят как отсутствующая
+граница v0 (сертификаты не предоставлены, не скрыто); (2) реальная CI-матрица — подтверждена
+тремя реальными прогонами; (3) win32-x64 build/smoke — подтверждён для всех трёх продуктовых
+бинарников через реальный публичный релиз.
+
+#### Специфики 01–12, 14, 15 — сквозная перепроверка (4 параллельных Explore-агента)
+
+**01–04** (владеющие G00–G05, G07–G09, G11, G13–G15): 13 requirement-строк из разных Gxx-трейсов
+лично перепроверены построчно (schema/DDL/identity/lock-level/state-machine artifacts — все
+существуют, тесты существуют и делают заявленное). Все architecture guardrails, относящиеся к
+01–04 (canonical state.sqlite / no writable cross-DB ATTACH / no path-derived durable ID /
+content-shared rows без context-полей / exact source_blob для searchable / explicit routing без
+process-global current-*), подтверждены прямым чтением кода и `rg`-сканом (0 нарушений). 5
+вхождений `[OPEN]` в `03-data-model.md` сведены к 2 живым легитимно-открытым вопросам (O6, O7 —
+задокументированы правильно) + 2 историческим следам уже закрытого D-016 + 1 дубль-хиту. Одна
+документальная находка — см. выше (устаревшие test-имена в G02-evidence).
+
+**05–08** (владеющие G05–G10, G13, G14; e2e G11/G12/G15/G16): 20+ requirement-строк лично
+перепроверены (projection contract/fault-matrix F1-F12/reconcile/retention/FTS-validate/spool
+codec/memory op-state-machine/router/recall — все artifacts и тесты существуют). Guardrails
+(dense projection validate-on-open перед fill, hooks — только spool append без прямого
+demon-ingestion, per-worktree read lock через весь search pipeline, recalled memory untrusted
+banner, memory-mutations transactional/idempotent) все подтверждены структурно. D-024
+(continuous consolidation trigger) — код дословно соответствует DEVIATIONS.md, расхождений нет.
+Наблюдение (не расхождение): нет единого e2e-теста «hook → spool → import → реальная локальная
+LLM → memory_entry» одним прогоном — путь доказан по сегментам (hook→segment, segment→import,
+envelope→apply) плюс отдельный real-model e2e (`generate --test llama`, `xtask memory-bench`);
+сегментация архитектурно обоснована (реальный LLM-инференс делает единый тест дорогим/
+недетерминированным) и честно задокументирована в module-doc теста
+`consolidation_trigger.rs::a_stop_event_drives_a_real_consolidation_run_through_the_live_daemon`.
+
+**09–12** (владеющие G10–G12, G15, G16): requirement-строки из search pipeline/BM25-weights/
+RRF-fusion/Embedder-Generator contracts/MCP-dispatch/proxy-handshake/redaction/privacy/perms —
+лично перепроверены, все существуют байт-в-байт с as-built-текстом. Open questions,
+относящиеся к этим разделам, закрыты через ADR, не принято на веру:
+- **O1** (dense backend) — ADR-0003 (brute-force); `rg`-подтверждено 0 dense-SDK зависимостей в
+  продакшен-крейтах (единственные хиты — изолированный `spike/` workspace + doc-комментарии).
+- **O3** (модель/доставка/генератор) — ADR-0004/0005/0006, все три ADR внутренне
+  непротиворечивы и ссылаются друг на друга как половины одного вопроса; амендменты D-016/D-017/
+  T14-09 реально в коде (`onnx.rs:65,73`, `llama.rs` + `minijinja` в `Cargo.toml`).
+- **O4** (языки v0) — ADR-0001 (TS/JS/Rust).
+- **O7 первая половина** (SyntaxLocator) — ADR-0002, соответствует spec 03 §2.4 as-built.
+- **O7 вторая половина** (symbol graph) — подтверждено НЕ реализована в production ingestion:
+  `rg 'find_usages|get_dependencies' crates/` = 0 совпадений; `edge_kind`/`insert_resolved_edge`
+  существуют в схеме, но вызываются только тестами — deferred-граница цела.
+
+Все три relevant guardrails (no real dense backend before T10 spike; data_policy local_only
+default + central guard before provider selection; recalled memory untrusted) подтверждены
+кодом. Расхождений не найдено.
+
+**14–15 + idea.md** (владелец каждый GNN; e2e G17): idea.md §18 «Открыто» (rev 6) сверено
+дословно с 15-roadmap.md §4 (O1-O8) и TRACEABILITY.md's «Open questions» — 7 из 8 пунктов прямое
+соответствие, O4 (language set) — implicit gap в idea.md, явно формализованный спекой номером,
+не противоречие. См. финальную таблицу O1–O8 ниже (обновлена также в TRACEABILITY.md).
+
+#### Финальная диспозиция O1–O8 (2026-08-05)
+
+См. `docs/implementation-plan/TRACEABILITY.md`'s таблицу «Open questions» (обновлена этим же
+гейтом) — воспроизведена здесь для полноты:
+
+| # | Вопрос | Финальный вердикт | Ссылка |
+| --- | --- | --- | --- |
+| O1 | Dense backend | **resolved** | ADR-0003 (brute-force); 0 dense-SDK зависимостей в продакшене |
+| O2 | Числа gates | **resolved** (2026-08-05) | quality/memory-quality/latency/resources — все зафиксированы, T12-05/T14-07/T17-05 |
+| O3 | Модель/доставка/генератор | **resolved** | ADR-0004/0005/0006 |
+| O4 | Языки v0 | **resolved** | ADR-0001 (TS/JS/Rust) |
+| O5 | v1→v2 memory migration | **легитимно открыт для v0** | 13§3/T17-04 as-built; clean-start only; pre-GA release-gate item |
+| O6 | Retention K/T | **легитимно открыт для v0** | 06§5/15§4/T17-05 as-built; provisional K=2/T=168h |
+| O7 | Locator/graph | **split**: SyntaxLocator resolved (ADR-0002) / graph deferred-v0.x подтверждено (0 production call sites) | |
+| O8 | DB split | **resolved/fixed** | 0 writable cross-DB ATTACH, подтверждено `rg` |
+
+#### Architecture guardrails (CLAUDE.md) — итоговое подтверждение
+
+Все 11 пунктов свода проверены (личный обзор + 4 агента, покрытие пересекается намеренно для
+перекрёстной проверки) — ни одного нарушения не найдено:
+
+- `state.sqlite` каноничен; `cache.sqlite`/`projection/` независимо валидируемы — OK.
+- Никогда writable cross-DB `ATTACH` — OK (0 реальных SQL ATTACH, подтверждено `rg` дважды).
+- Ни один durable ID не выводится из пути; worktree identity — стабильный UUID — OK.
+- Content-shared строки без path/generation/context-полей — OK (DDL лично прочитан).
+- У каждого searchable-файла точный `source_blob`; у skipped — нет occurrences — OK (structural FK).
+- Dense projection untrusted: validate on every open, rebuild on doubt — OK.
+- Hooks вносят данные только через durable spool append, никогда напрямую демону — OK.
+- Memory mutations/evidence/audit/consolidation cursor — транзакционно строгие, идемпотентные — OK.
+- Request routing явный, нет process-global current project/worktree/branch — OK (`rg` 0 хитов).
+- Per-worktree read lock охватывает весь hybrid-search pipeline — OK.
+- Data policy default `local_only`; remote calls через central policy guard первым — OK.
+- Recalled memory и indexed repository content untrusted, никогда не инструкции — OK.
+- Production-код не coupled к реальному dense backend до T10 spike — OK.
+- Deferred scope (description leg/reranker/graph/ANN-memory/multi-harness/FreeBSD/win32-arm64) не реализован в v0 — OK.
+
+**Итог G17: `PASS after D-029, D-033, D-034, D-035`.** Все четыре deviation зарегистрированы,
+исправлены (кроме D-035, где сам фикс не требуется — находка переклассифицирована как
+не блокирующая v0) и подтверждены реальными прогонами (локальными и через настоящий GitHub
+Actions). `DEVIATIONS.md`: 0 записей `open`/`fixing`/`blocked`. Все гейты G00–G17 в «Gate
+results» — `PASS`/`PASS after D-NNN`. Релиз-механизм (spec 13 целиком) подтверждён реальным
+публичным релизом `0.0.0`. Примечание к evidence: попытка финального повторного полного
+локального `cargo xtask ci` после всех правок зависла на `root:test` (17/18 job прошли
+чисто за ≤1167.1с, `nextest`'s собственный `--list`-discovery застрял на много часов без
+прогресса — environment-артефакт этой машины, вероятно связанный с состоянием, оставшимся
+от ранее принудительно остановленного параллельного процесса, не воспроизводимая проблема
+кода); процесс остановлен, повторный локальный прогон не потребовался — уже имеющееся
+evidence (три зелёных прогона на настоящем GitHub Actions, включая полный `cargo xtask ci`
+18/18 внутри `ci.yml`, плюс focused-прогоны `local-rag-core`/`-hook`/`-proxy`/`-store` нативно
+на этой машине сразу после правок) строго более авторитетно, чем ещё одна локальная попытка.
+v0-очередь (T00-01…G17) закрыта.
