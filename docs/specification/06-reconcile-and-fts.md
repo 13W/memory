@@ -335,7 +335,7 @@ Pin roots (a `file_revision`/generation is unreferenced only if reachable from n
 
 ```
 pins: active + building/projection-target generations
-      last K retired generations OR retention window T (rollback/debug)   [OPEN: K, T]
+      last K retired generations OR retention window T (rollback/debug)   [SPEC: K=2, T=168h — ADR-0007]
       memory evidence / audit / export references
       active rebuild/embedding job leases (temporary pins)
 sweep: mark-and-sweep of unreferenced file_revisions, executed in batches
@@ -415,6 +415,16 @@ behavior, only in the specific numbers. Whether GA re-derives `K`/`T` from real 
 formally keeping the provisional defaults permanent) remains the actual open product decision,
 tracked as a pre-GA release-gate item alongside O2/O5 (see G17: "O2/O6 remaining values resolved
 by evidence or release blocked").
+
+As-built note (X-001, `[SPEC]`, closes O6): [ADR-0007](../adr/0007-retention-k-t-final-values.md)
+resolves O6 by owner product decision, not by telemetry — `retired_generations_keep = 2` and
+`retired_generations_ttl_h = 168` are the final, normative v0/GA values, not provisional
+placeholders. No usage-metrics telemetry project was commissioned; the ADR records why (building
+one was judged not worth gating GA on) and why this reading is consistent with `G06`'s earlier
+"O6 не считать закрытым без данных" note despite appearing to contradict it (precedence: the later
+spec text above, not the group-06 planning card, governs). The mark/sweep mechanism above is
+unchanged — `K`/`T` were already pure configuration, never constants — so nothing here is a
+normative behavior change, only a change in the numbers' epistemic status.
 
 ## 6. Non-git roots
 
