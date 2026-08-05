@@ -25,6 +25,7 @@ use super::lock::{self, StoreLockError, StoreLockGuard, StoreLockInfo};
 use super::mcp::McpHandler;
 use super::memory::build_memory_context;
 use super::mode::DaemonMode;
+#[cfg(unix)]
 use super::probe::SocketLivenessProbe;
 use super::resume::{build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs};
 use super::search::build_search_engine;

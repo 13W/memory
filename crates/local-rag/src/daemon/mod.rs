@@ -73,6 +73,4 @@ pub use resume::{
 };
 pub use search::{NoRebuildVectorSource, build_search_engine};
 pub use session::{SessionGuard, SessionRegistry};
-#[cfg(unix)]
-pub use shutdown::ShutdownSignal;
-pub use shutdown::drain_and_shutdown;
+pub use shutdown::{ShutdownSignal, drain_and_shutdown};
