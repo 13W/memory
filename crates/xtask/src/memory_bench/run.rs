@@ -45,9 +45,11 @@ use local_rag_store::{
     ScopeKind, StateDb, TrustLevel, WindowObservation, create_memory_entry,
 };
 
+use crate::git::git_short_head;
 use crate::memory_bench::corpus::{RouterCase, load_router_cases};
 use crate::memory_bench::report::{CaseResult, Latency, MemoryBenchReport, Provenance};
 use crate::memory_bench::score::{CaseTally, aggregate, op_kind, score_case};
+use crate::stats::percentile;
 
 /// A fixed, synthetic `repo_id` stamped on every benchmark window's
 /// observations (see [`build_window`]). Never a real `repository` row.
@@ -290,33 +292,6 @@ fn build_window(case: &RouterCase) -> ConsolidationWindow {
     }
 }
 
-/// Nearest-rank percentile; empty is `0.0`, never `NaN` (mirrors
-/// `crate::bench::run::percentile`).
-fn percentile(samples: &mut [f64], q: f64) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((samples.len() as f64) * q).ceil() as usize;
-    samples[idx.saturating_sub(1).min(samples.len() - 1)]
-}
-
-fn git_short_head(dir: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args([
-            "-C",
-            &dir.display().to_string(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
 /// Where model weights are kept **between** runs — reuses
 /// `crate::bench::run`'s own `LOCAL_RAG_BENCH_MODEL_HOME` env var and cache
 /// root: `StoreLayout::model_dir` already namespaces by `model_id`, so the
@@ -343,19 +318,6 @@ fn fresh_case_state_dir(case_ord: usize) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
     use crate::memory_bench::corpus::{CaseExpected, CaseInput, CaseObservation};
-
-    #[test]
-    fn percentile_is_nearest_rank_and_total() {
-        let mut one = [7.0];
-        assert_eq!(percentile(&mut one, 0.5), 7.0);
-        assert_eq!(percentile(&mut one, 0.95), 7.0);
-
-        let mut ten: Vec<f64> = (1..=10).map(|n| n as f64).collect();
-        assert_eq!(percentile(&mut ten, 0.50), 5.0);
-        assert_eq!(percentile(&mut ten, 0.95), 10.0);
-
-        assert_eq!(percentile(&mut [], 0.5), 0.0, "empty is 0, never NaN");
-    }
 
     #[test]
     fn build_window_maps_every_observation_field() {

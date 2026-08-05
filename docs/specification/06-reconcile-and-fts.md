@@ -401,6 +401,21 @@ are `query_only` and cannot create temp tables), so no canonical row and no main
 frame is written. Shard/FTS rows for swept generations are **not** touched here — they disappear
 via desired-set reconciliation (05 §8), never as part of a sweep.
 
+As-built note (T17-05, `[OPEN]` — still open; boundary made explicit, not resolved, mirroring
+O5/T17-04's own pattern). O6 asks for real `K`/`T` retention numbers derived from usage metrics.
+No usage-metrics telemetry exists anywhere in this codebase — no counter or log records how often
+a `retiring` generation is actually consulted after retirement (rollback, debug inspection, or
+otherwise) — and this task adds none: building that telemetry is a separate project (its own
+schema, its own privacy/`local_only` review under the data-policy guard, 12 §1-2) rather than
+something a release-report task can produce as a side effect. **v0 ships the current provisional
+defaults unchanged**: `retired_generations_keep = 2`, `retired_generations_ttl_h = 168`, read from
+`[storage]` exactly as T06-01 left them. The mark/sweep *mechanism* above needs no further work —
+it already treats `K`/`T` as configuration, not constants — so nothing here is a normative gap in
+behavior, only in the specific numbers. Whether GA re-derives `K`/`T` from real telemetry (versus
+formally keeping the provisional defaults permanent) remains the actual open product decision,
+tracked as a pre-GA release-gate item alongside O2/O5 (see G17: "O2/O6 remaining values resolved
+by evidence or release blocked").
+
 ## 6. Non-git roots
 
 `kind='non_git'` worktrees reconcile identically minus git triggers (watcher + periodic only).
