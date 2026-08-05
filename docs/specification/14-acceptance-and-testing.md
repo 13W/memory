@@ -41,8 +41,35 @@ stated justification ("tuning changes are versioned"). They are derived from the
 baseline**, deliberately not from the first v2 run: that run regressed, and deriving a threshold
 from a regressed measurement would encode the regression as acceptable (O2). The gate consequently
 **failed on the first v2 run** — MRR 0.5646 vs the 0.6963 baseline, Recall@5 0.7755 — which was
-registered as `D-016` rather than papered over. The `latency`/`resources` rows remain
-`[BASELINE]`-pending (T17-05); `memory-quality` closed as of T14-07/ADR-0006 (see below).
+registered as `D-016` rather than papered over. `memory-quality` closed as of T14-07/ADR-0006 (see
+below); the `latency`/`resources` rows closed as this release's first-established v2 baseline as
+of T17-05 (see below).
+
+As-built note (T17-05, `[SPEC]`): the `latency`/`resources` rows are no longer `[BASELINE]`-pending
+— `cargo xtask release-report` (`crates/xtask/src/release_report/`) measures both, end to end,
+against one real indexed corpus and one real daemon process, and records the numbers **as this
+release's first-established v2 baseline, deliberately never gated** — the same precedent T10's
+dense-backend spike metrics already set (measured and recorded, not pass/fail thresholds), because
+there is no prior v1/v2 measurement to regress against the way `quality`'s MRR diff has one. First
+real run (`fixtures/release/run-2026-08-05.json`/`.report.md`, `/opt/soft/local-rag --subdir src`,
+93 files / 545 occurrences, `embeddinggemma-300m` dense + `gemma-4-e2b-it-gguf-q4-0` router, this
+host's `aarch64-apple-darwin`): warm search p50/p95 = 112.185 / 701.828 ms (already measured by
+`cargo xtask bench` since T12-05 — the p95 figure here is wide because the very first, cold-cache
+query in the run dominates the tiny 49-query sample; it is recorded raw, not smoothed); one-file
+reconcile p50/p95 = 37.954 / 40.380 ms; branch-checkout reconcile (10 files, `[SPEC]`: 10% of the
+indexed set, floor 5, ceiling 50) p50/p95 = 171.094 / 173.676 ms — both against
+`local_rag_index::reconcile::reconcile_once` in `ScanMode::Fast` with an already-warm `StatCache`,
+the same warm-cache path production's own `TriggerKind::FsChange`/`TriggerKind::GitHead` triggers
+use. Idle RAM (real `local-rag serve`, settled 3s, sampled 5s at 250ms): a flat 19,906,560 bytes
+(~19.0 MiB) across every sample — an idle daemon holding a store lock and nothing else allocates
+almost nothing beyond its own binary/runtime footprint. `state.sqlite` 1,413,120 bytes,
+`cache.sqlite` 5,128,192 bytes, dense shard directory 1,709,465 bytes ⇒ 15,139.04 bytes/occurrence
+over 545 occurrences. Embedding-cache-budget adherence: 1,652,736 bytes actually cached against a
+2,147,483,648-byte (2048 MiB) default budget — a ratio of 0.0008, nowhere near eviction pressure at
+this corpus size. Source/worktree byte ratio: 496,069 / 2,113,957 = 0.2347 (the indexed `src/`
+subtree is about a quarter of its own on-disk footprint; the rest is non-indexed files under the
+same root). These are v0's first recorded numbers, not acceptance thresholds — a future run that
+lands far outside them is a signal to look, not an automatic failure.
 
 As-built note (T14-07, `[SPEC]`): the `memory-quality` row's `P`/`R` are now set —
 `min_precision = 0.60`, `min_recall = 0.55` — in `fixtures/memory/baseline/thresholds.json`,

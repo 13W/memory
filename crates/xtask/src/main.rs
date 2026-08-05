@@ -16,6 +16,12 @@
 //! T14-07). Also **not** part of `ci`: it needs the installed GGUF weights
 //! and the `llama-cpp-2` toolchain (ADR-0006).
 //!
+//! `cargo xtask release-report` assembles the versioned release report for
+//! spec 14 §2's 9 acceptance gates (T17-05, see [`release_report`]'s own
+//! module doc). Also **not** part of `ci`: it needs everything `bench` and
+//! `memory-bench` need, plus a built `local-rag` binary for the idle-RAM
+//! measurement.
+//!
 //! `cargo xtask dist-ort` fetches and verifies the pinned ONNX Runtime shared
 //! library per reachable platform (T17-03, see [`dist_ort`]). Also **not**
 //! part of `ci`: it needs the network and writes into a caller-chosen release
@@ -23,7 +29,10 @@
 
 mod bench;
 mod dist_ort;
+mod git;
 mod memory_bench;
+mod release_report;
+mod stats;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -36,9 +45,10 @@ fn main() -> ExitCode {
         Some("ci") => run_ci(),
         Some("bench") => run_bench(),
         Some("memory-bench") => run_memory_bench(),
+        Some("release-report") => run_release_report(),
         Some("dist-ort") => dist_ort::run(),
         other => {
-            eprintln!("usage: cargo xtask <ci|bench|memory-bench|dist-ort>");
+            eprintln!("usage: cargo xtask <ci|bench|memory-bench|release-report|dist-ort>");
             eprintln!("unknown task: {}", other.unwrap_or("<none>"));
             ExitCode::from(2)
         }
@@ -297,6 +307,94 @@ fn run_memory_bench() -> ExitCode {
             eprintln!("[memory-bench] gate: skipped (no thresholds yet: {e})");
             ExitCode::SUCCESS
         }
+    }
+}
+
+/// `cargo xtask release-report --corpus <dir> [--subdir <rel>] [--memory-corpus <path>]`
+/// `[--memory-model <catalog-id>] [--local-rag-bin <path>] [--out <path>]`
+fn run_release_report() -> ExitCode {
+    let mut corpus_dir: Option<PathBuf> = None;
+    let mut subdir: Option<String> = None;
+    let mut memory_corpus_path: Option<PathBuf> = None;
+    let mut memory_model_id: Option<String> = None;
+    let mut local_rag_bin: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--corpus" => corpus_dir = args.next().map(PathBuf::from),
+            "--subdir" => subdir = args.next(),
+            "--memory-corpus" => memory_corpus_path = args.next().map(PathBuf::from),
+            "--memory-model" => memory_model_id = args.next(),
+            "--local-rag-bin" => local_rag_bin = args.next().map(PathBuf::from),
+            "--out" => out = args.next().map(PathBuf::from),
+            other => {
+                eprintln!("unknown argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(corpus_dir) = corpus_dir else {
+        eprintln!(
+            "usage: cargo xtask release-report --corpus <dir> [--subdir <rel>] \
+             [--memory-corpus <path>] [--memory-model <catalog-id>] \
+             [--local-rag-bin <path>] [--out <path>]"
+        );
+        return ExitCode::from(2);
+    };
+    let out = out.unwrap_or_else(|| release_report::baseline_dir().join("run.json"));
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("release-report: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match runtime.block_on(release_report::run::run(&release_report::run::Options {
+        corpus_dir,
+        subdir,
+        memory_corpus_path,
+        memory_model_id,
+        local_rag_bin,
+    })) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("release-report: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some(parent) = out.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("release-report: creating {}: {e}", parent.display());
+        return ExitCode::FAILURE;
+    }
+    let json = serde_json::to_string_pretty(&report).expect("report serializes");
+    if let Err(e) = std::fs::write(&out, json + "\n") {
+        eprintln!("release-report: writing {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+    let md_path = out.with_extension("report.md");
+    if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
+        eprintln!("release-report: writing {}: {e}", md_path.display());
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "release-report: wrote {} and {}",
+        out.display(),
+        md_path.display()
+    );
+
+    if report.overall_passed() {
+        eprintln!("[release-report] overall: PASS");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("[release-report] overall: FAIL");
+        ExitCode::FAILURE
     }
 }
 

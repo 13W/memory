@@ -52,6 +52,8 @@ use local_rag_store::{
 use crate::bench::corpus::Corpus;
 use crate::bench::report::{BenchReport, Latency, Provenance, QueryResult};
 use crate::bench::score::{Candidate, Metrics, aggregate, rank_of_match};
+use crate::git::git_short_head;
+use crate::stats::percentile;
 
 /// Directories excluded from the indexed corpus, mirroring the v1 baseline's own
 /// exclusion (see the module docs).
@@ -69,7 +71,12 @@ const WARMUP_PASSES: usize = 1;
 const TIMED_PASSES: usize = 3;
 
 /// A monotone UUIDv7 source: benchmark runs need ids, not entropy.
-struct SeqUuids {
+///
+/// `pub(crate)` (not private): exposed via [`IndexedStore::uuids`] for
+/// `crate::release_report`'s own reconcile-latency measurements (T17-05),
+/// which need the same monotone source to mint further ids after the initial
+/// index without re-litigating identity generation.
+pub(crate) struct SeqUuids {
     counter: std::sync::atomic::AtomicU64,
 }
 
@@ -183,14 +190,43 @@ pub struct Options {
     pub lexical_weights: Vec<f64>,
 }
 
-/// Run the benchmark end to end, once per requested fusion weight.
-///
-/// The returned reports are in the order the weights were given; a run with no
-/// explicit weights yields exactly one, at the shipped default.
-pub async fn run(options: &Options) -> Result<Vec<BenchReport>, String> {
-    let corpus =
-        Corpus::load(&crate::bench::corpus_fixture_path()).map_err(|e| format!("corpus: {e}"))?;
+/// A fully indexed, embedded, and switched-in throwaway store — steps 1-5 of
+/// the benchmark run (model install through FTS materialization), factored
+/// out so [`release_report`](crate::release_report) can measure real
+/// resource/latency numbers (T17-05) against the exact same real corpus run
+/// without a second indexing harness. [`run`] itself continues straight into
+/// step 6 (the 49-query loop) against these same handles.
+pub(crate) struct IndexedStore {
+    pub layout: StoreLayout,
+    pub state: Arc<StateDb>,
+    pub cache: Arc<CacheDb>,
+    pub uuids: Arc<SeqUuids>,
+    pub worktree_id: Uuid,
+    pub model_space: Uuid,
+    /// The actually-indexed root (`corpus_dir` joined with `subdir`, if any).
+    pub root: PathBuf,
+    /// The corpus checkout root — may differ from `root` when `subdir` is set;
+    /// `Provenance.corpus_commit` reports this one's HEAD, not the
+    /// subdirectory's.
+    pub checkout: PathBuf,
+    pub params: ShardParams,
+    pub embedder: Arc<dyn Embedder>,
+    pub entry: &'static ModelCatalogEntry,
+    pub report: local_rag_index::reconcile::ReconcileReport,
+    pub index_ms: u64,
+    pub embed_ms: u64,
+    pub now_ms: i64,
+    /// The `StatCache` the initial reconcile warmed for `root` — carried out
+    /// (not dropped) so `release_report::latency`'s own further `Fast`-mode
+    /// reconciles measure the real warm-cache path production uses, not a
+    /// cold first-touch of every file.
+    pub stat_cache: StatCache,
+}
 
+/// Steps 1-5: install the model, register the worktree, reconcile, embed,
+/// project+switch, materialize FTS. See [`IndexedStore`]'s own doc for why
+/// this is a separate function from [`run`].
+pub(crate) async fn build_indexed_store(options: &Options) -> Result<IndexedStore, String> {
     let home = tempdir()?;
     let layout = StoreLayout::new(home.join("local-rag"));
     layout.ensure().map_err(|e| format!("store layout: {e}"))?;
@@ -368,6 +404,61 @@ pub async fn run(options: &Options) -> Result<Vec<BenchReport>, String> {
     )
     .await
     .map_err(|e| format!("materialize fts: {e}"))?;
+
+    Ok(IndexedStore {
+        layout,
+        state,
+        cache,
+        uuids,
+        worktree_id,
+        model_space,
+        root,
+        checkout,
+        params,
+        embedder,
+        entry,
+        report,
+        index_ms,
+        embed_ms,
+        now_ms,
+        stat_cache,
+    })
+}
+
+/// Run the benchmark end to end, once per requested fusion weight.
+///
+/// The returned reports are in the order the weights were given; a run with no
+/// explicit weights yields exactly one, at the shipped default.
+pub async fn run(options: &Options) -> Result<Vec<BenchReport>, String> {
+    let corpus =
+        Corpus::load(&crate::bench::corpus_fixture_path()).map_err(|e| format!("corpus: {e}"))?;
+    let indexed = build_indexed_store(options).await?;
+    score_queries(&indexed, options, &corpus).await
+}
+
+/// Step 6: run the 49 queries against an already-built `indexed` store, once
+/// per requested fusion weight. Borrows rather than consumes `indexed` so
+/// [`crate::release_report::run`] (T17-05) can score the exact same real
+/// indexed store this returns from, then go on to measure resources/latency
+/// against it, without a second indexing pass.
+pub(crate) async fn score_queries(
+    indexed: &IndexedStore,
+    options: &Options,
+    corpus: &Corpus,
+) -> Result<Vec<BenchReport>, String> {
+    let layout = indexed.layout.clone();
+    let state = indexed.state.clone();
+    let cache = indexed.cache.clone();
+    let uuids = indexed.uuids.clone();
+    let root = indexed.root.clone();
+    let checkout = indexed.checkout.clone();
+    let params = indexed.params;
+    let embedder = indexed.embedder.clone();
+    let entry = indexed.entry;
+    let report = &indexed.report;
+    let index_ms = indexed.index_ms;
+    let embed_ms = indexed.embed_ms;
+    let now_ms = indexed.now_ms;
 
     // 6. Run the 49 queries, once per requested fusion weight (D-018). The
     //    corpus is indexed and embedded exactly once above, so the points differ
@@ -588,32 +679,6 @@ fn request_root(root: &Path) -> RequestRoot {
     }
 }
 
-/// Nearest-rank percentile over already-collected samples.
-fn percentile(samples: &mut [f64], q: f64) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((samples.len() as f64) * q).ceil() as usize;
-    samples[idx.saturating_sub(1).min(samples.len() - 1)]
-}
-
-fn git_short_head(dir: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args([
-            "-C",
-            &dir.display().to_string(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
 /// Where model weights are kept **between** runs.
 ///
 /// The store is disposable — a fresh index every run is the point — but the
@@ -627,9 +692,21 @@ fn model_home() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".local/share/local-rag-bench"))
 }
 
+/// Unique **per call**, not just per process: `cargo xtask bench` itself only
+/// ever calls this once, but `crate::release_report`'s own tests (T17-05)
+/// call [`build_indexed_store`] more than once from the same test binary
+/// process — real, concurrent test threads sharing one pid. A pid-only path
+/// let two such calls collide on the exact same directory (a real incident
+/// during T17-05's own development: `UNIQUE constraint failed: repository.
+/// repo_id` from two concurrent `create_repository` calls landing in what
+/// had become, by accident, one shared `state.sqlite`).
 fn tempdir() -> Result<PathBuf, String> {
-    let base = std::env::temp_dir().join(format!("local-rag-bench-{}", std::process::id()));
-    // A previous run under the same pid must never be mistaken for this one's.
+    static CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("local-rag-bench-{}-{call}", std::process::id()));
+    // A previous run under the same pid+call must never be mistaken for this
+    // one's (relevant for `call == 0`, a fresh process reusing a stale dir
+    // left by a killed prior run under a recycled pid).
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).map_err(|e| format!("temp dir: {e}"))?;
     Ok(base)
@@ -651,18 +728,5 @@ mod tests {
     #[test]
     fn queries_run_at_the_baselines_limit() {
         assert_eq!(QUERY_LIMIT, 5, "v1 searched with limit 5; hit@5 is deepest");
-    }
-
-    #[test]
-    fn percentile_is_nearest_rank_and_total() {
-        let mut one = [7.0];
-        assert_eq!(percentile(&mut one, 0.5), 7.0);
-        assert_eq!(percentile(&mut one, 0.95), 7.0);
-
-        let mut ten: Vec<f64> = (1..=10).map(|n| n as f64).collect();
-        assert_eq!(percentile(&mut ten, 0.50), 5.0);
-        assert_eq!(percentile(&mut ten, 0.95), 10.0);
-
-        assert_eq!(percentile(&mut [], 0.5), 0.0, "empty is 0, never NaN");
     }
 }

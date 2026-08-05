@@ -132,9 +132,9 @@
     {
       "id": "GAP-06",
       "family": "fault",
-      "description": "PARTIALLY RESOLVED (T07-05). Executable failpoint/kill-point scripts for the F1-F12 projection matrix (05 §10) and S1-S8 spool matrix (07 §7) were not present in v1 (v1 has no crash/kill/torn-write tests). The harness mechanism landed in T00-03; the F1-F12 projection matrix is now fully executable (crates/projection/tests/fault_matrix.rs + fault_matrix_coverage.rs's mechanically-checked cross-reference against matrix.json, plus the pre-existing switch_faults.rs/rebuild_faults.rs/rebuild.rs tests for F1/F11/F12). S1-S8 (spool kill matrix, 07 §7) remains open — it needs the spool_import_cursor table (T13-05) first.",
+      "description": "RESOLVED (T00-03, T07-05, T13-06; closed at gate G13 after D-019). Executable failpoint/kill-point scripts for the F1-F12 projection matrix (05 §10) and S1-S8 spool matrix (07 §7) were not present in v1 (v1 has no crash/kill/torn-write tests). The harness mechanism landed in T00-03; the F1-F12 projection matrix is fully executable (crates/projection/tests/fault_matrix.rs + fault_matrix_coverage.rs's mechanically-checked cross-reference against matrix.json, plus the pre-existing switch_faults.rs/rebuild_faults.rs/rebuild.rs tests for F1/F11/F12). S1-S8 (spool kill matrix, 07 §7) shipped in T13-06: crates/local-rag-hook/tests/kill_matrix.rs (S1/S2) and crates/store/tests/spool_kill_matrix.rs (S3-S8), all real SIGABRT-subprocess/failpoint tests, gated PASS at G13 (after D-019, an unrelated redaction-version propagation gap the same gate found and fixed).",
       "blocking": false,
-      "resolves_in": "T00-03 (harness, done), T07-05 (F1-F12, done), T13-06 (S1-S8, open)"
+      "resolves_in": "T00-03 (harness, done), T07-05 (F1-F12, done), T13-06 (S1-S8, done, gated PASS after D-019 at G13)"
     }
   ],
   "baseline": {

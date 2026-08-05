@@ -29,11 +29,25 @@ tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
 ] }
-
-[dev-dependencies]
-# `dist_ort`'s own tests build a real, throwaway `.tgz` fixture under an
-# isolated temp root — the same isolation `crates/models`'s installer tests
-# use, not a bespoke one.
+# T17-05's `release-report` subcommand measures a real `local-rag serve`
+# process's idle RSS (spec 14 §2's `resources` gate) — `std` exposes no
+# process memory introspection at all. `default-features = false` +
+# `system` keeps this to exactly `System`/`Process` (no `disk`/`network`/
+# `component`/`user` probing, none of which this task needs). Chosen over
+# raw `libc::getrusage`/platform `#[cfg]` branches specifically because it
+# also covers `win32-x64` (a real target, spec 01 §2) in one API, not just
+# the four Unix release targets a `ps`-shell-out would reach. See
+# `CONTRIBUTING.md`'s "Approved external dependencies" table for the full
+# scope/license note.
+sysinfo = { version = "0.39", default-features = false, features = [
+    "system",
+] }
+# `local-rag-test-support` (`TempHome`, real-subprocess helpers): originally
+# only a dev-dependency for `dist_ort`'s own tests (isolated temp roots, the
+# same convention `crates/models`'s installer tests use); promoted to a real
+# dependency at T17-05, whose `release-report` subcommand spawns a real
+# `local-rag serve` subprocess to measure idle RAM — production command
+# logic now, not only `#[cfg(test)]` code.
 local-rag-test-support = { path = "../test-support" }
 
 [lints]
