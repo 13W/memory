@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use crate::error::ProxyError;
@@ -90,6 +91,7 @@ pub fn spawn_detached_daemon(daemon_binary: &Path) -> std::io::Result<()> {
 /// its own startup (spec 02 §4.1), so re-spawning on every connect failure
 /// would race a slow-starting daemon against a flood of redundant sibling
 /// processes all fighting over the same store lock.
+#[cfg(unix)]
 pub async fn connect_or_spawn(
     socket_path: &Path,
     daemon_binary: &Path,

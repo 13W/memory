@@ -58,6 +58,7 @@ use local_rag_protocol::{
 };
 use serde_json::value::RawValue;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, oneshot, watch};
 
@@ -141,6 +142,7 @@ impl RequestHandler for EchoRequestHandler {
 /// A malformed accept (a transient OS error) is retried — the listener
 /// itself stays bound; only one accept attempt failed (same policy T15-01's
 /// `handshake_stub` already established).
+#[cfg(unix)]
 pub async fn serve_connections<H: RequestHandler>(
     listener: UnixListener,
     ctx: HandshakeContext,
@@ -162,6 +164,7 @@ pub async fn serve_connections<H: RequestHandler>(
     }
 }
 
+#[cfg(unix)]
 async fn handle_connection<H: RequestHandler>(
     stream: UnixStream,
     ctx: HandshakeContext,

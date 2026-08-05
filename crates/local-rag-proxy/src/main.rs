@@ -17,10 +17,14 @@ mod transport;
 
 use std::process::ExitCode;
 
+#[cfg(unix)]
 use local_rag_core::identity::{SystemUuidV7, UuidSource};
+#[cfg(unix)]
 use local_rag_core::paths::{StoreLayout, SystemEnv};
+#[cfg(unix)]
 use local_rag_protocol::RequestContext;
 
+#[cfg(unix)]
 use handshake::{check_spool_format_compatibility, establish_session, resolve_session_params};
 
 const BIN: &str = "local-rag-proxy";
@@ -73,6 +77,21 @@ fn run_proxy() -> ExitCode {
 /// because [`run_proxy`] must feed it to [`std::process::exit`], and
 /// `ExitCode` is deliberately opaque (no `From<ExitCode> for i32`, no
 /// `PartialEq`) beyond being returned from `main`.
+///
+/// Windows has no local IPC transport to the daemon yet (named-pipe support
+/// across this crate/`local-rag`/`local-rag-hook` is not implemented — D-033,
+/// a separate follow-up, not part of this platform-portability fix). This
+/// exits with a clear, typed message rather than failing to compile or
+/// hanging on a connect attempt that can never succeed.
+#[cfg(not(unix))]
+async fn run() -> u8 {
+    eprintln!(
+        "{BIN}: not yet supported on this platform (no local IPC transport implemented for Windows)"
+    );
+    1
+}
+
+#[cfg(unix)]
 async fn run() -> u8 {
     // Installed before any other work — see `daemon::shutdown::
     // ShutdownSignal::install`'s own doc comment (T15-01) for why this

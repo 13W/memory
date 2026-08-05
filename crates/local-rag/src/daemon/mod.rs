@@ -48,12 +48,14 @@ pub use consolidation_trigger::{
 };
 pub use error::{error_envelope, migration_only_reason};
 pub use gitroot::{case_sensitivity, probe as probe_worktree_root, request_root};
-pub use handshake::{EchoRequestHandler, HandshakeContext, RequestHandler, serve_connections};
+#[cfg(unix)]
+pub use handshake::serve_connections;
+pub use handshake::{EchoRequestHandler, HandshakeContext, RequestHandler};
 pub use idle::{IdleGateInputs, idle_eligible};
 pub use jobs::{JobGuard, JobKind, JobRegistry};
-pub use lifecycle::{
-    DaemonHandle, DaemonStartupError, ShutdownReason, StartOptions, run, wait_for_shutdown_trigger,
-};
+#[cfg(unix)]
+pub use lifecycle::wait_for_shutdown_trigger;
+pub use lifecycle::{DaemonHandle, DaemonStartupError, ShutdownReason, StartOptions, run};
 pub use lock::{
     StoreLockError, StoreLockFileState, StoreLockGuard, StoreLockInfo, acquire,
     read_store_lock_file,
