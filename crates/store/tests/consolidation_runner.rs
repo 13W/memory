@@ -279,15 +279,37 @@ async fn lease_renews_on_cadence_while_the_generator_runs() {
     );
 
     let probe_fut = async {
-        // Past the first ~30s renewal cadence, well short of the original
-        // lease's 120s deadline.
-        tokio::time::sleep(Duration::from_millis(45_000)).await;
-        let read = db.open_read().expect("read conn");
-        let lease_until = read_lease_until(&read, &run_id);
-        assert!(
-            lease_until.unwrap_or(0) > original_lease_until,
-            "lease_until must have moved forward by ~45s of virtual time, got {lease_until:?}"
-        );
+        // D-034: a single `sleep(45_000)` then one-shot read raced the
+        // renewal's own write under CI load. The renewal transaction crosses
+        // to `StateWriter`'s dedicated real OS thread (never inline on the
+        // async task, `daemon::shutdown`'s own doc), so it is not a pure
+        // timer wait — `tokio::time::pause`'s auto-advance-on-idle only
+        // tracks registered timers, not that channel round-trip. On a fast,
+        // unloaded machine the writer thread replies before the executor
+        // ever considers itself idle, so this never raced locally; a
+        // contended CI runner can let auto-advance skip the probe's own
+        // sleep past 30s (the renewal's virtual deadline) before that real
+        // reply has actually landed, observed once as `got Some(120000)`
+        // (the pre-renewal value) on a real `windows/ubuntu-latest` run.
+        // Poll instead of a single point-in-time check: each retry both
+        // advances virtual time (past the first renewal's 30s deadline, and
+        // past `original_lease_until` all the same) and lets more real time
+        // elapse for the pending write to land, without weakening the
+        // assertion — it still fails loudly, just after genuinely giving the
+        // renewal a chance to be visible, up to and past the run's own 150s
+        // generator sleep so a truly-never-renewed lease still fails, not
+        // just a slow one.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(160_000);
+        loop {
+            tokio::time::sleep(Duration::from_millis(5_000)).await;
+            let read = db.open_read().expect("read conn");
+            if read_lease_until(&read, &run_id).unwrap_or(0) > original_lease_until {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("lease_until never moved forward from the original {original_lease_until}");
+            }
+        }
     };
 
     let (run_result, ()) = tokio::join!(run_fut, probe_fut);

@@ -49,6 +49,29 @@ impl ShutdownSignal {
     }
 }
 
+/// Windows has no SIGTERM; `tokio::signal::ctrl_c()` (CTRL_C_EVENT via
+/// `SetConsoleCtrlHandler`, fully cross-platform in `tokio`) is the whole
+/// story here — nothing platform-specific left to install ahead of time, so
+/// `install()` is a no-op constructor kept only so both platforms share one
+/// call site. Real functionality, not a stub: `local-rag watch` (this
+/// type's only caller so far, `cli::watch`) never touches the daemon's own
+/// still-Unix-only IPC transport (D-033), so it is not blocked by that gap.
+#[cfg(windows)]
+pub struct ShutdownSignal;
+
+#[cfg(windows)]
+impl ShutdownSignal {
+    pub fn install() -> Self {
+        ShutdownSignal
+    }
+
+    /// Wait for CTRL-C (or CTRL_BREAK/CTRL_CLOSE, which `tokio::signal::
+    /// ctrl_c()` also observes on Windows).
+    pub async fn wait(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Drain and release the store (spec 02 §4.3's four ordered steps).
 ///
 /// 1. **Stop accepting**: signal the accept loop to return, then
