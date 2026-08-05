@@ -69,6 +69,7 @@
 //! `None` through this same path with no dedicated branch for either.
 
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -90,6 +91,7 @@ pub const RECALL_BUDGET: Duration = Duration::from_millis(300);
 /// Best-effort read-only recall + stdout print. Never returns an error,
 /// never panics on an ordinary failure (every fallible step collapses to
 /// `Option`) — the caller has nothing to check and nothing to propagate.
+#[cfg(unix)]
 pub fn recall_and_print(layout: &StoreLayout, event: &ParsedEvent) {
     let Some(text) = try_recall(layout, event) else {
         return;
@@ -102,6 +104,15 @@ pub fn recall_and_print(layout: &StoreLayout, event: &ParsedEvent) {
     print_hook_output(event, &text);
 }
 
+/// Windows has no local transport to the daemon yet — named-pipe IPC across
+/// this crate/`local-rag`/`local-rag-proxy` is not implemented (D-033,
+/// tracked separately from this crate's own scope). This degrades exactly
+/// like every other "daemon unreachable" case on the Unix path already does:
+/// no output, no error, the caller proceeds unconditionally.
+#[cfg(not(unix))]
+pub fn recall_and_print(_layout: &StoreLayout, _event: &ParsedEvent) {}
+
+#[cfg(unix)]
 fn try_recall(layout: &StoreLayout, event: &ParsedEvent) -> Option<String> {
     let deadline = Instant::now() + RECALL_BUDGET;
     let stream = UnixStream::connect(layout.socket_path()).ok()?;
@@ -133,6 +144,7 @@ fn try_recall(layout: &StoreLayout, event: &ParsedEvent) -> Option<String> {
 /// if the deadline has already passed (a zero `Duration` is rejected by
 /// `set_read_timeout`/`set_write_timeout` themselves, not treated as
 /// "instant" — this bails out before ever calling either).
+#[cfg(unix)]
 fn set_timeouts(stream: &UnixStream, deadline: Instant) -> Option<()> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {

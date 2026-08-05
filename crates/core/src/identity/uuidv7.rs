@@ -158,23 +158,19 @@ pub trait UuidSource {
     fn next_uuid(&self) -> Uuid;
 }
 
-/// OS-backed UUIDv7 generator: `SystemTime` for the timestamp and
-/// `/dev/urandom` for entropy.
-///
-/// Unix-only for now; other platforms' entropy sources land with the rest of
-/// the Windows story (spec 02 §2.1 SID lookup is likewise deferred).
-#[cfg(unix)]
+/// OS-backed UUIDv7 generator: `SystemTime` for the timestamp, the
+/// platform's own CSPRNG for entropy (`/dev/urandom` on Unix,
+/// `BCryptGenRandom` on Windows — spec 02 §2.1 SID lookup is the one
+/// remaining Windows-story item still deferred, not this).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemUuidV7;
 
-#[cfg(unix)]
 impl UuidSource for SystemUuidV7 {
     fn next_uuid(&self) -> Uuid {
         uuidv7_from(system_now_ms(), os_random_10())
     }
 }
 
-#[cfg(unix)]
 fn system_now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -192,6 +188,48 @@ fn os_random_10() -> [u8; 10] {
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
         .expect("read entropy from /dev/urandom");
+    buf
+}
+
+/// `BCryptGenRandom` with a null algorithm handle and
+/// `BCRYPT_USE_SYSTEM_PREFERRED_RNG` — the documented "use the OS's default
+/// CSPRNG, no algorithm provider to open/close" mode (bcrypt.h), the exact
+/// Windows analog of reading `/dev/urandom`. No new crate dependency: a
+/// direct FFI declaration linking `bcrypt.dll`'s import library, always
+/// present on every supported Windows version (Vista+).
+#[cfg(windows)]
+fn os_random_10() -> [u8; 10] {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut core::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+    let mut buf = [0u8; 10];
+    // SAFETY: `pb_buffer`/`cb_buffer` describe exactly `buf`'s live extent
+    // for the duration of this one call; the null algorithm handle is only
+    // valid together with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` (documented),
+    // which is the only flag passed.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    // A non-zero NTSTATUS means the OS entropy source itself is unavailable
+    // — exactly as unrecoverable for ID minting as a `/dev/urandom` open
+    // failure is on Unix (see the sibling implementation above).
+    assert_eq!(
+        status, 0,
+        "BCryptGenRandom failed with NTSTATUS {status:#x}"
+    );
     buf
 }
 

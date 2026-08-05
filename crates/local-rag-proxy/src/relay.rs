@@ -50,6 +50,7 @@ impl ShutdownSignal {
 /// whole call — every relayed request carries byte-identical
 /// session_id/worktree_root/repo_hint (spec 02 §3.3, 11 §1): this proxy
 /// holds no per-request state of its own to vary it by.
+#[cfg(unix)]
 pub async fn relay<I, O, R, W>(
     mut stdin: I,
     mut stdout: O,

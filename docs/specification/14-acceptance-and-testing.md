@@ -3,6 +3,17 @@
 Numbers marked `[BASELINE]` are fixed only after the v1 baseline run `[OPEN]`; the *existence*
 and *shape* of each gate is `[FIXED]`.
 
+As-built note (G17, `[SPEC]`, found stale at the final gate): the `[OPEN]` above literally
+describes only the `quality` row's path (fixed against a real v1 baseline run — D-016/D-017/
+D-018). The other three `[BASELINE]` rows never had a v1 equivalent to run against and were
+closed by a different mechanism instead: `memory-quality` (T14-07/ADR-0006/T14-09 — no v1
+memory-quality corpus existed, GAP-04) and `latency`/`resources` (T17-05 — first-established v2
+baseline, deliberately never gated, no prior measurement to regress against). As of 2026-08-05
+all four `[BASELINE]` rows are fixed (see the as-built notes at §2 below and
+`fixtures/release/run-2026-08-05.{json,report.md}`); the header `[OPEN]` marker is retained
+verbatim as a historical record rather than rewritten, per this project's evidence-preservation
+rule — treat §2's per-row as-built notes as authoritative over this header for current status.
+
 ## 1. Fixture strategy `[FIXED]`
 
 v1 tests are converted to **implementation-neutral fixtures before any rewrite code**:

@@ -11,11 +11,13 @@ use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_search::QueryEmbedder;
 use local_rag_store::{CacheDb, CacheOpenError, OpenError, StateDb, WriteError};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::error::migration_only_reason;
+#[cfg(unix)]
 use super::handshake::{HandshakeContext, serve_connections};
 use super::idle::{IdleGateInputs, idle_eligible};
 use super::jobs::JobRegistry;
@@ -27,7 +29,9 @@ use super::probe::SocketLivenessProbe;
 use super::resume::{build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs};
 use super::search::build_search_engine;
 use super::session::SessionRegistry;
-use super::shutdown::{ShutdownSignal, drain_and_shutdown};
+#[cfg(unix)]
+use super::shutdown::ShutdownSignal;
+use super::shutdown::drain_and_shutdown;
 
 /// Why [`DaemonHandle::start`] could not bring the daemon up at all (distinct
 /// from [`DaemonMode::MigrationOnly`], which is a *successful* start in a
@@ -182,6 +186,22 @@ impl DaemonHandle {
     /// error, a cache-open failure, a bind failure) is a genuine
     /// [`DaemonStartupError`] — nothing is reachable, and the caller
     /// (`main.rs`) reports it and exits.
+    /// Windows has no local IPC transport implemented yet (named-pipe
+    /// support across this crate/`local-rag-proxy`/`local-rag-hook` is not
+    /// implemented — D-033, a separate follow-up, not part of this
+    /// platform-portability fix). Startup fails immediately with a typed
+    /// error, before any side effect (no directory/lock/store touched),
+    /// rather than failing to compile or binding a transport that does not
+    /// exist on this platform.
+    #[cfg(not(unix))]
+    pub async fn start(_opts: StartOptions) -> Result<DaemonHandle, DaemonStartupError> {
+        Err(DaemonStartupError::Bind(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "local-rag daemon IPC is not yet implemented on Windows (named pipes; tracked separately)",
+        )))
+    }
+
+    #[cfg(unix)]
     pub async fn start(opts: StartOptions) -> Result<DaemonHandle, DaemonStartupError> {
         let StartOptions {
             layout,
@@ -600,6 +620,7 @@ pub enum ShutdownReason {
 /// `poll_interval` is how often the idle gate is re-checked while waiting —
 /// a plain parameter (no `[SPEC]` number exists for it), so tests can drive
 /// it with `tokio::time::pause`/`advance` instead of real sleeps.
+#[cfg(unix)]
 pub async fn wait_for_shutdown_trigger(
     handle: &DaemonHandle,
     signal: &mut ShutdownSignal,
@@ -638,6 +659,7 @@ pub async fn wait_for_shutdown_trigger(
 /// bearing, not stylistic: a SIGTERM arriving during startup (lock/migrate/
 /// cache/bind, spec 02 §4.1) must be caught too, not just one arriving after
 /// the wait loop begins.
+#[cfg(unix)]
 pub async fn run(
     opts: StartOptions,
     idle_shutdown_secs: u64,
@@ -650,4 +672,20 @@ pub async fn run(
             .await;
     handle.shutdown().await;
     Ok(reason)
+}
+
+/// Windows has no local IPC transport implemented yet — see
+/// [`DaemonHandle::start`]'s Windows arm (D-033). Returns the same typed
+/// error `start()` would, without touching `ShutdownSignal` (Unix-only) at
+/// all.
+#[cfg(not(unix))]
+pub async fn run(
+    _opts: StartOptions,
+    _idle_shutdown_secs: u64,
+    _idle_poll_interval: Duration,
+) -> Result<ShutdownReason, DaemonStartupError> {
+    Err(DaemonStartupError::Bind(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "local-rag daemon IPC is not yet implemented on Windows (named pipes; tracked separately)",
+    )))
 }

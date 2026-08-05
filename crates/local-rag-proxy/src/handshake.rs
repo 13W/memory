@@ -7,8 +7,10 @@ use std::time::Duration;
 use local_rag_core::paths::Env;
 use local_rag_protocol::{Hello, Message, PROTO_VERSION, ShutdownRequest, Welcome, decode_message};
 use tokio::io::{AsyncBufRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
+#[cfg(unix)]
 use crate::connect::{DEFAULT_BACKOFF, connect_or_spawn};
 use crate::error::ProxyError;
 use crate::transport::{read_bounded_line, write_message};
@@ -168,6 +170,7 @@ pub fn check_spool_format_compatibility(
 
 /// A live, version-matched session: the split UDS connection plus the
 /// WELCOME the daemon answered with.
+#[cfg(unix)]
 pub struct EstablishedSession {
     pub reader: tokio::io::BufReader<OwnedReadHalf>,
     pub writer: OwnedWriteHalf,
@@ -180,6 +183,7 @@ pub struct EstablishedSession {
 /// `SHUTDOWN_REQUEST`, wait for it to close, then connect again (a fresh
 /// `connect_or_spawn` — with no daemon left holding the store, this spawns
 /// the current, presumably now-matching, binary).
+#[cfg(unix)]
 pub async fn establish_session(
     socket_path: &Path,
     daemon_binary: &Path,
