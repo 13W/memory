@@ -28,29 +28,92 @@ use local_rag_store::{
 use local_rag::daemon::gitroot;
 
 use super::index::open_state;
-use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
+use super::{
+    EXIT_USAGE, block_on, fail, parse_scope_kind, resolve_layout_and_config, system_now_ms,
+};
 
 const BIN: &str = "local-rag";
 
-const USAGE: &str = "usage: local-rag memory list|approve|reject|edit|retract|merge|evidence …";
+fn parse_memory_kind(raw: &str) -> Result<MemoryKind, String> {
+    MemoryKind::from_db(raw).ok_or_else(|| {
+        "must be one of fact/decision/convention/procedure/task/question/hypothesis".to_string()
+    })
+}
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    match args.next().as_deref() {
-        Some("list") => run_list(args),
-        Some("approve") => run_approve(args),
-        Some("reject") => run_reject(args),
-        Some("edit") => run_edit(args),
-        Some("retract") => run_retract(args),
-        Some("merge") => run_merge(args),
-        Some("evidence") => run_evidence(args),
-        Some(other) => {
-            eprintln!("{BIN} memory: unknown subcommand {other:?}\n{USAGE}");
-            ExitCode::from(EXIT_USAGE)
-        }
-        None => {
-            eprintln!("{BIN} memory: {USAGE}");
-            ExitCode::from(EXIT_USAGE)
-        }
+#[derive(Debug, clap::Args)]
+pub struct MemoryListArgs {
+    /// List pending review candidates instead of durable memory entries.
+    #[arg(long)]
+    candidates: bool,
+    #[arg(long, value_parser = parse_memory_kind)]
+    kind: Option<MemoryKind>,
+    /// A memory state (active/superseded/retracted/…) or, with
+    /// `--candidates`, a candidate review state — the same free-text
+    /// vocabulary this filter always accepted, since one flag covers both.
+    #[arg(long)]
+    state: Option<String>,
+    #[arg(long, value_parser = parse_scope_kind)]
+    scope: Option<ScopeKind>,
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(i64).range(1..))]
+    limit: i64,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+    offset: i64,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum MemoryCommand {
+    /// List durable memory entries (or, with `--candidates`, pending review candidates).
+    List(MemoryListArgs),
+    Approve {
+        candidate_id: String,
+    },
+    Reject {
+        candidate_id: String,
+    },
+    Edit {
+        memory_id: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        importance: Option<f64>,
+    },
+    Retract {
+        memory_id: String,
+        #[arg(long)]
+        expected_version: i64,
+    },
+    Merge {
+        /// `<memory_id>:<expected_version>`.
+        #[arg(long)]
+        survivor: String,
+        /// `<memory_id>:<expected_version>`; repeat for multiple losers.
+        #[arg(long = "loser")]
+        losers: Vec<String>,
+    },
+    Evidence {
+        memory_id: String,
+    },
+}
+
+pub fn run(command: MemoryCommand) -> ExitCode {
+    match command {
+        MemoryCommand::List(args) => run_list(args),
+        MemoryCommand::Approve { candidate_id } => run_approve(candidate_id),
+        MemoryCommand::Reject { candidate_id } => run_reject(candidate_id),
+        MemoryCommand::Edit {
+            memory_id,
+            expected_version,
+            text,
+            importance,
+        } => run_edit(memory_id, expected_version, text, importance),
+        MemoryCommand::Retract {
+            memory_id,
+            expected_version,
+        } => run_retract(memory_id, expected_version),
+        MemoryCommand::Merge { survivor, losers } => run_merge(survivor, losers),
+        MemoryCommand::Evidence { memory_id } => run_evidence(memory_id),
     }
 }
 
@@ -120,70 +183,28 @@ fn print_memory_entry(row: &MemoryEntryRow) {
 // list
 // ---------------------------------------------------------------------------
 
-fn run_list(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut candidates_mode = false;
-    let mut kind_filter: Option<MemoryKind> = None;
+fn run_list(args: MemoryListArgs) -> ExitCode {
+    let MemoryListArgs {
+        candidates: candidates_mode,
+        kind: kind_filter,
+        state: state_raw,
+        scope: scope_filter,
+        limit,
+        offset,
+    } = args;
+
     let mut state_filter: Option<MemoryState> = None;
     let mut candidate_state_filter: Option<CandidateState> = None;
-    let mut scope_filter: Option<ScopeKind> = None;
-    let mut limit: i64 = 20;
-    let mut offset: i64 = 0;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--candidates" => candidates_mode = true,
-            "--kind" => match args.next().as_deref().and_then(MemoryKind::from_db) {
-                Some(k) => kind_filter = Some(k),
-                None => {
-                    eprintln!(
-                        "{BIN} memory list: --kind must be one of fact/decision/convention/procedure/task/question/hypothesis"
-                    );
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--state" => {
-                let Some(raw) = args.next() else {
-                    eprintln!("{BIN} memory list: --state needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                };
-                if let Some(s) = MemoryState::from_db(&raw) {
-                    state_filter = Some(s);
-                } else if let Some(c) = CandidateState::from_db(&raw) {
-                    candidate_state_filter = Some(c);
-                } else {
-                    eprintln!(
-                        "{BIN} memory list: --state {raw:?} is not a valid memory or candidate state"
-                    );
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            }
-            "--scope" => match args.next().as_deref().and_then(ScopeKind::from_db) {
-                Some(s) => scope_filter = Some(s),
-                None => {
-                    eprintln!(
-                        "{BIN} memory list: --scope must be one of global/repository/worktree"
-                    );
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--limit" => match args.next().as_deref().and_then(|v| v.parse::<i64>().ok()) {
-                Some(v) if v >= 1 => limit = v,
-                _ => {
-                    eprintln!("{BIN} memory list: --limit needs a positive integer");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--offset" => match args.next().as_deref().and_then(|v| v.parse::<i64>().ok()) {
-                Some(v) if v >= 0 => offset = v,
-                _ => {
-                    eprintln!("{BIN} memory list: --offset needs a non-negative integer");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            other => {
-                eprintln!("{BIN} memory list: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
+    if let Some(raw) = state_raw {
+        if let Some(s) = MemoryState::from_db(&raw) {
+            state_filter = Some(s);
+        } else if let Some(c) = CandidateState::from_db(&raw) {
+            candidate_state_filter = Some(c);
+        } else {
+            eprintln!(
+                "{BIN} memory list: --state {raw:?} is not a valid memory or candidate state"
+            );
+            return ExitCode::from(EXIT_USAGE);
         }
     }
 
@@ -284,16 +305,7 @@ fn run_list(mut args: impl Iterator<Item = String>) -> ExitCode {
 // approve / reject
 // ---------------------------------------------------------------------------
 
-fn run_approve(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(id) = args.next() else {
-        eprintln!("{BIN} memory approve: usage: {BIN} memory approve <candidate_id>");
-        return ExitCode::from(EXIT_USAGE);
-    };
-    if let Some(extra) = args.next() {
-        eprintln!("{BIN} memory approve: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
-
+fn run_approve(id: String) -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
@@ -332,16 +344,7 @@ fn run_approve(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-fn run_reject(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(id) = args.next() else {
-        eprintln!("{BIN} memory reject: usage: {BIN} memory reject <candidate_id>");
-        return ExitCode::from(EXIT_USAGE);
-    };
-    if let Some(extra) = args.next() {
-        eprintln!("{BIN} memory reject: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
-
+fn run_reject(id: String) -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
@@ -374,49 +377,18 @@ fn run_reject(mut args: impl Iterator<Item = String>) -> ExitCode {
 // edit / retract
 // ---------------------------------------------------------------------------
 
-fn run_edit(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(id) = args.next() else {
-        eprintln!(
-            "{BIN} memory edit: usage: {BIN} memory edit <memory_id> --expected-version N [--text T] [--importance F]"
-        );
+fn run_edit(
+    id: String,
+    expected_version: i64,
+    text: Option<String>,
+    importance: Option<f64>,
+) -> ExitCode {
+    if let Some(v) = importance
+        && !(0.0..=1.0).contains(&v)
+    {
+        eprintln!("{BIN} memory edit: --importance needs a number between 0 and 1");
         return ExitCode::from(EXIT_USAGE);
-    };
-    let mut expected_version: Option<i64> = None;
-    let mut text: Option<String> = None;
-    let mut importance: Option<f64> = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--expected-version" => match args.next().as_deref().and_then(|v| v.parse().ok()) {
-                Some(v) => expected_version = Some(v),
-                None => {
-                    eprintln!("{BIN} memory edit: --expected-version needs an integer");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--text" => match args.next() {
-                Some(v) => text = Some(v),
-                None => {
-                    eprintln!("{BIN} memory edit: --text needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--importance" => match args.next().as_deref().and_then(|v| v.parse::<f64>().ok()) {
-                Some(v) if (0.0..=1.0).contains(&v) => importance = Some(v),
-                _ => {
-                    eprintln!("{BIN} memory edit: --importance needs a number between 0 and 1");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            other => {
-                eprintln!("{BIN} memory edit: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
     }
-    let Some(expected_version) = expected_version else {
-        eprintln!("{BIN} memory edit: --expected-version is required");
-        return ExitCode::from(EXIT_USAGE);
-    };
     if text.is_none() && importance.is_none() {
         eprintln!("{BIN} memory edit: at least one of --text/--importance is required");
         return ExitCode::from(EXIT_USAGE);
@@ -468,34 +440,7 @@ fn run_edit(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-fn run_retract(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(id) = args.next() else {
-        eprintln!(
-            "{BIN} memory retract: usage: {BIN} memory retract <memory_id> --expected-version N"
-        );
-        return ExitCode::from(EXIT_USAGE);
-    };
-    let mut expected_version: Option<i64> = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--expected-version" => match args.next().as_deref().and_then(|v| v.parse().ok()) {
-                Some(v) => expected_version = Some(v),
-                None => {
-                    eprintln!("{BIN} memory retract: --expected-version needs an integer");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            other => {
-                eprintln!("{BIN} memory retract: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
-    let Some(expected_version) = expected_version else {
-        eprintln!("{BIN} memory retract: --expected-version is required");
-        return ExitCode::from(EXIT_USAGE);
-    };
-
+fn run_retract(id: String, expected_version: i64) -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
@@ -554,43 +499,24 @@ fn parse_id_version(spec: &str) -> Option<(String, i64)> {
     Some((id.to_string(), version))
 }
 
-fn run_merge(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut survivor: Option<(String, i64)> = None;
-    let mut losers: Vec<(String, i64)> = Vec::new();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--survivor" => match args.next().as_deref().and_then(parse_id_version) {
-                Some(v) => survivor = Some(v),
-                None => {
-                    eprintln!(
-                        "{BIN} memory merge: --survivor needs <memory_id>:<expected_version>"
-                    );
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--loser" => match args.next().as_deref().and_then(parse_id_version) {
-                Some(v) => losers.push(v),
-                None => {
-                    eprintln!("{BIN} memory merge: --loser needs <memory_id>:<expected_version>");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            other => {
-                eprintln!("{BIN} memory merge: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
-    let Some((survivor_id, survivor_expected_version)) = survivor else {
-        eprintln!(
-            "{BIN} memory merge: usage: {BIN} memory merge --survivor <id>:<version> --loser <id>:<version> [--loser ...]"
-        );
+fn run_merge(survivor: String, losers: Vec<String>) -> ExitCode {
+    let Some((survivor_id, survivor_expected_version)) = parse_id_version(&survivor) else {
+        eprintln!("{BIN} memory merge: --survivor needs <memory_id>:<expected_version>");
         return ExitCode::from(EXIT_USAGE);
     };
     if losers.is_empty() {
         eprintln!("{BIN} memory merge: at least one --loser is required");
         return ExitCode::from(EXIT_USAGE);
     }
+    let mut parsed_losers: Vec<(String, i64)> = Vec::with_capacity(losers.len());
+    for loser in &losers {
+        let Some(v) = parse_id_version(loser) else {
+            eprintln!("{BIN} memory merge: --loser needs <memory_id>:<expected_version>");
+            return ExitCode::from(EXIT_USAGE);
+        };
+        parsed_losers.push(v);
+    }
+    let losers = parsed_losers;
 
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
@@ -650,16 +576,7 @@ fn run_merge(mut args: impl Iterator<Item = String>) -> ExitCode {
 // evidence
 // ---------------------------------------------------------------------------
 
-fn run_evidence(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(id) = args.next() else {
-        eprintln!("{BIN} memory evidence: usage: {BIN} memory evidence <memory_id>");
-        return ExitCode::from(EXIT_USAGE);
-    };
-    if let Some(extra) = args.next() {
-        eprintln!("{BIN} memory evidence: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
-
+fn run_evidence(id: String) -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),

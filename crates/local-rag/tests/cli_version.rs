@@ -33,7 +33,7 @@ fn no_arguments_at_all_is_a_usage_error() {
         .expect("run local-rag");
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("usage:"),
+        String::from_utf8_lossy(&output.stderr).contains("Usage:"),
         "{:?}",
         output.stderr
     );

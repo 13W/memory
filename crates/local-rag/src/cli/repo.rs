@@ -16,33 +16,39 @@ use local_rag::daemon::gitroot;
 use local_rag_store::{AttachError, Candidate, RequestRoot, Resolution, attach, resolve};
 
 use super::index::open_state;
-use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
+use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    match args.next().as_deref() {
-        Some("list") => run_list(args),
-        Some("attach") => run_attach(args),
-        Some(other) => {
-            eprintln!("{BIN} repo: unknown subcommand {other:?}");
-            ExitCode::from(EXIT_USAGE)
-        }
-        None => {
-            eprintln!(
-                "{BIN} repo: usage: {BIN} repo list|attach <repo_id> [--path P] [--worktree <id>]"
-            );
-            ExitCode::from(EXIT_USAGE)
-        }
+#[derive(Debug, clap::Subcommand)]
+pub enum RepoCommand {
+    /// List every registered repository.
+    List,
+    /// Attach a worktree to a repository (spec 04 §7).
+    Attach {
+        repo_id: String,
+        /// Directory to attach (defaults to the current directory).
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// The exact worktree identity to bind — required when the path
+        /// matches more than one detached worktree of this repository.
+        #[arg(long)]
+        worktree: Option<String>,
+    },
+}
+
+pub fn run(command: RepoCommand) -> ExitCode {
+    match command {
+        RepoCommand::List => run_list(),
+        RepoCommand::Attach {
+            repo_id,
+            path,
+            worktree,
+        } => run_attach(repo_id, path, worktree),
     }
 }
 
-fn run_list(args: impl Iterator<Item = String>) -> ExitCode {
-    if let Some(extra) = args.into_iter().next() {
-        eprintln!("{BIN} repo list: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
-
+fn run_list() -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
@@ -84,38 +90,7 @@ fn run_list(args: impl Iterator<Item = String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_attach(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(repo_id) = args.next() else {
-        eprintln!(
-            "{BIN} repo attach: usage: {BIN} repo attach <repo_id> [--path P] [--worktree <id>]"
-        );
-        return ExitCode::from(EXIT_USAGE);
-    };
-    let mut path: Option<PathBuf> = None;
-    let mut worktree_id: Option<String> = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--path" => match args.next() {
-                Some(v) => path = Some(PathBuf::from(v)),
-                None => {
-                    eprintln!("{BIN} repo attach: --path needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--worktree" => match args.next() {
-                Some(v) => worktree_id = Some(v),
-                None => {
-                    eprintln!("{BIN} repo attach: --worktree needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            other => {
-                eprintln!("{BIN} repo attach: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
-
+fn run_attach(repo_id: String, path: Option<PathBuf>, worktree_id: Option<String>) -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),

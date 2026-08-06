@@ -66,6 +66,18 @@ serde_json = { version = "1", features = ["raw_value"] }
 # version/features as `local-rag-store` — 0 new external sources, only a
 # direct edge for the type name.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# X-002 (explicit product decision, post-G17): the CLI's own 17-command,
+# multi-level surface (`repo attach`, `memory merge --loser <id>:<version>
+# [--loser ...]`, …) outgrew the T15-07/T15-08 hand-rolled `std::env::args()`
+# convention (spec 11 §6's as-built note for those tasks) — every subcommand
+# hand-wrote its own flag loop, usage string, and error formatting, and a
+# repeated flag like `merge --loser` had no `Vec<T>` primitive to reach for.
+# `clap`'s `derive` feature replaces that with one typed `Parser`/`Subcommand`
+# tree per module (CONTRIBUTING.md dependency table has the transitive-set
+# breakdown). Only `local-rag` gains this dependency — `local-rag-proxy`/
+# `local-rag-hook`/`xtask` have no comparable command surface and stay on
+# `std::env::args()`.
+clap = { version = "4", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 # `kill(pid, SIGTERM)` is not exposed by `std::process::Child::kill` (unix-only

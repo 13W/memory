@@ -655,3 +655,31 @@ section on its first real smoke test against a freshly-indexed store: `state.sql
 process umask's default (typically `0644`) instead of `0600` — pre-existing since T01-02/T01-05,
 unrelated to any new code in this task. Fixed and closed within this same task per the deviation
 workflow before `doctor` itself was finished (`DEVIATIONS.md`).
+
+As-built note (X-002, `[SPEC]`, post-G17 product decision). The `local-rag` binary's argument
+parsing moved from hand-rolled `std::env::args()` (T15-07/T15-08/T16-02/T16-03's as-built notes
+above) to `clap` (`derive` feature) — those notes' "hand-parsed … no CLI-parsing crate was added"
+sentences describe the T15-07-era implementation, superseded by this task, not the current one;
+they are left as historical record rather than rewritten, the same precedent X-001 set for spec 06
+§5. `local-rag-proxy`/`local-rag-hook`/`xtask` are unaffected — none has a comparable multi-command
+surface, and all three keep hand-rolled `std::env::args()`. `crates/local-rag/src/cli::Cli`
+(`#[derive(clap::Parser)]`) is the single root; `crates/local-rag/src/cli::Command`
+(`#[derive(clap::Subcommand)]`) is the top-level dispatch `main.rs` matches on. Every command in
+this section's sketch keeps its exact spelling, flags, and positional grammar — this task changed
+only the parsing implementation, not the command surface `[FIXED]` by 01 §1 no-external-daemon /
+`[SPEC]` by this section. Two observable, intentional differences from the prior hand-rolled
+output, both already updated in this crate's own `tests/cli_*.rs`: usage/error text for a missing
+required flag, an unknown flag/subcommand, or a bad `--kind`/`--scope` value is now `clap`'s own
+generated `Usage:`/`error:`/`invalid value` wording rather than this codebase's hand-written
+sentences (exit code stays `2`, `EXIT_USAGE`, `clap`'s own default for the same class of error);
+`local-rag inspect`'s `<kind>` positional is a `clap::ValueEnum` now, so an invalid kind reports
+`clap`'s "possible values" list instead of the hand-written `expected observation|memory|
+generation` phrase. Every domain-level validation this CLI already had — a malformed worktree UUID,
+`rebuild`'s "at least one of --fts/--dense", `purge`'s "exactly one of --memory/--session/--all",
+`memory merge`'s `<id>:<version>` spec format, `memory edit`'s "at least one of --text/
+--importance" — stays exactly as before, checked by application code after a successful parse, not
+by `clap`: these are business rules over already-well-typed values, not argument-shape questions,
+and moving them into `clap`'s validators would have changed their exit code (`1` via `fail()`,
+not `2`) or blurred that line for no benefit. `memory merge --loser <id>:<version> [--loser ...]`
+is the first genuinely repeated flag this CLI has ever had a typed primitive for: a plain
+`Vec<String>` field.

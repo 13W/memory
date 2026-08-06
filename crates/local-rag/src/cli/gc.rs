@@ -20,21 +20,19 @@ use local_rag_store::{
 };
 
 use super::index::open_state;
-use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
+use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
-pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
-    let mut dry_run = false;
-    for arg in args {
-        match arg.as_str() {
-            "--dry-run" => dry_run = true,
-            other => {
-                eprintln!("{BIN} gc: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+#[derive(Debug, clap::Args)]
+pub struct GcArgs {
+    /// Report what each sweep would remove without removing it.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+pub fn run(args: GcArgs) -> ExitCode {
+    let dry_run = args.dry_run;
 
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,

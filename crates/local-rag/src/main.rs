@@ -50,35 +50,31 @@ fn test_daemon_version_override() -> Option<String> {
 }
 
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
-        Some("version" | "--version" | "-V") => {
+    use clap::Parser;
+    let cli = cli::Cli::parse();
+    match cli.command {
+        cli::Command::Version => {
             println!("{}", local_rag_core::version_line(BIN));
             ExitCode::SUCCESS
         }
-        Some("serve") => run_serve(),
-        Some("status") => cli::status::run(std::env::args().skip(2)),
-        Some("stop") => cli::service::run_stop(std::env::args().skip(2)),
-        Some("restart") => cli::service::run_restart(std::env::args().skip(2)),
-        Some("init") => cli::init::run(std::env::args().skip(2)),
-        Some("index") => cli::index::run_index(std::env::args().skip(2)),
-        Some("reindex") => cli::index::run_reindex(std::env::args().skip(2)),
-        Some("watch") => cli::watch::run_watch(std::env::args().skip(2)),
-        Some("repo") => cli::repo::run(std::env::args().skip(2)),
-        Some("worktree") => cli::worktree::run(std::env::args().skip(2)),
-        Some("rebuild") => cli::rebuild::run(std::env::args().skip(2)),
-        Some("memory") => cli::memory::run(std::env::args().skip(2)),
-        Some("gc") => cli::gc::run(std::env::args().skip(2)),
-        Some("stats") => cli::stats::run(std::env::args().skip(2)),
-        Some("inspect") => cli::inspect::run(std::env::args().skip(2)),
-        Some("export") => cli::export::run(std::env::args().skip(2)),
-        Some("purge") => cli::purge::run(std::env::args().skip(2)),
-        Some("doctor") => cli::doctor::run(std::env::args().skip(2)),
-        _ => {
-            eprintln!(
-                "usage: {BIN} version|serve|status|stop|restart|init|index|reindex|watch|repo|worktree|rebuild|memory|gc|stats|inspect|export|purge|doctor"
-            );
-            ExitCode::from(2)
-        }
+        cli::Command::Serve => run_serve(),
+        cli::Command::Status(args) => cli::status::run(args),
+        cli::Command::Stop => cli::service::run_stop(),
+        cli::Command::Restart => cli::service::run_restart(),
+        cli::Command::Init(args) => cli::init::run(args),
+        cli::Command::Index(args) => cli::index::run_index(args),
+        cli::Command::Reindex => cli::index::run_reindex(),
+        cli::Command::Watch => cli::watch::run_watch(),
+        cli::Command::Repo { command } => cli::repo::run(command),
+        cli::Command::Worktree { command } => cli::worktree::run(command),
+        cli::Command::Rebuild(args) => cli::rebuild::run(args),
+        cli::Command::Memory { command } => cli::memory::run(command),
+        cli::Command::Gc(args) => cli::gc::run(args),
+        cli::Command::Stats(args) => cli::stats::run(args),
+        cli::Command::Inspect(args) => cli::inspect::run(args),
+        cli::Command::Export(args) => cli::export::run(args),
+        cli::Command::Purge(args) => cli::purge::run(args),
+        cli::Command::Doctor(args) => cli::doctor::run(args),
     }
 }
 

@@ -25,32 +25,24 @@ use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms
 
 const BIN: &str = "local-rag";
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut worktree: Option<String> = None;
-    let mut fts = false;
-    let mut dense = false;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--worktree" => match args.next() {
-                Some(v) => worktree = Some(v),
-                None => {
-                    eprintln!("{BIN} rebuild: --worktree needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--fts" => fts = true,
-            "--dense" => dense = true,
-            other => {
-                eprintln!("{BIN} rebuild: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+#[derive(Debug, clap::Args)]
+pub struct RebuildArgs {
+    #[arg(long)]
+    worktree: String,
+    /// Re-derive the FTS view from already-indexed content.
+    #[arg(long)]
+    fts: bool,
+    /// Re-derive the dense projection from already-embedded vectors.
+    #[arg(long)]
+    dense: bool,
+}
 
-    let Some(worktree) = worktree else {
-        eprintln!("{BIN} rebuild: usage: {BIN} rebuild --worktree <id> [--fts] [--dense]");
-        return ExitCode::from(EXIT_USAGE);
-    };
+pub fn run(args: RebuildArgs) -> ExitCode {
+    let RebuildArgs {
+        worktree,
+        fts,
+        dense,
+    } = args;
     if !fts && !dense {
         eprintln!("{BIN} rebuild: at least one of --fts or --dense is required");
         return ExitCode::from(EXIT_USAGE);

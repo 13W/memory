@@ -5,30 +5,23 @@ use std::process::ExitCode;
 use local_rag_store::{all_worktree_ids, current_worktree_path, worktree_summary};
 
 use super::index::open_state;
-use super::{EXIT_USAGE, fail, resolve_layout_and_config};
+use super::{fail, resolve_layout_and_config};
 
 const BIN: &str = "local-rag";
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    match args.next().as_deref() {
-        Some("list") => run_list(args),
-        Some(other) => {
-            eprintln!("{BIN} worktree: unknown subcommand {other:?}");
-            ExitCode::from(EXIT_USAGE)
-        }
-        None => {
-            eprintln!("{BIN} worktree: usage: {BIN} worktree list");
-            ExitCode::from(EXIT_USAGE)
-        }
+#[derive(Debug, clap::Subcommand)]
+pub enum WorktreeCommand {
+    /// List every registered worktree.
+    List,
+}
+
+pub fn run(command: WorktreeCommand) -> ExitCode {
+    match command {
+        WorktreeCommand::List => run_list(),
     }
 }
 
-fn run_list(args: impl Iterator<Item = String>) -> ExitCode {
-    if let Some(extra) = args.into_iter().next() {
-        eprintln!("{BIN} worktree list: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
-
+fn run_list() -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),

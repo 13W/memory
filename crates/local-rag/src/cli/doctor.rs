@@ -52,7 +52,7 @@ use local_rag_store::{
 
 use local_rag::daemon::{StoreLockFileState, read_store_lock_file};
 
-use super::{EXIT_USAGE, fail, resolve_layout_and_config, system_now_ms};
+use super::{fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
@@ -179,28 +179,25 @@ impl DoctorReport {
 // CLI entry
 // ---------------------------------------------------------------------------
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut worktree_filter: Option<Uuid> = None;
-    let mut json = false;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--worktree" => match args.next() {
-                Some(v) => match v.parse::<Uuid>() {
-                    Ok(id) => worktree_filter = Some(id),
-                    Err(_) => return fail(BIN, &format!("{v:?} is not a valid worktree id")),
-                },
-                None => {
-                    eprintln!("{BIN} doctor: --worktree needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--json" => json = true,
-            other => {
-                eprintln!("{BIN} doctor: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+#[derive(Debug, clap::Args)]
+pub struct DoctorArgs {
+    /// Report only this worktree's heads (all worktrees by default).
+    #[arg(long)]
+    worktree: Option<String>,
+    /// Print the report as JSON instead of human-readable lines.
+    #[arg(long)]
+    json: bool,
+}
+
+pub fn run(args: DoctorArgs) -> ExitCode {
+    let worktree_filter: Option<Uuid> = match args.worktree {
+        Some(v) => match v.parse::<Uuid>() {
+            Ok(id) => Some(id),
+            Err(_) => return fail(BIN, &format!("{v:?} is not a valid worktree id")),
+        },
+        None => None,
+    };
+    let json = args.json;
 
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,

@@ -1,16 +1,24 @@
-//! The `local-rag` binary's CLI surface beyond `version`/`serve` (spec 11 §6)
-//! — T15-07: `status`/`stop`/`restart`/`init`, `index`/`reindex`/`watch`,
-//! `repo`/`worktree`, `rebuild`. T15-08 (D-025): `memory`, `gc`, `stats`.
-//! T16-02 (D-025): `inspect`, `export`, `purge`, over the domain layer in
-//! `local_rag_store::privacy`. T16-03 (D-025): `doctor`.
+//! The `local-rag` binary's CLI surface beyond `serve` (spec 11 §6) —
+//! T15-07: `version`/`status`/`stop`/`restart`/`init`, `index`/`reindex`/
+//! `watch`, `repo`/`worktree`, `rebuild`. T15-08 (D-025): `memory`, `gc`,
+//! `stats`. T16-02 (D-025): `inspect`, `export`, `purge`, over the domain
+//! layer in `local_rag_store::privacy`. T16-03 (D-025): `doctor`.
 //!
-//! Argument parsing is deliberately hand-rolled (`std::env::args()`, the same
-//! convention `main.rs`/`local-rag-proxy`/`xtask`'s own `run_bench` already
-//! use) — this workspace has never added a CLI-parsing crate, and the whole
-//! surface here (one level of nesting, no repeated/multi-valued flags) does
-//! not need one. Each command owns its own small flag loop in its own file
-//! (module-per-concern, mirroring `daemon/{lock,probe,shutdown,...}.rs`),
-//! not one central parser that would need to know every command's grammar.
+//! Argument parsing is `clap` (`derive` feature, X-002 — explicit post-G17
+//! product decision; see `docs/specification/11-interfaces.md` §6's X-002
+//! as-built note and `CONTRIBUTING.md`'s dependency table for why hand-rolled
+//! `std::env::args()`, T15-07's original as-built choice, stopped being
+//! enough). [`Cli`] is the single root `#[derive(Parser)]`; [`Command`] is
+//! the top-level `#[derive(Subcommand)]` enum `main.rs` matches on. Each
+//! subcommand still owns its own `Args`/`Subcommand` type and `run` function
+//! in its own file (module-per-concern, mirroring
+//! `daemon/{lock,probe,shutdown,...}.rs`) — only the per-file hand-written
+//! flag loop moved to a derive; a command's business logic, once past its own
+//! typed `run(args: ...)` entry point, is unchanged.
+//!
+//! `local-rag-proxy`/`local-rag-hook`/`xtask` are unaffected: none of them
+//! has a comparable multi-command surface, and they keep hand-rolled
+//! `std::env::args()`.
 //!
 //! None of these commands ever take `store.lock` (`daemon::lock::acquire`) —
 //! that lock is exclusive to *one running daemon instance*, not "the only
@@ -44,8 +52,77 @@ use std::process::ExitCode;
 use local_rag_core::config::{Config, ConfigError};
 use local_rag_core::paths::{PathError, StoreLayout, SystemEnv, config_dir};
 
+// `#[command(version)]` defaults to this crate's own `CARGO_PKG_VERSION` —
+// numerically identical to `local_rag_core::VERSION` (both resolve
+// `version.workspace = true`), so `--version`/`-V` print the same
+// `{bin} {version}` line the explicit `Command::Version` subcommand below
+// prints via `local_rag_core::version_line`. A plain `//` comment, not
+// `///`: clap's derive lifts a doc comment on `Cli` itself into `--help`'s
+// about text, which this implementation note is not meant to be.
+#[derive(Debug, clap::Parser)]
+#[command(
+    name = "local-rag",
+    version,
+    about = "local-rag: daemon + CLI (spec 11 §6)"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Print the binary's name and version.
+    Version,
+    /// Run the daemon (spec 02 §4).
+    Serve,
+    /// Report whether a daemon is running against this store.
+    Status(status::StatusArgs),
+    /// Stop a running daemon.
+    Stop,
+    /// Stop, then start a fresh daemon.
+    Restart,
+    /// Register the default embedding model's `code_raw` representation.
+    Init(init::InitArgs),
+    /// Index a directory as a new (or already-known) worktree.
+    Index(index::IndexArgs),
+    /// Re-index the current directory's already-registered worktree.
+    Reindex,
+    /// Continuously reconcile the current directory's worktree until interrupted.
+    Watch,
+    /// Repository registry operations.
+    Repo {
+        #[command(subcommand)]
+        command: repo::RepoCommand,
+    },
+    /// Worktree registry operations.
+    Worktree {
+        #[command(subcommand)]
+        command: worktree::WorktreeCommand,
+    },
+    /// Force-rebuild the FTS view and/or dense projection from already-indexed content.
+    Rebuild(rebuild::RebuildArgs),
+    /// Durable memory review and mutation.
+    Memory {
+        #[command(subcommand)]
+        command: memory::MemoryCommand,
+    },
+    /// Run retention/GC sweeps.
+    Gc(gc::GcArgs),
+    /// Report store-wide counts and queue occupancy.
+    Stats(stats::StatsArgs),
+    /// Read one observation/memory/generation row as JSON.
+    Inspect(inspect::InspectArgs),
+    /// Export a scoped, deterministic JSON dump of memory entries.
+    Export(export::ExportArgs),
+    /// Hard-delete a memory entry, session, or everything.
+    Purge(purge::PurgeArgs),
+    /// Store-wide, read-only health report.
+    Doctor(doctor::DoctorArgs),
+}
+
 /// Usage/argument-parse error — reserved uniformly across every subcommand in
-/// this module tree.
+/// this module tree (`clap`'s own default mismatch exit code is the same 2).
 pub const EXIT_USAGE: u8 = 2;
 
 /// Resolve `(layout, config)` the same way `main.rs::serve` does, minus the
@@ -82,6 +159,17 @@ pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
         .build()
         .expect("a current-thread tokio runtime")
         .block_on(fut)
+}
+
+/// A `clap` `value_parser` for `local_rag_store::ScopeKind` — shared by
+/// `export --scope` and `memory list --scope`, the CLI's only two consumers
+/// of this scope vocabulary. A free function, not a `ValueEnum` derive on
+/// `ScopeKind` itself: that type lives in `local-rag-store`, outside this
+/// crate, so the orphan rule rules a derive there out; `ScopeKind::from_db`
+/// already exists as the exact string vocabulary to defer to.
+pub(crate) fn parse_scope_kind(raw: &str) -> Result<local_rag_store::ScopeKind, String> {
+    local_rag_store::ScopeKind::from_db(raw)
+        .ok_or_else(|| "must be one of global/repository/worktree".to_string())
 }
 
 /// The current wall-clock time as Unix milliseconds — mirrors

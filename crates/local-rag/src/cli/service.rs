@@ -26,7 +26,7 @@ use local_rag_core::process::pid_exists;
 
 use local_rag::daemon::{LIVENESS_PROBE_TIMEOUT_MS, StoreLockInfo};
 
-use super::{EXIT_USAGE, fail, resolve_layout_and_config};
+use super::{fail, resolve_layout_and_config};
 
 const BIN: &str = "local-rag";
 
@@ -119,11 +119,7 @@ pub(crate) fn stop_running_daemon(layout: &StoreLayout) -> StopOutcome {
     }
 }
 
-pub fn run_stop(mut args: impl Iterator<Item = String>) -> ExitCode {
-    if let Some(arg) = args.next() {
-        eprintln!("{BIN} stop: unknown argument {arg:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
+pub fn run_stop() -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
@@ -197,11 +193,7 @@ fn wait_until_ready(layout: &StoreLayout, timeout: Duration) -> bool {
     }
 }
 
-pub fn run_restart(mut args: impl Iterator<Item = String>) -> ExitCode {
-    if let Some(arg) = args.next() {
-        eprintln!("{BIN} restart: unknown argument {arg:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
+pub fn run_restart() -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),

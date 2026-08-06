@@ -136,10 +136,10 @@ fn inspect_with_an_unknown_kind_is_a_usage_error() {
     let (home, _layout) = open_layout();
     let output = run_cli(&home, &["inspect", "bogus", "some-id"]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
-    assert!(
-        stderr(&output).contains("observation|memory|generation"),
-        "{output:?}"
-    );
+    let err = stderr(&output);
+    assert!(err.contains("observation"), "{output:?}");
+    assert!(err.contains("memory"), "{output:?}");
+    assert!(err.contains("generation"), "{output:?}");
 }
 
 // ---------------------------------------------------------------------

@@ -17,27 +17,20 @@ use local_rag::daemon::gitroot;
 
 use super::index::open_state;
 use super::inspect::memory_inspection_json;
-use super::{EXIT_USAGE, fail, resolve_layout_and_config, system_now_ms};
+use super::{fail, parse_scope_kind, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut scope_filter: Option<ScopeKind> = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--scope" => match args.next().as_deref().and_then(ScopeKind::from_db) {
-                Some(s) => scope_filter = Some(s),
-                None => {
-                    eprintln!("{BIN} export: --scope must be one of global/repository/worktree");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            other => {
-                eprintln!("{BIN} export: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+#[derive(Debug, clap::Args)]
+pub struct ExportArgs {
+    /// Narrow the export to one scope (global/repository/worktree); every
+    /// scope this invocation resolves to by default.
+    #[arg(long, value_parser = parse_scope_kind)]
+    scope: Option<ScopeKind>,
+}
+
+pub fn run(args: ExportArgs) -> ExitCode {
+    let scope_filter = args.scope;
 
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,

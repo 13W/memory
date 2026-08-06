@@ -34,12 +34,7 @@ use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
-pub fn run_watch(args: impl Iterator<Item = String>) -> ExitCode {
-    if let Some(extra) = args.into_iter().next() {
-        eprintln!("{BIN} watch: unknown argument {extra:?}");
-        return ExitCode::from(super::EXIT_USAGE);
-    }
-
+pub fn run_watch() -> ExitCode {
     let (layout, config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),

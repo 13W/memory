@@ -15,21 +15,19 @@ use local_rag_store::{
 use local_rag::daemon::gitroot;
 
 use super::index::{open_cache, open_state};
-use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config};
+use super::{block_on, fail, resolve_layout_and_config};
 
 const BIN: &str = "local-rag";
 
-pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
-            other => {
-                eprintln!("{BIN} stats: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+#[derive(Debug, clap::Args)]
+pub struct StatsArgs {
+    /// Print the stats report as JSON instead of human-readable lines.
+    #[arg(long)]
+    json: bool,
+}
+
+pub fn run(args: StatsArgs) -> ExitCode {
+    let json = args.json;
 
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
