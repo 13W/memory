@@ -59,8 +59,11 @@ Modes: hybrid (default) fuses BM25 with dense vector search — use it unless yo
 not to. lexical is exact-token full-text: identifiers, string literals, error messages, \
 anything you can spell. code is dense-only: paraphrases and \"the code that does X\" when you \
 cannot guess the identifier. semantic is not available in this version and returns \
-UNSUPPORTED_MODE. name_pattern filters by identifier prefix on the local or qualified name; it \
-narrows, it does not rank.
+UNSUPPORTED_MODE. name_pattern narrows, it does not rank, and it is not a prefix of the whole \
+identifier: the pattern is split into words the same way identifiers are \
+(snake_case/camelCase/kebab-case), and a unit is kept when each of those words prefix-matches a \
+word of its local or qualified name, in any order and at any position — \"repr_register\" keeps \
+register_embedder_representation.
 
 Reading a result: each hit carries occurrence_id, path, unit_kind, span (byte offsets), \
 language, the fused score, and legs — the per-leg rank that produced it. Excerpts come from the \
