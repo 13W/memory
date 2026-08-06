@@ -86,8 +86,13 @@ pub fn catalog() -> Value {
                         },
                         "name_pattern": {
                             "type": "string",
-                            "description": "Keep only units whose local or qualified name \
-                                starts with this prefix."
+                            "description": "Narrowing filter on the local or qualified \
+                                name, not a prefix of the whole name. The pattern is split \
+                                into words the same way identifiers are \
+                                (snake_case/camelCase/kebab-case), and a unit is kept when \
+                                each of those words prefix-matches a word of its name, in any \
+                                order and at any position — \"repr_register\" keeps \
+                                register_embedder_representation."
                         }
                     },
                     "required": ["query"],

@@ -65,7 +65,13 @@ previous generation physically present in the cache so the assertion cannot pass
 `bm25`), the input T12-03 fuses into §7's `results[]`; the enrichment stage remains a stub
 (T12-04). `name_pattern` is realized as an FTS5 column filter (§2's as-built note), so the
 "prefix-tokenized on `local_name`/`qualified_name`" step needs no state-side join and no
-cross-database `ATTACH`.
+cross-database `ATTACH`. **"Prefix-tokenized" is per token, not per string** (D-039): the pattern
+goes through the same `tokenize_identifier` as the indexed names, and each resulting word becomes a
+prefix term `AND`-ed with the others, so a name matches when every pattern word prefix-matches
+*some* word of it — independent of order and position, and never a prefix of the whole identifier
+(`repr_register` keeps `register_embedder_representation`). The caller-facing texts that state this
+contract are the MCP tool schema's `name_pattern` description and the server `instructions`
+(11 §2); they must keep saying exactly what `multi_token_pattern_ands_every_prefix` proves.
 
 As-built note (T12-02, `[SPEC]`): `Stage::DenseLeg` is likewise real — it resolves the active
 `code_raw` representation, embeds the query through the injected `QueryEmbedder`, and runs the
