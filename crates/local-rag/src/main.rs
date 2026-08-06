@@ -12,15 +12,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use local_rag::daemon::{
-    DaemonStartupError, EmbedderQueryAdapter, MemoryEmbedderQueryAdapter, ShutdownReason,
-    StartOptions, StoreLockError,
+    DaemonStartupError, ShutdownReason, StartOptions, StoreLockError, code_query_embedder,
+    memory_query_embedder,
 };
 use local_rag_core::identity::SystemUuidV7;
 use local_rag_core::paths::{StoreLayout, SystemEnv, config_dir, data_dir};
-use local_rag_memory::recall::UnavailableEmbedder as UnavailableMemoryEmbedder;
-use local_rag_models::{DEFAULT_MODEL_ID, OnnxEmbedder, find, is_installed};
 use local_rag_protocol::ErrorEnvelope;
-use local_rag_search::{QueryEmbedder, UnavailableEmbedder};
 use local_rag_store::{DEFAULT_WRITE_QUEUE_CAPACITY, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
 
 const BIN: &str = "local-rag";
@@ -120,8 +117,8 @@ async fn serve() -> ExitCode {
     let _ = data_dir(&env); // resolved via `layout`; kept for a clearer error above if it fails
 
     let now_ms = system_now_ms();
-    let query_embedder = build_query_embedder(&layout);
-    let memory_query_embedder = build_memory_query_embedder(&layout);
+    let code_embedder = code_query_embedder(&layout);
+    let memory_embedder = memory_query_embedder(&layout);
 
     let opts = StartOptions {
         layout,
@@ -136,8 +133,8 @@ async fn serve() -> ExitCode {
         data_policy: config.models.data_policy,
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: config.daemon.max_open_shards,
-        query_embedder,
-        memory_query_embedder,
+        query_embedder: code_embedder,
+        memory_query_embedder: memory_embedder,
         recall_token_budget: config.memory.recall_token_budget,
         consolidation_batch_size: config.memory.consolidation_batch_size,
         consolidation_queue_threshold: config.memory.consolidation_queue_threshold,
@@ -173,67 +170,6 @@ fn system_now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Build `search_code`'s dense-leg provider from whatever the store already
-/// has on disk (T15-07), gated on the same signal `cli::init` uses — the
-/// default model's `.ok` marker — not on any flag or config toggle.
-///
-/// A missing model, or one that fails to open (corrupt install, no ONNX
-/// Runtime on `PATH`/`ORT_DYLIB_PATH`), degrades to [`UnavailableEmbedder`]
-/// rather than failing daemon startup: `search_code` already has a tested,
-/// spec-correct `lexical_only` fallback for exactly this case
-/// (`daemon::search::build_search_engine`'s own doc), and a store the
-/// operator has not run `local-rag init --download-models` against yet must
-/// still serve lexical search.
-fn build_query_embedder(layout: &StoreLayout) -> Arc<dyn QueryEmbedder> {
-    let Some(entry) = find(DEFAULT_MODEL_ID) else {
-        return Arc::new(UnavailableEmbedder);
-    };
-    if !is_installed(layout, entry.model_id) {
-        return Arc::new(UnavailableEmbedder);
-    }
-    match OnnxEmbedder::open(layout, entry) {
-        Ok(embedder) => Arc::new(EmbedderQueryAdapter::new(embedder)),
-        Err(e) => {
-            eprintln!(
-                "{BIN}: {} is installed but could not be opened ({e}); \
-                 search_code will stay lexical_only until this is fixed",
-                entry.model_id
-            );
-            Arc::new(UnavailableEmbedder)
-        }
-    }
-}
-
-/// `recall`'s dense-leg provider (D-036) — the same disk-state gate and
-/// fail-open-to-degraded shape as [`build_query_embedder`], but opened under
-/// the `memory` representation key (`OnnxEmbedder::open_for_memory`) and
-/// wrapped in [`MemoryEmbedderQueryAdapter`] instead. A missing/uninstalled
-/// model, or one `local-rag init` never ran against, degrades to
-/// `local_rag_memory::recall::UnavailableEmbedder` — `recall`'s own tested
-/// `dense_degraded: NoRepresentation`/`EmbedFailed` fallback, not a daemon
-/// startup failure.
-fn build_memory_query_embedder(
-    layout: &StoreLayout,
-) -> Arc<dyn local_rag_memory::recall::QueryEmbedder> {
-    let Some(entry) = find(DEFAULT_MODEL_ID) else {
-        return Arc::new(UnavailableMemoryEmbedder);
-    };
-    if !is_installed(layout, entry.model_id) {
-        return Arc::new(UnavailableMemoryEmbedder);
-    }
-    match OnnxEmbedder::open_for_memory(layout, entry) {
-        Ok(embedder) => Arc::new(MemoryEmbedderQueryAdapter::new(embedder)),
-        Err(e) => {
-            eprintln!(
-                "{BIN}: {} is installed but could not be opened for its memory \
-                 representation ({e}); recall will stay dense-degraded until this is fixed",
-                entry.model_id
-            );
-            Arc::new(UnavailableMemoryEmbedder)
-        }
-    }
 }
 
 /// A human-readable startup failure message, naming the canonical error code
