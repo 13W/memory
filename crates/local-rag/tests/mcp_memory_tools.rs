@@ -6,11 +6,21 @@
 
 mod support;
 
-use local_rag_store::{GLOBAL_SCOPE_OWNER_ID, MemoryKind, MemoryState, ScopeKind, StateDb};
+use std::sync::Arc;
+
+use local_rag::daemon::DaemonHandle;
+use local_rag_core::identity::domain::subject_memory_entry;
+use local_rag_memory::recall::{QueryEmbedError, QueryEmbedder};
+use local_rag_store::{
+    CacheDb, DEFAULT_MODEL_SPACE_ID, DistanceMetric, EmbeddingKey, GLOBAL_SCOPE_OWNER_ID,
+    MemoryKind, MemoryState, RepresentationKey, RepresentationKind, ScopeKind, StateDb,
+    SubjectKind, ensure_store_instance_uuid, insert_embedding, register_representation,
+    set_model_space_representation,
+};
 use serde_json::Value;
 use support::{
     Client, git_available, open_layout, seed_indexed_worktree, seed_memory_entry,
-    seed_memory_evidence, seed_observation, seed_pending_candidate, start,
+    seed_memory_evidence, seed_observation, seed_pending_candidate, start, start_options,
     transition_seeded_memory_entry,
 };
 
@@ -623,10 +633,155 @@ async fn recall_dense_leg_unavailable_is_visible_in_the_response() {
 
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
-    // Production default is `UnavailableEmbedder` until T15-07 -- the
-    // degraded reason must be visible in the response (this card's own
-    // "degraded status" test bullet), never silent.
+    // This test's own `start()` never registers a `memory` representation
+    // (unlike `recall_dense_leg_returns_a_hit_once_memory_representation_is_
+    // registered_and_cached` below) -- the degraded reason must be visible
+    // in the response whenever the daemon genuinely has nothing to serve the
+    // dense leg with (uninstalled model, unregistered representation: D-036),
+    // never silent.
     assert!(!parsed["dense_degraded"].is_null(), "{text}");
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+/// A [`QueryEmbedder`] returning a fixed vector for one exact key — the
+/// memory-side counterpart of the `FixedEmbedder` fixture
+/// `daemon::query_embedder`'s own unit tests use, here driving a real
+/// end-to-end daemon (D-036's own "regression-тест" bullet).
+struct FixedMemoryEmbedder {
+    key: RepresentationKey,
+    vector: Vec<f32>,
+}
+
+impl QueryEmbedder for FixedMemoryEmbedder {
+    fn embed_query(
+        &self,
+        _query: &str,
+        key: &RepresentationKey,
+    ) -> Result<Vec<f32>, QueryEmbedError> {
+        if key != &self.key {
+            return Err(QueryEmbedError {
+                reason: format!("unexpected key: {key:?}"),
+            });
+        }
+        Ok(self.vector.clone())
+    }
+}
+
+#[tokio::test]
+async fn recall_dense_leg_returns_a_hit_once_memory_representation_is_registered_and_cached() {
+    let (home, layout) = open_layout();
+
+    let memory_key = RepresentationKey {
+        kind: RepresentationKind::Memory,
+        representation_version: 1,
+        normalization_version: 1,
+        model_id: "fixture-model".to_string(),
+        dimensions: 3,
+        distance_metric: DistanceMetric::Cosine,
+    };
+    let text = "a distinctive memory fact";
+    let store_instance_uuid;
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        // First-writer-wins, same as `seed_indexed_worktree_with_content`:
+        // this is the exact uuid `DaemonHandle::start` will read back and
+        // bind `cache.sqlite` to, so the row seeded below survives into the
+        // daemon's own cache handle instead of being wiped as a mismatch.
+        store_instance_uuid = state
+            .writer()
+            .transaction(|tx| ensure_store_instance_uuid(tx, "test-instance"))
+            .await
+            .expect("seed store_instance_uuid");
+
+        seed_memory_entry(
+            &state,
+            "mem-1",
+            MemoryKind::Fact,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            text,
+            1_000,
+        )
+        .await;
+
+        let key = memory_key.clone();
+        state
+            .writer()
+            .transaction(move |tx| {
+                let id = register_representation(tx, "mem-repr-1", &key, 1_000)?;
+                set_model_space_representation(
+                    tx,
+                    DEFAULT_MODEL_SPACE_ID,
+                    RepresentationKind::Memory,
+                    &id,
+                    true,
+                    1_000,
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("register memory representation");
+    }
+
+    let vector = vec![1.0_f32, 0.0, 0.0];
+    {
+        let cache =
+            CacheDb::open(layout.cache_db(), &store_instance_uuid).expect("open cache.sqlite");
+        let subject_hash = subject_memory_entry("mem-1", text);
+        let seeded = vector.clone();
+        cache
+            .writer()
+            .transaction(move |tx| {
+                insert_embedding(
+                    tx,
+                    &EmbeddingKey {
+                        subject_kind: SubjectKind::MemoryEntry,
+                        subject_hash,
+                        representation_id: "mem-repr-1".to_string(),
+                    },
+                    3,
+                    &seeded,
+                    1_000,
+                )
+            })
+            .await
+            .expect("seed embedding_cache row");
+    }
+
+    let socket_path = layout.socket_path();
+    let mut opts = start_options(layout.clone());
+    opts.memory_query_embedder = Arc::new(FixedMemoryEmbedder {
+        key: memory_key,
+        vector,
+    });
+    let handle = DaemonHandle::start(opts).await.expect("start");
+
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"query":"distinctive"}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    let text_field = body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text_field).unwrap();
+    assert!(
+        parsed["dense_degraded"].is_null(),
+        "expected a dense hit, not a degraded leg: {text_field}"
+    );
+    let ids: Vec<&str> = parsed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["memory_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"mem-1"), "{text_field}");
 
     drop(home);
     handle.shutdown().await;

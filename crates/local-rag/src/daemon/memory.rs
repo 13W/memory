@@ -33,16 +33,19 @@ pub struct MemoryContext {
 
 /// Build the [`MemoryContext`] the MCP memory tools call.
 ///
-/// `embedder` is `main.rs`'s `UnavailableEmbedder` today — the same "type
-/// before backend, real provider is T15-07's job" precedent
-/// [`super::search::build_search_engine`] already documents for code search's
-/// own `query_embedder`; recall's dense leg correctly degrades
-/// (`dense_degraded: Some(EmbedFailed(..))`) until then. `dense_backend` is
-/// always [`BruteForceCosine`] — it has no availability gating of its own
-/// (unlike the embedder, it is just cosine math over whatever vectors the
-/// embedder did or didn't produce), so it is hardcoded here rather than
-/// threaded through `StartOptions`, mirroring [`super::search::
-/// NoRebuildVectorSource`]'s own unconditional construction.
+/// `embedder` is `main.rs::build_memory_query_embedder`'s result (D-036) — a
+/// real `MemoryEmbedderQueryAdapter` when the default model is installed and
+/// its `memory` representation registered, `UnavailableEmbedder` otherwise
+/// (uninstalled model, unregistered representation, or an open failure);
+/// recall's dense leg correctly degrades (`dense_degraded: Some(...)`) in
+/// every unavailable case, the same "type before backend, real provider is
+/// T15-07's job" precedent [`super::search::build_search_engine`] documents
+/// for code search's own `query_embedder`, now closed on the memory side too.
+/// `dense_backend` is always [`BruteForceCosine`] — it has no availability
+/// gating of its own (unlike the embedder, it is just cosine math over
+/// whatever vectors the embedder did or didn't produce), so it is hardcoded
+/// here rather than threaded through `StartOptions`, mirroring
+/// [`super::search::NoRebuildVectorSource`]'s own unconditional construction.
 pub fn build_memory_context(
     state: Arc<StateDb>,
     cache: Arc<CacheDb>,

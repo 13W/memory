@@ -263,6 +263,7 @@ mod tests {
             layout: layout.clone(),
             uuids: Arc::new(SeqUuids::new()),
             embedder: Arc::new(HashingEmbedder::new(RepresentationKind::CodeRaw)),
+            memory_embedder: Arc::new(HashingEmbedder::new(RepresentationKind::Memory)),
             model_space_id: DEFAULT_MODEL_SPACE_ID.parse().expect("valid UUID"),
             retention: RetentionParams {
                 keep_last_k: 2,

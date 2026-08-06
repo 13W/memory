@@ -12,7 +12,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use local_rag::daemon::{
-    DaemonStartupError, EmbedderQueryAdapter, ShutdownReason, StartOptions, StoreLockError,
+    DaemonStartupError, EmbedderQueryAdapter, MemoryEmbedderQueryAdapter, ShutdownReason,
+    StartOptions, StoreLockError,
 };
 use local_rag_core::identity::SystemUuidV7;
 use local_rag_core::paths::{StoreLayout, SystemEnv, config_dir, data_dir};
@@ -120,6 +121,7 @@ async fn serve() -> ExitCode {
 
     let now_ms = system_now_ms();
     let query_embedder = build_query_embedder(&layout);
+    let memory_query_embedder = build_memory_query_embedder(&layout);
 
     let opts = StartOptions {
         layout,
@@ -135,14 +137,7 @@ async fn serve() -> ExitCode {
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: config.daemon.max_open_shards,
         query_embedder,
-        // `recall`'s dense leg (T15-04) stays on the explicit-degradation
-        // path (`dense_degraded: Some(EmbedFailed(..))`), deliberately, not
-        // as an oversight: no `memory`-kind `RepresentationKey` has ever been
-        // registered in production (D-013 assigned that to group 14, which
-        // closed without doing it), so there is no real key to build a
-        // provider against here — see `daemon::query_embedder`'s own module
-        // doc for the full as-built rationale (T15-07).
-        memory_query_embedder: Arc::new(UnavailableMemoryEmbedder),
+        memory_query_embedder,
         recall_token_budget: config.memory.recall_token_budget,
         consolidation_batch_size: config.memory.consolidation_batch_size,
         consolidation_queue_threshold: config.memory.consolidation_queue_threshold,
@@ -207,6 +202,36 @@ fn build_query_embedder(layout: &StoreLayout) -> Arc<dyn QueryEmbedder> {
                 entry.model_id
             );
             Arc::new(UnavailableEmbedder)
+        }
+    }
+}
+
+/// `recall`'s dense-leg provider (D-036) — the same disk-state gate and
+/// fail-open-to-degraded shape as [`build_query_embedder`], but opened under
+/// the `memory` representation key (`OnnxEmbedder::open_for_memory`) and
+/// wrapped in [`MemoryEmbedderQueryAdapter`] instead. A missing/uninstalled
+/// model, or one `local-rag init` never ran against, degrades to
+/// `local_rag_memory::recall::UnavailableEmbedder` — `recall`'s own tested
+/// `dense_degraded: NoRepresentation`/`EmbedFailed` fallback, not a daemon
+/// startup failure.
+fn build_memory_query_embedder(
+    layout: &StoreLayout,
+) -> Arc<dyn local_rag_memory::recall::QueryEmbedder> {
+    let Some(entry) = find(DEFAULT_MODEL_ID) else {
+        return Arc::new(UnavailableMemoryEmbedder);
+    };
+    if !is_installed(layout, entry.model_id) {
+        return Arc::new(UnavailableMemoryEmbedder);
+    }
+    match OnnxEmbedder::open_for_memory(layout, entry) {
+        Ok(embedder) => Arc::new(MemoryEmbedderQueryAdapter::new(embedder)),
+        Err(e) => {
+            eprintln!(
+                "{BIN}: {} is installed but could not be opened for its memory \
+                 representation ({e}); recall will stay dense-degraded until this is fixed",
+                entry.model_id
+            );
+            Arc::new(UnavailableMemoryEmbedder)
         }
     }
 }
