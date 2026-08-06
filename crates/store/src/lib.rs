@@ -438,8 +438,8 @@ pub use memory::{
     memory_evidence_for, observation_evidence_source, open_next_run, pending_backlog,
     pending_candidate_ages, pending_candidate_counts, processing_cursor, propose_candidate,
     read_audit_events_for_entity, recall_candidate_by_id, recall_candidates_for_scope,
-    reject_candidate, renew_lease, retry_run, run_once, stale_runs, transition_candidate,
-    transition_memory_entry, transition_run, upsert_processing_cursor,
+    reject_candidate, renew_lease, retry_run, run_once, sessions_with_pending_backlog, stale_runs,
+    transition_candidate, transition_memory_entry, transition_run, upsert_processing_cursor,
 };
 pub use migrate::{
     ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn, VersionDiagnosis,

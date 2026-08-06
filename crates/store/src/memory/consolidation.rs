@@ -243,6 +243,35 @@ pub fn pending_backlog(conn: &Connection, session_id: &str) -> rusqlite::Result<
     Ok((max_seq - cursor).max(0))
 }
 
+/// Every `session_id` whose [`pending_backlog`] is non-zero, ascending — the
+/// same "past the cursor" criterion, evaluated for all sessions at once
+/// (D-040).
+///
+/// The consolidation trigger's other session source
+/// (`known_spool_sessions`) enumerates the spool *directory*, so it is blind
+/// to a session whose envelopes only ever arrived through a daemon-internal
+/// write that bypasses the spool (`give_feedback`, spec 11 §2). This is the
+/// state-side enumeration that closes that gap: it sees an envelope however
+/// it was inserted.
+pub fn sessions_with_pending_backlog(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    // Grouped rather than a per-row `WHERE received_seq > cursor` scan: this
+    // shape lets the `envelope_session(session_id, received_seq)` index serve
+    // both the grouping and each group's `MAX`, and evaluates the cursor
+    // lookup once per session instead of once per envelope.
+    let mut stmt = conn.prepare(
+        "SELECT e.session_id FROM observation_envelope e \
+         GROUP BY e.session_id \
+         HAVING MAX(e.received_seq) > COALESCE( \
+             (SELECT c.last_consolidated_received_seq FROM processing_cursor c \
+               WHERE c.session_id = e.session_id), 0) \
+         ORDER BY e.session_id",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 /// Upsert the `session_id`'s consolidation cursor, mirroring
 /// [`observation`](crate::observation)'s `spool_import_cursor` upsert idiom.
 pub fn upsert_processing_cursor(
@@ -1019,6 +1048,61 @@ mod tests {
             pending_backlog(&read, "sess-1").expect("backlog"),
             0,
             "cursor caught up to max_received_seq"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-040: sessions_with_pending_backlog
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sessions_with_pending_backlog_lists_only_sessions_past_their_own_cursor() {
+        let (_home, db) = open_state();
+        seed_envelopes(&db, "sess-b", 2).await;
+        seed_envelopes(&db, "sess-a", 3).await;
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            sessions_with_pending_backlog(&read).expect("enumerate"),
+            vec!["sess-a".to_string(), "sess-b".to_string()],
+            "no cursor at all still counts as pending, ascending"
+        );
+        drop(read);
+
+        // sess-b's envelopes are received_seq 1..=2, sess-a's 3..=5.
+        db.writer()
+            .transaction(|tx| upsert_processing_cursor(tx, "sess-b", 2))
+            .await
+            .expect("catch sess-b up");
+        db.writer()
+            .transaction(|tx| upsert_processing_cursor(tx, "sess-a", 4))
+            .await
+            .expect("advance sess-a partway");
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            sessions_with_pending_backlog(&read).expect("enumerate"),
+            vec!["sess-a".to_string()],
+            "a caught-up session drops out; a partially consolidated one stays"
+        );
+
+        assert!(
+            sessions_with_pending_backlog(&read)
+                .expect("enumerate")
+                .iter()
+                .all(|s| pending_backlog(&read, s).expect("backlog") > 0),
+            "the same criterion as pending_backlog, per session"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_with_pending_backlog_is_empty_with_no_envelopes() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        assert!(
+            sessions_with_pending_backlog(&read)
+                .expect("enumerate")
+                .is_empty()
         );
     }
 }

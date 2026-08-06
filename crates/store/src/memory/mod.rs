@@ -109,8 +109,8 @@ pub use consolidation::{
     IllegalRunTransition, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, NewConsolidationRun,
     RenewError, RunState, RunTransitionError, RunWindow, SnapshotOutcome, StaleRun, acquire_lease,
     consolidation_run_state, create_consolidation_run, lease_expired, open_next_run,
-    pending_backlog, processing_cursor, renew_lease, retry_run, stale_runs, transition_run,
-    upsert_processing_cursor,
+    pending_backlog, processing_cursor, renew_lease, retry_run, sessions_with_pending_backlog,
+    stale_runs, transition_run, upsert_processing_cursor,
 };
 pub(crate) use entry::all_memory_entry_ids;
 pub use entry::{
