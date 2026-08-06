@@ -108,6 +108,22 @@ impl ModelCatalogEntry {
             distance_metric: DistanceMetric::Cosine,
         }
     }
+
+    /// The representation key this model's `memory` vectors carry (D-036) —
+    /// same model/dimensions/metric as [`Self::representation_key`], a fresh
+    /// `representation_version`: this `kind` has never shipped before, so its
+    /// own version numbering starts independently, not inherited from
+    /// `code_raw`'s D-016/D-017 history.
+    pub fn memory_representation_key(&self) -> RepresentationKey {
+        RepresentationKey {
+            kind: RepresentationKind::Memory,
+            representation_version: 1,
+            normalization_version: 1,
+            model_id: self.model_id.to_string(),
+            dimensions: self.dimensions,
+            distance_metric: DistanceMetric::Cosine,
+        }
+    }
 }
 
 /// The q8 (`model_quantized`) operating point ADR-0005 selected: 295 MiB against
@@ -171,6 +187,20 @@ mod tests {
         assert_eq!(key.distance_metric, DistanceMetric::Cosine);
         assert_eq!(key.kind, RepresentationKind::CodeRaw);
         assert_eq!(entry.license, "Gemma Terms of Use");
+    }
+
+    #[test]
+    fn the_memory_key_matches_code_raw_except_kind_and_version() {
+        let entry = find(DEFAULT_MODEL_ID).expect("the default model is catalogued");
+        let code_raw = entry.representation_key();
+        let memory = entry.memory_representation_key();
+        assert_eq!(memory.kind, RepresentationKind::Memory);
+        assert_ne!(memory.kind, code_raw.kind);
+        assert_eq!(memory.model_id, code_raw.model_id);
+        assert_eq!(memory.dimensions, code_raw.dimensions);
+        assert_eq!(memory.distance_metric, code_raw.distance_metric);
+        assert_eq!(memory.normalization_version, code_raw.normalization_version);
+        assert_eq!(memory.representation_version, 1);
     }
 
     #[test]

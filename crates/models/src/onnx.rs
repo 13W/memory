@@ -144,6 +144,30 @@ impl OnnxEmbedder {
     /// working against a fixture) does not repeat the marker check; the
     /// marker-checking entry point is [`OnnxEmbedder::open`].
     pub fn open_dir(dir: &Path, entry: &ModelCatalogEntry) -> Result<Self, OnnxError> {
+        Self::open_dir_with_key(dir, entry, entry.representation_key())
+    }
+
+    /// Open the provider for `entry`'s `memory` representation (D-036) — same
+    /// on-disk model as [`Self::open`], a second `ort` session tagged with
+    /// [`ModelCatalogEntry::memory_representation_key`] instead of
+    /// [`ModelCatalogEntry::representation_key`]. `kind` gates identity only
+    /// (`Embedder::embed`'s own check); tokenization/inference are identical.
+    pub fn open_for_memory(
+        layout: &local_rag_core::paths::StoreLayout,
+        entry: &ModelCatalogEntry,
+    ) -> Result<Self, OnnxError> {
+        let dir = local_rag_embed::require_model_assets(layout, entry.model_id)
+            .map_err(OnnxError::Assets)?;
+        Self::open_dir_with_key(&dir, entry, entry.memory_representation_key())
+    }
+
+    /// Shared body of [`Self::open_dir`]/[`Self::open_for_memory`]: everything
+    /// but which [`RepresentationKey`] the resulting embedder identifies as.
+    fn open_dir_with_key(
+        dir: &Path,
+        entry: &ModelCatalogEntry,
+        key: RepresentationKey,
+    ) -> Result<Self, OnnxError> {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| OnnxError::Tokenizer(e.to_string()))?;
 
@@ -172,7 +196,7 @@ impl OnnxEmbedder {
             .to_string();
 
         Ok(OnnxEmbedder {
-            key: entry.representation_key(),
+            key,
             tokenizer,
             session: Mutex::new(session),
             model_dir: dir.to_path_buf(),

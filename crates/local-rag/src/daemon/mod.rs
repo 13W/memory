@@ -66,7 +66,7 @@ pub use mode::{DaemonMode, MigrationOnlyReason};
 pub use probe::{LIVENESS_PROBE_TIMEOUT_MS, LivenessOutcome, LivenessProbe};
 #[cfg(unix)]
 pub use probe::{SocketLivenessProbe, fetch_welcome};
-pub use query_embedder::EmbedderQueryAdapter;
+pub use query_embedder::{EmbedderQueryAdapter, MemoryEmbedderQueryAdapter};
 pub use resume::{
     ConsolidationResumeError, ResumeOutcome, build_best_effort_pool, resume_spool_import,
     resume_stale_consolidation_runs,

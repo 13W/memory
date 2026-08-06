@@ -51,6 +51,11 @@ pub(crate) struct IndexCtx {
     pub layout: StoreLayout,
     pub uuids: Arc<dyn UuidSource + Send + Sync>,
     pub embedder: Arc<dyn Embedder>,
+    /// The same installed model, opened again under its `memory`
+    /// representation key (D-036) — a second `ProviderEntry` so
+    /// `run_backfill` also covers `SubjectKind::MemoryEntry` subjects, not
+    /// only code ones.
+    pub memory_embedder: Arc<dyn Embedder>,
     pub model_space_id: Uuid,
     pub retention: RetentionParams,
     pub data_policy: local_rag_core::config::DataPolicy,
@@ -155,7 +160,10 @@ pub(crate) async fn project_generation(
         (params, policy)
     };
 
-    let pool = ProviderPool::new(vec![ProviderEntry::local("cli", ctx.embedder.clone())]);
+    let pool = ProviderPool::new(vec![
+        ProviderEntry::local("cli", ctx.embedder.clone()),
+        ProviderEntry::local("cli", ctx.memory_embedder.clone()),
+    ]);
     let backfill = local_rag_embed::run_backfill(
         &ctx.state,
         &ctx.cache,
@@ -347,6 +355,13 @@ pub(crate) async fn finish_index_ctx(
             entry.model_id
         )
     })?);
+    let memory_embedder: Arc<dyn Embedder> =
+        Arc::new(OnnxEmbedder::open_for_memory(layout, entry).map_err(|e| {
+            format!(
+                "{} is installed but could not be opened for its memory representation: {e}",
+                entry.model_id
+            )
+        })?);
 
     let cache = open_cache(&state, layout).await?;
 
@@ -360,6 +375,7 @@ pub(crate) async fn finish_index_ctx(
         layout: layout.clone(),
         uuids: Arc::new(SystemUuidV7),
         embedder,
+        memory_embedder,
         model_space_id,
         retention: RetentionParams::from_storage_config(&config.storage),
         data_policy: config.models.data_policy,
@@ -582,7 +598,8 @@ mod tests {
     use local_rag_protocol::SearchMode;
     use local_rag_search::{QueryEmbedder, SearchRequest};
     use local_rag_store::{
-        RepresentationKind, WorktreeKind, register_representation, set_model_space_representation,
+        GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, RepresentationKind, ScopeKind,
+        WorktreeKind, create_memory_entry, register_representation, set_model_space_representation,
         set_repo_data_policy,
     };
     use local_rag_test_support::TempHome;
@@ -625,6 +642,7 @@ mod tests {
             layout: layout.clone(),
             uuids: Arc::new(SeqUuids::new()),
             embedder: Arc::new(HashingEmbedder::new(RepresentationKind::CodeRaw)),
+            memory_embedder: Arc::new(HashingEmbedder::new(RepresentationKind::Memory)),
             model_space_id: DEFAULT_MODEL_SPACE_ID.parse().expect("valid UUID"),
             retention: RetentionParams {
                 keep_last_k: 2,
@@ -645,6 +663,25 @@ mod tests {
                     tx,
                     DEFAULT_MODEL_SPACE_ID,
                     RepresentationKind::CodeRaw,
+                    &id,
+                    true,
+                    now_ms,
+                )
+            })
+            .await
+            .expect("register representation");
+    }
+
+    async fn register_memory(ctx: &IndexCtx, now_ms: i64) {
+        let key = ctx.memory_embedder.key();
+        ctx.state
+            .writer()
+            .transaction(move |tx| {
+                let id = register_representation(tx, "test-memory", &key, now_ms)?;
+                set_model_space_representation(
+                    tx,
+                    DEFAULT_MODEL_SPACE_ID,
+                    RepresentationKind::Memory,
                     &id,
                     true,
                     now_ms,
@@ -758,6 +795,88 @@ mod tests {
             "{:?}",
             response.results
         );
+    }
+
+    /// D-036: `finish_index_ctx`/`project_generation`'s backfill pool now
+    /// carries a second, memory-tagged provider entry alongside the code_raw
+    /// one — once `memory` is `required` for the model space, indexing a
+    /// worktree also backfills whatever memory entries already exist, not
+    /// only code occurrences.
+    #[tokio::test]
+    async fn indexing_backfills_memory_vectors_once_memory_representation_is_registered() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).expect("repo dir");
+        std::fs::write(root.join("main.rs"), "fn parse_config() {}").expect("seed file");
+
+        let ctx = open_ctx(&layout);
+        let now_ms = 1_000;
+        register_code_raw(&ctx, now_ms).await;
+        register_memory(&ctx, now_ms).await;
+
+        ctx.state
+            .writer()
+            .transaction(move |tx| {
+                create_memory_entry(
+                    tx,
+                    &NewMemoryEntry {
+                        memory_id: "mem-1",
+                        kind: MemoryKind::Fact,
+                        text: "a fact to embed",
+                        canonical_key: None,
+                        scope_kind: ScopeKind::Global,
+                        scope_owner_id: GLOBAL_SCOPE_OWNER_ID,
+                        confidence: 0.5,
+                        importance: 0.5,
+                        valid_from_tree: None,
+                        last_verified_tree: None,
+                        supersedes_id: None,
+                    },
+                    now_ms,
+                )
+            })
+            .await
+            .expect("seed memory entry tx (infrastructure)")
+            .expect("seed memory entry (domain)");
+
+        let repo_id = ctx.uuids.next_uuid();
+        let worktree_id = ctx.uuids.next_uuid();
+        let facts = facts_for(&root);
+        register_new_worktree(&ctx.state, repo_id, worktree_id, &facts, now_ms)
+            .await
+            .expect("register worktree");
+
+        let meta = load_worktree_meta(
+            &ctx.state,
+            &worktree_id.to_string(),
+            CaseSensitivity::Sensitive,
+        )
+        .expect("load meta")
+        .expect("worktree exists");
+        let mut stat_cache = StatCache::new();
+        let scanner = Scanner::new();
+        index_worktree(
+            &ctx,
+            &meta,
+            &mut stat_cache,
+            &ctx.classifier,
+            &scanner,
+            now_ms,
+        )
+        .await
+        .expect("index");
+
+        let conn = ctx.cache.open_read().expect("open cache.sqlite for read");
+        let memory_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM embedding_cache WHERE subject_kind = 'memory_entry'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert!(memory_rows >= 1, "no memory vector was backfilled");
     }
 
     #[tokio::test]

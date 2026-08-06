@@ -121,23 +121,31 @@ fn bare_init_registers_code_raw_when_the_model_is_already_installed() {
     let output = cmd.output().expect("run local-rag init");
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("registered code_raw representation"),
+        stdout.contains("registered code_raw representation"),
+        "{:?}",
+        output.stdout
+    );
+    // D-036: `init` also registers the `memory` representation, same model,
+    // second `RepresentationKey` (`kind: Memory`).
+    assert!(
+        stdout.contains("registered memory representation"),
         "{:?}",
         output.stdout
     );
     assert_eq!(
         representation_row_count(&layout),
-        1,
-        "exactly one representation row after a fresh init"
+        2,
+        "exactly two representation rows (code_raw + memory) after a fresh init"
     );
 
-    // Idempotency: running it again must not create a second row.
+    // Idempotency: running it again must not create a second pair of rows.
     let second = run_cli(&home, &["init"]);
     assert_eq!(second.status.code(), Some(0), "{second:?}");
     assert_eq!(
         representation_row_count(&layout),
-        1,
-        "a repeated init must converge on the same row, not add another"
+        2,
+        "a repeated init must converge on the same two rows, not add more"
     );
 }

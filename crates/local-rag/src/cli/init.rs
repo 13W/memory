@@ -1,17 +1,21 @@
-//! `local-rag init [--download-models]` (spec 11 §6, D-013).
+//! `local-rag init [--download-models]` (spec 11 §6, D-013, D-036).
 //!
 //! Registration is gated on **disk state**, not on the `--download-models`
 //! flag: both bare `init` and `init --download-models` attempt to register
-//! the `code_raw` representation whenever the default model is already
-//! installed (`.ok` marker present), and both skip registration — printing a
-//! hint instead — when it is not. D-013's own card asks "for the installed
-//! model", not "for the flag", and gating on disk state is what makes a
-//! repeated `init` genuinely idempotent: there is no separate "did I already
-//! register this run" flag to get out of sync with what is actually on disk.
+//! the `code_raw` and `memory` representations whenever the default model is
+//! already installed (`.ok` marker present), and both skip registration —
+//! printing a hint instead — when it is not. D-013's own card asks "for the
+//! installed model", not "for the flag", and gating on disk state is what
+//! makes a repeated `init` genuinely idempotent: there is no separate "did I
+//! already register this run" flag to get out of sync with what is actually
+//! on disk.
 //!
 //! `register_representation`'s own `ON CONFLICT` on the six-field key (T11-01)
 //! already makes registration itself idempotent; running this twice converges
-//! on the same `representation_id` rather than creating a second row.
+//! on the same `representation_id` rather than creating a second row. Both
+//! representations come from the same installed model, opened twice under
+//! different `RepresentationKey`s (`OnnxEmbedder::open`/`open_for_memory`,
+//! D-036) — `kind` does not change tokenization or inference, only identity.
 
 use std::process::ExitCode;
 
@@ -83,28 +87,60 @@ pub fn run(args: InitArgs) -> ExitCode {
             );
         }
     };
+    let memory_embedder = match OnnxEmbedder::open_for_memory(&layout, entry) {
+        Ok(embedder) => embedder,
+        Err(e) => {
+            return fail(
+                BIN,
+                &format!(
+                    "{DEFAULT_MODEL_ID} is installed but could not be opened for its memory \
+                     representation: {e}"
+                ),
+            );
+        }
+    };
 
     let state = match StateDb::open(layout.state_db()) {
         Ok(state) => state,
         Err(e) => return fail(BIN, &format!("could not open state.sqlite: {e}")),
     };
 
-    let key = embedder.key();
-    let representation_id = SystemUuidV7.next_uuid().to_string();
+    let code_raw_key = embedder.key();
+    let memory_key = memory_embedder.key();
     let now_ms = system_now_ms();
 
-    match block_on(register_code_raw_representation(
+    let code_raw_id = match block_on(register_code_raw_representation(
         &state,
-        key,
-        representation_id,
+        code_raw_key,
+        SystemUuidV7.next_uuid().to_string(),
         now_ms,
     )) {
-        Ok(id) => {
-            println!("{BIN}: registered code_raw representation {id} for {DEFAULT_MODEL_ID}");
-            ExitCode::SUCCESS
+        Ok(id) => id,
+        Err(e) => {
+            return fail(
+                BIN,
+                &format!("could not register the code_raw representation: {e}"),
+            );
         }
-        Err(e) => fail(BIN, &format!("could not register the representation: {e}")),
-    }
+    };
+    let memory_id = match block_on(register_memory_representation(
+        &state,
+        memory_key,
+        SystemUuidV7.next_uuid().to_string(),
+        now_ms,
+    )) {
+        Ok(id) => id,
+        Err(e) => {
+            return fail(
+                BIN,
+                &format!("could not register the memory representation: {e}"),
+            );
+        }
+    };
+
+    println!("{BIN}: registered code_raw representation {code_raw_id} for {DEFAULT_MODEL_ID}");
+    println!("{BIN}: registered memory representation {memory_id} for {DEFAULT_MODEL_ID}");
+    ExitCode::SUCCESS
 }
 
 /// Register `key` as the default model space's `code_raw` representation,
@@ -138,6 +174,32 @@ pub(crate) async fn register_code_raw_representation(
         .await
 }
 
+/// Register `key` as the default model space's `memory` representation
+/// (D-036) — same shape as [`register_code_raw_representation`], symmetric
+/// split from [`run`] for the same testability reason.
+pub(crate) async fn register_memory_representation(
+    state: &StateDb,
+    key: RepresentationKey,
+    representation_id: String,
+    now_ms: i64,
+) -> Result<String, WriteError> {
+    state
+        .writer()
+        .transaction(move |tx| {
+            let id = register_representation(tx, &representation_id, &key, now_ms)?;
+            set_model_space_representation(
+                tx,
+                DEFAULT_MODEL_SPACE_ID,
+                RepresentationKind::Memory,
+                &id,
+                true,
+                now_ms,
+            )?;
+            Ok(id)
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use local_rag_core::paths::StoreLayout;
@@ -149,6 +211,17 @@ mod tests {
     fn fixture_key(dimensions: u32) -> RepresentationKey {
         RepresentationKey {
             kind: RepresentationKind::CodeRaw,
+            representation_version: 1,
+            normalization_version: 1,
+            model_id: "fixture-model".to_string(),
+            dimensions,
+            distance_metric: DistanceMetric::Cosine,
+        }
+    }
+
+    fn fixture_memory_key(dimensions: u32) -> RepresentationKey {
+        RepresentationKey {
+            kind: RepresentationKind::Memory,
             representation_version: 1,
             normalization_version: 1,
             model_id: "fixture-model".to_string(),
@@ -238,6 +311,62 @@ mod tests {
             .query_row("SELECT count(*) FROM representation", [], |r| r.get(0))
             .expect("count");
         assert_eq!(rows, 1, "no duplicate representation row was created");
+    }
+
+    #[tokio::test]
+    async fn after_memory_registration_the_default_space_requires_memory() {
+        let (_home, state) = open_state();
+        register_memory_representation(&state, fixture_memory_key(8), "mem-a".to_string(), 1_000)
+            .await
+            .expect("register");
+
+        let conn = state.open_read().expect("read connection");
+        let coverage: (String, i64) = conn
+            .query_row(
+                "SELECT representation_id, required FROM model_space_representation \
+                 WHERE model_space_id = ?1 AND representation_kind = 'memory'",
+                [DEFAULT_MODEL_SPACE_ID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("membership row exists");
+        assert_eq!(coverage.1, 1, "memory must be required, not merely present");
+        assert!(!coverage.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn code_raw_and_memory_registration_coexist_independently() {
+        let (_home, state) = open_state();
+        register_code_raw_representation(&state, fixture_key(8), "rep-code".to_string(), 1_000)
+            .await
+            .expect("register code_raw");
+        register_memory_representation(&state, fixture_memory_key(8), "rep-mem".to_string(), 1_000)
+            .await
+            .expect("register memory");
+
+        let conn = state.open_read().expect("read connection");
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM model_space_representation", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            rows, 2,
+            "code_raw and memory are two distinct representation-kind rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_memory_registration_is_idempotent() {
+        let (_home, state) = open_state();
+        let key = fixture_memory_key(8);
+        let first =
+            register_memory_representation(&state, key.clone(), "attempt-1".to_string(), 1_000)
+                .await
+                .expect("first registration");
+        let second = register_memory_representation(&state, key, "attempt-2".to_string(), 2_000)
+            .await
+            .expect("second registration");
+        assert_eq!(first, second, "the same key must converge on one row");
     }
 
     #[test]
