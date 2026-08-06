@@ -269,6 +269,34 @@ fn retention_k_t_final_values_adr_is_well_formed() {
     );
 }
 
+#[test]
+fn tui_dashboard_adr_is_well_formed() {
+    let path = adr_dir().join("0008-tui-dashboard.md");
+    let adr = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for section in ["## Status", "## Context", "## Decision", "## Consequences"] {
+        assert!(
+            adr.contains(section),
+            "ADR-0008 must contain a `{section}` section"
+        );
+    }
+    assert!(
+        adr.contains("Accepted"),
+        "ADR-0008 must record an Accepted status"
+    );
+    assert!(
+        adr.contains("G18") && adr.contains("groups/18-tui-dashboard.md"),
+        "ADR-0008 must name the group/gate it opens"
+    );
+    assert!(
+        adr.contains("playground"),
+        "ADR-0008 must record the explicit playground exclusion"
+    );
+    assert!(
+        adr.contains("X-NNN") && adr.contains("TRACEABILITY.md"),
+        "ADR-0008 must explain why this is a new group instead of an X-NNN card"
+    );
+}
+
 /// The ADR's measurement artifact must exist and stay machine-readable: the
 /// decision cites numbers, and a citation to a missing or unparsable file is not
 /// evidence.

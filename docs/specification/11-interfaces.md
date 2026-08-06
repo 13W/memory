@@ -716,3 +716,51 @@ and moving them into `clap`'s validators would have changed their exit code (`1`
 not `2`) or blurred that line for no benefit. `memory merge --loser <id>:<version> [--loser ...]`
 is the first genuinely repeated flag this CLI has ever had a typed primitive for: a plain
 `Vec<String>` field.
+
+## 7. TUI dashboard `[SPEC surface, post-v0 — ADR-0008]`
+
+A fourth user-facing surface, alongside §§1–6: a terminal client reading/writing the same
+`state.sqlite`/`cache.sqlite` and, for the two screens that need a live daemon, the same UDS
+transport §1/§4 already define. `docs/adr/0008-tui-dashboard.md` is the product decision;
+`docs/implementation-plan/groups/18-tui-dashboard.md` (`T18-00`–`T18-09`, gate `G18`) is the
+implementation record. This section is a forward sketch, the same convention §6's CLI list
+originally used before any CLI task shipped — each `T18-NN` card appends its own as-built note
+here once implemented, not before.
+
+```
+local-rag-tui                        # separate crate/binary, not a `local-rag` subcommand
+```
+
+Screens: **Status**, **Logs**, **Memory**, **Repositories**, **Repo Settings**, **Server
+Settings** — no playground (ADR-0008's own explicit exclusion).
+
+Data access per screen, decided by ADR-0008:
+
+- **Status** (identity/mode/version, durable counts), **Repositories & Worktrees**, **Memory**
+  (read and every mutation — approve/reject/edit/retract/merge), **Repo Settings**: direct
+  `state.sqlite`/`cache.sqlite` access, the same architecturally-sanctioned pattern every `local-rag`
+  CLI command already uses (§6's own as-built note: WAL + `busy_timeout=5000`, no `store.lock`
+  taken) — no running daemon required. Memory mutations call the identical
+  `local_rag_store::memory::apply_*`/`approve_candidate`/`reject_candidate` functions
+  `cli/memory.rs` already calls, with `Actor::User`; confirmation is required before invoking any
+  operation the MCP catalog (§2's `annotations`, `X-003`) marks `destructiveHint: true` — today
+  exactly `retract_memory` — read from `tools::catalog()` as the single source of truth, never a
+  TUI-local classification.
+- **Server Settings** (`config.toml`): reading is already possible (`Config::load`); writing
+  requires a new `Config::save`/TOML-serialization primitive this section requires but
+  `crates/core/src/config/mod.rs` does not yet have (`T18-07`). A saved change takes effect only
+  after `local-rag restart` — no daemon config hot-reload exists or is added by this group.
+- **Logs** (recent per-tool calls) and **live queue occupancy** inside Status: the one exception
+  — this data exists only inside a running daemon's memory, never in SQLite. Requires new daemon
+  instrumentation (`T18-08`): an in-memory ring buffer of recent calls plus per-tool counters,
+  written at the single point every request already passes through
+  (`daemon/handshake.rs::handle_connection`, wrapping `handler.handle(...)`), read via two new
+  JSON-RPC methods on the existing `tools/call`-sibling dispatch (`daemon/mcp/dispatch.rs`):
+  `admin/tail_calls`, `admin/tool_stats`. Polled by the TUI (~1 s), not pushed —
+  `local_rag_protocol::handshake` is deliberately request/response only (02 §4.2); adding
+  server-initiated push would change the protocol crate itself, out of this group's scope. When no
+  daemon is reachable, both screens show an explicit "daemon not running" state rather than stale
+  or fabricated numbers.
+
+Distribution follows §6's own npm/platform-package convention (`local-rag-tui` alongside
+`local-rag`/`local-rag-proxy`/`local-rag-hook`) — `T18-01`'s own card.
