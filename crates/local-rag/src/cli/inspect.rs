@@ -19,27 +19,25 @@ use local_rag_store::privacy::{
 use local_rag_store::{AuditEventRow, GenerationRow, PayloadStatus};
 
 use super::index::open_state;
-use super::{EXIT_USAGE, fail, resolve_layout_and_config, system_now_ms};
+use super::{fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(kind) = args.next() else {
-        eprintln!("{BIN} inspect: usage: {BIN} inspect <observation|memory|generation> <id>");
-        return ExitCode::from(EXIT_USAGE);
-    };
-    let Some(id) = args.next() else {
-        eprintln!("{BIN} inspect {kind}: usage: {BIN} inspect {kind} <id>");
-        return ExitCode::from(EXIT_USAGE);
-    };
-    if let Some(extra) = args.next() {
-        eprintln!("{BIN} inspect: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
-    if !matches!(kind.as_str(), "observation" | "memory" | "generation") {
-        eprintln!("{BIN} inspect: unknown kind {kind:?} (expected observation|memory|generation)");
-        return ExitCode::from(EXIT_USAGE);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InspectKind {
+    Observation,
+    Memory,
+    Generation,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InspectArgs {
+    kind: InspectKind,
+    id: String,
+}
+
+pub fn run(args: InspectArgs) -> ExitCode {
+    let InspectArgs { kind, id } = args;
 
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
@@ -55,23 +53,22 @@ pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     let now_ms = system_now_ms();
 
-    let value = match kind.as_str() {
-        "observation" => match inspect_observation(&conn, &id, now_ms) {
+    let value = match kind {
+        InspectKind::Observation => match inspect_observation(&conn, &id, now_ms) {
             Ok(Some(found)) => observation_inspection_json(&found),
             Ok(None) => return fail(BIN, &format!("no observation with id {id}")),
             Err(e) => return fail(BIN, &format!("could not inspect observation {id}: {e}")),
         },
-        "memory" => match inspect_memory(&conn, &id, now_ms) {
+        InspectKind::Memory => match inspect_memory(&conn, &id, now_ms) {
             Ok(Some(found)) => memory_inspection_json(&found),
             Ok(None) => return fail(BIN, &format!("no memory entry with id {id}")),
             Err(e) => return fail(BIN, &format!("could not inspect memory {id}: {e}")),
         },
-        "generation" => match inspect_generation(&conn, &id) {
+        InspectKind::Generation => match inspect_generation(&conn, &id) {
             Ok(Some(found)) => generation_row_json(&found),
             Ok(None) => return fail(BIN, &format!("no generation with id {id}")),
             Err(e) => return fail(BIN, &format!("could not inspect generation {id}: {e}")),
         },
-        _ => unreachable!("validated above"),
     };
     println!(
         "{}",

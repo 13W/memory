@@ -18,7 +18,7 @@ use local_rag_core::process::pid_exists;
 
 use local_rag::daemon::{LIVENESS_PROBE_TIMEOUT_MS, StoreLockFileState, read_store_lock_file};
 
-use super::{EXIT_USAGE, fail, resolve_layout_and_config};
+use super::{fail, resolve_layout_and_config};
 
 const BIN: &str = "local-rag";
 
@@ -154,25 +154,21 @@ fn compute_status(layout: &StoreLayout) -> StatusReport {
     }
 }
 
-pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
-            other => {
-                eprintln!("{BIN} status: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+#[derive(Debug, clap::Args)]
+pub struct StatusArgs {
+    /// Print the status report as JSON instead of a human-readable line.
+    #[arg(long)]
+    json: bool,
+}
 
+pub fn run(args: StatusArgs) -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
     };
 
     let report = compute_status(&layout);
-    if json {
+    if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&report.to_json())

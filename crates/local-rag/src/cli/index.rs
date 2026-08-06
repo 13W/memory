@@ -39,7 +39,7 @@ use local_rag_store::{
     resolve, worktree_summary,
 };
 
-use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
+use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
@@ -459,24 +459,21 @@ async fn run_pipeline(ctx: &IndexCtx, worktree_id: Uuid, now_ms: i64) -> ExitCod
     }
 }
 
-pub fn run_index(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(path_arg) = args.next() else {
-        eprintln!("{BIN} index: usage: {BIN} index <path>");
-        return ExitCode::from(EXIT_USAGE);
-    };
-    if let Some(extra) = args.next() {
-        eprintln!("{BIN} index: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
+#[derive(Debug, clap::Args)]
+pub struct IndexArgs {
+    /// Directory to index (registered as a new worktree if not already known).
+    path: String,
+}
 
+pub fn run_index(args: IndexArgs) -> ExitCode {
     let (layout, config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
     };
 
-    let path = PathBuf::from(&path_arg);
+    let path = PathBuf::from(&args.path);
     let Some(facts) = gitroot::probe(&path) else {
-        return fail(BIN, &format!("{path_arg}: not an accessible directory"));
+        return fail(BIN, &format!("{}: not an accessible directory", args.path));
     };
 
     let state = match open_state(&layout) {
@@ -519,12 +516,7 @@ pub fn run_index(mut args: impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
-pub fn run_reindex(args: impl Iterator<Item = String>) -> ExitCode {
-    if let Some(extra) = args.into_iter().next() {
-        eprintln!("{BIN} reindex: unknown argument {extra:?}");
-        return ExitCode::from(EXIT_USAGE);
-    }
-
+pub fn run_reindex() -> ExitCode {
     let (layout, config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),

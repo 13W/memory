@@ -25,44 +25,28 @@ const BIN: &str = "local-rag";
 const USAGE: &str = "usage: local-rag purge --memory <id> --expected-version N --yes \
      | --session <id> --yes | --all --yes";
 
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut memory_id: Option<String> = None;
-    let mut session_id: Option<String> = None;
-    let mut all = false;
-    let mut expected_version: Option<i64> = None;
-    let mut yes = false;
+#[derive(Debug, clap::Args)]
+pub struct PurgeArgs {
+    #[arg(long = "memory")]
+    memory_id: Option<String>,
+    #[arg(long = "session")]
+    session_id: Option<String>,
+    #[arg(long)]
+    all: bool,
+    #[arg(long)]
+    expected_version: Option<i64>,
+    #[arg(long)]
+    yes: bool,
+}
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--memory" => match args.next() {
-                Some(v) => memory_id = Some(v),
-                None => {
-                    eprintln!("{BIN} purge: --memory needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--session" => match args.next() {
-                Some(v) => session_id = Some(v),
-                None => {
-                    eprintln!("{BIN} purge: --session needs a value");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--all" => all = true,
-            "--expected-version" => match args.next().as_deref().and_then(|v| v.parse().ok()) {
-                Some(v) => expected_version = Some(v),
-                None => {
-                    eprintln!("{BIN} purge: --expected-version needs an integer");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            },
-            "--yes" => yes = true,
-            other => {
-                eprintln!("{BIN} purge: unknown argument {other:?}\n{USAGE}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+pub fn run(args: PurgeArgs) -> ExitCode {
+    let PurgeArgs {
+        memory_id,
+        session_id,
+        all,
+        expected_version,
+        yes,
+    } = args;
 
     let selector_count = [memory_id.is_some(), session_id.is_some(), all]
         .iter()

@@ -25,21 +25,20 @@ use local_rag_store::{
     register_representation, set_model_space_representation,
 };
 
-use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
+use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
 
-pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
-    let mut download = false;
-    for arg in args {
-        match arg.as_str() {
-            "--download-models" => download = true,
-            other => {
-                eprintln!("{BIN} init: unknown argument {other:?}");
-                return ExitCode::from(EXIT_USAGE);
-            }
-        }
-    }
+#[derive(Debug, clap::Args)]
+pub struct InitArgs {
+    /// Fetch and install the default embedding model's weights before
+    /// checking whether `code_raw` can be registered.
+    #[arg(long)]
+    download_models: bool,
+}
+
+pub fn run(args: InitArgs) -> ExitCode {
+    let download = args.download_models;
 
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
@@ -258,7 +257,8 @@ mod tests {
 
     #[test]
     fn init_rejects_an_unknown_argument() {
-        let code = run(["--bogus".to_string()].into_iter());
-        assert_eq!(code, ExitCode::from(EXIT_USAGE));
+        use clap::Parser;
+        let result = crate::cli::Cli::try_parse_from(["local-rag", "init", "--bogus"]);
+        assert!(result.is_err(), "{result:?}");
     }
 }
