@@ -2,13 +2,15 @@
 //!
 //! Distinct from [`local_rag_protocol::ErrorCode`], which is the *daemon*-
 //! side MCP tool error vocabulary (spec 02 §6). Nothing here is ever an MCP
-//! JSON-RPC response: this proxy never synthesizes one on a handshake/relay
-//! failure — that would require parsing the client's incoming `initialize`
-//! request for its `id` first, which is out of this task's scope (T15-03's
-//! job). Diagnostics go to stderr and the process exits non-zero instead.
-//! This decision is flagged in the T15-02 plan as worth revisiting
-//! empirically against a real Claude Code client; if that proves
-//! insufficient, it is a narrow, later, additive change, not a redesign.
+//! JSON-RPC response: a handshake or relay failure goes to stderr and the
+//! process exits non-zero instead.
+//!
+//! The one place this proxy does synthesize a JSON-RPC error is
+//! `relay::PendingRequests` (D-038): a request already relayed to a daemon
+//! that then died has an `id` this proxy has already seen, and answering it
+//! is what stops the client waiting forever on a response nobody is left to
+//! send. That is bookkeeping about requests in flight, not a diagnostic
+//! vocabulary, so it lives with the relay rather than here.
 
 use std::fmt;
 
@@ -47,6 +49,11 @@ pub enum ProxyError {
     /// matched daemon — a persistently flapping/misbehaving daemon, not a
     /// normal one-shot upgrade.
     UpgradeLoopExceeded,
+    /// The relay's reconnect loop ran out of rounds without reaching a daemon
+    /// that stays up — one that never comes back, or that accepts a
+    /// connection and immediately drops it, rather than the ordinary restart
+    /// this proxy recovers from (D-038).
+    ReconnectLoopExceeded,
 }
 
 impl fmt::Display for ProxyError {
@@ -90,6 +97,12 @@ impl fmt::Display for ProxyError {
                 write!(
                     f,
                     "gave up after repeated version-mismatch upgrade attempts"
+                )
+            }
+            ProxyError::ReconnectLoopExceeded => {
+                write!(
+                    f,
+                    "gave up reconnecting: the daemon connection kept dropping without a usable session"
                 )
             }
         }
