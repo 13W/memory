@@ -23,7 +23,10 @@
 //!    first lets the very same tick also open a fresh window for that
 //!    session, instead of losing a whole tick to a spurious `Existing`.
 //! 2. **Per-session import + checkpoint-gated new-run open**: for every
-//!    session [`known_spool_sessions`] reports, import its fresh tail
+//!    session [`known_spool_sessions`] or [`sessions_with_pending_backlog`]
+//!    reports (D-040 — the latter is the only source that sees a session
+//!    whose envelopes all arrived through a spool-bypassing daemon-internal
+//!    write such as `give_feedback`), import its fresh tail
 //!    (reusing the same `import_session_tail` call the startup spool-resume
 //!    pass makes), then open a new consolidation window if either this
 //!    import just saw a `Stop`/`SessionEnd` row, or the session's backlog
@@ -61,7 +64,7 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
     ConsolidationWindow, GeneratedOp, ImportError, RequestRoot, RunOutcome, SnapshotOutcome,
     StateDb, WriteError, import_session_tail, known_spool_sessions, open_next_run, pending_backlog,
-    run_once,
+    run_once, sessions_with_pending_backlog,
 };
 use tokio::sync::oneshot;
 
@@ -139,7 +142,20 @@ where
     )
     .await;
 
-    let sessions = known_spool_sessions(layout).unwrap_or_default();
+    // Two independent session sources, unioned (D-040): the spool directory
+    // sees a session the moment a hook writes for it (even before any of its
+    // bytes have been imported), while `sessions_with_pending_backlog` sees
+    // envelopes however they were inserted — including the daemon-internal
+    // `give_feedback` write that bypasses the spool entirely, which no spool
+    // directory ever represents.
+    let mut session_set: std::collections::BTreeSet<String> = known_spool_sessions(layout)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if let Ok(read) = db.open_read() {
+        session_set.extend(sessions_with_pending_backlog(&read).unwrap_or_default());
+    }
+    let sessions: Vec<String> = session_set.into_iter().collect();
     let request_root = RequestRoot::default();
     let mut results = Vec::with_capacity(sessions.len());
 
@@ -604,6 +620,69 @@ mod tests {
             recovered_state, "applied",
             "the stale run itself was also recovered this same tick"
         );
+    }
+
+    /// D-040: `give_feedback` inserts its envelope straight through
+    /// `insert_envelope` (the documented daemon-internal exemption from the
+    /// spool-only constraint), so a session that only ever used it has **no
+    /// spool directory at all** — `known_spool_sessions` cannot see it, and
+    /// before this fix it was structurally unreachable for consolidation no
+    /// matter how large its backlog grew.
+    #[tokio::test]
+    async fn a_session_with_no_spool_directory_is_still_consolidated() {
+        let (_home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+        // Exactly what `mcp::memory_write::give_feedback` writes: `McpFeedback`
+        // envelopes, `mcp:<session>:<request>` source identity, no spool.
+        db.writer()
+            .transaction(|tx| {
+                for i in 0..3 {
+                    tx.execute(
+                        "INSERT INTO observation_envelope \
+                           (observation_id, source_event_id, dedup_key, payload_hash, event_type, \
+                            evidence_kind, trust, session_id) \
+                         VALUES (?1, ?2, ?2, 'deadbeef', 'McpFeedback', 'user_statement', 'normal', 'sess-fb')",
+                        rusqlite::params![
+                            format!("obs-fb-{i}"),
+                            format!("mcp:sess-fb:{i}"),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed give_feedback envelopes");
+        assert!(
+            !layout.spool_session("sess-fb").exists(),
+            "the premise: this session never touched the spool",
+        );
+        // `McpFeedback` is neither `Stop` nor `SessionEnd`, so the backlog
+        // threshold is the only trigger this session can ever cross.
+        let mut params = default_params();
+        params.queue_threshold = 3;
+
+        let results = consolidation_trigger_tick(
+            &db,
+            &layout,
+            &uuids,
+            &jobs,
+            &params,
+            1_000,
+            &|_window| async { Ok(noop_ops()) },
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "sess-fb");
+        match &results[0].1 {
+            SessionTickOutcome::Ran(RunOutcome::Applied(_)) => {}
+            other => panic!("expected Ran(Applied(_)) for the spool-less session, got {other:?}"),
+        }
+        // The cursor really moved: the session is no longer backlogged, so a
+        // second tick finds nothing to do rather than re-opening the window.
+        let read = db.open_read().expect("read conn");
+        assert_eq!(pending_backlog(&read, "sess-fb").expect("backlog"), 0,);
     }
 
     #[tokio::test]
