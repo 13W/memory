@@ -212,6 +212,82 @@ v0-очередь (T00-01…G17) закрыта; задачи в этом раз
 - [x] X-002 Перевести CLI `local-rag` (`crates/local-rag/src/cli/*` + `main.rs`) с ручного
       `std::env::args()`-парсинга на `clap` (derive API); `local-rag-proxy`/`local-rag-hook`/
       `xtask` вне scope
+- [ ] X-003 Проставить MCP tool annotations (`readOnlyHint`/`destructiveHint`/`idempotentHint`/
+      `openWorldHint`/`title`) для всех 17 инструментов каталога (найдено post-v0, владелец
+      явно попросил при живом MCP-dogfood-тестировании) — полная карточка ниже
+
+#### X-003 — MCP tool annotations
+
+- **Зависит от:** ничего внутри 00–17 (не переоткрывает ни один гейт); чисто аддитивная правка
+  каталога `mcp::tools::catalog`.
+- **Спецификация:** MCP `Tool.annotations` (протокольная фича ревизий `2025-03-26`/`2025-06-18` —
+  обе уже входят в `SUPPORTED_MCP_PROTOCOL`, `crates/local-rag/src/daemon/mcp/instructions.rs:15`,
+  так что клиент вправе рассчитывать на это поле уже сегодня). В репозитории сейчас **ноль**
+  упоминаний `annotations`/`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint` —
+  ни в `tools.rs` (`grep` подтверждён), ни в `11-interfaces.md` — фича никогда не заявлялась
+  нормативно, это новый скоуп, не расхождение с уже согласованным текстом (поэтому `X-NNN`, не
+  `D-NNN`, тот же прецедент, что X-001: «ADR/новая фича, не broken behaviour»). Требует `[SPEC]`
+  амендмента 11 §2 as-built после реализации (то же соглашение, что T15-03/T15-04/T15-05's
+  собственные as-built заметки в том же разделе).
+- **Результат:** каждая запись `mcp::tools::catalog` (`crates/local-rag/src/daemon/mcp/tools.rs`)
+  получает `annotations: {title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint}`
+  наряду с уже существующими `name`/`description`/`inputSchema`. Явное владельческое решение
+  (сформулировано в этой сессии): **все инструменты `destructiveHint: false`, кроме того, что
+  реально удаляет из памяти** — `retract_memory` (v1 name mapping «forget → retract_memory», спека
+  11 §2 уже называет его этим термином) — единственный с `destructiveHint: true`.
+- **Рекомендованная таблица по всем 17** (owner подтверждает/правит при реализации, `merge_memories`
+  — единственная спорная строка, помечена ниже):
+  - `readOnlyHint: true` (и, соответственно, `destructiveHint`/`idempotentHint` для read-only тулов
+    по MCP-спеке не проверяются, но `idempotentHint: true` не помешает): `search_code`,
+    `get_file_context`, `project_overview`, `recall`, `list_memory`, `inspect_memory_evidence`,
+    `list_memory_candidates`, `health`, `stats`.
+  - `readOnlyHint: false, destructiveHint: false`: `remember` (`idempotentHint: false` — без
+    `canonical_key` повторный вызов создаёт новую запись), `approve_memory_candidate`
+    (`idempotentHint: true` — повторное approve уже approved-кандидата возвращает
+    `AlreadyApproved`, не ошибку и не второй эффект), `reject_memory_candidate`,
+    `edit_memory_candidate`, `edit_memory`, `give_feedback` (`idempotentHint: true` —
+    `dedup_key = mcp:<session>:<request_id>` делает повторный идентичный вызов буквально
+    идемпотентным по построению).
+  - `readOnlyHint: false, destructiveHint: true, idempotentHint: false`: **только**
+    `retract_memory`.
+  - `merge_memories` — **спорная строка**: технически не «удаление» (loser переходит в
+    `superseded`, audit-preserving, обратимо не через API, но данные не потеряны), но необратимо
+    меняет активное состояние двух и более записей одним вызовом. Владелец при реализации явно
+    выбирает `destructiveHint: false` (согласуясь с «только retract_memory» этой карточки) или
+    `true` (расширяя правило на «необратимо для активного состояния») — не решать молча.
+  - `openWorldHint: false` везде — вся система локальна, ни один инструмент не обращается к
+    внешнему миру (архитектурный guardrail `data_policy` default `local_only`, CLAUDE.md).
+  - `title` — короткое человекочитаемое имя (напр. `retract_memory` → «Retract memory entry»),
+    не копия `name`/`description`.
+- **В scope:** только `annotations`-блок в существующих 17 записях каталога; ничего в
+  `dispatch.rs`/`content.rs`/семантике самих тулов не меняется.
+- **Не в scope:** восемнадцатый tools.list-запрос/новый tool; поведенческие изменения любого
+  инструмента; `capabilities.tools.listChanged` (остаётся `false`, каталог по-прежнему
+  compile-time константа).
+- **Тесты:** новый unit-тест на `mcp::tools::catalog`, аналогичный уже существующим
+  `additionalProperties: false`-тестам — проверяет, что все 17 записей несут непустой
+  `annotations`, что `destructiveHint == true` ровно у одной записи (`retract_memory`) и `false`
+  у всех остальных, и что `readOnlyHint` совпадает с списком выше. Live-проверка: `tools/list` MCP
+  round-trip (по образцу существующих `mcp_contract`-тестов) — распарсенный ответ содержит
+  `annotations` на каждой записи.
+- **Приёмка:** `tools/list` через реальный `local-rag-proxy`+`local-rag serve` возвращает
+  `annotations` на всех 17 инструментах; `destructiveHint` — `true` только у `retract_memory`.
+- **Evidence:** заполняется после выполнения в `PROGRESS.md`'s «Task evidence».
+
+- [ ] D-036 Продуктовая регистрация `memory`-representation никогда не выполняется — `remember`/`recall`'s
+      dense-плечо навсегда `no_representation` в реальном запуске; переоткрывает memory-половину D-013
+      (найдено post-v0 при живом MCP-dogfood-тестировании)
+- [ ] D-037 Демон не подхватывает эмбеддинг-модель, установленную после его старта, без полного
+      `local-rag restart` (продуктовый gap, владелец должен выбрать hot-reload vs документирование)
+- [ ] D-038 Уже установленная MCP-сессия не переживает независимо инициированный рестарт демона
+      (`local-rag stop`/`restart`/crash) — proxy завершает процесс вместо реконнекта, требуя ручной `/mcp`
+      (продуктовый gap, владелец должен выбрать протокольное расширение upgrade-flow)
+- [ ] D-039 `search_code`'s `name_pattern` caller-facing текст (tool schema + server instructions)
+      описывает буквальный prefix-of-whole-string, реальное поведение — AND независимых от порядка
+      префиксов по словам-токенам; текстовая правка, поведение не трогать
+- [ ] D-040 `give_feedback`'s observation навсегда сиротится (никогда не входит в consolidation),
+      если сессия ни разу не писала в spool — continuous trigger обходит только `known_spool_sessions`
+      (директории на диске), не distinct `session_id` в `observation_envelope`
 
 ## Evidence
 
