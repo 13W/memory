@@ -6,8 +6,9 @@
 //! exists in this crate's `Cargo.toml` at all — a structural guarantee, not
 //! a discipline one, that nothing here could accumulate state across
 //! sessions even by accident. The only state this binary ever holds is one
-//! open connection and the [`handshake::SessionParams`] it was launched
-//! with.
+//! open connection, the [`handshake::SessionParams`] it was launched with
+//! (replayed verbatim whenever [`relay`] reconnects after a daemon restart,
+//! D-038), and the ids of requests currently in flight on that connection.
 
 mod connect;
 mod error;
@@ -25,7 +26,7 @@ use local_rag_core::paths::{StoreLayout, SystemEnv};
 use local_rag_protocol::RequestContext;
 
 #[cfg(unix)]
-use handshake::{check_spool_format_compatibility, establish_session, resolve_session_params};
+use handshake::{establish_session, resolve_session_params, session_warnings};
 
 const BIN: &str = "local-rag-proxy";
 
@@ -124,8 +125,9 @@ async fn run() -> u8 {
     };
 
     let params = resolve_session_params(&env, || SystemUuidV7.next_uuid().to_string());
+    let socket_path = layout.socket_path();
 
-    let session = match establish_session(&layout.socket_path(), &daemon_binary, &params).await {
+    let session = match establish_session(&socket_path, &daemon_binary, &params).await {
         Ok(session) => session,
         Err(e) => {
             eprintln!("{BIN}: {e}");
@@ -135,16 +137,7 @@ async fn run() -> u8 {
     // Migration-only is a successful handshake in a degraded serving mode
     // (spec 02 §6 `[FIXED]`: "nothing degrades silently") — surfaced here
     // rather than left implicit in every tool call's own response.
-    if session.welcome.mode != "normal" {
-        eprintln!(
-            "{BIN}: the daemon is running in degraded mode: {}",
-            session.welcome.mode
-        );
-    }
-    if let Some(warning) = check_spool_format_compatibility(
-        local_rag_core::spool::FORMAT_VERSION,
-        session.welcome.spool_max_format_version,
-    ) {
+    for warning in session_warnings(&session.welcome) {
         eprintln!("{BIN}: {warning}");
     }
 
@@ -157,16 +150,16 @@ async fn run() -> u8 {
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
 
-    match relay::relay(
-        stdin,
-        stdout,
-        session.reader,
-        session.writer,
-        context,
-        signal,
-    )
-    .await
-    {
+    // The same three inputs this first `establish_session` used, so a
+    // reconnect after the daemon restarts under a live session reproduces it
+    // exactly (D-038).
+    let endpoint = relay::DaemonEndpoint {
+        socket_path: &socket_path,
+        daemon_binary: &daemon_binary,
+        params: &params,
+    };
+
+    match relay::relay(stdin, stdout, session, endpoint, context, signal).await {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{BIN}: {e}");

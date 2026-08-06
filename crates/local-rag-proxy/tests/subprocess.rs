@@ -489,15 +489,15 @@ fn persistent_version_mismatch_exceeds_the_upgrade_round_budget() {
     fake.join().expect("fake old daemon thread panicked");
 }
 
-/// The literal "daemon down/restart" scenario: a real daemon is killed
-/// ungracefully (`SIGKILL`, leaving a stale, unbound `run/daemon.sock`
-/// behind — see [`send_sigkill`]'s own doc), and a **fresh** proxy
-/// invocation against the same store must transparently detect the dead
-/// owner, spawn a brand-new daemon, and complete a real MCP handshake —
-/// proxy's own connections are one-per-process (`establish_session` runs
-/// once at startup, spec 02 §3.3's own as-built note), so "restart" is
-/// necessarily exercised by a *new* proxy process, not a live reconnect
-/// inside an existing one.
+/// The literal "daemon down/restart" scenario for a proxy that has not
+/// started yet: a real daemon is killed ungracefully (`SIGKILL`, leaving a
+/// stale, unbound `run/daemon.sock` behind — see [`send_sigkill`]'s own
+/// doc), and a **fresh** proxy invocation against the same store must
+/// transparently detect the dead owner, reach a brand-new daemon (spawning
+/// one itself, unless the retiring proxy's own D-038 reconnect got there
+/// first), and complete a real MCP handshake. The same restart under an
+/// *already relaying* proxy is D-038's own scenario, covered separately by
+/// [`a_live_proxy_reconnects_after_its_daemon_is_restarted_mid_session`].
 #[test]
 fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
     let home = TempHome::new().expect("temp home");
@@ -516,6 +516,17 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
 
     let old_daemon = daemon_pid(&layout);
     send_sigkill(old_daemon);
+
+    // Retire the first proxy before observing the kill: the daemon it spawned
+    // is its *child*, and a child that has exited stays a zombie — answering
+    // `kill(pid, 0)` like a live process — until someone reaps it. Since
+    // D-038 the proxy no longer exits when its daemon dies (it reconnects, and
+    // reaps on the way), so ending it here is what makes "the killed daemon is
+    // gone" an observation about the daemon rather than a race with whatever
+    // the surviving proxy does next.
+    drop(stdin1);
+    let _ = wait_for_exit(&mut proxy1, Duration::from_secs(30));
+
     let deadline = Instant::now() + Duration::from_secs(10);
     while pid_exists(old_daemon) {
         assert!(
@@ -524,11 +535,6 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-
-    // Not the scenario under test: let the now-orphaned first proxy exit on
-    // its own (its daemon connection just died under it) before moving on.
-    drop(stdin1);
-    let _ = wait_for_exit(&mut proxy1, Duration::from_secs(20));
 
     let mut proxy2 = spawn_proxy(&home, &[("LOCAL_RAG_SESSION_ID", "test-session-restart-2")]);
     let mut stdin2 = proxy2.stdin.take().expect("proxy stdin");
@@ -542,7 +548,7 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(
         response["result"]["serverInfo"]["name"], "local-rag",
-        "a fresh proxy must recover by spawning a brand-new daemon: {response}"
+        "a fresh proxy must recover against a brand-new daemon: {response}"
     );
     let _ = stdout2;
 
@@ -561,6 +567,225 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
 }
 
 // ---------------------------------------------------------------------
+// D-038: an independently initiated daemon restart (`local-rag restart`/
+// `stop`, a crash, an OOM kill) under an already-relaying proxy.
+// ---------------------------------------------------------------------
+
+/// Poll `store.lock` until it names a *different*, ready daemon than
+/// `previous_pid` — i.e. until the proxy under test has reconnected far
+/// enough to have spawned a replacement. Bounded like
+/// [`wait_until_daemon_ready`], and for the same reason.
+fn wait_for_replacement_daemon(layout: &StoreLayout, previous_pid: u32, timeout: Duration) -> u32 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(bytes) = std::fs::read(layout.store_lock())
+            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && json.get("ready").and_then(|v| v.as_bool()) == Some(true)
+            && let Some(pid) = json.get("pid").and_then(|v| v.as_u64())
+            && pid as u32 != previous_pid
+        {
+            return pid as u32;
+        }
+        if Instant::now() >= deadline {
+            panic!("no replacement daemon became ready within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// D-038's own scenario: a real daemon is `SIGTERM`ed in the middle of a
+/// live relay session (exactly what `local-rag restart`/`stop` does — see
+/// `cli::service::stop_running_daemon`, which signals the pid from
+/// `store.lock` without going through the `ShutdownRequest` protocol, so a
+/// connected proxy gets no warning at all). The proxy process must survive
+/// it: reconnect to a freshly spawned daemon on its own, and serve the next
+/// MCP tool call over the same stdin/stdout the client already holds.
+#[test]
+fn a_live_proxy_reconnects_after_its_daemon_is_restarted_mid_session() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    let mut proxy = spawn_proxy(&home, &[("LOCAL_RAG_SESSION_ID", "test-session-reconnect")]);
+    let mut stdin = proxy.stdin.take().expect("proxy stdin");
+    let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
+
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(response["id"], serde_json::json!(1));
+
+    wait_until_daemon_ready(&layout, Duration::from_secs(5));
+    let old_daemon = daemon_pid(&layout);
+
+    // The restart, exactly as `local-rag stop` performs it.
+    send_sigterm(old_daemon);
+
+    // The proxy notices on its own and spawns a replacement — nothing on
+    // stdin prompts it. Waiting for that replacement before writing the next
+    // request is what makes this test deterministic rather than a race
+    // against the reconnect: a request written while the proxy still holds
+    // the dead connection is a *different* scenario, covered by the in-flight
+    // test below.
+    let new_daemon = wait_for_replacement_daemon(&layout, old_daemon, Duration::from_secs(30));
+    // The replacement can legitimately become ready while the outgoing daemon
+    // is still finishing its own exit: an orderly drain releases the store
+    // lock (spec 02 §4.3) before the process itself is reaped, which is
+    // exactly what lets the successor bind at all. Bounded wait, not an
+    // instant assertion.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while pid_exists(old_daemon) {
+        assert!(
+            Instant::now() < deadline,
+            "the SIGTERMed daemon must exit, not merely be replaced in store.lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        proxy.try_wait().expect("try_wait").is_none(),
+        "the proxy process must survive its daemon being restarted under it"
+    );
+
+    // The point of the whole exercise: the next tool call just works, with no
+    // client-side intervention (no `/mcp` reconnect, no new proxy process).
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(
+        response["id"],
+        serde_json::json!(2),
+        "the first line after the restart must be this call's own response, \
+         not a leftover error: {response}"
+    );
+    assert!(
+        response["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|t| t["name"] == serde_json::json!("search_code")),
+        "{response}"
+    );
+    let _ = stdout;
+
+    drop(stdin);
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(20));
+    assert!(
+        status.success(),
+        "proxy must still exit 0 once stdin closes: {status:?}"
+    );
+
+    assert_eq!(daemon_pid(&layout), new_daemon);
+    cleanup_daemon(&layout, Duration::from_secs(20));
+}
+
+/// A fake daemon that completes a version-matched handshake, reads exactly
+/// one relayed request, and then drops the connection **without answering
+/// it** — a daemon dying with a request in flight, deterministically, with
+/// none of the timing luck real-process signalling would need. Dropping the
+/// listener with it unbinds the socket, so the proxy's reconnect genuinely
+/// falls through to spawning a real daemon.
+fn spawn_fake_daemon_dying_mid_request(
+    socket_path: std::path::PathBuf,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+        let (stream, _) = listener.accept().expect("accept fake daemon connection");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+        let mut writer = stream;
+
+        let mut hello_line = String::new();
+        reader.read_line(&mut hello_line).expect("read HELLO");
+
+        let welcome = Message::Welcome(Welcome {
+            proto: local_rag_protocol::PROTO_VERSION,
+            daemon_version: local_rag_core::VERSION.to_string(),
+            store_instance_uuid: "fake-instance".to_string(),
+            capabilities: Vec::new(),
+            mcp_passthrough_version: MCP_PASSTHROUGH_VERSION,
+            spool_max_format_version: local_rag_core::spool::FORMAT_VERSION,
+            mode: "normal".to_string(),
+        });
+        let bytes = encode_message(&welcome).expect("encode WELCOME");
+        writer.write_all(&bytes).expect("write WELCOME");
+
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read relayed request");
+        // No response: this daemon dies holding the request.
+    })
+}
+
+/// D-038's explicitly out-of-scope half, stated as a guarantee instead: a
+/// request already in flight when the daemon dies is **not** replayed (this
+/// proxy holds no session state to resume with, spec 11 §1) — it is failed,
+/// promptly and in-band, so the client sees a retryable transport error
+/// rather than a call that never returns. The session itself survives: the
+/// very next call, on the same stdio, is answered by the reconnected daemon.
+#[test]
+fn a_request_in_flight_when_the_daemon_dies_fails_cleanly_and_the_session_continues() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    let fake = spawn_fake_daemon_dying_mid_request(layout.socket_path());
+
+    let mut proxy = spawn_proxy(&home, &[("LOCAL_RAG_SESSION_ID", "test-session-in-flight")]);
+    let mut stdin = proxy.stdin.take().expect("proxy stdin");
+    let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
+
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    // The bounded read is the assertion that matters most here: without the
+    // synthesized error this call would hang until the test's own timeout.
+    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(response["id"], serde_json::json!(1));
+    assert_eq!(
+        response["error"]["code"],
+        serde_json::json!(-32000),
+        "an unanswered in-flight request must come back as a JSON-RPC error: {response}"
+    );
+    assert!(response.get("result").is_none(), "{response}");
+
+    fake.join().expect("fake daemon thread panicked");
+
+    // The proxy reconnects on its own — the fake listener is unbound by now,
+    // so this spawns a real `local-rag serve` — and the retry the client is
+    // free to send is answered normally.
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#,
+    );
+    let (stdout, line) = read_line(stdout, Duration::from_secs(30));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(response["id"], serde_json::json!(2));
+    assert_eq!(
+        response["result"]["serverInfo"]["name"], "local-rag",
+        "the retry must be answered by the reconnected, real daemon: {response}"
+    );
+    let _ = stdout;
+
+    wait_until_daemon_ready(&layout, Duration::from_secs(5));
+
+    drop(stdin);
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(20));
+    assert!(status.success(), "proxy must exit 0: {status:?}");
+
+    cleanup_daemon(&layout, Duration::from_secs(20));
+}
+
+// ---------------------------------------------------------------------
 // T17-04: proxy-side spool `format_version` compatibility warning
 // (spec 11 §4 `[FIXED concern]`).
 // ---------------------------------------------------------------------
@@ -573,6 +798,11 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
 /// `Response`, so a test can prove the real relay loop still runs a clean
 /// JSON-RPC round trip on stdout alongside whatever this proxy prints to
 /// stderr about the mismatch.
+///
+/// It then holds the connection open until the proxy itself closes it. Since
+/// D-038 the proxy treats a daemon disappearing as something to reconnect to
+/// (spawning a real one, here pointlessly), so a fake that hung up early
+/// would drag an unrelated daemon start into a test about a stderr warning.
 fn spawn_fake_daemon_with_spool_version(
     socket_path: std::path::PathBuf,
     spool_max_format_version: u16,
@@ -610,6 +840,9 @@ fn spawn_fake_daemon_with_spool_version(
         });
         let bytes = encode_message(&response).expect("encode Response");
         writer.write_all(&bytes).expect("write Response");
+
+        let mut drained = String::new();
+        let _ = reader.read_line(&mut drained); // returns once the proxy exits
     })
 }
 

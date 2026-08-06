@@ -168,6 +168,28 @@ pub fn check_spool_format_compatibility(
     })
 }
 
+/// Everything about a freshly established session worth telling the operator
+/// (spec 02 §6 `[FIXED]`: "nothing degrades silently"), reported identically
+/// for the session this proxy starts with and for every one it reconnects
+/// into (D-038) — a restart that lands in migration-only mode must announce
+/// itself as loudly as a cold start in that mode does.
+pub fn session_warnings(welcome: &Welcome) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if welcome.mode != "normal" {
+        warnings.push(format!(
+            "the daemon is running in degraded mode: {}",
+            welcome.mode
+        ));
+    }
+    if let Some(warning) = check_spool_format_compatibility(
+        local_rag_core::spool::FORMAT_VERSION,
+        welcome.spool_max_format_version,
+    ) {
+        warnings.push(warning.to_string());
+    }
+    warnings
+}
+
 /// A live, version-matched session: the split UDS connection plus the
 /// WELCOME the daemon answered with.
 #[cfg(unix)]

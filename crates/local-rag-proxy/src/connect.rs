@@ -72,6 +72,7 @@ pub fn resolve_daemon_binary_path(proxy_exe: &Path) -> Option<PathBuf> {
 pub fn spawn_detached_daemon(daemon_binary: &Path) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    reap_exited_daemons();
     Command::new(daemon_binary)
         .arg("serve")
         .stdin(Stdio::null())
@@ -80,6 +81,23 @@ pub fn spawn_detached_daemon(daemon_binary: &Path) -> std::io::Result<()> {
         .process_group(0)
         .spawn()?;
     Ok(())
+}
+
+/// Collect any daemon this proxy spawned earlier that has since exited.
+///
+/// [`spawn_detached_daemon`] deliberately never waits on what it spawns — the
+/// daemon outlives this proxy by design — so an exited one stays a zombie for
+/// as long as this process lives. That was invisible while a proxy exited the
+/// moment its daemon went away, but D-038's relay now outlives daemon
+/// restarts, and a zombie answers `kill(pid, 0)` exactly as a live process
+/// does — the very check store-lock ownership is decided by (spec 02 §4.4).
+#[cfg(unix)]
+fn reap_exited_daemons() {
+    // SAFETY: `waitpid` with `WNOHANG` never blocks and writes nothing
+    // through the null status pointer; `-1` means "any child", and this
+    // process has no children other than daemons it spawned itself.
+    #[allow(unsafe_code)]
+    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
 }
 
 /// Connect to `socket_path`, spawning a detached daemon on the first
