@@ -34,6 +34,22 @@ pub const MAX_RECALL_LIMIT: i64 = 50;
 pub const DEFAULT_LIST_LIMIT: i64 = 20;
 pub const MAX_LIST_LIMIT: i64 = 100;
 
+/// `Tool.annotations` (X-003, `[SPEC]`) — `openWorldHint` is always `false`:
+/// this system is fully local (`data_policy` default `local_only`, CLAUDE.md's
+/// own architecture guardrail), no tool ever reaches out to the world.
+/// `destructive`/`idempotent` are chosen per tool, not derived from a
+/// mechanical rule -- see the X-003 as-built note (spec 11 §2) for the full
+/// per-tool table and the reasoning behind each one.
+fn annotations(title: &str, read_only: bool, destructive: bool, idempotent: bool) -> Value {
+    serde_json::json!({
+        "title": title,
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": false
+    })
+}
+
 /// The full `tools/list` result.
 pub fn catalog() -> Value {
     serde_json::json!({
@@ -43,6 +59,7 @@ pub fn catalog() -> Value {
                 "description": "Search this workspace's indexed code. Returns fused hits \
                     with path, unit kind, byte span, language, per-leg ranks and an excerpt \
                     cut from the exact indexed bytes. Never indexes on demand.",
+                "annotations": annotations("Search code", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -82,6 +99,7 @@ pub fn catalog() -> Value {
                 "description": "List everything the index knows about one file: its units \
                     (occurrence id, kind, name, qualified name, byte span) with excerpts from \
                     the exact indexed bytes, plus the generation they came from.",
+                "annotations": annotations("Get file context", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -102,6 +120,7 @@ pub fn catalog() -> Value {
                     recursive file and unit counts, likely entry-point files, and the most \
                     frequently imported module specifiers, all derived from the active index \
                     generation.",
+                "annotations": annotations("Project overview", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -115,6 +134,7 @@ pub fn catalog() -> Value {
                     scope's most recent eligible memories. Returns both the rendered \
                     additionalContext text block and structured entries with ids for follow-up \
                     tool calls (inspect_memory_evidence, edit_memory).",
+                "annotations": annotations("Recall memory", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -140,6 +160,7 @@ pub fn catalog() -> Value {
                 "description": "Review durable memory entries in scope (global, repository, \
                     and — when a worktree resolves — worktree), including terminal states \
                     (superseded/retracted/resolved/rejected), unlike recall which excludes them.",
+                "annotations": annotations("List memory entries", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -186,6 +207,7 @@ pub fn catalog() -> Value {
                 "description": "Review pending/approved/rejected/expired memory candidates \
                     proposed by consolidation. Candidates have no scope (global to the store) — \
                     the request's worktree context is not consulted.",
+                "annotations": annotations("List memory candidates", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -214,6 +236,7 @@ pub fn catalog() -> Value {
                 "name": "inspect_memory_evidence",
                 "description": "The observation ids cited as evidence for one memory entry. An \
                     unknown memory_id returns an empty list, not an error.",
+                "annotations": annotations("Inspect memory evidence", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -231,6 +254,7 @@ pub fn catalog() -> Value {
                 "description": "Store-wide counts of memory entries (by kind/state) and pending \
                     candidates (by review state), plus write-queue backpressure and, when the \
                     request's worktree resolves, its projection status.",
+                "annotations": annotations("Store statistics", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -240,6 +264,7 @@ pub fn catalog() -> Value {
             {
                 "name": "health",
                 "description": "Daemon mode, version, and store instance identity.",
+                "annotations": annotations("Daemon health", true, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -251,6 +276,7 @@ pub fn catalog() -> Value {
                 "description": "Create a new durable memory entry directly (not via candidate \
                     review). Defaults to repository scope when the request's worktree resolves, \
                     else global.",
+                "annotations": annotations("Create memory entry", false, false, false),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -297,6 +323,7 @@ pub fn catalog() -> Value {
                 "name": "approve_memory_candidate",
                 "description": "Approve a pending memory candidate, materializing its proposed \
                     operation through the same transactional path a direct write would use.",
+                "annotations": annotations("Approve memory candidate", false, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -312,6 +339,7 @@ pub fn catalog() -> Value {
             {
                 "name": "reject_memory_candidate",
                 "description": "Reject a pending memory candidate. Never materializes.",
+                "annotations": annotations("Reject memory candidate", false, false, false),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -329,6 +357,7 @@ pub fn catalog() -> Value {
                 "description": "Edit a pending memory candidate's proposed operation and/or \
                     conflict list. Legal only while the candidate is still pending (candidates \
                     have no version to check instead).",
+                "annotations": annotations("Edit memory candidate", false, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -362,6 +391,7 @@ pub fn catalog() -> Value {
                 "name": "edit_memory",
                 "description": "Edit an existing memory entry's text and/or importance. \
                     Rejects editing a terminal-state entry.",
+                "annotations": annotations("Edit memory entry", false, false, false),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -396,6 +426,7 @@ pub fn catalog() -> Value {
                 "description": "Retract a memory entry (v1 'forget'): audit-preserving \
                     withdrawal, not a delete. Illegal for kinds without a retracted state (e.g. \
                     hypothesis).",
+                "annotations": annotations("Retract memory entry", false, true, false),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -418,6 +449,7 @@ pub fn catalog() -> Value {
                 "description": "Merge two or more memory entries (v1 'consolidate'): the \
                     survivor absorbs the losers' evidence; losers become superseded, pointing at \
                     the survivor.",
+                "annotations": annotations("Merge memory entries", false, false, false),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -451,6 +483,7 @@ pub fn catalog() -> Value {
                     (not through the spool) — the daemon-internal equivalent of a hook's ingest \
                     append. Feeds the next consolidation pass; does not itself mutate any memory \
                     entry.",
+                "annotations": annotations("Give feedback", false, false, true),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -588,6 +621,68 @@ mod tests {
                 Value::Bool(false)
             );
         }
+    }
+
+    #[test]
+    fn catalog_every_tool_has_annotations() {
+        for tool in catalog()["tools"].as_array().unwrap() {
+            let annotations = tool["annotations"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} has no annotations object", tool["name"]));
+            for key in [
+                "title",
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(
+                    annotations.contains_key(key),
+                    "{} annotations missing {key}",
+                    tool["name"]
+                );
+            }
+            assert_eq!(annotations["openWorldHint"], Value::Bool(false));
+        }
+    }
+
+    #[test]
+    fn catalog_destructive_hint_is_true_only_for_retract_memory() {
+        let catalog = catalog();
+        let destructive: Vec<&str> = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["annotations"]["destructiveHint"] == Value::Bool(true))
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(destructive, ["retract_memory"]);
+    }
+
+    #[test]
+    fn catalog_read_only_hint_matches_the_read_only_tool_list() {
+        let catalog = catalog();
+        let read_only: Vec<&str> = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["annotations"]["readOnlyHint"] == Value::Bool(true))
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            read_only,
+            [
+                "search_code",
+                "get_file_context",
+                "project_overview",
+                "recall",
+                "list_memory",
+                "list_memory_candidates",
+                "inspect_memory_evidence",
+                "stats",
+                "health",
+            ]
+        );
     }
 
     #[test]

@@ -303,6 +303,39 @@ for the same underlying condition, rather than a separate "materialization faile
 retry-safety for this tool set comes from `expected_version`/idempotency keys/candidate
 `review_state`, not from the envelope's own `retryable` flag.
 
+As-built note (X-003, `[SPEC]`, post-G17 product decision). Every entry in `mcp::tools::catalog`
+now carries an `annotations` object (`title`/`readOnlyHint`/`destructiveHint`/`idempotentHint`/
+`openWorldHint`) — the MCP `Tool.annotations` field both supported protocol revisions
+(`2025-03-26`/`2025-06-18`, `instructions.rs::SUPPORTED_MCP_PROTOCOL`) already define, requested
+by the owner during live MCP-dogfood testing after finding the field absent. `openWorldHint` is
+`false` for all 17 tools: the system is fully local, no tool ever reaches an external service
+(01 §1 no-mandatory-external-daemon / data-policy `local_only` default). `readOnlyHint: true` for
+the nine read-only tools (`search_code`, `get_file_context`, `project_overview`, `recall`,
+`list_memory`, `list_memory_candidates`, `inspect_memory_evidence`, `stats`, `health`);
+`destructiveHint: true` for exactly one tool, `retract_memory` (v1 "forget") — every other
+mutating tool, including `merge_memories`, is `destructiveHint: false`. `merge_memories` was the
+one deliberately open question this task's own card left unresolved ("technically not a
+delete — losers become `superseded`, audit-preserving — but irreversibly changes ≥ 2 active
+records in one call"); the owner's explicit choice is `false`, keeping "only `retract_memory` is
+destructive" as a single, simple rule rather than extending it to "irreversible for active
+state." `idempotentHint` follows each tool's actual retry behavior, not a blanket default:
+`remember` is `false` (no `canonical_key` ⇒ a bare retry creates a second entry);
+`approve_memory_candidate` is `true` (`review.rs::approve_candidate`'s `AlreadyApproved`
+short-circuit makes a repeat call a safe no-op, not an error); `reject_memory_candidate` is
+`false` (`review.rs::reject_candidate`'s `ReviewError::NotPending` on an already-rejected
+candidate — a repeat call errors, unlike approve's short-circuit); `edit_memory_candidate` is
+`true` (`review.rs::edit_candidate` carries no version field — "candidates have no version to
+check instead," the schema's own words — so a repeated identical patch against a still-pending
+candidate reproduces the same state); `edit_memory` and `retract_memory` are both `false` (both
+carry `expected_version` optimistic-concurrency preconditions, the same class: a blind retry
+after the first call already advanced the version is `OPTIMISTIC_CONFLICT`, not a safe no-op);
+`give_feedback` is `true` (its `dedup_key = mcp:<session_id>:<request_id>` — T15-05's as-built
+note above — makes a retried identical call literally idempotent by construction). `title` is a
+short human-readable label distinct from `name`/`description` (e.g. `retract_memory` → "Retract
+memory entry"). In scope: only the `annotations` block on the existing 17 catalog entries
+(`crates/local-rag/src/daemon/mcp/tools.rs::annotations` helper); `dispatch.rs`/`content.rs`
+are unchanged — `tools::catalog()` was already returned as-is in `tools/list`.
+
 ## 3. Hooks
 
 ### 3.1 Ingestion hooks `[FIXED]`

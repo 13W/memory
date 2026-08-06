@@ -266,6 +266,25 @@ fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
             "give_feedback",
         ]
     );
+    // X-003: every advertised tool carries annotations, and destructiveHint
+    // is true for exactly one of them (retract_memory) -- the acceptance
+    // check this task card names explicitly (a real `local-rag-proxy` +
+    // `local-rag serve` round trip, not just the in-process daemon test).
+    let destructive: Vec<&str> = response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| {
+            assert!(
+                t["annotations"].is_object(),
+                "{} has no annotations",
+                t["name"]
+            );
+            (t["annotations"]["destructiveHint"] == serde_json::json!(true))
+                .then(|| t["name"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(destructive, ["retract_memory"]);
     let _ = stdout;
 
     wait_until_daemon_ready(&layout, Duration::from_secs(5)); // must already be true by now

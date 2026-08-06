@@ -110,6 +110,24 @@ async fn tools_list_advertises_all_seventeen_v0_tools() {
             "give_feedback",
         ]
     );
+    // X-003: every advertised tool carries annotations, and destructiveHint
+    // is true for exactly one of them (retract_memory).
+    let destructive: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| {
+            assert!(
+                t["annotations"].is_object(),
+                "{} has no annotations",
+                t["name"]
+            );
+            (t["annotations"]["destructiveHint"] == Value::Bool(true))
+                .then(|| t["name"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(destructive, ["retract_memory"]);
+
     // v1 name mapping (spec 11 §2): forget -> retract_memory,
     // consolidate(src,tgt) -> merge_memories -- neither v1 name is ever
     // exposed as its own tool (this task card's own test bullet).
