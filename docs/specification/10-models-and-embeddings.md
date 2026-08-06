@@ -200,6 +200,21 @@ task would have had to invent. The full adapter (`crates/local-rag/src/daemon/qu
 documents this as its own as-built rationale; closing the `memory` half remains open work for
 whichever task next owns group 14's model-axis registration.
 
+As-built note (D-037, `[SPEC]`): the note above says `main.rs::serve` wires the provider "whenever
+that representation is installed and opens cleanly", which was true only of the store as it looked
+*at startup*. Both providers are now built by
+`local_rag::daemon::query_embedder::code_query_embedder`/`memory_query_embedder` (moved out of
+`main.rs` so the construction is testable), and both defer the open behind `LazyQueryEmbedder`:
+the `.ok` marker is re-read on each query that actually needs a vector, until a provider opens. A
+daemon started before `local-rag init --download-models` therefore leaves `degraded: "lexical_only"`
+(and `recall`'s `dense_degraded`) on the next `search_code`/`recall` after the weights land, with no
+`local-rag restart` — the previous behavior held the startup verdict for the process's whole
+lifetime. Deliberately *not* a background poll: there is no timer, no interval to configure, and a
+lexical-only query still never touches the marker. Once a provider is open the fast path is a read
+lock and an `Arc` clone; an installed model that fails to open is terminal for the process (a
+corrupt install or a missing ONNX Runtime does not clear itself, and reopening an ONNX session per
+query is not a price the query path can pay), so that case degrades exactly as before.
+
 As-built note (T11-04, `[SPEC]`): the backfill worker is `local_rag_embed::backfill`
 (`run_backfill`), and it fixes the two things §3/§4 leave to the implementation.
 
