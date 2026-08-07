@@ -843,9 +843,10 @@ Distribution follows §6's own npm/platform-package convention (`local-rag-tui` 
 As-built note (T18-01, `[SPEC]`). The skeleton above is real: `crates/local-rag-tui` (workspace
 member, `default-members`, `[package.metadata.dist] dist = true` — the fourth product binary
 `dist plan` emits, verified against the same `cargo-dist 0.32.0`/`dist-workspace.toml`
-auto-discovery T17-03 already relies on; that file itself is unchanged). `src/main.rs` is a
-bin-only crate (no `src/lib.rs`, the same shape as `local-rag-proxy` — no reusable library logic
-exists yet to justify one). The event loop is `ratatui::run`/`DefaultTerminal` (feature
+auto-discovery T17-03 already relies on; that file itself is unchanged). `src/main.rs` was, at this
+task's own point in time, bin-only (no `src/lib.rs`, the same shape as `local-rag-proxy` — no
+reusable library logic existed yet to justify one; T18-02 changes this, see its own as-built note
+below). The event loop is `ratatui::run`/`DefaultTerminal` (feature
 `crossterm`, ratatui 0.30's own convenience entry point) rather than a hand-rolled
 `enable_raw_mode`/`set_hook` pair — raw mode, the alternate screen, and a panic hook that restores
 both before delegating to the previously-installed hook are all ratatui's own, already-tested
@@ -866,3 +867,33 @@ local-rag-dashboard.js` (third launcher entrypoint, `stdio: 'inherit'` load-bear
 full-screen terminal app needs the real inherited TTY, not a pipe) and `npm/memory/src/
 resolve.js`'s `binaryPath` JSDoc union extended to `'local-rag-tui'` (the function itself was
 already binary-name-agnostic).
+
+As-built note (T18-02, `[SPEC]`). The Status screen is real: `local_rag_tui::status` (new
+`crates/local-rag-tui/src/status.rs`, exported from a new `src/lib.rs` — this crate is lib+bin as
+of this task, mirroring `local-rag-hook`'s own split; required because the live-subprocess test
+below must call this crate's own compute functions from a `tests/*.rs` file, which only sees a
+package's library target, never its binary). `DaemonStatus`/`probe_daemon` independently
+reimplement `local_rag::cli::status`'s private `StatusReport`/`compute_status` (verified
+line-by-line identical) over the same public `local_rag::daemon`/`local_rag_core::process`
+primitives — `read_store_lock_file`, `pid_exists`, and (unix-only) `fetch_welcome` compared against
+`store_instance_uuid`. Durable counts (`read_durable_counts`) deliberately do **not** mirror `cli
+stats`'s own direct `StateDb::open` — this screen's card names it offline-safe, and `StateDb::open`
+applies pending migrations as a side effect of opening (02 §4.1), an undesirable effect for a
+screen whose only purpose is to look. It instead takes `cli doctor`'s own precaution:
+`StateDb::diagnose_versions` (never constructs a `StateDb`) first, opening for real only once that
+confirms `Applied` with an empty `pending` list; any other diagnosis (including "no store yet")
+surfaces as `DurableCounts::Unavailable { reason }`, rendered instead of counts, never silently
+skipped or crashed on. `render_status` is a plain `&mut ratatui::Frame` function with no I/O — a
+`Paragraph` for daemon identity, a `Table` for durable counts (`memory entries <kind>/<state>`,
+`pending candidates <state>`, `worktree`, `projection status`) — the first use of
+`ratatui::backend::TestBackend` in this workspace, three tests asserting on the rendered buffer's
+text. Two new `tests/*.rs` files: `status_offline.rs` (fixture `state.sqlite`, all five
+`DaemonStatus` branches plus `DurableCounts` independent of daemon state) and `status_live.rs`
+(spawns a real `local-rag serve`, calls `probe_daemon`/`read_durable_counts` directly against it —
+same `local_rag_binary_path()`/`spawn_serve`/`wait_until_ready` pattern
+`local-rag-hook/tests/recall_rpc.rs` already established, since `CARGO_BIN_EXE_local-rag` is not
+set for another package's binary regardless of dev-vs-normal dependency edge). `main.rs`'s loop now
+resolves `StoreLayout` once at startup and recomputes `compute_status_data` on every event (not
+only a keypress) — cheap (file reads when the daemon is dead, one bounded UDS round-trip when
+alive) and gives a live-feeling screen with no tick timer/async, which this task does not
+introduce (that is T18-08/T18-09's own scope for Logs/live stats).
