@@ -33,10 +33,21 @@
 //! (`registry::settings`), which reuses [`DataPolicy::most_restrictive`] from
 //! here. The central remote-policy guard in the provider pool (spec 10 §1, 12 §1)
 //! is a later group (T11/T16); this module only supplies the values it consumes.
+//!
+//! **Write direction (T18-07, ADR-0008 Server Settings screen):** [`Config::save`]
+//! is [`Config::load`]'s inverse — [`Config::to_raw`] mirrors `from_raw` (the same
+//! `data_policy` string/enum crossing, in reverse), [`Config::to_toml_string`]
+//! serializes that through the same [`RawConfig`]/[`RawModels`] shape `load` reads
+//! through, so an unknown key present in a hand-edited file is dropped on load and
+//! — necessarily, being absent from the typed [`Config`] that round-trips through
+//! `RawConfig` — never reappears on the next save. This is a property of reusing
+//! one lenient shape for both directions, not a separate preservation mechanism;
+//! round-trip fidelity holds for every field this module models, not for
+//! passthrough of arbitrary unknown TOML.
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The only `schema_version` this binary supports (spec 02 §3.1).
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -122,7 +133,7 @@ impl Default for DataPolicy {
 }
 
 /// `[daemon]` section of `config.toml` (spec 02 §3.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonConfig {
     /// Idle-shutdown grace period, seconds (only when fully idle).
@@ -150,7 +161,7 @@ impl Default for DaemonConfig {
 /// [ADR-0007](../../../../docs/adr/0007-retention-k-t-final-values.md)), not
 /// placeholders — still ordinary, operator-overridable configuration, not
 /// hard-coded constants.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
     /// LRU eviction target for `cache.sqlite` vectors, MiB.
@@ -199,7 +210,7 @@ impl Default for ModelsConfig {
 ///
 /// `languages` is the first-release language set fixed by ADR-0001 (O4):
 /// TypeScript, JavaScript, Rust.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
     /// Languages to index (ADR-0001, closes O4).
@@ -229,7 +240,7 @@ impl Default for IndexConfig {
 /// opt-in exclusion, no built-in entries — and global-only for v0: unlike
 /// `data_policy` (spec 02 §3.2), the spec does not ask for a per-repository
 /// override here, so `repo_settings` is not extended for this section.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpoolConfig {
     /// Denied path prefixes, matched component-wise against an observation's
@@ -246,7 +257,7 @@ pub struct SpoolConfig {
 /// tokens, config]`" without fixing a TOML layout the way `[storage]`/
 /// `[spool]` are shown verbatim — as-built here, the same way T13-01 added
 /// `[spool]` for a section the spec named but did not lay out.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
     /// Recall's `additionalContext` token budget (spec 08 §6, 11 §5).
@@ -366,6 +377,53 @@ impl Config {
             memory: raw.memory,
         })
     }
+
+    /// The inverse of [`Config::from_raw`]: crosses [`DataPolicy`] back to its
+    /// canonical string form, otherwise a plain field-for-field copy.
+    fn to_raw(&self) -> RawConfig {
+        RawConfig {
+            schema_version: self.schema_version,
+            daemon: self.daemon.clone(),
+            storage: self.storage.clone(),
+            models: RawModels {
+                default_model_space: self.models.default_model_space.clone(),
+                data_policy: self.models.data_policy.as_str().to_string(),
+            },
+            index: self.index.clone(),
+            spool: self.spool.clone(),
+            memory: self.memory.clone(),
+        }
+    }
+
+    /// Serialize to the same TOML shape [`Config::parse_toml`] reads.
+    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
+        toml::to_string_pretty(&self.to_raw()).map_err(ConfigError::TomlSerialize)
+    }
+
+    /// Write the config to `<config_dir>/config.toml`, atomically: the full text
+    /// is written to a sibling `.tmp` file first, then renamed into place, so a
+    /// reader (or a crash) never observes a partially written file (same idiom as
+    /// `crates/projection/src/fake.rs`/`brute_force.rs`).
+    ///
+    /// Does not take effect in a running daemon — there is no live config reload
+    /// (out of scope, T18-07 card); the caller is responsible for prompting a
+    /// `local-rag restart`.
+    pub fn save(&self, config_dir: &Path) -> Result<(), ConfigError> {
+        std::fs::create_dir_all(config_dir).map_err(ConfigError::Io)?;
+        let text = self.to_toml_string()?;
+        let final_path = config_toml_path(config_dir);
+        let tmp_path = final_path.with_extension("tmp");
+        std::fs::write(&tmp_path, text.as_bytes()).map_err(ConfigError::Io)?;
+        #[cfg(feature = "failpoints")]
+        local_rag_test_support::fail_point!(
+            "config.save.between_write_and_rename",
+            Err(ConfigError::Io(std::io::Error::other(
+                "simulated crash between config.toml write and rename"
+            )))
+        );
+        std::fs::rename(&tmp_path, &final_path).map_err(ConfigError::Io)?;
+        Ok(())
+    }
 }
 
 /// The `<config_dir>/config.toml` path (spec 02 §3.1).
@@ -380,6 +438,8 @@ pub enum ConfigError {
     Io(std::io::Error),
     /// The file is not valid TOML.
     Toml(toml::de::Error),
+    /// [`Config::to_toml_string`] could not serialize the config.
+    TomlSerialize(toml::ser::Error),
     /// `schema_version` is not the supported version.
     UnsupportedSchemaVersion {
         /// The version found in the file.
@@ -399,6 +459,9 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Io(err) => write!(f, "reading config.toml failed: {err}"),
             ConfigError::Toml(err) => write!(f, "config.toml is not valid TOML: {err}"),
+            ConfigError::TomlSerialize(err) => {
+                write!(f, "config.toml could not be serialized: {err}")
+            }
             ConfigError::UnsupportedSchemaVersion { found, supported } => write!(
                 f,
                 "config.toml schema_version {found} is unsupported (this binary supports {supported})"
@@ -417,6 +480,7 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Io(err) => Some(err),
             ConfigError::Toml(err) => Some(err),
+            ConfigError::TomlSerialize(err) => Some(err),
             ConfigError::UnsupportedSchemaVersion { .. }
             | ConfigError::InvalidDataPolicy { .. } => None,
         }
@@ -425,8 +489,9 @@ impl std::error::Error for ConfigError {
 
 /// The lenient deserialization target: primitive fields, unknown keys ignored,
 /// missing keys defaulted per section. Validated into [`Config`] by
-/// [`Config::from_raw`].
-#[derive(Deserialize)]
+/// [`Config::from_raw`]; [`Config::to_raw`] builds one back for
+/// [`Config::to_toml_string`].
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct RawConfig {
     schema_version: u32,
@@ -453,7 +518,7 @@ impl Default for RawConfig {
 }
 
 /// `[models]` before validation: `data_policy` is still an unparsed string.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct RawModels {
     default_model_space: String,
@@ -708,5 +773,87 @@ consolidation_queue_threshold = 50
         assert_eq!(cfg.memory.consolidation_queue_threshold, 30);
         // A partial `[memory]` section still defaults the untouched key.
         assert_eq!(cfg.memory.recall_token_budget, 1500);
+    }
+
+    // ---- write direction: `to_toml_string`/`save` (T18-07) ------------------
+
+    #[test]
+    fn default_config_round_trips_through_to_toml_string() {
+        let cfg = Config::default();
+        let text = cfg.to_toml_string().expect("serializes");
+        let parsed = Config::parse_toml(&text).expect("re-parses");
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn a_fully_customized_config_round_trips_through_to_toml_string() {
+        let mut cfg = Config::default();
+        cfg.daemon.idle_shutdown_secs = 42;
+        cfg.daemon.max_open_shards = 3;
+        cfg.daemon.log_level = "debug".to_string();
+        cfg.storage.embedding_cache_budget_mb = 4096;
+        cfg.storage.payload_ttl_hours = 24;
+        cfg.storage.retired_generations_keep = 5;
+        cfg.storage.retired_generations_ttl_h = 12;
+        cfg.models.default_model_space = "fast".to_string();
+        cfg.models.data_policy = DataPolicy::AllowRemoteWithRedaction;
+        cfg.index.languages = vec!["python".to_string(), "go".to_string()];
+        cfg.index.max_file_size_kb = 2048;
+        cfg.spool.deny_paths = vec!["secrets".to_string(), ".env".to_string()];
+        cfg.spool.deny_tools = vec!["Bash".to_string()];
+        cfg.memory.recall_token_budget = 3000;
+        cfg.memory.consolidation_batch_size = 5;
+        cfg.memory.consolidation_queue_threshold = 30;
+
+        let text = cfg.to_toml_string().expect("serializes");
+        let parsed = Config::parse_toml(&text).expect("re-parses");
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_a_customized_config() {
+        let home = local_rag_test_support::TempHome::new().expect("temp home");
+        let config_dir = home.join("config");
+
+        let mut cfg = Config::default();
+        cfg.daemon.log_level = "trace".to_string();
+        cfg.models.data_policy = DataPolicy::AllowRemoteFull;
+        cfg.index.languages = vec!["rust".to_string()];
+
+        cfg.save(&config_dir).expect("save");
+        let loaded = Config::load(&config_dir).expect("load");
+        assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn an_unknown_key_present_on_load_is_absent_after_a_save() {
+        let home = local_rag_test_support::TempHome::new().expect("temp home");
+        let config_dir = home.join("config");
+        std::fs::create_dir_all(&config_dir).expect("mk config dir");
+        std::fs::write(
+            config_toml_path(&config_dir),
+            "schema_version = 1\nsome_future_key = \"unrecognized\"\n\n[models]\ndata_policy = \"local_only\"\n",
+        )
+        .expect("write config.toml");
+
+        let loaded = Config::load(&config_dir).expect("load ignores the unknown key");
+        loaded.save(&config_dir).expect("save");
+
+        let text = std::fs::read_to_string(config_toml_path(&config_dir)).expect("read back");
+        assert!(
+            !text.contains("some_future_key"),
+            "a key absent from the typed Config cannot reappear on save: {text}"
+        );
+        let reloaded = Config::load(&config_dir).expect("reload");
+        assert_eq!(reloaded, loaded);
+    }
+
+    #[test]
+    fn save_creates_a_missing_config_dir() {
+        let home = local_rag_test_support::TempHome::new().expect("temp home");
+        let config_dir = home.join("nested").join("config"); // never created
+
+        Config::default().save(&config_dir).expect("save");
+        assert!(config_toml_path(&config_dir).is_file());
     }
 }

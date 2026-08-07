@@ -83,6 +83,7 @@ use local_rag_store::{
     memory_evidence_for, reject_candidate, resolve,
 };
 
+use crate::keys::{is_ctrl, step};
 use crate::store_read::open_read_offline_safe;
 use crate::store_write::open_write_offline_safe;
 
@@ -150,17 +151,6 @@ fn cycle_option<T: Copy + PartialEq>(current: Option<T>, domain: &[T], forward: 
                 }
             }
         },
-    }
-}
-
-fn step(selected: usize, down: bool, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    if down {
-        (selected + 1).min(len - 1)
-    } else {
-        selected.saturating_sub(1)
     }
 }
 
@@ -936,11 +926,6 @@ fn navigate(nav: &MemoryNav, data: &MemoryScreenData, code: KeyCode) -> MemoryNa
     }
 }
 
-fn is_ctrl_x(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
 /// `EditForm`'s own dispatch: `Tab` switches field, any unmodified printable char appends to the
 /// focused buffer, `Backspace` deletes from it, `Enter` validates+submits, `Ctrl+X` cancels. See
 /// the module doc's own section on why plain `q`/digits must reach here as content, not quit.
@@ -958,7 +943,7 @@ fn handle_edit_form_key(nav: &MemoryNav, key: KeyEvent) -> MemoryKeyOutcome {
         return MemoryKeyOutcome::Nav(nav.clone());
     };
 
-    if is_ctrl_x(&key) {
+    if is_ctrl(&key, 'x') {
         return MemoryKeyOutcome::Nav(MemoryNav::List(list.clone()));
     }
 
@@ -1050,7 +1035,7 @@ fn handle_merge_select_key(
         return MemoryKeyOutcome::Nav(nav.clone());
     };
 
-    if is_ctrl_x(&key) {
+    if is_ctrl(&key, 'x') {
         return MemoryKeyOutcome::Nav(MemoryNav::List(list.clone()));
     }
 
@@ -1172,7 +1157,7 @@ fn handle_confirm_action_key(nav: &MemoryNav, key: KeyEvent) -> MemoryKeyOutcome
         KeyCode::Backspace | KeyCode::Char('n') | KeyCode::Char('N') => {
             MemoryKeyOutcome::Nav(MemoryNav::List(list.clone()))
         }
-        _ if is_ctrl_x(&key) => MemoryKeyOutcome::Nav(MemoryNav::List(list.clone())),
+        _ if is_ctrl(&key, 'x') => MemoryKeyOutcome::Nav(MemoryNav::List(list.clone())),
         _ => MemoryKeyOutcome::Nav(nav.clone()),
     }
 }

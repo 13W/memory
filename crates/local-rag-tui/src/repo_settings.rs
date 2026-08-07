@@ -46,11 +46,12 @@
 //! small function, not a shared one — genuine reuse would need a third occurrence of the *same*
 //! semantics, the threshold `store_read.rs`'s own extraction already set at T18-04.
 //!
-//! `step` (list clamping) and `is_ctrl_x` (the T18-05 `SettingForm`/`EditForm`-style cancel
-//! predicate) are third and second small-helper copies respectively (`repositories.rs`/`memory.rs`
-//! already each have their own `step`; `memory.rs` already has its own `is_ctrl_x`) — deliberately
-//! still not extracted, deferred by the same "wait for a genuine third occurrence of *identical*
-//! code" convention, noted here for whoever hits the next occurrence.
+//! `step` (list clamping) and the `Ctrl+X`-cancel predicate this module used to call `is_ctrl_x`
+//! were this crate's third and second small-helper copies respectively (`repositories.rs`/
+//! `memory.rs` already each had their own `step`; `memory.rs` already had its own `is_ctrl_x`) —
+//! that third occurrence was the threshold `store_read.rs`'s own extraction had set at T18-04, so
+//! T18-07 (which needed a second control chord, `Ctrl+S`, for its own Server Settings screen)
+//! finally extracted both into [`crate::keys`], generalizing `is_ctrl_x` to `keys::is_ctrl(key, c)`.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use local_rag_core::DataPolicy;
@@ -61,24 +62,9 @@ use local_rag_store::{
     set_repo_data_policy, set_repo_setting,
 };
 
+use crate::keys::{is_ctrl, step};
 use crate::store_read::open_read_offline_safe;
 use crate::store_write::open_write_offline_safe;
-
-fn step(selected: usize, down: bool, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    if down {
-        (selected + 1).min(len - 1)
-    } else {
-        selected.saturating_sub(1)
-    }
-}
-
-fn is_ctrl_x(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-}
 
 const DATA_POLICIES: [DataPolicy; 4] = [
     DataPolicy::LocalOnly,
@@ -472,7 +458,7 @@ fn handle_setting_form_key(nav: &RepoSettingsNav, key_event: KeyEvent) -> RepoSe
         return RepoSettingsKeyOutcome::Nav(nav.clone());
     };
 
-    if is_ctrl_x(&key_event) {
+    if is_ctrl(&key_event, 'x') {
         return RepoSettingsKeyOutcome::Nav(RepoSettingsNav::RepoDetail {
             repo_id: repo_id.clone(),
             selected: *list_selected,

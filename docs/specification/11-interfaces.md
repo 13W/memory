@@ -838,10 +838,9 @@ Data access per screen, decided by ADR-0008:
   operation the MCP catalog (§2's `annotations`, `X-003`) marks `destructiveHint: true` — today
   exactly `retract_memory` — read from `tools::catalog()` as the single source of truth, never a
   TUI-local classification.
-- **Server Settings** (`config.toml`): reading is already possible (`Config::load`); writing
-  requires a new `Config::save`/TOML-serialization primitive this section requires but
-  `crates/core/src/config/mod.rs` does not yet have (`T18-07`). A saved change takes effect only
-  after `local-rag restart` — no daemon config hot-reload exists or is added by this group.
+- **Server Settings** (`config.toml`): a staged form over all six `Config` sections, flushed by
+  `Config::save` (TOML-serialization, `T18-07`) on `Ctrl+S`. A saved change takes effect only after
+  `local-rag restart` — no daemon config hot-reload exists or is added by this group.
 - **Logs** (recent per-tool calls) and **live queue occupancy** inside Status: the one exception
   — this data exists only inside a running daemon's memory, never in SQLite. Requires new daemon
   instrumentation (`T18-08`): an in-memory ring buffer of recent calls plus per-tool counters,
@@ -1133,3 +1132,57 @@ tests and pure navigation/cycle unit tests in `repo_settings.rs` itself. `step` 
 `is_ctrl_x` (the `SettingForm`/`EditForm`-style cancel predicate) are deliberately third and second
 small-helper duplicates respectively, not yet extracted — the same "wait for a genuine third
 occurrence of identical code" threshold `store_read.rs`'s own T18-04 extraction already set.
+
+As-built note (T18-07, `[SPEC]`). The Server Settings screen is real:
+`local_rag_tui::server_settings` (new `crates/local-rag-tui/src/server_settings.rs`), the 5th
+top-level screen (digit `5`, `SCREENS: [Screen; 5]`). Backend: `crates/core/src/config/mod.rs`
+gained `Serialize` on `DaemonConfig`/`StorageConfig`/`IndexConfig`/`SpoolConfig`/`MemoryConfig`/
+`RawConfig`/`RawModels`, `Config::to_raw` (the inverse of the existing private `from_raw` — crosses
+`DataPolicy` back to its canonical string), `Config::to_toml_string`, and `Config::save(&self,
+config_dir)` — `fs::write` to a `.tmp` sibling then `fs::rename` into place (the same plain
+atomic-write idiom `crates/projection/src/fake.rs`/`brute_force.rs` already use), gated by a new
+`config.save.between_write_and_rename` failpoint (`crates/core` gained the same optional
+`local-rag-test-support` + `failpoints` feature wiring `crates/models`/`crates/embed` already
+carry) fired after the `.tmp` write and before the rename. A new `ConfigError::TomlSerialize`
+variant carries `toml::ser::Error` (distinct from the existing `Toml(toml::de::Error)`, the
+opposite direction). Round-trip fidelity (`load` → mutate → `save` → `load` preserves every typed
+field; an unknown key present on load cannot reappear on save) and the atomic-write crash
+guarantee (old file byte-for-byte untouched, no half-written file, a retry succeeds) are both
+covered — the former inline in `config/mod.rs`'s own `#[cfg(test)]` module, the latter in a new
+`crates/core/tests/config_save_faults.rs` (`#![cfg(feature = "failpoints")]`), following
+`crates/models/tests/install_faults.rs`'s own `Armed`-guard-plus-serializing-`Mutex` shape.
+
+Unlike every prior write screen, this one stages edits rather than applying them immediately:
+`ServerSettingsNav` carries a working `Config` copy across frames (`FieldList`/`FieldForm`/
+`SavedPrompt`, all three carrying `config`), mutated in memory as each of 16 fields
+(`FieldId`, one per `Config` leaf across all six sections) is edited through `FieldForm`'s
+free-text entry — including `models.data_policy`, validated by `DataPolicy::from_str_value` on
+submit exactly like every numeric field's own `str::parse`, deliberately not given Repo Settings'
+own `p`/`P` cycling shortcut, to keep one interaction model for all 16 fields. Nothing is written
+to `config.toml` until `Ctrl+S` (`FieldList` → `Execute(Save)`), which transitions to
+`SavedPrompt` — "saved, takes effect after `local-rag restart`" — offering `r`/`R` to invoke it
+immediately (`execute_server_settings_action`'s `Restart` action, resolving the sibling `local-rag`
+binary the same way `local-rag-proxy::connect::resolve_daemon_binary_path`/`local-rag/src/cli/
+service.rs`'s own restart logic each already do, invoked synchronously via
+`std::process::Command::status` with stdio redirected away from the TUI's own — no live config
+reload in the daemon, unchanged from this section's own text above). This screen is also the first
+not backed by `state.sqlite`/`StoreLayout` at all: `compute_server_settings_data`/
+`execute_server_settings_action` take a plain `config_dir: &Path` (`local_rag_core::paths::
+config_dir`, resolved once by `main.rs` alongside `StoreLayout`), and `handle_server_settings_key`
+takes no `data` parameter (unlike every other screen's handler) since nothing here is re-read per
+frame — the working `Config` already lives on `nav`. `main.rs`'s own `server_settings_nav` starts
+from a new `initial_nav(config_dir)` (a real `Config::load`, falling back to defaults with an
+explanatory `status` on an unreadable/invalid file) rather than `::default()`, the one screen whose
+starting nav value requires a genuine disk read.
+
+Also extracted at this task: `crate::keys` (new `crates/local-rag-tui/src/keys.rs`, crate-private),
+`step` and `is_ctrl_x`'s third and second small-helper duplicates respectively (`repositories.rs`/
+`memory.rs`/`repo_settings.rs`) finally past the "wait for a genuine third occurrence" threshold
+T18-06's own as-built note above named — `is_ctrl_x` generalized to `is_ctrl(key, c)` since this
+screen needs a second control chord (`Ctrl+S`) alongside the existing `Ctrl+X`. New
+`tests/server_settings_offline.rs` (`TempHome` + a direct `home.join("config")` path, the same
+`Env`-free convention `crates/core/tests/config.rs` already uses — nothing here goes through
+`paths::config_dir`'s own environment-variable resolution) covers `initial_nav` on a missing/valid/
+invalid file and `execute_server_settings_action(Save)` writing a real, `Config::load`-readable
+file; plus inline `#[cfg(test)]` `TestBackend` render tests and pure unit tests for every field's
+parse/display round-trip and every nav/key transition in `server_settings.rs` itself.

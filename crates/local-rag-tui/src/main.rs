@@ -12,16 +12,21 @@
 //! [`is_text_entry_key`], consulted only while `memory::captures_all_keys(&memory_nav)` — see that
 //! function's own doc and `memory.rs`'s module doc for the full rationale. T18-06 adds Repo
 //! Settings (`local_rag_tui::repo_settings`), the same `{Nav, Execute}`/`captures_all_keys`
-//! carve-out shape reused for its own `SettingForm`.
+//! carve-out shape reused for its own `SettingForm`. T18-07 adds Server Settings
+//! (`local_rag_tui::server_settings`) — the first screen resolved via `local_rag_core::paths::
+//! config_dir` rather than `StoreLayout`, so `run_app` now also takes a `config_dir: &Path`; its
+//! `server_settings_nav` starts from `server_settings::initial_nav(config_dir)` (a real on-disk
+//! read), not `::default()`, unlike every other screen's own nav — see that function's own doc.
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use local_rag_core::paths::{StoreLayout, SystemEnv};
 use local_rag_tui::memory::{self, MemoryNav};
 use local_rag_tui::repo_settings::{self, RepoSettingsNav};
 use local_rag_tui::repositories::{self, RepositoriesNav};
+use local_rag_tui::server_settings;
 use local_rag_tui::status::{compute_status_data, render_status};
 use ratatui::DefaultTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -39,13 +44,15 @@ enum Screen {
     Repositories,
     Memory,
     RepoSettings,
+    ServerSettings,
 }
 
-const SCREENS: [Screen; 4] = [
+const SCREENS: [Screen; 5] = [
     Screen::Status,
     Screen::Repositories,
     Screen::Memory,
     Screen::RepoSettings,
+    Screen::ServerSettings,
 ];
 
 fn main() -> ExitCode {
@@ -64,8 +71,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let config_dir = match local_rag_core::paths::config_dir(&SystemEnv) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("{BIN}: could not resolve the config directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match ratatui::run(|terminal| run_app(terminal, &layout)) {
+    match ratatui::run(|terminal| run_app(terminal, &layout, &config_dir)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{BIN}: {err}");
@@ -84,12 +98,17 @@ fn main() -> ExitCode {
 /// handled in — the same WYSIWYG discipline Status already had (recompute every iteration), now
 /// also needed so `Enter` resolves "which row is selected" against the exact data just drawn, not
 /// a stale prior frame's.
-fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Result<()> {
+fn run_app(
+    terminal: &mut DefaultTerminal,
+    layout: &StoreLayout,
+    config_dir: &Path,
+) -> std::io::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut screen = Screen::Status;
     let mut repositories_nav = RepositoriesNav::default();
     let mut memory_nav = MemoryNav::default();
     let mut repo_settings_nav = RepoSettingsNav::default();
+    let mut server_settings_nav = server_settings::initial_nav(config_dir);
 
     loop {
         // `Terminal::draw` calls `Terminal::autoresize` on every call, so a terminal resize needs
@@ -158,6 +177,30 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
                         repo_settings::RepoSettingsKeyOutcome::Execute(action) => {
                             repo_settings_nav =
                                 repo_settings::execute_repo_settings_action(layout, action);
+                        }
+                    }
+                }
+                (ev, force_local)
+            }
+            Screen::ServerSettings => {
+                let data = server_settings::compute_server_settings_data(&server_settings_nav);
+                terminal.draw(|frame| server_settings::render_server_settings(frame, &data))?;
+                let ev = event::read()?;
+                // Same carve-out as Memory's own `EditForm`/Repo Settings' `SettingForm`, for
+                // `FieldForm`'s identical free-text needs — see `server_settings.rs`'s module doc.
+                let force_local = server_settings::captures_all_keys(&server_settings_nav)
+                    && is_text_entry_key(&ev);
+                if force_local || !is_global_key(ev.clone()) {
+                    match server_settings::handle_server_settings_key(
+                        &server_settings_nav,
+                        ev.clone(),
+                    ) {
+                        server_settings::ServerSettingsKeyOutcome::Nav(next) => {
+                            server_settings_nav = next
+                        }
+                        server_settings::ServerSettingsKeyOutcome::Execute(action) => {
+                            server_settings_nav =
+                                server_settings::execute_server_settings_action(config_dir, action);
                         }
                     }
                 }
@@ -299,6 +342,10 @@ mod tests {
         assert_eq!(
             screen_for_key(press(KeyCode::Char('4'))),
             Some(Screen::RepoSettings)
+        );
+        assert_eq!(
+            screen_for_key(press(KeyCode::Char('5'))),
+            Some(Screen::ServerSettings)
         );
     }
 
