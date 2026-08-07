@@ -233,6 +233,23 @@ precisely than the shipped code:
   `"normal"` in practice today — included for the contract's own "daemon/version/store status"
   completeness, not because MigrationOnly ever reaches it.
 
+As-built note (T19-05, `[SPEC]`, group 19 plan). `stats()` gained a `tool_calls` field: `tools/
+call` invocation counts by tool name, both `session` (this connection's own calls) and
+`since_daemon_start` (every session's calls, summed, since the daemon process started) — what
+turns D-041's own stated limitation, "agentic behavioral compliance is not automatable as a unit
+test," into an observed number rather than an impression. Both are `Vec<{name, count}>` sorted by
+tool name, for deterministic JSON. Recording happens in `dispatch::route_tools_call`, immediately
+after the tool name is parsed and *before* dispatch to the tool's own handler (including before
+the `MigrationOnly` short-circuit) — an attempted call is counted, not only a successful one, so a
+degraded-mode or argument-invalid call still shows up. `session` is keyed by the request's own
+`session_id` (spec 02 §3.3 — one `local-rag-proxy` process/connection) and is cleared once every
+connection sharing that id has closed (`local_rag::daemon::tool_calls::ToolCallCounters`, an RAII
+guard registered alongside the existing `SessionRegistry` one at connection accept) — bounded
+memory on a long-lived daemon serving many short Claude Code sessions, not a token history.
+`since_daemon_start` is never cleared short of a restart and is deliberately **not persisted**
+(`[SPEC]`, this task's own scope boundary) — `state.sqlite`'s schema is unchanged; a daemon
+restart resets it to zero, the same way `write_queues`' own in-memory numbers already do.
+
 As-built note (T15-05, `[SPEC]`): the eight memory-write/candidate-review tools this section's
 table names — `remember`, `approve_memory_candidate`, `reject_memory_candidate`,
 `edit_memory_candidate`, `edit_memory`, `retract_memory`, `merge_memories`, `give_feedback` — are

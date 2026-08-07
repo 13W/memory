@@ -33,6 +33,7 @@ use super::session::SessionRegistry;
 #[cfg(unix)]
 use super::shutdown::ShutdownSignal;
 use super::shutdown::drain_and_shutdown;
+use super::tool_calls::ToolCallCounters;
 
 /// Why [`DaemonHandle::start`] could not bring the daemon up at all (distinct
 /// from [`DaemonMode::MigrationOnly`], which is a *successful* start in a
@@ -324,6 +325,7 @@ impl DaemonHandle {
         let lock_info = lock_guard.info().clone();
 
         let sessions = SessionRegistry::new();
+        let tool_calls = ToolCallCounters::new();
         let shutdown_requested = Arc::new(Notify::new());
         let handshake_ctx = HandshakeContext {
             instance_uuid: Arc::from(instance_uuid.as_str()),
@@ -331,9 +333,16 @@ impl DaemonHandle {
             supported_proto,
             mode: mode_rx.clone(),
             sessions: sessions.clone(),
+            tool_calls: tool_calls.clone(),
             shutdown_requested: Arc::clone(&shutdown_requested),
         };
-        let mcp_handler = McpHandler::new(engine, memory_ctx, mode_rx.clone(), system_now_ms);
+        let mcp_handler = McpHandler::new(
+            engine,
+            memory_ctx,
+            mode_rx.clone(),
+            system_now_ms,
+            tool_calls,
+        );
         let (handshake_stop_tx, handshake_stop_rx) = oneshot::channel();
         let handshake_join = tokio::spawn(serve_connections(
             listener,

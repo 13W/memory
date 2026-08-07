@@ -43,6 +43,7 @@ pub mod resume;
 pub mod search;
 pub mod session;
 pub mod shutdown;
+pub mod tool_calls;
 
 pub use consolidation_trigger::{
     ConsolidationTriggerParams, SessionTickOutcome, consolidation_trigger_tick,

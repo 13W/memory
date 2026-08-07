@@ -274,7 +274,8 @@ pub fn catalog() -> Value {
                 "name": "stats",
                 "description": "Store-wide counts of memory entries (by kind/state) and \
                     pending candidates (by review state), write-queue backpressure, and — when \
-                    the worktree resolves — its projection status.",
+                    the worktree resolves — its projection status; also tools/call counts by \
+                    name, this session and since daemon start.",
                 "annotations": annotations("Store statistics", true, false, true),
                 "inputSchema": {
                     "type": "object",

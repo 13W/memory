@@ -897,6 +897,21 @@ async fn stats_reports_counts_by_kind_state_and_pending_candidates_by_state() {
         "{text}"
     );
 
+    // T19-05: `stats` itself is a `tools/call` — recording happens before
+    // dispatch, so its own call is always counted in both slices. This is
+    // the only call this connection/daemon has made, so both are exactly
+    // one entry.
+    assert_eq!(
+        parsed["tool_calls"]["session"],
+        serde_json::json!([{"name": "stats", "count": 1}]),
+        "{text}"
+    );
+    assert_eq!(
+        parsed["tool_calls"]["since_daemon_start"],
+        serde_json::json!([{"name": "stats", "count": 1}]),
+        "{text}"
+    );
+
     drop(home);
     handle.shutdown().await;
 }

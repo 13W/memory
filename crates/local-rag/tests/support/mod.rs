@@ -622,17 +622,31 @@ pub async fn start(layout: &StoreLayout) -> DaemonHandle {
 pub struct Client {
     stream: StdUnixStream,
     reader: StdBufReader<StdUnixStream>,
+    session_id: String,
 }
 
 impl Client {
     pub fn connect(socket_path: &Path) -> Self {
+        Self::connect_with_session(socket_path, "sess-1")
+    }
+
+    /// Like [`Client::connect`], but with a caller-chosen `session_id` —
+    /// carried both in the HELLO handshake and in every request's
+    /// `RequestContext` (T19-05's own per-session `tools/call` counters key
+    /// on exactly this value), so two `Client`s connected with different
+    /// ids are genuinely distinct sessions from the daemon's point of view.
+    pub fn connect_with_session(socket_path: &Path, session_id: &str) -> Self {
         let stream = StdUnixStream::connect(socket_path).expect("connect");
         let reader = StdBufReader::new(stream.try_clone().expect("clone stream"));
-        let mut client = Client { stream, reader };
+        let mut client = Client {
+            stream,
+            reader,
+            session_id: session_id.to_string(),
+        };
         client.write(&Message::Hello(Hello {
             proto: 1,
             proxy_version: "0.0.0".to_string(),
-            session_id: "sess-1".to_string(),
+            session_id: client.session_id.clone(),
             worktree_root: None,
             harness: "claude-code".to_string(),
         }));
@@ -662,7 +676,7 @@ impl Client {
     pub fn call(&mut self, mcp_json: &str, worktree_root: Option<&str>) {
         let mcp = RawValue::from_string(mcp_json.to_string()).expect("valid json");
         let context = RequestContext {
-            session_id: "sess-1".to_string(),
+            session_id: self.session_id.clone(),
             worktree_root: worktree_root.map(str::to_string),
             repo_hint: None,
         };

@@ -74,6 +74,80 @@ async fn explicit_context_routing_across_two_requests_on_one_connection() {
     handle.shutdown().await;
 }
 
+/// T19-05, spec 11 §2: `tools/call` counters are per-session (isolated
+/// between two distinct connections) and aggregate (summed across every
+/// session since the daemon started) — `stats`'s own `tool_calls` field.
+/// Two connections with different `session_id`s run sequentially (each
+/// `tokio::task::spawn_blocking(...).await` fully completes before the
+/// next starts), so the resulting counts are deterministic.
+#[tokio::test]
+async fn tool_call_counters_are_isolated_per_session_and_summed_in_the_aggregate() {
+    let (_home, layout) = open_layout();
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+
+    let socket_path_a = socket_path.clone();
+    let stats_a = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect_with_session(&socket_path_a, "session-a");
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{}}}"#,
+            None,
+        );
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{}}}"#,
+            None,
+        );
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    let socket_path_b = socket_path.clone();
+    let stats_b = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect_with_session(&socket_path_b, "session-b");
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{}}}"#,
+            None,
+        );
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    let text_a = stats_a["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed_a: Value = serde_json::from_str(text_a).unwrap();
+    assert_eq!(
+        parsed_a["tool_calls"]["session"],
+        serde_json::json!([{"name": "recall", "count": 2}, {"name": "stats", "count": 1}]),
+        "session-a's own counts: two recalls plus this stats call itself: {text_a}"
+    );
+
+    let text_b = stats_b["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed_b: Value = serde_json::from_str(text_b).unwrap();
+    assert_eq!(
+        parsed_b["tool_calls"]["session"],
+        serde_json::json!([{"name": "recall", "count": 1}, {"name": "stats", "count": 1}]),
+        "session-b must not see session-a's calls: {text_b}"
+    );
+    // Aggregate reflects both sessions combined: 3 recalls total (2 from A
+    // + 1 from B), and 2 stats calls (A's own + this one — recording
+    // happens before this response is built, so B's own call already
+    // counts toward what it sees).
+    assert_eq!(
+        parsed_b["tool_calls"]["since_daemon_start"],
+        serde_json::json!([{"name": "recall", "count": 3}, {"name": "stats", "count": 2}]),
+        "{text_b}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A real, existing directory that was never registered, and a path that
 /// does not exist at all, both resolve to `WORKTREE_NOT_INDEXED` — a
 /// normal tool result (`isError: true`), never a JSON-RPC-level error and
