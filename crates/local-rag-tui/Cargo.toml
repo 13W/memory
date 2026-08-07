@@ -1,0 +1,90 @@
+[package]
+name = "local-rag-tui"
+description = "local-rag terminal dashboard (skeleton; ratatui/crossterm event loop, ADR-0008)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# T18-01: the fourth product binary dist ships (spec 13 §1, amended by spec 11 §7 / ADR-0008),
+# alongside local-rag/local-rag-proxy/local-rag-hook. `publish = false` (workspace-wide) otherwise
+# hides every package from dist by default.
+[package.metadata.dist]
+dist = true
+
+[dependencies]
+# `local_rag_core::version_line` backs this binary's own `version`/`--version`/`-V` diagnostic,
+# the same convention `local-rag-proxy`/`local-rag-hook` already use. Already resolved throughout
+# the workspace — 0 new external sources.
+local-rag-core = { path = "../core" }
+# T18-02's Status/Repositories/Memory/Repo-Settings screens read/write state.sqlite/cache.sqlite
+# directly — the same architecturally-sanctioned pattern every `local-rag` CLI command already
+# uses (ADR-0008, spec 11 §7), no running daemon required. Declared here per this task's own card
+# scope; the skeleton itself opens no database. Already resolved throughout the workspace — 0 new
+# external sources.
+local-rag-store = { path = "../store" }
+# T18-08/T18-09's Logs/live-stats screens speak the two new `admin/tail_calls`/`admin/tool_stats`
+# JSON-RPC methods over the existing UDS transport this crate already defines. Declared here per
+# this task's own card scope; unused by the skeleton itself. Already resolved throughout the
+# workspace — 0 new external sources.
+local-rag-protocol = { path = "../protocol" }
+# Library half only (`pub mod daemon;`, `crates/local-rag/src/lib.rs`) — a Cargo path dependency
+# on a package that has both a lib and a bin target links only the lib target, so this never pulls
+# in `local-rag`'s CLI/daemon binary. T18-02's offline-safe Status screen calls
+# `daemon::probe::fetch_welcome` (when a daemon is live) and `daemon::lock::read_store_lock_file`
+# (best-effort fallback when it is not) — spec 11 §7's own text names both by module path.
+# Declared here per this task's own card scope; unused by the skeleton itself. This is the first
+# crate to depend on `local-rag` as a real (non-dev) dependency — `local-rag-proxy`/`local-rag-hook`
+# only ever depend on it as a dev-dependency, to spawn a real subprocess in tests — but nothing in
+# CLAUDE.md's architecture guardrails forbids it: no durable ID is derived from this edge, no
+# cross-database ATTACH is involved, and T18-02's direct state.sqlite/cache.sqlite access goes
+# through `local-rag-store`, not through this crate.
+local-rag = { path = "../local-rag" }
+# ADR-0008 `[FIXED]`: ratatui + crossterm is the chosen TUI stack (comparative TUI-vs-Web-UI
+# decision already made, not re-litigated here); `std` has no terminal-UI widget/layout toolkit.
+# `default-features = false` + `crossterm` selects exactly the crossterm backend (this workspace
+# never needs `termion`/`termwiz`/`termina`) and its own implied `std` feature, skipping the
+# `all-widgets` default (adds only the calendar widget + its own `time`/`palette`/`approx`
+# dependencies — none of ADR-0008's six screens is a calendar), `macros` (no call site yet),
+# `layout-cache`, `palette`, `serde`. `Cargo.lock` still resolves `palette`/`palette_derive`/
+# `palette_math`/`time`/`approx` (ratatui-core's own optional deps for the un-activated
+# `all-widgets`/`serde` features, present in every workspace member's Cargo.toml resolution) but
+# they compile into nothing this crate links — verified: `cargo tree -p local-rag-tui -i palette
+# --target all` prints nothing. `ratatui::run()`/`ratatui::init()`/`ratatui::restore()` (all gated
+# on the `crossterm` feature) are this task's own event-loop entry/exit — see `src/main.rs`. As of
+# ratatui 0.30 the crate is workspace-split: `ratatui-core`, `ratatui-widgets`, and (via this
+# feature) `ratatui-crossterm`. Native-linking transitive set actually new to this workspace
+# (verified via `cargo tree -p local-rag-tui -e normal --target all`, diffed against `Cargo.lock`
+# before this task): `kasuari` (a maintained fork of the unmaintained `cassowary-rs`
+# layout-constraint solver), `line-clipping`, `lru`, `strum` (+`strum_macros` build-time),
+# `unicode-truncate`, `unicode-width`, `allocator-api2` (via `hashbrown`), `instability`
+# (build-time, +`indoc`/`litrs` its own build deps). `bitflags`/`compact_str`/`hashbrown`/
+# `itertools`/`thiserror`/`unicode-segmentation` were already resolved elsewhere in the workspace
+# (`clap`/`tokenizers`/`ignore` etc.) — 0 new sources for those. None are dense-backend/model/
+# network SDKs. MIT.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# The terminal backend itself (raw mode, alternate screen, key/mouse/resize event polling) — `std`
+# has no cross-platform terminal control API, and this is ADR-0008's own `[FIXED]` choice over
+# `termion`/`termwiz` (POSIX-only) precisely because this workspace ships a real win32-x64 dist
+# target (`dist-workspace.toml`). Declared as a direct dependency even though `ratatui-crossterm`
+# already resolves it transitively (this workspace's convention: an explicit edge for a crate this
+# code imports by name, not reliance on transitive unification — mirrors `serde_json`'s `raw_value`
+# row in CONTRIBUTING.md) — this crate's own event loop calls `crossterm::event::read()` directly.
+# Default features kept, unlike most rows in this table: every one of crossterm 0.29's own
+# defaults is load-bearing here — `events` (`mio`+`signal-hook` on unix) is what the synchronous
+# `event::poll`/`event::read` API this skeleton uses is actually built on, `windows`
+# (`crossterm_winapi`) is required for the real win32-x64 dist target, `bracketed-paste`/
+# `derive-more` are crossterm's own low-cost internal defaults. Native-linking transitive set
+# actually new to this workspace (same verification method as `ratatui`'s row above): `document
+# -features` (build-time, +`litrs`), `derive_more` (+`derive_more-impl` build-time, +`convert_case`
+# used by the derive), `parking_lot` (+`parking_lot_core`, `lock_api`), `rustix` (+`linux-raw-sys`,
+# unix-only), `signal-hook`, `signal-hook-mio`, `crossterm_winapi` (`cfg(windows)`-only, never
+# compiled on the macOS/Linux hosts this environment builds on — same disclosure pattern as
+# `notify`'s/`sysinfo`'s/`clap`'s own Windows-only branches above); `mio`/`libc` were already
+# resolved elsewhere in the workspace (`notify`) — 0 new sources for those. Not a dense-backend/
+# model/network SDK. Same license as ratatui (MIT).
+crossterm = "0.29"
+
+[lints]
+workspace = true

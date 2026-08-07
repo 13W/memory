@@ -19,6 +19,7 @@ members = [
     "crates/local-rag",
     "crates/local-rag-proxy",
     "crates/local-rag-hook",
+    "crates/local-rag-tui",
     "crates/test-support",
     "crates/xtask",
 ]
@@ -39,6 +40,7 @@ default-members = [
     "crates/local-rag",
     "crates/local-rag-proxy",
     "crates/local-rag-hook",
+    "crates/local-rag-tui",
 ]
 
 [workspace.package]

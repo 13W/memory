@@ -74,7 +74,7 @@ function resolvePlatformPackage(fromFile, opts = {}) {
  *   package's root (i.e. `ResolveResult.packageDir` on an `ok:true` result).
  * @param {string} platform - `process.platform`-shaped value; only `"win32"`
  *   changes the suffix.
- * @param {'local-rag'|'local-rag-proxy'|'local-rag-hook'} name
+ * @param {'local-rag'|'local-rag-proxy'|'local-rag-hook'|'local-rag-tui'} name
  * @returns {string} absolute path, e.g. ".../bin/local-rag-proxy"
  */
 function binaryPath(packageDir, platform, name) {

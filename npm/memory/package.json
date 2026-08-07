@@ -6,7 +6,8 @@
   "type": "commonjs",
   "bin": {
     "local-rag-mcp": "bin/local-rag-mcp.js",
-    "local-rag-hook": "bin/local-rag-hook.js"
+    "local-rag-hook": "bin/local-rag-hook.js",
+    "local-rag-dashboard": "bin/local-rag-dashboard.js"
   },
   "files": [
     "bin",
