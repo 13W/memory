@@ -764,3 +764,30 @@ Data access per screen, decided by ADR-0008:
 
 Distribution follows §6's own npm/platform-package convention (`local-rag-tui` alongside
 `local-rag`/`local-rag-proxy`/`local-rag-hook`) — `T18-01`'s own card.
+
+As-built note (T18-01, `[SPEC]`). The skeleton above is real: `crates/local-rag-tui` (workspace
+member, `default-members`, `[package.metadata.dist] dist = true` — the fourth product binary
+`dist plan` emits, verified against the same `cargo-dist 0.32.0`/`dist-workspace.toml`
+auto-discovery T17-03 already relies on; that file itself is unchanged). `src/main.rs` is a
+bin-only crate (no `src/lib.rs`, the same shape as `local-rag-proxy` — no reusable library logic
+exists yet to justify one). The event loop is `ratatui::run`/`DefaultTerminal` (feature
+`crossterm`, ratatui 0.30's own convenience entry point) rather than a hand-rolled
+`enable_raw_mode`/`set_hook` pair — raw mode, the alternate screen, and a panic hook that restores
+both before delegating to the previously-installed hook are all ratatui's own, already-tested
+responsibility, not reimplemented here. Resize needs no dedicated branch: `Terminal::draw` calls
+`Terminal::autoresize` on every call, so looping back to `draw()` after any event (including
+`Event::Resize` itself) already re-queries the real terminal size. Quit is `q`/`Esc`/`Ctrl+C`; no
+screen exists yet to reserve any other binding for. Dependencies were added per this task's own
+card scope, ahead of their first call site: `local-rag-store`/`local-rag-protocol` (first used by
+T18-02/T18-08–T18-09) and `local-rag`'s **library** half only (`pub mod daemon;` — this crate
+links only its lib target, never its binary; first used by T18-02's
+`daemon::probe::fetch_welcome`/`daemon::lock::read_store_lock_file`). `local-rag-core` is the one
+dependency with a real call site already, `version_line`, backing this binary's own
+`version`/`--version`/`-V` diagnostic — the same convention `local-rag-proxy`/`local-rag-hook`
+already use. `CONTRIBUTING.md`'s dependency-policy table gained `ratatui`/`crossterm` rows
+(workspace-split as of ratatui 0.30 — `ratatui-core`/`ratatui-widgets`/`ratatui-crossterm` — MIT
+throughout; `crossterm`'s own transitive set MIT). Distribution: `npm/memory/bin/
+local-rag-dashboard.js` (third launcher entrypoint, `stdio: 'inherit'` load-bearing here — a
+full-screen terminal app needs the real inherited TTY, not a pipe) and `npm/memory/src/
+resolve.js`'s `binaryPath` JSDoc union extended to `'local-rag-tui'` (the function itself was
+already binary-name-agnostic).
