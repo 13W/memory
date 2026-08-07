@@ -524,6 +524,46 @@ for it. Three encoding details this section states less precisely than the shipp
 "provenance separate from text, available via tools only" `[FIXED]`, enforced at the type level:
 the formatter cannot print what it was never given.
 
+As-built note (T19-02, `[SPEC]`, group 19 plan — `docs/implementation-plan/groups/
+19-mcp-adoption.md`). A fixed tool-routing trailer is appended once, after the closing
+`</memory>` tag, whenever the block is non-empty:
+
+```
+Tools for this workspace: search_code (use instead of Grep/Glob when meaning matters or the
+identifier is unknown), recall (call before your first file read, grep, or search this
+session), remember (call the moment something durable surfaces). If these tools are deferred,
+load them via tool search first.
+```
+
+`local_rag_memory::recall::format::TOOL_ROUTING_TRAILER` is the single point of truth: both the
+`recall` MCP tool's direct `RecallResult.additional_context` and the hook-injected
+`SessionStart`/`UserPromptSubmit` `additionalContext` (11 §3.2) read the identical string —
+`format_additional_context` is still the only writer, so the two channels cannot drift apart.
+Four properties this note fixes precisely, none of them changing prior `[FIXED]` behavior:
+
+- **Empty recall is unaffected**: the trailer is appended after the entry loop, past the
+  `entries.is_empty()` early return (line ~129 of `format.rs`) that already produces `""` — it
+  does not sit behind a second, separately-maintained check. "Empty recall ⇒ no output at all"
+  (this section, above) still holds exactly as before T19-02.
+- **Outside the untrusted-content tag, on purpose**: the trailer is this daemon's own trusted,
+  hardcoded guidance — not recalled memory text — so it is emitted after `</memory>\n`, never
+  inside it. Placing it inside the tag would blur the boundary spec 12 §4 draws around "recalled
+  memory is untrusted" (the tag is exactly what separates recalled content from everything else),
+  even though the trailer's own text carries no injection risk (it is a compile-time constant,
+  never derived from stored/recalled data).
+- **Not sanitized/escaped/capped**: unlike entry text, the trailer does not pass through
+  `sanitize`/`escape_delimiter`/`cap_bytes` (12 §4 item 1) — those defenses exist for
+  attacker-influenced recalled text; the trailer has no such input.
+- **Terminology matches T19-01**, but is not verbatim identical to the tool catalog's
+  descriptions — the trailer re-renders on every non-empty recall (every `UserPromptSubmit`,
+  potentially), unlike the `tools/list` catalog a client fetches once per session, so it stays
+  terse by deliberate choice, not oversight.
+
+Whether an **empty** recall should also carry a first-session adoption nudge (arguably the
+weakest-adoption case of all) is an explicitly open product question, not decided by this task —
+registered `blocked` as `D-042` (`DEVIATIONS.md`) pending an owner decision / new design revision,
+the same disposition this group already uses for `T19-06`.
+
 ## 6. CLI `[SPEC surface, commands implied by design]`
 
 ```
