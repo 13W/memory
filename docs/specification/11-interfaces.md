@@ -366,7 +366,7 @@ that competition by construction. Two caller-facing changes to `mcp::tools::cata
   workflow-timing trigger ("Call before your first file read, grep, or search …" /
   "Call the moment something durable surfaces … not later"). Tool names, `inputSchema`, and
   `annotations` are unchanged (spec-fixed); only prose changed.
-- The eight administrative/review tools (`list_memory`, `list_memory_candidates`,
+- The twelve administrative/review tools (`list_memory`, `list_memory_candidates`,
   `inspect_memory_evidence`, `stats`, `health`, `approve_memory_candidate`,
   `reject_memory_candidate`, `edit_memory_candidate`, `edit_memory`, `retract_memory`,
   `merge_memories`, `give_feedback`) are held to 1–2 sentences — they are not part of the
