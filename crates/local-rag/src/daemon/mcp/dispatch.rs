@@ -22,17 +22,21 @@ use super::{content, instructions, jsonrpc, tools};
 use crate::daemon::gitroot;
 use crate::daemon::memory::MemoryContext;
 use crate::daemon::mode::DaemonMode;
+use crate::daemon::tool_calls::ToolCallCounters;
 
 /// Everything one `dispatch` call needs. Built fresh per request by
 /// [`super::McpHandler::handle`] — `now_ms` in particular must be a live
 /// clock read, not a startup-frozen value, since the FTS staleness decision
-/// `SearchEngine` makes is clock-dependent.
+/// `SearchEngine` makes is clock-dependent. `tool_calls` is the one
+/// exception to "fresh per request": it borrows the daemon-lifetime shared
+/// counters (spec 11 §2, T19-05), the same instance every request shares.
 pub struct DispatchContext<'a> {
     pub engine: Option<&'a SearchEngine>,
     pub memory: Option<&'a MemoryContext>,
     pub mode: &'a DaemonMode,
     pub request_context: &'a RequestContext,
     pub now_ms: i64,
+    pub tool_calls: &'a ToolCallCounters,
 }
 
 /// Parse and answer one MCP JSON-RPC message. `None` means `text` was a
@@ -101,6 +105,17 @@ async fn route_tools_call(
 ) -> Result<Value, (i64, String)> {
     let call = tools::parse_tool_call(params).map_err(|msg| (jsonrpc::INVALID_PARAMS, msg))?;
 
+    // T19-05, spec 11 §2: count the attempt, not the outcome — before the
+    // MigrationOnly short-circuit below and before per-tool argument
+    // validation, so a degraded-mode or malformed call still shows up in
+    // `stats`. A client only ever sends names from the catalog it fetched;
+    // an unrecognized name here (the `other` arm below) still gets counted
+    // rather than specially filtered — a harmless one-off entry for a
+    // malformed/adversarial client, or a signal worth seeing for a genuine
+    // protocol bug, not silently dropped.
+    ctx.tool_calls
+        .record(&ctx.request_context.session_id, &call.name);
+
     // `engine`/`memory` are always `Some` together or `None` together (built
     // from the same `(state_db, cache_db)` pair in `lifecycle.rs`) — one
     // combined gate, not two, so this stays the identical single
@@ -131,7 +146,16 @@ async fn route_tools_call(
         "inspect_memory_evidence" => {
             super::memory::inspect_memory_evidence(memory, &call.arguments).await
         }
-        "stats" => super::memory::stats(memory, root, &call.arguments).await,
+        "stats" => {
+            super::memory::stats(
+                memory,
+                root,
+                &call.arguments,
+                &ctx.request_context.session_id,
+                ctx.tool_calls,
+            )
+            .await
+        }
         "health" => super::memory::health(memory, ctx.mode, &call.arguments).await,
         "remember" => {
             super::memory_write::remember(

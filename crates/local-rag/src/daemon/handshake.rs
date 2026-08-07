@@ -64,10 +64,11 @@ use tokio::sync::{Notify, oneshot, watch};
 
 use super::mode::DaemonMode;
 use super::session::SessionRegistry;
+use super::tool_calls::ToolCallCounters;
 
 /// Everything a per-connection task needs — cheap to clone per accept
-/// (`Arc<str>`/`watch::Receiver`/`SessionRegistry`/`Arc<Notify>` all already
-/// share their underlying state across clones).
+/// (`Arc<str>`/`watch::Receiver`/`SessionRegistry`/`ToolCallCounters`/
+/// `Arc<Notify>` all already share their underlying state across clones).
 #[derive(Clone)]
 pub struct HandshakeContext {
     pub instance_uuid: Arc<str>,
@@ -75,6 +76,11 @@ pub struct HandshakeContext {
     pub supported_proto: RangeInclusive<u16>,
     pub mode: watch::Receiver<DaemonMode>,
     pub sessions: SessionRegistry,
+    /// `tools/call` observability counters (spec 11 §2, T19-05) — a guard
+    /// begins tracking this connection's session id alongside the existing
+    /// `SessionRegistry` registration below; `mcp::McpHandler` records into
+    /// the same shared counters on every dispatched call.
+    pub tool_calls: ToolCallCounters,
     /// Signaled once when any connection sends `ShutdownRequest` (spec 02
     /// §4.2, 13 §4's upgrade flow) — `lifecycle::wait_for_shutdown_trigger`
     /// is the reader.
@@ -204,6 +210,7 @@ async fn handle_connection<H: RequestHandler>(
     }
 
     let _session_guard = ctx.sessions.register(hello.session_id.clone());
+    let _tool_call_guard = ctx.tool_calls.begin_session(hello.session_id.clone());
 
     loop {
         let Some(line) = read_bounded_line(&mut reader, MAX_MESSAGE_BYTES).await else {
@@ -307,6 +314,7 @@ mod tests {
             supported_proto,
             mode: mode_rx,
             sessions: SessionRegistry::new(),
+            tool_calls: ToolCallCounters::new(),
             shutdown_requested: Arc::new(Notify::new()),
         }
     }

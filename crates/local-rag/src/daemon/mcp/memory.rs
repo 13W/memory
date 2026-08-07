@@ -499,6 +499,30 @@ struct WorktreeStatsWire {
     projection_last_error: Option<String>,
 }
 
+/// One tool's `tools/call` count (T19-05, spec 11 §2).
+#[derive(Debug, Serialize)]
+struct ToolCallCountWire {
+    name: String,
+    count: u64,
+}
+
+impl From<(String, u64)> for ToolCallCountWire {
+    fn from((name, count): (String, u64)) -> Self {
+        ToolCallCountWire { name, count }
+    }
+}
+
+/// `tools/call` counts by tool name (T19-05, spec 11 §2) — `session` is
+/// this connection's own counts (cleared when it closes), `since_daemon_start`
+/// is a running total that survives every other session's disconnect but not
+/// a daemon restart (in-memory only, `[SPEC]` deliberately not persisted).
+/// Both are sorted by tool name for deterministic JSON.
+#[derive(Debug, Serialize)]
+struct ToolCallCountsWire {
+    session: Vec<ToolCallCountWire>,
+    since_daemon_start: Vec<ToolCallCountWire>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatsResult {
     memory: MemoryStatsWire,
@@ -506,12 +530,15 @@ struct StatsResult {
     worktree: Option<WorktreeStatsWire>,
     store_instance_uuid: Option<String>,
     write_queues: WriteQueuesWire,
+    tool_calls: ToolCallCountsWire,
 }
 
 pub async fn stats(
     ctx: &MemoryContext,
     root: RequestRoot,
     args: &Map<String, Value>,
+    session_id: &str,
+    tool_calls: &crate::daemon::tool_calls::ToolCallCounters,
 ) -> Result<CallToolResult, String> {
     reject_unknown_keys(args, &[])?;
 
@@ -591,6 +618,18 @@ pub async fn stats(
                 capacity: ctx.cache.writer().queue_capacity(),
                 available: ctx.cache.writer().available_slots(),
             },
+        },
+        tool_calls: ToolCallCountsWire {
+            session: tool_calls
+                .session_snapshot(session_id)
+                .into_iter()
+                .map(ToolCallCountWire::from)
+                .collect(),
+            since_daemon_start: tool_calls
+                .aggregate_snapshot()
+                .into_iter()
+                .map(ToolCallCountWire::from)
+                .collect(),
         },
     }))
 }

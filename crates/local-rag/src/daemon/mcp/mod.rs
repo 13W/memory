@@ -71,6 +71,10 @@ pub struct McpHandler {
     /// clock-dependent, so a stale `now_ms` would silently misjudge it on
     /// every request after the first.
     now: fn() -> i64,
+    /// `tools/call` observability counters (spec 11 §2, T19-05) — the same
+    /// shared instance every connection's `HandshakeContext::tool_calls`
+    /// guard tracks; `dispatch::route_tools_call` records into it.
+    tool_calls: super::tool_calls::ToolCallCounters,
 }
 
 impl McpHandler {
@@ -79,12 +83,14 @@ impl McpHandler {
         memory: Option<Arc<MemoryContext>>,
         mode: watch::Receiver<DaemonMode>,
         now: fn() -> i64,
+        tool_calls: super::tool_calls::ToolCallCounters,
     ) -> Self {
         McpHandler {
             engine,
             memory,
             mode,
             now,
+            tool_calls,
         }
     }
 }
@@ -98,6 +104,7 @@ impl RequestHandler for McpHandler {
             mode: &mode,
             request_context: &ctx,
             now_ms: (self.now)(),
+            tool_calls: &self.tool_calls,
         };
         let response_text = dispatch::dispatch(mcp.get(), &dispatch_ctx).await?;
         Some(RawValue::from_string(response_text).expect("dispatch always produces valid JSON"))
