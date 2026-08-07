@@ -61,6 +61,30 @@ distinct from the npm launcher T17-01/T17-03 already cover above:
   execs the cached native binary directly, no Node at all); the MCP server pays this once per
   session, not once per event the way the hook's own tighter budget matters for.
 
+As-built note (T19-04, `[SPEC]`, group 19 plan). A fifth adoption channel, alongside
+`SERVER_INSTRUCTIONS` (D-041), the tool catalog (T19-01), and the recall trailer (T19-02):
+`plugin/skills/memory-first-workflow/SKILL.md`, a Claude Code plugin skill — a compact
+built-in-tool → local-rag-tool routing table reusing the exact trigger phrasing T19-01 settled on
+for all five read-heavy tools (`search_code`, `get_file_context`, `project_overview`, `recall`,
+`remember`), plus the `RECALL → SEARCH_CODE → THINK → ACT → REMEMBER` cycle `SERVER_INSTRUCTIONS`
+(D-041) already carries, quoted verbatim (same arrow character, U+2192) for cross-channel
+consistency. Verified against the official reference (`code.claude.com/docs/en/{plugins-reference,
+skills,plugins}`): skills ship at `<plugin>/skills/<name>/SKILL.md` — **not**
+`.claude-plugin/skills/`, that directory holds only `plugin.json` — auto-discovered on install with
+no `plugin.json` entry, the identical default-location convention `hooks/hooks.json`/`.mcp.json`
+already use; the manifest's own `skills` field exists only to *add* extra non-default paths, never
+to register the default one. No `disable-model-invocation`/`user-invocable` override: both stay
+default (`true`), so the skill's `description` stays in every session's skill listing and Claude
+can route to it without an explicit invocation — the entire point of this channel, and a deliberate
+divergence from the official quickstart's own canonical example, which defaults the other way
+(`disable-model-invocation: true`, user-invocable only). Confirmed via a real
+`claude plugin marketplace add`/`install`/`details` round trip:
+`claude plugin details memory@memory` reports `Skills (1)  memory-first-workflow`, ~90 always-on /
+~200 on-invoke projected tokens. `install-uninstall.test.js`'s existing repo-wide
+`git status --porcelain` diff (unchanged since T17-02) already proves the skill's own static files
+never write into a user's project on install/uninstall — no new test needed for that half of the
+"plugin packaging must not modify users' repositories" guardrail.
+
 ## 2. Launcher requirements (verified by packaging tests) `[FIXED list]`
 
 - signal forwarding + reliable termination of the stdio child; CTRL-C / SIGTERM correctness;

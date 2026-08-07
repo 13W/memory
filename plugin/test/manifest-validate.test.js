@@ -3,6 +3,9 @@
 // Card requirement: "manifest/schema" — validated by the real `claude
 // plugin validate --strict` CLI, not a reimplementation of its schema
 // checks (hermetic: validate never touches `CLAUDE_CONFIG_DIR` state).
+// Validates the whole `plugin/` directory recursively, so `plugin/skills/`
+// (T19-04) is covered by this same call with no code change here —
+// verified empirically: `--strict` still passes with the skill present.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
