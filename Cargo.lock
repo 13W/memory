@@ -1200,6 +1200,7 @@ dependencies = [
  "crossterm",
  "local-rag",
  "local-rag-core",
+ "local-rag-memory",
  "local-rag-protocol",
  "local-rag-store",
  "local-rag-test-support",

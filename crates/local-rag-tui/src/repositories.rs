@@ -21,20 +21,21 @@
 //!
 //! # Why durable reads never silently apply a pending migration
 //!
-//! Duplicates `status.rs`'s own `StateDb::diagnose_versions`-before-`StateDb::open` dance (see that
-//! module's doc for the full rationale) rather than sharing it — this screen is equally read-only,
-//! and duplicating a ~20-line dance keeps this card from touching T18-02's already-shipped,
-//! already-tested code a second time. Revisit extraction into a shared helper once a third screen
-//! needs the identical precaution (T18-04's Memory screen is a likely next occurrence).
+//! Duplicated `status.rs`'s own `StateDb::diagnose_versions`-before-`StateDb::open` dance at first
+//! (this screen is equally read-only) rather than sharing it, to keep this card from touching
+//! T18-02's already-shipped, already-tested code a second time — with a note to revisit extraction
+//! once a third screen needed the identical precaution. T18-04's Memory screen was that third
+//! occurrence: the dance now lives in [`crate::store_read`], and this module calls it instead.
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
-    StateDb, VersionDiagnosis, WorktreePathObservation, WorktreeSummary, all_repository_ids,
-    current_path, current_worktree_path, worktree_path_history, worktree_summary,
-    worktrees_of_repo,
+    WorktreePathObservation, WorktreeSummary, all_repository_ids, current_path,
+    current_worktree_path, worktree_path_history, worktree_summary, worktrees_of_repo,
 };
+
+use crate::store_read::open_read_offline_safe;
 
 /// Which drill-down level is active, and enough identity to recompute that level's data next
 /// frame. `selected` is the single source of truth for list position — never derived from
@@ -166,38 +167,6 @@ pub enum RepositoriesScreenData {
         current_path: Option<String>,
         history: Vec<WorktreePathObservation>,
     },
-}
-
-/// Mirrors `status.rs::describe_versions_blocker` exactly (see module doc for why this is
-/// duplicated rather than shared).
-fn describe_versions_blocker(versions: &VersionDiagnosis) -> String {
-    match versions {
-        VersionDiagnosis::NotInitialized => "store not yet initialized".to_string(),
-        VersionDiagnosis::MissingBookkeeping => {
-            "state.sqlite exists but is not a recognized store".to_string()
-        }
-        VersionDiagnosis::Applied(r) => format!(
-            "{} migration(s) pending; run `local-rag serve`/`index` first",
-            r.pending.len()
-        ),
-        VersionDiagnosis::Fault(e) => e.to_string(),
-        _ => "unknown version diagnosis".to_string(),
-    }
-}
-
-/// Mirrors `status.rs::read_durable_counts`'s own open dance (see module doc).
-fn open_read_offline_safe(layout: &StoreLayout) -> Result<Connection, String> {
-    let versions = StateDb::diagnose_versions(&layout.state_db(), local_rag_store::ALL)
-        .map_err(|e| format!("could not read state.sqlite versions: {e}"))?;
-    let ready = matches!(&versions, VersionDiagnosis::Applied(r) if r.pending.is_empty());
-    if !ready {
-        return Err(describe_versions_blocker(&versions));
-    }
-    let state = StateDb::open(layout.state_db())
-        .map_err(|e| format!("could not open state.sqlite: {e}"))?;
-    state
-        .open_read()
-        .map_err(|e| format!("could not open a read connection: {e}"))
 }
 
 fn compute_repos_level(conn: &Connection, selected: usize) -> RepositoriesScreenData {

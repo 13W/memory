@@ -946,3 +946,59 @@ two worktrees — one `detach()`ed — plus a worktree observed at two different
 level) and inline `#[cfg(test)]` `TestBackend` render tests plus pure navigation unit tests in
 `repositories.rs`/`main.rs`; no live-subprocess test — none of the primitives this screen calls
 touch a running daemon.
+
+As-built note (T18-04, `[SPEC]`). The Memory screen is real, read-only:
+`local_rag_tui::memory` (new `crates/local-rag-tui/src/memory.rs`), the third top-level screen
+(`Screen::Memory`, digit `3`, `SCREENS: [Screen; 3]`). `MemoryNav` has two levels — `List(ListNav)`
+and `EntryDetail { memory_id, list }` — but unlike `RepositoriesNav::ascend`, which only ever
+discards a single `selected: usize` on the way back up, `EntryDetail` carries and restores the
+*entire* prior `ListNav` (mode + all four filters + pagination offset) verbatim: losing a
+multi-key filter/pagination setup on every "peek at a record's evidence and go back" would be a
+materially worse regression than Repositories' own single-index loss. `ListNav` holds two
+separately typed state filters (`entry_state_filter: Option<MemoryState>`,
+`candidate_state_filter: Option<CandidateState>`), not one shared field the way `cli/memory.rs`'s
+own `--state: Option<String>` parses against both domains — the TUI has an explicit `Tab` toggle
+instead of free text, so there is no parse-ambiguity to resolve, and keeping them separate means
+toggling `Tab` back and forth never discards either mode's own filter. New keys, reserved
+disjoint from Repositories' `Up`/`Down`/`Enter`/`Backspace` (reused with the same physical
+meaning, safe because `main.rs` dispatches per-screen): `Tab` toggles Entries ⇄ Candidates;
+`k`/`K`, `s`/`S`, `o`/`O` cycle the kind/state/scope filters forward/backward (matched by literal
+`KeyCode::Char`, not a `SHIFT` modifier check — the standard crossterm idiom, since terminals
+typically deliver Shift+letter as the literal uppercase symbol already); `PageDown`/`PageUp` page
+the list. `a`/`r`/`e`/`x`/`m` (approve/reject/edit/retract/merge mnemonics) are deliberately left
+unbound — T18-05's own scope, reserved so it can add mutation actions to this same screen without
+renegotiating any key already claimed here. `compute_entry_list`/`compute_candidate_list`
+transplant `cli/memory.rs::run_list`'s two paths verbatim (that function is private to the
+`local-rag` binary target), including their pagination asymmetry: entries union every applicable
+scope (`local_rag_memory::recall::scopes_for`) in Rust, sort by `(created_at, memory_id)`, then
+`skip`/`take` (`list_memory_entries_for_scope` has no SQL `LIMIT`/`OFFSET` of its own — pagination
+has to slice the union, not any one scope's rows); candidates pass `limit+1`/`offset` straight to
+`list_candidates`'s own SQL `LIMIT`/`OFFSET` and truncate the extra row for `has_more`. Leaving
+both filters unset returns every state including terminal ones (`retracted`/`rejected`/
+`superseded`) — deliberately unlike `recall`, which only ever surfaces `active` memory;
+`list_memory_entries_for_scope`'s own `state_filter: None` branch already has no implicit
+`active`-only clause, so this is a property of the primitive, not new filtering logic.
+`compute_entry_detail` re-fetches by id via `memory_entry_by_id` rather than reusing the cached
+list row — the same WYSIWYG-safe idiom `WorktreeDetail`'s `worktree_summary` re-fetch already
+established — and its `Ok(None)` branch gives a correctly-typed "entry vanished between frames"
+`Unavailable`, not a panic. The evidence panel shows bare `memory_evidence_for` ids only (that
+function's own signature is `Vec<String>` — no text/source/time); the richer shape
+(`evidence_summaries_for`/`inspect_memory`) is `pub(crate)` outside `inspect_memory` itself, which
+additionally pulls a full audit trail — out of this card's literal scope, and `cli/memory.rs`'s own
+module doc already defers the full `local-rag inspect` command to T16-02. The offline-safe
+`StateDb::diagnose_versions`-before-`StateDb::open` precaution — independently pasted into both
+`status.rs` (T18-02) and `repositories.rs` (T18-03), with the latter's own doc comment naming a
+third occurrence as the deferral trigger — is extracted here into a new shared
+`crates/local-rag-tui/src/store_read.rs` (`open_read_offline_safe`/`describe_versions_blocker`);
+`status.rs`/`repositories.rs` are refactored to call it (a pure move — every error string stayed
+byte-identical, so `status_offline.rs`/`repositories_offline.rs`'s existing assertions kept
+passing unchanged). New direct dependency: `local-rag-memory` (library half only), for
+`scopes_for`. New `tests/memory_offline.rs` (per-file-fixture, seed helpers duplicated from
+`crates/local-rag/tests/support/mod.rs:390-567` — the same per-file convention
+`repositories_offline.rs`/`status_offline.rs` already established) covering both modes, every
+filter, pagination on both paths, entry detail with/without evidence, a vanished entry, and an
+uninitialized store; inline `#[cfg(test)]` `TestBackend` render tests plus pure navigation/filter-
+cycle unit tests in `memory.rs` itself. No live-subprocess test — none of the primitives this
+screen calls touch a running daemon. `App`-struct extraction remains deferred (a second nav-
+bearing local, `memory_nav`, alongside `repositories_nav` — still a flat, readable `match`, not
+yet the pressure point either T18-02's or T18-03's own as-built notes flagged).
