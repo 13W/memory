@@ -90,6 +90,24 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # resolved elsewhere in the workspace (`notify`) — 0 new sources for those. Not a dense-backend/
 # model/network SDK. Same license as ratatui (MIT).
 crossterm = "0.29"
+# T18-05's Memory-screen mutations (approve/reject/edit/retract/merge) drive
+# `StateWriter::transaction` — an `async fn` — via this crate's own `rt::block_on` (a fresh
+# current-thread runtime per mutation, mirroring `local-rag`'s CLI-only `cli::block_on`, which is
+# unreachable from here: `pub(crate)` inside `mod cli;`, declared only on `local-rag`'s *binary*
+# target, never its library half). A real (non-dev) dependency as of this task — until T18-05,
+# `main.rs`'s event loop was fully synchronous end to end and `tokio` was dev-only, used solely by
+# `#[tokio::test]` seed helpers; that is no longer literally true (see `rt.rs`'s own doc), though
+# `run_app` itself still never becomes an async fn — only a single mutation's own `rt::block_on`
+# call ever enters an async context, exactly like the CLI's own one-shot-runtime-per-invocation
+# shape. Same feature set as before this promotion; 0 new external sources — this exact version
+# and feature set was already resolved workspace-wide via `local-rag`/`local-rag-store`'s own
+# normal `tokio` dependency.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+] }
 
 [dev-dependencies]
 # T18-02's fixture-store tests need an isolated LOCAL_RAG_HOME (`TempHome`), and its live-subprocess
@@ -99,18 +117,6 @@ crossterm = "0.29"
 # crates' own tests; `local-rag` is already a *normal* dependency of this crate as of T18-01, so no
 # new edge is added here for the subprocess binary itself — only for `TempHome`).
 local-rag-test-support = { path = "../test-support" }
-# Seed helpers (`create_memory_entry`/`propose_candidate`/`insert_projection_state`, all already
-# `pub` in `local_rag_store`) go through `StateWriter::transaction`, an `async fn` —
-# `#[tokio::test]` is this workspace's uniform way of driving one (mirrors `local-rag-hook`'s own
-# dev-dependency). Production code in this crate stays fully synchronous (`fetch_welcome`/
-# `StateDb::open_read`/`diagnose_versions` are all blocking std/rusqlite calls) — tokio never
-# becomes a real runtime dependency of the shipped `local-rag-tui` binary.
-tokio = { version = "1", default-features = false, features = [
-    "rt-multi-thread",
-    "macros",
-    "sync",
-    "time",
-] }
 # Hand-crafting a `store.lock` JSON fixture directly (bypassing `acquire()`'s flock — the same
 # "pure read" contract `read_store_lock_file` itself relies on) and polling `store.lock` in the
 # live-subprocess test both need it. Already resolved throughout the workspace — 0 new external

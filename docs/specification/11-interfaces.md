@@ -1002,3 +1002,86 @@ cycle unit tests in `memory.rs` itself. No live-subprocess test — none of the 
 screen calls touch a running daemon. `App`-struct extraction remains deferred (a second nav-
 bearing local, `memory_nav`, alongside `repositories_nav` — still a flat, readable `match`, not
 yet the pressure point either T18-02's or T18-03's own as-built notes flagged).
+
+As-built note (T18-05, `[SPEC]`). Memory mutations (approve/reject/edit/retract/merge) are real,
+layered on top of T18-04's read paths without touching their own shape. `handle_memory_key` stays
+100% pure — no I/O of any kind — by changing its return type to `MemoryKeyOutcome::{Nav(MemoryNav),
+Execute(MemoryAction)}`: it only ever *decides* a mutation should run; a new `execute_memory_action`
+is the sole function in `memory.rs` that ever touches `.writer()`, mirroring `cli/memory.rs`'s five
+`run_*` functions literally (`Actor::User`, `idempotency_key: None`, `evidence: &[]` for retract) —
+down to porting `memory_op_error_message`/`review_error_message`/`op_outcome_*` verbatim (a third
+occurrence of that exact match in the workspace, after `daemon/mcp/memory_write.rs`'s own JSON-
+envelope pair; not worth a shared crate, since CLI/TUI want a plain `String` and MCP wants JSON).
+
+`MemoryNav` grows four variants: `EditForm` (a free-text `text`/`importance` buffer — this crate's
+first text-input surface), `MergeSelect` (pick one survivor + one-or-more losers from the same
+paginated entries query `List` itself uses, as materialized `(memory_id, entry_version)` pairs so a
+pick survives `PageUp`/`PageDown` to another page), `ConfirmAction` (a boxed pending `MemoryAction`
+plus its own human description), and `ActionResult` (a dismissible success/error banner). Every one
+carries its own `list: ListNav` and restores it verbatim on cancel/dismiss, the same discipline
+`EntryDetail` already established. `MemoryNav`/`MemoryAction` both drop `derive(Eq)` — `Edit`'s
+`importance: f64` isn't `Eq` — verified nothing in this crate needs it (`assert_eq!` only needs
+`PartialEq`).
+
+**The confirm-modal gate is genuinely dynamic**, not a hardcoded TUI-side list, per the card's own
+"TUI reads this list as source of truth, not its own": `gate()` calls the real
+`local_rag::daemon::mcp::catalog()` and checks `annotations.destructiveHint` for the action's own
+tool name, falling back to `true` (require confirmation) for an unrecognized/malformed entry. This
+required one prerequisite fix: `crates/local-rag/src/daemon/mcp/mod.rs`'s `mod tools;` is private,
+and its existing `pub use tools::{DEFAULT_LIST_LIMIT, ...}` line did not re-export `catalog` —
+`local_rag::daemon::mcp::tools::catalog()` was genuinely uncallable from outside the crate. Fixed by
+adding `catalog` to that same `pub use` list (the established "widen visibility for direct reuse"
+precedent, e.g. `insert_envelope`'s `pub(crate)`→`pub` for T15-05) — not a `D-NNN`, since no
+`[FIXED]`/`[SPEC]` text was contradicted, only a Rust-visibility gap the card's own literal
+instruction required closing. Verified against the real catalog, not a mock: today this inserts
+`ConfirmAction` for exactly `retract_memory` (X-003's own regression test holds "`destructiveHint:
+true` for exactly one tool" catalog-wide) and lets `approve_memory_candidate`/
+`reject_memory_candidate`/`edit_memory`/`merge_memories` execute directly.
+
+**The global-quit carve-out for text entry**, the one place this task reinterprets — narrowly,
+deliberately — a documented invariant: T18-01/T18-03's `should_quit`/`screen_for_key`/
+`is_global_key` in `main.rs` stay byte-identical (same signatures, same bodies, all 6 pre-existing
+tests untouched), but `EditForm` must accept literal `q`/digits as buffer content, not global quit/
+screen-switch. `run_app`'s Memory branch adds a narrow, separate predicate,
+`memory::captures_all_keys(&memory_nav) && is_text_entry_key(&ev)` (true only for a bare, unmodified
+`q` or ASCII digit while `nav` is `EditForm`) — when true, it skips consulting `is_global_key` for
+that one keystroke entirely, rather than changing what `is_global_key`/`should_quit` themselves
+compute. `Ctrl+C`/`Esc` are deliberately excluded from the carve-out (neither is ever produced as
+typed content), so both keep quitting unconditionally even mid-edit — the same universal-precedent
+shape every modal text-input UI already uses (vim's own insert mode, any TUI form).
+
+**Store access**: `store_read.rs`'s diagnose-before-open dance is factored into `pub(crate) fn
+diagnose_ready`, shared by the existing `open_read_offline_safe` and a new sibling module,
+`store_write.rs::open_write_offline_safe(layout) -> Result<StateDb, String>` — same offline-safe
+refusal-on-pending-migration precaution every read screen already has, now also covering mutations
+(a deliberate consistency choice: the CLI's own `cli::index::open_state` is willing to apply a
+pending migration as a side effect of opening, but this dashboard treats every screen's own store
+access uniformly rather than letting some keypresses silently migrate the store and others refuse
+to). `StateWriter::transaction` is `async fn`; this crate's event loop is otherwise fully
+synchronous, so a new `rt.rs` (crate-internal, `mod rt;` not `pub mod rt;`) supplies a `block_on`
+equivalent to `local-rag`'s own `cli::block_on` — unreachable from here, `pub(crate)` inside `mod
+cli;`, itself declared only on `local-rag`'s binary target, never its library half. `tokio` moves
+from `[dev-dependencies]` to a real dependency of `local-rag-tui` as a result (same feature set, 0
+new external sources — already resolved workspace-wide via `local-rag`/`local-rag-store`'s own
+normal `tokio` edge); `main.rs`'s own loop still never becomes an `async fn` — only a single
+mutation's own `rt::block_on` call ever enters an async context, one throwaway current-thread
+runtime per mutation, mirroring the CLI's identical one-shot-runtime-per-invocation shape.
+
+New `tests/memory_mutations_offline.rs` (per-file-fixture, seed helpers duplicated from
+`crates/local-rag/tests/support/mod.rs:390-567`) — plain synchronous `#[test]`s, not
+`#[tokio::test]`: `execute_memory_action` drives its own throwaway runtime internally, and tokio
+forbids starting a runtime from inside a runtime already driving the current thread, so the file
+carries its own small `block_on` to drive only the async seed calls, sequentially, never nested with
+`execute_memory_action`'s own. Covers every action's success path (approve materializes a candidate,
+reject moves it to `rejected`, edit bumps `entry_version`, retract transitions an active `Fact` to
+`retracted`, merge supersedes a loser pointing `supersedes_id` at the survivor) plus every typed
+domain rejection the card names surfacing without a panic: `OptimisticConflict` (stale
+`expected_version`), `IllegalTransition` (retracting a `Hypothesis`, which has no `retracted` state;
+approving an already-`rejected` candidate — `ReviewError::NotPending` turned out to be
+`edit_memory_candidate`'s own variant, not reachable from `approve_candidate`, since only
+`approve → approve` short-circuits to `AlreadyApproved` and every other non-`pending` source state
+is an ordinary illegal-transition rejection), and `EntryTerminal` (editing a retracted entry — note
+`transition_memory_entry` itself never bumps `entry_version`, spec 04 §5's own as-built text, so the
+seeded entry is still v1 after transitioning). Plus inline `#[cfg(test)]` `TestBackend` render tests
+for all four new screen states and pure unit tests for every new nav transition/key binding in
+`memory.rs` itself, including the text-entry carve-out predicates.

@@ -62,7 +62,9 @@ fn annotations(title: &str, read_only: bool, destructive: bool, idempotent: bool
     })
 }
 
-/// The full `tools/list` result.
+/// The full `tools/list` result. Re-exported as `local_rag::daemon::mcp::catalog` (T18-05) —
+/// `local-rag-tui`'s Memory screen reads this same JSON to decide which mutations need a
+/// confirm-modal (`annotations.destructiveHint`), rather than encoding its own copy of that list.
 pub fn catalog() -> Value {
     serde_json::json!({
         "tools": [
