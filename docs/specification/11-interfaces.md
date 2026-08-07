@@ -1085,3 +1085,51 @@ is an ordinary illegal-transition rejection), and `EntryTerminal` (editing a ret
 seeded entry is still v1 after transitioning). Plus inline `#[cfg(test)]` `TestBackend` render tests
 for all four new screen states and pure unit tests for every new nav transition/key binding in
 `memory.rs` itself, including the text-entry carve-out predicates.
+
+As-built note (T18-06, `[SPEC]`). The Repo Settings screen is real — the first production caller
+anywhere in the workspace of `crates/store/src/registry/settings.rs` (T02-05 shipped that backend
+fully, with no CLI command or MCP tool ever calling it). Repository selection is a flat picker list
+(`all_repository_ids`+`current_path`, the same tandem `repositories.rs::compute_repos_level`
+already uses), not the cwd-`resolve()` auto-detection Status/Memory use — a settings screen should
+reach any registered repository, not only the one the dashboard happens to be launched from, and
+`resolve()`'s own `GlobalOnly`/`Ambiguous` branches have no good answer for a settings form. `Enter`
+descends `RepoList` into `RepoDetail`; `Backspace` ascends back, resetting `selected` to `0` (the
+same simpler "no breadcrumb restore" precedent `RepositoriesNav::ascend` already established — a
+flat, unfiltered, unpaginated list has nothing costlier to lose).
+
+`RepoDetail` shows `data_policy` (4 fixed values, cycled and written immediately by `p`/`P` — no
+confirm-modal, because `repo_settings`'s primitives have no MCP catalog entry at all, so there is
+nothing for T18-05's `destructiveHint` gate to consult) above a generic `(key, value)` list, filtered
+to exclude the `data_policy` key itself (shown separately). `e`/`E` opens `SettingForm` pre-filled
+from the selected row; `n`/`N` opens it empty; both funnel through the same upsert
+(`set_repo_setting`) — **the screen offers no delete**, matching `local_rag_store`'s own capability
+exactly (no `delete_repo_setting` exists anywhere in the crate). `cycle_data_policy` has no "unset"
+position in the cycle itself (unlike `memory.rs`'s `cycle_option`, which legitimately toggles a read
+filter through `None`): `set_repo_data_policy` cannot express "unset" since there is no delete, so
+from an unset repository the first `p` writes `DataPolicy::LocalOnly` (forward) or
+`DataPolicy::AllowRemoteFull` (backward) — `None` sits at the wrap boundary, never reachable as an
+output. Errors from either mutation surface inline on `RepoDetail`/`SettingForm`'s own `error`
+field (the lighter idiom T18-05's `MergeSelect` established) rather than a separate dismissible
+banner, since every mutation here returns to the exact screen it was triggered from.
+
+`execute_repo_settings_action` mirrors T18-05's `execute_memory_action` shape — the sole function
+touching `.writer()`, via the same `store_write::open_write_offline_safe`+`rt::block_on` pair (no
+changes to either, `store_write.rs`'s own doc comment had already named this task as its second
+expected caller) — but with a flatter result type: `set_repo_setting`/`set_repo_data_policy` return
+a single `rusqlite::Result<()>`, not `apply_edit`/`apply_retract`'s own double-nested
+`rusqlite::Result<Result<Outcome, MemoryOpError>>` (`repo_settings` has no typed domain-error enum),
+so `StateWriter::transaction` collapses every failure — including an unknown `repo_id`'s FK
+`ConstraintViolation` — into one `Result<(), WriteError>`.
+
+`Screen::RepoSettings` is the 4th top-level screen (digit `4`), reusing the identical
+`captures_all_keys`/`is_text_entry_key` carve-out `main.rs` already built for Memory's own
+`EditForm`, for `SettingForm`'s identical free-text needs (including bare `q`/digits as buffer
+content). New `tests/repo_settings_offline.rs` (per-file-fixture, seed helpers duplicated from
+`crates/local-rag/tests/support/mod.rs` — only `create_repository`/`observe_repository_path`, no
+worktree needed) covers both mutations' round-trip-and-upsert behavior, list/detail reads, an
+unknown-`repo_id` write surfacing an inline error without a panic, and both the read/write offline-
+safe refusals before the store is ever initialized; plus inline `#[cfg(test)]` `TestBackend` render
+tests and pure navigation/cycle unit tests in `repo_settings.rs` itself. `step` (list clamping) and
+`is_ctrl_x` (the `SettingForm`/`EditForm`-style cancel predicate) are deliberately third and second
+small-helper duplicates respectively, not yet extracted — the same "wait for a genuine third
+occurrence of identical code" threshold `store_read.rs`'s own T18-04 extraction already set.

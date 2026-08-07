@@ -10,11 +10,14 @@
 //! Memory mutations (`local_rag_tui::memory`'s own `MemoryKeyOutcome::{Nav, Execute}`) and this
 //! loop's one narrow exception to "global keys are never delegated to the screen's own handler":
 //! [`is_text_entry_key`], consulted only while `memory::captures_all_keys(&memory_nav)` — see that
-//! function's own doc and `memory.rs`'s module doc for the full rationale.
+//! function's own doc and `memory.rs`'s module doc for the full rationale. T18-06 adds Repo
+//! Settings (`local_rag_tui::repo_settings`), the same `{Nav, Execute}`/`captures_all_keys`
+//! carve-out shape reused for its own `SettingForm`.
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use local_rag_core::paths::{StoreLayout, SystemEnv};
 use local_rag_tui::memory::{self, MemoryNav};
+use local_rag_tui::repo_settings::{self, RepoSettingsNav};
 use local_rag_tui::repositories::{self, RepositoriesNav};
 use local_rag_tui::status::{compute_status_data, render_status};
 use ratatui::DefaultTerminal;
@@ -29,15 +32,21 @@ const BIN: &str = "local-rag-tui";
 /// Repositories, Repo Settings, Server Settings); each later T18-0N card appends one variant here
 /// plus one [`SCREENS`] entry, no dispatcher rewrite. Digit keys were chosen over `Tab`-cycling for
 /// direct addressability and because they never collide with the `Up`/`Down`/`Enter`/`Backspace`
-/// keys Repositories/Memory need for their own drill-down.
+/// keys Repositories/Memory/Repo Settings need for their own drill-down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Status,
     Repositories,
     Memory,
+    RepoSettings,
 }
 
-const SCREENS: [Screen; 3] = [Screen::Status, Screen::Repositories, Screen::Memory];
+const SCREENS: [Screen; 4] = [
+    Screen::Status,
+    Screen::Repositories,
+    Screen::Memory,
+    Screen::RepoSettings,
+];
 
 fn main() -> ExitCode {
     if matches!(
@@ -80,6 +89,7 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
     let mut screen = Screen::Status;
     let mut repositories_nav = RepositoriesNav::default();
     let mut memory_nav = MemoryNav::default();
+    let mut repo_settings_nav = RepoSettingsNav::default();
 
     loop {
         // `Terminal::draw` calls `Terminal::autoresize` on every call, so a terminal resize needs
@@ -123,6 +133,31 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
                         memory::MemoryKeyOutcome::Nav(next) => memory_nav = next,
                         memory::MemoryKeyOutcome::Execute(action) => {
                             memory_nav = memory::execute_memory_action(layout, action);
+                        }
+                    }
+                }
+                (ev, force_local)
+            }
+            Screen::RepoSettings => {
+                let data = repo_settings::compute_repo_settings_data(layout, &repo_settings_nav);
+                terminal.draw(|frame| repo_settings::render_repo_settings(frame, &data))?;
+                let ev = event::read()?;
+                // Same carve-out as Memory's own `EditForm`, for `SettingForm`'s identical
+                // free-text needs — see `repo_settings.rs`'s module doc.
+                let force_local =
+                    repo_settings::captures_all_keys(&repo_settings_nav) && is_text_entry_key(&ev);
+                if force_local || !is_global_key(ev.clone()) {
+                    match repo_settings::handle_repo_settings_key(
+                        &repo_settings_nav,
+                        &data,
+                        ev.clone(),
+                    ) {
+                        repo_settings::RepoSettingsKeyOutcome::Nav(next) => {
+                            repo_settings_nav = next
+                        }
+                        repo_settings::RepoSettingsKeyOutcome::Execute(action) => {
+                            repo_settings_nav =
+                                repo_settings::execute_repo_settings_action(layout, action);
                         }
                     }
                 }
@@ -260,6 +295,10 @@ mod tests {
         assert_eq!(
             screen_for_key(press(KeyCode::Char('3'))),
             Some(Screen::Memory)
+        );
+        assert_eq!(
+            screen_for_key(press(KeyCode::Char('4'))),
+            Some(Screen::RepoSettings)
         );
     }
 
