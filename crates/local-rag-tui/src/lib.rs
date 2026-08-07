@@ -15,20 +15,28 @@
 //! T18-04 extraction — the offline-safe `state.sqlite` read dance shared by every screen above,
 //! moved out once a third screen needed it. [`store_write`] is T18-05's write-side counterpart —
 //! the same offline-safe precaution, returning a write-capable `StateDb`, reused as-is by
-//! [`repo_settings`] (T18-06, this module's own doc comment already anticipated a second write
-//! caller here). [`repo_settings`] is T18-06's — the Repo Settings screen: a `data_policy` form
-//! (4 fixed values, cycled and applied immediately, no confirm-modal — the backend has no MCP
-//! catalog entry to gate against) plus a generic `(key, value)` list, over
+//! [`repo_settings`] (T18-06). [`repo_settings`] is T18-06's — the Repo Settings screen: a
+//! `data_policy` form (4 fixed values, cycled and applied immediately, no confirm-modal — the
+//! backend has no MCP catalog entry to gate against) plus a generic `(key, value)` list, over
 //! `crates/store/src/registry/settings.rs` — the first production caller of that primitive
 //! anywhere in the workspace. `rt` (crate-internal, not re-exported) is T18-05's single-shot tokio
 //! runtime for driving a mutation's `StateWriter::transaction` from this crate's otherwise fully
-//! synchronous event loop, reused by every write screen since. Later T18-07+ cards add their own
-//! sibling modules here, not inside these.
+//! synchronous event loop, reused by every write screen that touches `state.sqlite`.
+//! [`server_settings`] is T18-07's — the Server Settings screen: a staged, `Ctrl+S`-flushed form
+//! over all six `local_rag_core::config::Config` sections, keyed off `config_dir` rather than
+//! `StoreLayout` (a different resolver — this is the first screen not backed by `state.sqlite` at
+//! all, so it does not use [`store_write`]/`rt`; `Config::save` is a plain synchronous file write).
+//! `keys` (crate-internal, not re-exported) is T18-07's extraction of `step`/`is_ctrl` — identical
+//! or near-identical logic that had accumulated independently in [`repositories`], [`memory`],
+//! and [`repo_settings`] by the time a third occurrence appeared, this crate's own threshold for
+//! sharing rather than duplicating a small helper.
 
+mod keys;
 pub mod memory;
 pub mod repo_settings;
 pub mod repositories;
 mod rt;
+pub mod server_settings;
 pub mod status;
 pub mod store_read;
 pub mod store_write;

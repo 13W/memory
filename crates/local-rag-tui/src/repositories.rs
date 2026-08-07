@@ -35,6 +35,7 @@ use local_rag_store::{
     current_worktree_path, worktree_path_history, worktree_summary, worktrees_of_repo,
 };
 
+use crate::keys::step;
 use crate::store_read::open_read_offline_safe;
 
 /// Which drill-down level is active, and enough identity to recompute that level's data next
@@ -122,17 +123,6 @@ impl RepositoriesNav {
                 selected: 0,
             },
         }
-    }
-}
-
-fn step(selected: usize, down: bool, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    if down {
-        (selected + 1).min(len - 1)
-    } else {
-        selected.saturating_sub(1)
     }
 }
 

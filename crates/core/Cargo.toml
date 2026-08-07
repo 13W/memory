@@ -39,6 +39,18 @@ serde_json = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Optional, dev-only path crate (0 external sources): enabled ONLY by the
+# `failpoints` feature so `Config::save` can host its named crash point between
+# the atomic write and its rename (T18-07). Off by default; the shipped binary
+# never links test-support.
+local-rag-test-support = { path = "../test-support", optional = true }
+
+[features]
+# Compiles `config.save.between_write_and_rename`, the crash point fired after
+# `config.toml`'s replacement text has been written to its `.tmp` sibling and
+# before that sibling is renamed into place.
+failpoints = ["dep:local-rag-test-support"]
+
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
 
