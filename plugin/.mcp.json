@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "memory": {
-      "command": "npx",
-      "args": ["--yes", "--package=@13w/memory", "local-rag-mcp"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/local-rag-mcp-launcher.js"]
     }
   }
 }

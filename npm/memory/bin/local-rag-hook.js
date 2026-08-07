@@ -13,7 +13,7 @@ const { spawnSync } = require("node:child_process");
 
 const { resolvePlatformPackage, binaryPath } = require("../src/resolve.js");
 const { formatMissingPlatformError } = require("../src/errors.js");
-const { refreshCache } = require("../src/hook-cache.js");
+const { refreshCache } = require("../src/binary-cache.js");
 
 function main() {
   const result = resolvePlatformPackage(__filename);
@@ -24,7 +24,7 @@ function main() {
   }
 
   const execPath = binaryPath(result.packageDir, process.platform, "local-rag-hook");
-  refreshCache(execPath);
+  refreshCache(execPath, "local-rag-hook");
 
   const child = spawnSync(execPath, process.argv.slice(2), { stdio: "inherit" });
   if (child.error) {

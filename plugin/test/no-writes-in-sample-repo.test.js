@@ -17,11 +17,11 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const { buildFlatLayout } = require("../../npm/memory/test/helpers/fixture-layout.js");
-const { nativeHookBinaryPath } = require("./helpers/native-hook-binary.js");
+const { nativeBinaryPath } = require("./helpers/native-binary.js");
 const { prepareSpoolDir } = require("./helpers/store-fixture.js");
 const { listTree } = require("./helpers/sample-repo.js");
 
-const nativeBin = nativeHookBinaryPath();
+const nativeBin = nativeBinaryPath("local-rag-hook");
 const SKIP_REASON = "target/debug/local-rag-hook is not built — run `cargo build -p local-rag-hook` first";
 
 test(
