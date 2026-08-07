@@ -26,9 +26,11 @@ use local_rag::daemon::{StoreLockFileState, gitroot, read_store_lock_file};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::process::pid_exists;
 use local_rag_store::{
-    CandidateCountRow, MemoryCountRow, ProjectionStateRow, RequestRoot, Resolution, StateDb,
-    VersionDiagnosis, memory_entry_counts, pending_candidate_counts, projection_state, resolve,
+    CandidateCountRow, MemoryCountRow, ProjectionStateRow, RequestRoot, Resolution,
+    memory_entry_counts, pending_candidate_counts, projection_state, resolve,
 };
+
+use crate::store_read::open_read_offline_safe;
 
 /// Best-effort daemon identity/mode. See the module doc for why this is redefined rather than
 /// imported from `local_rag::cli::status`.
@@ -130,60 +132,13 @@ pub fn probe_daemon(layout: &StoreLayout, probe_timeout: Duration) -> DaemonStat
     }
 }
 
-/// `VersionDiagnosis` → a human reason string, when it blocks opening `StateDb` for real. Mirrors
-/// `cli::doctor::describe_versions_blocker`'s own four live branches (that function additionally
-/// handles a pre-mapped `OpenError` branch, folded into this module's own `Unavailable` construction
-/// at each call site instead).
-fn describe_versions_blocker(versions: &VersionDiagnosis) -> String {
-    match versions {
-        VersionDiagnosis::NotInitialized => "store not yet initialized".to_string(),
-        VersionDiagnosis::MissingBookkeeping => {
-            "state.sqlite exists but is not a recognized store".to_string()
-        }
-        VersionDiagnosis::Applied(r) => format!(
-            "{} migration(s) pending; run `local-rag serve`/`index` first",
-            r.pending.len()
-        ),
-        VersionDiagnosis::Fault(e) => e.to_string(),
-        _ => "unknown version diagnosis".to_string(),
-    }
-}
-
 /// Read durable counts, never applying a pending migration (module doc). `cwd` is git-probed to
 /// resolve worktree identity, mirroring `cli stats` — pass the real `std::env::current_dir()` in
 /// production, an arbitrary path in a fixture test.
 pub fn read_durable_counts(layout: &StoreLayout, cwd: &Path) -> DurableCounts {
-    let versions = match StateDb::diagnose_versions(&layout.state_db(), local_rag_store::ALL) {
-        Ok(v) => v,
-        Err(e) => {
-            return DurableCounts::Unavailable {
-                reason: format!("could not read state.sqlite versions: {e}"),
-            };
-        }
-    };
-
-    let ready = matches!(&versions, VersionDiagnosis::Applied(r) if r.pending.is_empty());
-    if !ready {
-        return DurableCounts::Unavailable {
-            reason: describe_versions_blocker(&versions),
-        };
-    }
-
-    let state = match StateDb::open(layout.state_db()) {
-        Ok(s) => s,
-        Err(e) => {
-            return DurableCounts::Unavailable {
-                reason: format!("could not open state.sqlite: {e}"),
-            };
-        }
-    };
-    let conn = match state.open_read() {
+    let conn = match open_read_offline_safe(layout) {
         Ok(c) => c,
-        Err(e) => {
-            return DurableCounts::Unavailable {
-                reason: format!("could not open a read connection: {e}"),
-            };
-        }
+        Err(reason) => return DurableCounts::Unavailable { reason },
     };
 
     let entries_by_kind_state = match memory_entry_counts(&conn) {
@@ -417,17 +372,5 @@ mod tests {
         };
         let content = rendered_text(&data);
         assert!(content.contains("migration"), "{content}");
-    }
-
-    #[test]
-    fn describe_versions_blocker_covers_every_named_variant() {
-        assert_eq!(
-            describe_versions_blocker(&VersionDiagnosis::NotInitialized),
-            "store not yet initialized"
-        );
-        assert_eq!(
-            describe_versions_blocker(&VersionDiagnosis::MissingBookkeeping),
-            "state.sqlite exists but is not a recognized store"
-        );
     }
 }

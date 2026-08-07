@@ -41,6 +41,11 @@ local-rag-protocol = { path = "../protocol" }
 # cross-database ATTACH is involved, and T18-02's direct state.sqlite/cache.sqlite access goes
 # through `local-rag-store`, not through this crate.
 local-rag = { path = "../local-rag" }
+# T18-04's Memory screen resolves the caller's own worktree identity to the same
+# `(global, repository?, worktree?)` scope tuple `recall`/`remember` use, via
+# `local_rag_memory::recall::scopes_for` (library half only — no daemon/router pulled in for a
+# read-only screen). Already resolved throughout the workspace — 0 new external sources.
+local-rag-memory = { path = "../memory" }
 # ADR-0008 `[FIXED]`: ratatui + crossterm is the chosen TUI stack (comparative TUI-vs-Web-UI
 # decision already made, not re-litigated here); `std` has no terminal-UI widget/layout toolkit.
 # `default-features = false` + `crossterm` selects exactly the crossterm backend (this workspace

@@ -56,7 +56,17 @@ Web-дашборде v1 (логи/статистика, память, настр
 - **Результат:** экран Memory — список записей/кандидатов с фильтрами (kind/state/scope,
   candidates-переключатель) через `list_memory_entries_for_scope`/`list_candidates`; панель
   деталей + evidence (`memory_evidence_for`) для выбранной записи.
-- **Тесты:** рендер списка/фильтров/пагинации и evidence-панели на fixtures из `fixtures/memory/`.
+- **Тесты:** рендер списка/фильтров/пагинации и evidence-панели на fixtures из
+  `tests/memory_offline.rs`.
+
+  *(T18-04 planning-правка, до реализации: карточка изначально называла `fixtures/memory/`
+  (корень репозитория) как источник тестовых fixtures. Эта директория — router-quality behavior
+  corpus для `cargo xtask memory-bench` (`crates/xtask/src/memory_bench/`, 72 кейса
+  `memory.store.*`/`memory.router.op.*`, формат `{input, expected}` для `local_rag_memory::
+  router::route`); `existing_entries[]` там всегда `scope_kind: "global"`, без `state`, без
+  candidate/evidence-фикстур — не подходит для seed'а этого экрана. Используется установленный в
+  этом крейте (T18-02/T18-03) per-file-fixture паттерн: seed-хелперы, дублированные из
+  `crates/local-rag/tests/support/mod.rs:390-567`, прямо в `tests/memory_offline.rs`.)*
 
 ## T18-05 — Memory mutations
 

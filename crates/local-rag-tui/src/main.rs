@@ -10,6 +10,7 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use local_rag_core::paths::{StoreLayout, SystemEnv};
+use local_rag_tui::memory::{self, MemoryNav};
 use local_rag_tui::repositories::{self, RepositoriesNav};
 use local_rag_tui::status::{compute_status_data, render_status};
 use ratatui::DefaultTerminal;
@@ -24,14 +25,15 @@ const BIN: &str = "local-rag-tui";
 /// Repositories, Repo Settings, Server Settings); each later T18-0N card appends one variant here
 /// plus one [`SCREENS`] entry, no dispatcher rewrite. Digit keys were chosen over `Tab`-cycling for
 /// direct addressability and because they never collide with the `Up`/`Down`/`Enter`/`Backspace`
-/// keys Repositories needs for its own drill-down.
+/// keys Repositories/Memory need for their own drill-down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Status,
     Repositories,
+    Memory,
 }
 
-const SCREENS: [Screen; 2] = [Screen::Status, Screen::Repositories];
+const SCREENS: [Screen; 3] = [Screen::Status, Screen::Repositories, Screen::Memory];
 
 fn main() -> ExitCode {
     if matches!(
@@ -73,6 +75,7 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut screen = Screen::Status;
     let mut repositories_nav = RepositoriesNav::default();
+    let mut memory_nav = MemoryNav::default();
 
     loop {
         // `Terminal::draw` calls `Terminal::autoresize` on every call, so a terminal resize needs
@@ -98,6 +101,15 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
                 if !is_global_key(ev.clone()) {
                     repositories_nav =
                         repositories::handle_repositories_key(&repositories_nav, &data, ev.clone());
+                }
+                ev
+            }
+            Screen::Memory => {
+                let data = memory::compute_memory_data(layout, &cwd, &memory_nav);
+                terminal.draw(|frame| memory::render_memory(frame, &data))?;
+                let ev = event::read()?;
+                if !is_global_key(ev.clone()) {
+                    memory_nav = memory::handle_memory_key(&memory_nav, &data, ev.clone());
                 }
                 ev
             }
@@ -210,6 +222,10 @@ mod tests {
         assert_eq!(
             screen_for_key(press(KeyCode::Char('2'))),
             Some(Screen::Repositories)
+        );
+        assert_eq!(
+            screen_for_key(press(KeyCode::Char('3'))),
+            Some(Screen::Memory)
         );
     }
 
