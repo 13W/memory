@@ -13,6 +13,11 @@
 //! at which point `open` is a genuine no-op with respect to migration. `cli stats` (the closest CLI
 //! cousin to these screens) does not take this precaution, because none of its cards are framed as
 //! "offline-safe" the way every screen in this dashboard explicitly is.
+//!
+//! T18-05 extracted [`diagnose_ready`] out of [`open_read_offline_safe`] so `store_write::
+//! open_write_offline_safe` can share the identical diagnose-before-open precaution for a
+//! mutation's write-capable `StateDb` — the two paths cannot drift in wording since they now
+//! share one function, not two independently-typed copies of the same four match arms.
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::rusqlite::Connection;
@@ -37,14 +42,22 @@ pub fn describe_versions_blocker(versions: &VersionDiagnosis) -> String {
     }
 }
 
-/// Open a read-only `state.sqlite` connection, never applying a pending migration (module doc).
-pub fn open_read_offline_safe(layout: &StoreLayout) -> Result<Connection, String> {
+/// `Ok(())` only when `StateDb::open` would be a migration no-op — shared by [`open_read_offline_safe`]
+/// here and `store_write::open_write_offline_safe` (T18-05).
+pub(crate) fn diagnose_ready(layout: &StoreLayout) -> Result<(), String> {
     let versions = StateDb::diagnose_versions(&layout.state_db(), local_rag_store::ALL)
         .map_err(|e| format!("could not read state.sqlite versions: {e}"))?;
     let ready = matches!(&versions, VersionDiagnosis::Applied(r) if r.pending.is_empty());
-    if !ready {
-        return Err(describe_versions_blocker(&versions));
+    if ready {
+        Ok(())
+    } else {
+        Err(describe_versions_blocker(&versions))
     }
+}
+
+/// Open a read-only `state.sqlite` connection, never applying a pending migration (module doc).
+pub fn open_read_offline_safe(layout: &StoreLayout) -> Result<Connection, String> {
+    diagnose_ready(layout)?;
     let state = StateDb::open(layout.state_db())
         .map_err(|e| format!("could not open state.sqlite: {e}"))?;
     state

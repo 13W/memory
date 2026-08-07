@@ -6,7 +6,11 @@
 //! (`local_rag_tui::repositories`) and this dashboard's first screen-switching scheme: digit keys
 //! `1`..`SCREENS.len()` select a screen directly (see [`Screen`]/[`screen_for_key`]); `Enter`/
 //! `Backspace` drill into/out of Repositories' own repo → worktree → worktree-detail navigation;
-//! `q`/`Esc`/`Ctrl+C` always quit, unconditionally, at any screen or drill-down level.
+//! `q`/`Esc`/`Ctrl+C` always quit, unconditionally, at any screen or drill-down level. T18-05 adds
+//! Memory mutations (`local_rag_tui::memory`'s own `MemoryKeyOutcome::{Nav, Execute}`) and this
+//! loop's one narrow exception to "global keys are never delegated to the screen's own handler":
+//! [`is_text_entry_key`], consulted only while `memory::captures_all_keys(&memory_nav)` — see that
+//! function's own doc and `memory.rs`'s module doc for the full rationale.
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use local_rag_core::paths::{StoreLayout, SystemEnv};
@@ -81,7 +85,7 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
         // `Terminal::draw` calls `Terminal::autoresize` on every call, so a terminal resize needs
         // no dedicated handling beyond looping back to `draw()` after any event — including
         // `Event::Resize` itself.
-        let ev = match screen {
+        let (ev, suppress_global) = match screen {
             Screen::Status => {
                 let data = compute_status_data(
                     layout,
@@ -89,7 +93,7 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
                     Duration::from_millis(local_rag::daemon::LIVENESS_PROBE_TIMEOUT_MS),
                 );
                 terminal.draw(|frame| render_status(frame, &data))?;
-                event::read()?
+                (event::read()?, false)
             }
             Screen::Repositories => {
                 let data = repositories::compute_repositories_data(layout, &repositories_nav);
@@ -102,19 +106,33 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
                     repositories_nav =
                         repositories::handle_repositories_key(&repositories_nav, &data, ev.clone());
                 }
-                ev
+                (ev, false)
             }
             Screen::Memory => {
                 let data = memory::compute_memory_data(layout, &cwd, &memory_nav);
                 terminal.draw(|frame| memory::render_memory(frame, &data))?;
                 let ev = event::read()?;
-                if !is_global_key(ev.clone()) {
-                    memory_nav = memory::handle_memory_key(&memory_nav, &data, ev.clone());
+                // T18-05's `EditForm` must receive bare `q`/digits as buffer content, not global
+                // quit/screen-switch — the one narrow, documented exception to "global keys are
+                // never delegated to the screen's own handler" (see `memory.rs`'s own module doc,
+                // "The global-quit carve-out for text entry"). `Ctrl+C`/`Esc` are never produced as
+                // typed content, so they are deliberately excluded and keep quitting unconditionally.
+                let force_local = memory::captures_all_keys(&memory_nav) && is_text_entry_key(&ev);
+                if force_local || !is_global_key(ev.clone()) {
+                    match memory::handle_memory_key(&memory_nav, &data, ev.clone()) {
+                        memory::MemoryKeyOutcome::Nav(next) => memory_nav = next,
+                        memory::MemoryKeyOutcome::Execute(action) => {
+                            memory_nav = memory::execute_memory_action(layout, action);
+                        }
+                    }
                 }
-                ev
+                (ev, force_local)
             }
         };
 
+        if suppress_global {
+            continue;
+        }
         if should_quit(ev.clone()) {
             return Ok(());
         }
@@ -122,6 +140,22 @@ fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Res
             screen = next;
         }
     }
+}
+
+/// `true` only for a bare (no `Ctrl`) literal `q` or ASCII digit key-press — the exact, narrow set
+/// that `EditForm` must receive as buffer content rather than global quit/screen-switch. See
+/// `run_app`'s own Memory-screen branch and `memory.rs`'s module doc for the full rationale.
+fn is_text_entry_key(ev: &Event) -> bool {
+    let Event::Key(key) = ev else {
+        return false;
+    };
+    if key.kind != event::KeyEventKind::Press {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    matches!(key.code, KeyCode::Char(c) if c == 'q' || c.is_ascii_digit())
 }
 
 /// Digit keys `1`..`SCREENS.len()` jump directly to a screen; any other key (including `0` and
@@ -249,5 +283,30 @@ mod tests {
         assert!(is_global_key(press(KeyCode::Esc)));
         assert!(is_global_key(press(KeyCode::Char('1'))));
         assert!(is_global_key(press(KeyCode::Char('2'))));
+    }
+
+    #[test]
+    fn is_text_entry_key_accepts_bare_q_and_digits_only() {
+        assert!(is_text_entry_key(&press(KeyCode::Char('q'))));
+        assert!(is_text_entry_key(&press(KeyCode::Char('7'))));
+        assert!(!is_text_entry_key(&press(KeyCode::Char('a'))));
+        assert!(!is_text_entry_key(&press(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn is_text_entry_key_rejects_control_modified_and_released_keys() {
+        let mut ctrl_q = press(KeyCode::Char('q'));
+        if let Event::Key(key) = &mut ctrl_q {
+            key.modifiers = KeyModifiers::CONTROL;
+        }
+        assert!(!is_text_entry_key(&ctrl_q));
+
+        let mut released = press(KeyCode::Char('q'));
+        if let Event::Key(key) = &mut released {
+            key.kind = KeyEventKind::Release;
+        }
+        assert!(!is_text_entry_key(&released));
+
+        assert!(!is_text_entry_key(&Event::FocusGained));
     }
 }

@@ -37,7 +37,7 @@ pub use instructions::{
 };
 pub use tools::{
     DEFAULT_LIST_LIMIT, DEFAULT_RECALL_LIMIT, DEFAULT_SEARCH_LIMIT, MAX_LIST_LIMIT,
-    MAX_RECALL_LIMIT, MAX_SEARCH_LIMIT,
+    MAX_RECALL_LIMIT, MAX_SEARCH_LIMIT, catalog,
 };
 
 /// The real `RequestHandler`: parses and dispatches MCP JSON-RPC, calling
