@@ -1,13 +1,17 @@
 //! `local-rag-tui` — terminal dashboard entry point (ADR-0008, spec 11 §7).
 //!
-//! T18-01's own scope is the skeleton only: the `ratatui`/`crossterm` event loop (raw mode +
-//! alternate screen enter/restore, resize handling, a clean exit on panic) and this crate's
-//! dependency/dist wiring. No screen has real content yet — Status begins at T18-02.
+//! T18-01 built the skeleton: the `ratatui`/`crossterm` event loop (raw mode + alternate screen
+//! enter/restore, resize handling, a clean exit on panic) and this crate's dependency/dist wiring.
+//! T18-02 adds the first real screen — Status (`local_rag_tui::status`) — replacing the
+//! placeholder paragraph below.
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use local_rag_core::paths::{StoreLayout, SystemEnv};
+use local_rag_tui::status::{compute_status_data, render_status};
 use ratatui::DefaultTerminal;
-use ratatui::widgets::Paragraph;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 const BIN: &str = "local-rag-tui";
 
@@ -20,7 +24,15 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match ratatui::run(run_app) {
+    let layout = match StoreLayout::resolve(&SystemEnv) {
+        Ok(layout) => layout,
+        Err(e) => {
+            eprintln!("{BIN}: could not resolve the store directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match ratatui::run(|terminal| run_app(terminal, &layout)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{BIN}: {err}");
@@ -33,17 +45,20 @@ fn main() -> ExitCode {
 /// panic hook that restores both before delegating to the previously-installed hook (see its own
 /// doc comment) — this function's only job is drawing frames and reacting to input until the user
 /// asks to quit; `ratatui::run` restores the terminal again on return here, panic or not.
-fn run_app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+fn run_app(terminal: &mut DefaultTerminal, layout: &StoreLayout) -> std::io::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     loop {
         // `Terminal::draw` calls `Terminal::autoresize` on every call, so a terminal resize needs
         // no dedicated handling beyond looping back to `draw()` after any event — including
-        // `Event::Resize` itself.
-        terminal.draw(|frame| {
-            frame.render_widget(
-                Paragraph::new("local-rag-tui — coming soon (press q to quit)"),
-                frame.area(),
-            );
-        })?;
+        // `Event::Resize` itself. Recomputing on every event (not just a real keymap change) keeps
+        // the screen live without a tick timer/async — cheap when the daemon is dead (file reads
+        // only) and bounded by `LIVENESS_PROBE_TIMEOUT_MS` when it is alive.
+        let data = compute_status_data(
+            layout,
+            &cwd,
+            Duration::from_millis(local_rag::daemon::LIVENESS_PROBE_TIMEOUT_MS),
+        );
+        terminal.draw(|frame| render_status(frame, &data))?;
 
         if should_quit(event::read()?) {
             return Ok(());
