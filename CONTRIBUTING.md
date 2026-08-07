@@ -405,6 +405,19 @@ reimplemented schema check:
   `||` chaining, so Node is unavoidable on every tier) is the dominant cost, not a missed
   optimization; the MCP server pays this once per session, not once per hook event the way the
   hook's own budget matters for.
+- `plugin/skills/memory-first-workflow/SKILL.md` (T19-04) — a fifth adoption channel alongside
+  `SERVER_INSTRUCTIONS` (D-041), the tool catalog (T19-01), and the recall trailer (T19-02): a
+  compact routing table (built-in → local-rag tool → when) for all five read-heavy tools, reusing
+  their exact trigger phrasing. Auto-discovered from `skills/` — no `plugin.json` entry, same
+  default-location convention as `hooks/hooks.json`/`.mcp.json` (confirmed against
+  `code.claude.com/docs/en/{plugins-reference,skills}`: skills are always scanned from this
+  location; the manifest's own `skills` field exists only to *add* extra non-default paths, not to
+  register the default one). No `disable-model-invocation` override — the skill's `description`
+  stays in the per-session skill listing so Claude can route to it without an explicit invocation,
+  which is the entire point of this channel; the official quickstart's own canonical example
+  defaults the *other* way (`disable-model-invocation: true`, user-invocable only), a deliberate
+  deviation here. Real `claude plugin details memory@memory` output confirms discovery:
+  `Skills (1)  memory-first-workflow`.
 
 Run the suite: `node --test plugin/test/*.test.js` (same explicit-glob reasoning as `npm/`'s own
 section above). Three tiers: pure JSON/logic checks (always run, including

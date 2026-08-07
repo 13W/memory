@@ -76,6 +76,13 @@ test(
         assert.match(r.stdout, new RegExp(event), `expected ${event} in claude plugin details output`);
       }
 
+      // T19-04: the plugin skill (`plugin/skills/memory-first-workflow/`)
+      // is auto-discovered from its default-location directory — no
+      // `plugin.json` entry names it, so this is the only real proof it
+      // was actually picked up on install, not just present on disk.
+      assert.match(r.stdout, /Skills \(1\)/);
+      assert.match(r.stdout, /memory-first-workflow/);
+
       r = runClaude(["plugin", "uninstall", "memory@memory", "-s", "local", "-y"], configDir);
       assert.equal(r.status, 0, `uninstall: ${r.stdout}\n${r.stderr}`);
 
