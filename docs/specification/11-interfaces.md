@@ -897,3 +897,35 @@ resolves `StoreLayout` once at startup and recomputes `compute_status_data` on e
 only a keypress) — cheap (file reads when the daemon is dead, one bounded UDS round-trip when
 alive) and gives a live-feeling screen with no tick timer/async, which this task does not
 introduce (that is T18-08/T18-09's own scope for Logs/live stats).
+
+As-built note (T18-03, `[SPEC]`). The Repositories screen is real: `local_rag_tui::repositories`
+(new `crates/local-rag-tui/src/repositories.rs`), and this dashboard's first screen-switching and
+drill-down scheme — neither ADR-0008 nor this section nor T18-01/T18-02's own as-built code had
+decided either, so this card had to invent both. Top-level screens are selected by digit keys
+`1`..`SCREENS.len()` (`main.rs`'s new `Screen` enum + `SCREENS` array — ADR-0008 names six screens
+total, each later T18-0N card appends one variant and one array entry, no dispatcher rewrite);
+chosen over `Tab`-cycling for direct addressability and because digits never collide with the
+`Up`/`Down`/`Enter`/`Backspace` keys Repositories needs for its own navigation. Within the screen,
+`Enter` descends and `Backspace` ascends a three-level drill-down (`RepositoriesNav::{Repos,
+Worktrees, WorktreeDetail}`, one `compute_*_level` per level so an invisible level is never
+queried); `Esc`/`q`/`Ctrl+C` remain an unconditional, context-free quit at any level — `should_quit`
+itself is untouched, specifically so quit never needed to become context-sensitive. Each level maps
+directly onto the card's own named primitives: `Repos` → `all_repository_ids`+`current_path`+
+`worktrees_of_repo(...).len()`; `Worktrees` → `worktrees_of_repo(repo_id)`; `WorktreeDetail` →
+`worktree_summary`+`current_worktree_path`+`worktree_path_history` — the card originally named
+`path_history` here, which is actually repository-scoped; the worktree-scoped primitive this level
+needs is `worktree_path_history` (corrected in the card text itself, `groups/18-tui-dashboard.md`).
+Like Status, durable reads never silently apply a pending migration
+(`StateDb::diagnose_versions`-before-`StateDb::open`, `describe_versions_blocker`) — duplicated from
+`status.rs` rather than shared, to keep this task from touching T18-02's already-shipped code a
+second time; a shared helper is deferred until a third screen needs the identical precaution.
+Navigation transitions (`RepositoriesNav::moved`/`descend`/`ascend`) are pure — no I/O, no
+`ratatui::widgets::ListState` involved (that type only clamps its own selection at render time, not
+immediately, which would make an exact transition unit test impossible) — `RepositoriesNav`'s own
+`selected: usize` is the sole source of truth; `render_repositories` builds a fresh `ListState`
+from it every frame. First use of `ratatui::widgets::List`/`ListState` in this workspace. New
+`tests/repositories_offline.rs` (fixture `state.sqlite`, multiple repositories including one with
+two worktrees — one `detach()`ed — plus a worktree observed at two different paths for the history
+level) and inline `#[cfg(test)]` `TestBackend` render tests plus pure navigation unit tests in
+`repositories.rs`/`main.rs`; no live-subprocess test — none of the primitives this screen calls
+touch a running daemon.

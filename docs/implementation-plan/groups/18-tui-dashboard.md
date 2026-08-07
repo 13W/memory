@@ -42,8 +42,14 @@ Web-дашборде v1 (логи/статистика, память, настр
 
 - **Результат:** экран Repositories — список репозиториев (`local_rag_store::registry::
   all_repository_ids`, `current_path`, `worktrees_of_repo`) с drill-down в worktree
-  (`worktree_summary`, `current_worktree_path`, `path_history`). Только чтение.
+  (`worktree_summary`, `current_worktree_path`, `worktree_path_history`). Только чтение.
 - **Тесты:** рендер на фикстуре с несколькими repo/detached-worktree; drill-down навигация.
+
+  *(T18-03 as-built: карточка изначально называла `path_history` — это repo-уровневая функция
+  (`Vec<PathObservation>`, `crates/store/src/registry/repository.rs:168`); worktree-уровневый
+  аналог, реально нужный для drill-down в конкретный worktree, называется
+  `worktree_path_history` (`Vec<WorktreePathObservation>`,
+  `crates/store/src/registry/worktree.rs:437`) — исправлено при реализации.)*
 
 ## T18-04 — Memory browser (read-only)
 
