@@ -42,18 +42,20 @@ local-rag serves this workspace's hybrid code index from a local daemon. It neve
 demand: every tool answers from the index generation already committed by background work, or \
 reports why it cannot.
 
-Which tool: search_code finds code by name or by meaning — start here. get_file_context, once \
-you have a path, lists that file's indexed units (ids, kinds, names, byte spans) with excerpts; \
-cheaper and more complete than re-searching for a file you already located. project_overview \
-orients in an unfamiliar repository: a 3-level directory tree with recursive file/unit counts, \
-likely entry points, and the most-imported module specifiers.
+Working loop, not optional: call recall before your first file read, grep, or search this \
+session \u{2014} termless is fine, it returns the scope's most recent eligible memories. \
+Skipping it means re-deriving facts and decisions this project already paid once to store. Then \
+search_code for the actual code. Think through both, act (edit, run, verify). The moment \
+something durable surfaces \u{2014} a decision, a convention, a fact worth keeping \u{2014} call \
+remember before moving on to the next thing; deferring it to \"later\" is how it gets lost. \
+RECALL \u{2192} SEARCH_CODE \u{2192} THINK \u{2192} ACT \u{2192} REMEMBER: each arrow is a tool \
+call, not narration.
 
-Working loop: recall before you act. Call recall \u{2014} termless at session start, with a query \
-once one exists \u{2014} to surface durable facts, decisions, and conventions already known about \
-this project, then search_code to find the actual code. Think through both, act (edit, run, \
-verify), and when you learn something durable \u{2014} a decision, a convention, a fact worth \
-keeping \u{2014} call remember so a future session does not rediscover it. \
-RECALL \u{2192} SEARCH_CODE \u{2192} THINK \u{2192} ACT \u{2192} REMEMBER.
+Which tool, once recall has run: search_code finds code by name or by meaning. \
+get_file_context, once you have a path, lists that file's indexed units (ids, kinds, names, \
+byte spans) with excerpts; cheaper and more complete than re-searching for a file you already \
+located. project_overview orients in an unfamiliar repository: a 3-level directory tree with \
+recursive file/unit counts, likely entry points, and the most-imported module specifiers.
 
 Modes: hybrid (default) fuses BM25 with dense vector search — use it unless you have a reason \
 not to. lexical is exact-token full-text: identifiers, string literals, error messages, \

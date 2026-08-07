@@ -58,7 +58,8 @@ pub fn catalog() -> Value {
                 "name": "search_code",
                 "description": "Search this workspace's indexed code. Returns fused hits \
                     with path, unit kind, byte span, language, per-leg ranks and an excerpt \
-                    cut from the exact indexed bytes. Never indexes on demand.",
+                    cut from the exact indexed bytes. Never indexes on demand. Call recall \
+                    first this session if you have not yet.",
                 "annotations": annotations("Search code", true, false, true),
                 "inputSchema": {
                     "type": "object",
@@ -134,8 +135,9 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "recall",
-                "description": "Explicit durable-memory recall: the same scored pipeline the \
-                    session-start hook uses. An empty/absent query is legal and returns the \
+                "description": "Explicit durable-memory recall — call this before \
+                    search_code or any file exploration, not after. The same scored pipeline \
+                    the session-start hook uses. An empty/absent query is legal and returns the \
                     scope's most recent eligible memories. Returns both the rendered \
                     additionalContext text block and structured entries with ids for follow-up \
                     tool calls (inspect_memory_evidence, edit_memory).",
@@ -279,8 +281,9 @@ pub fn catalog() -> Value {
             {
                 "name": "remember",
                 "description": "Create a new durable memory entry directly (not via candidate \
-                    review). Defaults to repository scope when the request's worktree resolves, \
-                    else global.",
+                    review), the moment something durable surfaces — a decision, a convention, \
+                    a fact worth keeping. Do not defer it to later in the session. Defaults to \
+                    repository scope when the request's worktree resolves, else global.",
                 "annotations": annotations("Create memory entry", false, false, false),
                 "inputSchema": {
                     "type": "object",
