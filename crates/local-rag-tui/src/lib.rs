@@ -6,7 +6,10 @@
 //!
 //! [`status`] is T18-02's deliverable — the Status screen (spec 11 §7): daemon identity/mode
 //! (best-effort against `store.lock`, live-probed via `local_rag::daemon::fetch_welcome` when the
-//! lock says ready) plus durable counts read directly from `state.sqlite`. Later T18-03+ cards add
-//! their own sibling modules here, not inside this one.
+//! lock says ready) plus durable counts read directly from `state.sqlite`. [`repositories`] is
+//! T18-03's — the Repositories screen: browse registered repositories, drill into a repository's
+//! worktrees, then into one worktree's own detail. Later T18-04+ cards add their own sibling
+//! modules here, not inside these.
 
+pub mod repositories;
 pub mod status;
