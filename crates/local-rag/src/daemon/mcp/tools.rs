@@ -34,6 +34,18 @@ pub const MAX_RECALL_LIMIT: i64 = 50;
 pub const DEFAULT_LIST_LIMIT: i64 = 20;
 pub const MAX_LIST_LIMIT: i64 = 100;
 
+/// Not `[SPEC]`-fixed — chosen and documented, not derived (same precedent as
+/// `MAX_SEARCH_LIMIT` above). Deferred loading (T19-01's diagnosis, group 19
+/// plan) triggers once a client's *combined* MCP tool definitions cross a
+/// context-size threshold outside this daemon's control; the serialized
+/// `tools/list` catalog is this daemon's only lever on that budget. Set with
+/// ~20% headroom over the as-built size (`serde_json::to_string(&catalog())`
+/// was 12 252 bytes at T19-01) so ordinary wording fixes do not trip it, while
+/// still catching unbounded regrowth of the catalog back toward verbosity.
+/// `cfg(test)`: purely a regression-test bound, nothing at runtime reads it.
+#[cfg(test)]
+const MAX_CATALOG_BYTES: usize = 15_000;
+
 /// `Tool.annotations` (X-003, `[SPEC]`) — `openWorldHint` is always `false`:
 /// this system is fully local (`data_policy` default `local_only`, CLAUDE.md's
 /// own architecture guardrail), no tool ever reaches out to the world.
@@ -56,10 +68,11 @@ pub fn catalog() -> Value {
         "tools": [
             {
                 "name": "search_code",
-                "description": "Search this workspace's indexed code. Returns fused hits \
-                    with path, unit kind, byte span, language, per-leg ranks and an excerpt \
-                    cut from the exact indexed bytes. Never indexes on demand. Call recall \
-                    first this session if you have not yet.",
+                "description": "Use INSTEAD of Grep or Glob when you need to search by \
+                    meaning or don't know the exact identifier. Returns fused hits with path, \
+                    unit kind, byte span, language, per-leg ranks and an excerpt cut from the \
+                    exact indexed bytes. Never indexes on demand. Call recall first this \
+                    session if you have not yet.",
                 "annotations": annotations("Search code", true, false, true),
                 "inputSchema": {
                     "type": "object",
@@ -102,7 +115,8 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "get_file_context",
-                "description": "List everything the index knows about one file: its units \
+                "description": "Use INSTEAD of Read or another search once you already have \
+                    a file's path. Lists everything the index knows about it: its units \
                     (occurrence id, kind, name, qualified name, byte span) with excerpts from \
                     the exact indexed bytes, plus the generation they came from.",
                 "annotations": annotations("Get file context", true, false, true),
@@ -122,10 +136,10 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "project_overview",
-                "description": "Orient in this workspace: a 3-level directory tree with \
-                    recursive file and unit counts, likely entry-point files, and the most \
-                    frequently imported module specifiers, all derived from the active index \
-                    generation.",
+                "description": "Use INSTEAD of a series of ls/Glob calls when orienting in an \
+                    unfamiliar repository. Returns a 3-level directory tree with recursive \
+                    file and unit counts, likely entry-point files, and the most frequently \
+                    imported module specifiers, all derived from the active index generation.",
                 "annotations": annotations("Project overview", true, false, true),
                 "inputSchema": {
                     "type": "object",
@@ -135,12 +149,12 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "recall",
-                "description": "Explicit durable-memory recall — call this before \
-                    search_code or any file exploration, not after. The same scored pipeline \
-                    the session-start hook uses. An empty/absent query is legal and returns the \
-                    scope's most recent eligible memories. Returns both the rendered \
-                    additionalContext text block and structured entries with ids for follow-up \
-                    tool calls (inspect_memory_evidence, edit_memory).",
+                "description": "Call before your first file read, grep, or search this \
+                    session, never after — explicit durable-memory recall, the same scored \
+                    pipeline the session-start hook uses. An empty/absent query is legal and \
+                    returns the scope's most recent eligible memories. Returns both the \
+                    rendered additionalContext text block and structured entries with ids for \
+                    follow-up tool calls (inspect_memory_evidence, edit_memory).",
                 "annotations": annotations("Recall memory", true, false, true),
                 "inputSchema": {
                     "type": "object",
@@ -164,9 +178,9 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "list_memory",
-                "description": "Review durable memory entries in scope (global, repository, \
-                    and — when a worktree resolves — worktree), including terminal states \
-                    (superseded/retracted/resolved/rejected), unlike recall which excludes them.",
+                "description": "Review durable memory entries by scope (global/repository/ \
+                    worktree), including terminal states (superseded/retracted/resolved/ \
+                    rejected) that recall excludes.",
                 "annotations": annotations("List memory entries", true, false, true),
                 "inputSchema": {
                     "type": "object",
@@ -258,9 +272,9 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "stats",
-                "description": "Store-wide counts of memory entries (by kind/state) and pending \
-                    candidates (by review state), plus write-queue backpressure and, when the \
-                    request's worktree resolves, its projection status.",
+                "description": "Store-wide counts of memory entries (by kind/state) and \
+                    pending candidates (by review state), write-queue backpressure, and — when \
+                    the worktree resolves — its projection status.",
                 "annotations": annotations("Store statistics", true, false, true),
                 "inputSchema": {
                     "type": "object",
@@ -280,9 +294,9 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "remember",
-                "description": "Create a new durable memory entry directly (not via candidate \
-                    review), the moment something durable surfaces — a decision, a convention, \
-                    a fact worth keeping. Do not defer it to later in the session. Defaults to \
+                "description": "Call the moment something durable surfaces — a decision, a \
+                    convention, a fact worth keeping — not later in the session. Creates a new \
+                    durable memory entry directly (not via candidate review). Defaults to \
                     repository scope when the request's worktree resolves, else global.",
                 "annotations": annotations("Create memory entry", false, false, false),
                 "inputSchema": {
@@ -487,10 +501,10 @@ pub fn catalog() -> Value {
             },
             {
                 "name": "give_feedback",
-                "description": "Record free-text feedback as a durable observation, directly \
-                    (not through the spool) — the daemon-internal equivalent of a hook's ingest \
-                    append. Feeds the next consolidation pass; does not itself mutate any memory \
-                    entry.",
+                "description": "Records free-text feedback as a durable observation, directly \
+                    (not through the spool) — the daemon-internal equivalent of a hook's \
+                    ingest append. Feeds the next consolidation pass without mutating any \
+                    memory entry.",
                 "annotations": annotations("Give feedback", false, false, true),
                 "inputSchema": {
                     "type": "object",
@@ -570,6 +584,17 @@ pub fn reject_unknown_keys(args: &Map<String, Value>, known: &[&str]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_stays_within_the_byte_budget() {
+        let size = serde_json::to_string(&catalog()).unwrap().len();
+        assert!(
+            size <= MAX_CATALOG_BYTES,
+            "serialized tools/list catalog is {size} bytes, over the {MAX_CATALOG_BYTES}-byte \
+                budget (T19-01) — deferred loading in MCP clients keys off total tool-definition \
+                size, so catalog growth must be a deliberate choice, not an accident"
+        );
+    }
 
     #[test]
     fn catalog_advertises_all_seventeen_v0_tools_with_the_spec_fixed_names() {

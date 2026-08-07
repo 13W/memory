@@ -336,6 +336,41 @@ memory entry"). In scope: only the `annotations` block on the existing 17 catalo
 (`crates/local-rag/src/daemon/mcp/tools.rs::annotations` helper); `dispatch.rs`/`content.rs`
 are unchanged — `tools::catalog()` was already returned as-is in `tools/list`.
 
+As-built note (T19-01, `[SPEC]`, group 19 plan — `docs/implementation-plan/groups/
+19-mcp-adoption.md`). Diagnosis: agents with the plugin installed and full tool access were
+observed not calling `recall`/`search_code`/`remember` (D-041) for reasons composed of several
+mechanisms, of which D-041's `SERVER_INSTRUCTIONS` rewrite addressed only the weakest — the
+tool catalog itself competes with Claude Code's own system prompt, which explicitly directs the
+model to built-in `Grep`/`Glob`/`Read`, and a neutral "what this tool does" first sentence loses
+that competition by construction. Two caller-facing changes to `mcp::tools::catalog`:
+- The first sentence of `search_code`/`get_file_context`/`project_overview`'s descriptions now
+  names the built-in it substitutes for and the trigger condition ("Use INSTEAD of Grep or Glob
+  when …"); `recall`/`remember` (which have no direct built-in analogue) instead lead with a
+  workflow-timing trigger ("Call before your first file read, grep, or search …" /
+  "Call the moment something durable surfaces … not later"). Tool names, `inputSchema`, and
+  `annotations` are unchanged (spec-fixed); only prose changed.
+- The eight administrative/review tools (`list_memory`, `list_memory_candidates`,
+  `inspect_memory_evidence`, `stats`, `health`, `approve_memory_candidate`,
+  `reject_memory_candidate`, `edit_memory_candidate`, `edit_memory`, `retract_memory`,
+  `merge_memories`, `give_feedback`) are held to 1–2 sentences — they are not part of the
+  recall/search/remember working loop, but their token weight still counts toward the client-side
+  deferred-loading threshold that decides whether the whole catalog is inlined into context at
+  all (MCP Tool Search / deferred loading, Claude Code ≥ 2.1.7: tool definitions past ~10% of the
+  context window stop being inlined, and a deferred tool is rarely self-loaded).
+- New `mcp::tools::MAX_CATALOG_BYTES` constant (`#[cfg(test)]` — a regression-test bound, not a
+  runtime-read value; not `[SPEC]`-fixed, chosen and documented, same precedent as
+  `MAX_SEARCH_LIMIT`) plus a regression test asserting
+  `serde_json::to_string(&catalog()).len()` stays under it — a size budget guarding against the
+  catalog silently regrowing back toward the verbosity that motivated this task. As-built size:
+  12 252 bytes serialized (was 12 113 before this task — the trigger-phrasing additions to the
+  five working tools outweigh the admin-description trims), budget set to 15 000 bytes
+  (~20% headroom).
+
+Out of scope for T19-01 (deferred to the rest of group 19's queue, `19-mcp-adoption.md`):
+`SERVER_INSTRUCTIONS` (already rewritten by D-041), the per-prompt `additionalContext`
+tool-routing trailer (§5, T19-02), hook/`.mcp.json` cold-start reliability (T19-03), and the
+plugin skill channel (T19-04).
+
 ## 3. Hooks
 
 ### 3.1 Ingestion hooks `[FIXED]`
