@@ -14,12 +14,19 @@
 //! detail + evidence, mutate through the same primitives `cli/memory.rs` uses. [`store_read`] is a
 //! T18-04 extraction — the offline-safe `state.sqlite` read dance shared by every screen above,
 //! moved out once a third screen needed it. [`store_write`] is T18-05's write-side counterpart —
-//! the same offline-safe precaution, returning a write-capable `StateDb`. `rt` (crate-internal,
-//! not re-exported) is T18-05's single-shot tokio runtime for driving a mutation's
-//! `StateWriter::transaction` from this crate's otherwise fully synchronous event loop. Later
-//! T18-06+ cards add their own sibling modules here, not inside these.
+//! the same offline-safe precaution, returning a write-capable `StateDb`, reused as-is by
+//! [`repo_settings`] (T18-06, this module's own doc comment already anticipated a second write
+//! caller here). [`repo_settings`] is T18-06's — the Repo Settings screen: a `data_policy` form
+//! (4 fixed values, cycled and applied immediately, no confirm-modal — the backend has no MCP
+//! catalog entry to gate against) plus a generic `(key, value)` list, over
+//! `crates/store/src/registry/settings.rs` — the first production caller of that primitive
+//! anywhere in the workspace. `rt` (crate-internal, not re-exported) is T18-05's single-shot tokio
+//! runtime for driving a mutation's `StateWriter::transaction` from this crate's otherwise fully
+//! synchronous event loop, reused by every write screen since. Later T18-07+ cards add their own
+//! sibling modules here, not inside these.
 
 pub mod memory;
+pub mod repo_settings;
 pub mod repositories;
 mod rt;
 pub mod status;
