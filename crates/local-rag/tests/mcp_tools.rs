@@ -148,6 +148,54 @@ async fn tool_call_counters_are_isolated_per_session_and_summed_in_the_aggregate
     handle.shutdown().await;
 }
 
+/// G19 gate finding: `dispatch::route_tools_call`'s own doc comment claims
+/// an attempted call is counted even when it never reaches a tool handler
+/// — recording happens before the `other => unknown tool` arm below it.
+/// Nothing exercised that claim; an unrecognized tool name is the sharpest
+/// case (never dispatched anywhere, JSON-RPC-level `-32602` error, not
+/// even `isError` content) and the cheapest to construct.
+#[tokio::test]
+async fn an_unrecognized_tool_name_is_still_counted_even_though_the_call_itself_errors() {
+    let (_home, layout) = open_layout();
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+
+    let stats = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        let bogus = client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"definitely_not_a_real_tool","arguments":{}}}"#,
+            None,
+        );
+        assert_eq!(bogus["error"]["code"], -32602, "{bogus}");
+        assert!(
+            bogus["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool"),
+            "{bogus}"
+        );
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    let text = stats["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        parsed["tool_calls"]["session"],
+        serde_json::json!([
+            {"name": "definitely_not_a_real_tool", "count": 1},
+            {"name": "stats", "count": 1},
+        ]),
+        "the failed call must still show up, sorted by name alongside stats itself: {text}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A real, existing directory that was never registered, and a path that
 /// does not exist at all, both resolve to `WORKTREE_NOT_INDEXED` — a
 /// normal tool result (`isError: true`), never a JSON-RPC-level error and
