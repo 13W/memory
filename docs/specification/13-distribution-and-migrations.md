@@ -12,7 +12,10 @@ One native service binary, no mandatory external daemons; model assets delivered
 - Build tooling: `cargo-dist`, `cargo-zigbuild` `[FIXED]`.
 - Binaries per platform package `[SPEC]`: `local-rag` (daemon+CLI multiplexed), `local-rag-proxy`
   (stdio MCP proxy), `local-rag-hook` (spool writer). Single binary with argv0/subcommand
-  multiplexing is acceptable; hooks path must be exec-fast (<50 ms cold `[SPEC]`).
+  multiplexing is acceptable; hooks path must be exec-fast (<50 ms cold `[SPEC]`). The Claude Code
+  plugin's own MCP server entry point resolves through a three-tier fallback (a locally installed
+  npm package, a known-path cache, `npx` last resort — not a bare, uncached `npx` invocation) and
+  its cached-tier launcher-only overhead must stay under a p95 < 100 ms cold budget `[SPEC]`.
 
 As-built note (T17-03, `[SPEC]`). The npm scope stays `@13w`, but the launcher and platform
 package **names** are `@13w/memory` / `@13w/memory-{darwin-arm64,darwin-x64,linux-x64,
@@ -27,6 +30,36 @@ on-disk store path are **not** part of this rename — see `npm/memory/` and `pl
 names. Historical evidence in `docs/implementation-plan/PROGRESS.md` for T17-01/T17-02 still cites
 `@13w/local-rag*`, correctly, as that was the real name at the time those tasks executed — it is
 not rewritten (`CLAUDE.md`: prior evidence is never edited after the fact).
+
+As-built note (T19-03, `[SPEC]`, group 19 plan). Two changes to the plugin's own launch path,
+distinct from the npm launcher T17-01/T17-03 already cover above:
+
+- **`${CLAUDE_PLUGIN_DATA}` audit, closed without a code change.** The group 19 card asked
+  whether this variable, load-bearing for `hooks.json`'s fast path since T17-02, is actually
+  documented Claude Code plugin behavior. Verified against the official reference
+  (`code.claude.com/docs/en/plugins-reference`): yes — a real, persistent-per-plugin directory
+  distinct from the ephemeral `${CLAUDE_PLUGIN_ROOT}`, used here exactly the way the docs' own
+  worked example does. No code changed as a result; this note is the confirmation.
+- **A three-tier MCP launcher replaces the bare `npx` `.mcp.json` used before.**
+  `plugin/bin/local-rag-mcp-launcher.js` tries, in order: (1) a locally installed `@13w/memory`,
+  anchored at `${CLAUDE_PROJECT_DIR}/node_modules` only, `require()`-delegated into
+  `npm/memory/bin/local-rag-mcp.js` behind a preflight check (that file's own resolution failure
+  is fatal by design for the standalone case — `process.exit(1)` — so the preflight, not a bare
+  `require()`, is what keeps a missing platform `optionalDependency` from killing this launcher
+  before the remaining tiers run); (2) the same `${CLAUDE_PLUGIN_DATA}/bin/` cache the hook already
+  uses, a second entry (`local-rag-proxy`) populated by any prior successful tier-1 or tier-3 run
+  (`npm/memory/src/binary-cache.js`, renamed and generalized from the hook-only `hook-cache.js` it
+  replaces); (3) `npx --yes --package=@13w/memory local-rag-mcp`, today's only prior behavior, kept
+  as the unconditional last resort. `.mcp.json`'s `command`/`args` became `"node"` +
+  `${CLAUDE_PLUGIN_ROOT}/bin/local-rag-mcp-launcher.js` — not a bare shebang'd path, which the
+  official docs' own worked example for a plugin-bundled JS server also avoids, and which would
+  not work on `win32-x64` at all (a shell-less direct spawn does not consult shebangs). Real
+  measurement of the launcher's own overhead on the cached tier-2 path: p50 ≈ 39 ms / p95 ≈ 42 ms
+  (`plugin/test/mcp-cold-start.test.js`), under the p95 < 100 ms budget chosen above — structurally
+  larger than the hook's own <50 ms budget because `.mcp.json` has no shell for `||` fallback
+  chaining, so Node startup itself is unavoidable on every tier (unlike the hook's fast path, which
+  execs the cached native binary directly, no Node at all); the MCP server pays this once per
+  session, not once per event the way the hook's own tighter budget matters for.
 
 ## 2. Launcher requirements (verified by packaging tests) `[FIXED list]`
 

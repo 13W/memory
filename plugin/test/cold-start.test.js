@@ -16,11 +16,11 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const { buildFlatLayout } = require("../../npm/memory/test/helpers/fixture-layout.js");
-const { cachedHookPath } = require("../../npm/memory/src/hook-cache.js");
-const { nativeHookBinaryPath } = require("./helpers/native-hook-binary.js");
+const { cachedBinaryPath } = require("../../npm/memory/src/binary-cache.js");
+const { nativeBinaryPath } = require("./helpers/native-binary.js");
 const { prepareSpoolDir } = require("./helpers/store-fixture.js");
 
-const nativeBin = nativeHookBinaryPath();
+const nativeBin = nativeBinaryPath("local-rag-hook");
 const SKIP_REASON = "target/debug/local-rag-hook is not built — run `cargo build -p local-rag-hook` first";
 
 const MEASURED_ITERATIONS = 30;
@@ -61,7 +61,7 @@ test(
     });
     assert.equal(bootstrap.status, 0, `bootstrap run failed: ${bootstrap.stdout}\n${bootstrap.stderr}`);
 
-    const cachedPath = cachedHookPath(pluginData);
+    const cachedPath = cachedBinaryPath(pluginData, "local-rag-hook");
     assert.ok(fs.existsSync(cachedPath), "bootstrap must populate the cache symlink");
     // The cache points at the *resolved package's* binary path (one hop),
     // which is itself a symlink to the real native binary in this fixture

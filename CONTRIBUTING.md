@@ -316,9 +316,12 @@ its own separate Cargo workspace:
   connect.rs::spawn_detached_daemon`'s own process-group isolation. T17-02 adds a second
   entrypoint, `bin/local-rag-hook.js`, for the ingestion hook path — it must **always** exit 0
   (fail-open, unlike the MCP launcher) and best-effort refreshes a direct-exec cache symlink
-  under `${CLAUDE_PLUGIN_DATA}` (`src/hook-cache.js`) so a Claude Code plugin's hook commands can
-  skip Node/npx entirely on the steady-state path — see `## Claude Code plugin` below. T18-01 adds
-  a third entrypoint, `bin/local-rag-dashboard.js`, execing the native `local-rag-tui` terminal
+  under `${CLAUDE_PLUGIN_DATA}` (`src/binary-cache.js`, T19-03; was hook-only `hook-cache.js`) so
+  a Claude Code plugin's hook commands can skip Node/npx entirely on the steady-state path — see
+  `## Claude Code plugin` below. T19-03 makes `bin/local-rag-mcp.js` refresh that same cache too
+  (a second entry, `local-rag-proxy`, alongside the hook's own `local-rag-hook`), so
+  `plugin/bin/local-rag-mcp-launcher.js`'s known-path tier has something to find. T18-01 adds a
+  third entrypoint, `bin/local-rag-dashboard.js`, execing the native `local-rag-tui` terminal
   dashboard — `stdio: 'inherit'` here is not just convenient but load-bearing: a full-screen
   interactive TUI needs the real inherited TTY (raw-mode/alternate-screen ioctls have no meaning
   over a pipe), unlike the MCP proxy where it is "correct rather than a manual pipe/relay" for
@@ -366,34 +369,64 @@ reimplemented schema check:
   `npx --yes --package=@13w/memory local-rag-hook spool-write`, else `true` — the trailing
   `|| true` is load-bearing: spec 11 §3.1's "always exit 0" is a `[FIXED]` contract on the whole
   command a `hooks.json` entry invokes, not just the native binary once it is running, so it must
-  hold even when both the cache and `npx` fail (e.g. first run, offline).
-- `plugin/.mcp.json` — the `memory` MCP server, `npx --yes --package=@13w/memory
-  local-rag-mcp` (verified empirically: `npx <pkg> <bin-name>` — without `--package=`/`--yes` —
-  does **not** select a non-default bin from a multi-bin package; `--package=` is the form that
-  actually works).
-- `plugin/bin/local-rag-hook.js`'s own cache write is what makes the hooks.json fast path
-  possible: after the first (necessarily slower, `npx`-mediated) bootstrap run, every subsequent
-  hook invocation execs the native binary directly — a real measurement against the cargo-built
-  binary lands around p50 ≈ 5ms / p95 ≈ 6ms, comfortably under spec 13 §1's <50ms budget
-  (`plugin/test/cold-start.test.js`).
+  hold even when both the cache and `npx` fail (e.g. first run, offline). `${CLAUDE_PLUGIN_DATA}`
+  itself was independently audited against the official Claude Code plugin docs (T19-03,
+  `code.claude.com/docs/en/plugins-reference`): a real, documented, persistent-per-plugin
+  directory distinct from the ephemeral `${CLAUDE_PLUGIN_ROOT}`, used here exactly the way the
+  docs' own worked example does — no code change followed from the audit, only this confirmation.
+- `plugin/.mcp.json` — the `memory` MCP server, `"command": "node", "args":
+  ["${CLAUDE_PLUGIN_ROOT}/bin/local-rag-mcp-launcher.js"]` (T19-03; was a bare `npx --yes
+  --package=@13w/memory local-rag-mcp` — `--package=`/`--yes` verified empirically as the form
+  that actually selects a non-default bin from a multi-bin package, still true of the launcher's
+  own tier-3 fallback below). `command`/`args` must be `"node"` + a script path, not a bare
+  shebang'd path: the official docs' own worked example for a plugin-bundled JS server uses
+  exactly this shape, and unlike a POSIX shebang it also works on `win32-x64` (a real, supported
+  platform this project ships), where a direct, shell-less spawn does not consult shebangs at all.
+- `plugin/bin/local-rag-mcp-launcher.js` (T19-03) — ships with the plugin itself (not with
+  `@13w/memory`, which may not be installed anywhere on disk at all), and tries three tiers in
+  order: (1) a locally installed `@13w/memory`, resolved from `${CLAUDE_PROJECT_DIR}/node_modules`
+  only (not a monorepo-relative guess — a real installed plugin's `${CLAUDE_PLUGIN_ROOT}` lives in
+  `~/.claude/plugins/cache/...`, unrelated to this repo's own layout — and not `npm root -g`, a
+  100-300ms subprocess spawn on what is supposed to be the fast tier) and, once resolvable,
+  `require()`-delegated straight into `npm/memory/bin/local-rag-mcp.js` rather than duplicating its
+  resolution logic or paying a second nested Node bootstrap; a two-part preflight check (base
+  package *and* platform-specific package both resolvable) runs before that `require()`, because
+  the delegated file's own `main()` calls `process.exit(1)` synchronously on a resolution failure
+  — fatal by design for the standalone-binary case, which would otherwise kill this launcher before
+  tier 2/3 ever ran; (2) the same `${CLAUDE_PLUGIN_DATA}/bin/` cache the hook already uses, second
+  entry `local-rag-proxy` alongside `local-rag-hook` (`npm/memory/src/binary-cache.js`, renamed and
+  generalized from the hook-only `hook-cache.js` it replaces — `npm/memory/bin/local-rag-mcp.js`
+  now refreshes it too, so both tier-1 delegation and tier-3 `npx` naturally populate it, no
+  separate write-path code in the plugin launcher); (3) today's `npx --yes --package=@13w/memory
+  local-rag-mcp`, unconditional last resort. A real measurement of the launcher's own overhead on
+  the cached tier-2 path lands around p50 ≈ 39ms / p95 ≈ 42ms, under the p95 < 100ms budget T19-03
+  chose (`docs/specification/13-distribution-and-migrations.md` §1/§2) — structurally larger than
+  the hook's own <50ms budget because Node startup itself (`.mcp.json`'s `command` has no shell for
+  `||` chaining, so Node is unavoidable on every tier) is the dominant cost, not a missed
+  optimization; the MCP server pays this once per session, not once per hook event the way the
+  hook's own budget matters for.
 
 Run the suite: `node --test plugin/test/*.test.js` (same explicit-glob reasoning as `npm/`'s own
-section above). Three tiers: pure JSON/logic checks (always run); real cargo-built
-`target/debug/local-rag-hook`-backed end-to-end checks (`no-writes-in-sample-repo.test.js`,
-`cold-start.test.js` — skip with a named reason if that binary is not built, `cargo build -p
-local-rag-hook`); real `claude` CLI checks (`manifest-validate.test.js`,
-`install-uninstall.test.js`, both gated on `claude` being on `PATH`). All `claude`-CLI-mutating
-round trips (`marketplace add`/`install`/`uninstall`/`details`) live in one file
-(`install-uninstall.test.js`) deliberately — Node's test runner parallelizes across files, and
-concurrent `claude` invocations against the same source repo path raced when split across files;
-tests within one file run sequentially by default, which avoids it. Every mutating round trip runs
-under an isolated `CLAUDE_CONFIG_DIR` (a real, respected env var — this project's own dev sessions
-run under one), the same isolation idiom `LOCAL_RAG_HOME` gives every Rust test here.
+section above). Three tiers: pure JSON/logic checks (always run, including
+`mcp-launcher-tiers.test.js`'s fall-through-only assertions and `mcp-cold-start.test.js`'s
+synthetic-fixture budget check); real cargo-built-binary-backed end-to-end checks
+(`no-writes-in-sample-repo.test.js`, `cold-start.test.js` against `target/debug/local-rag-hook`;
+`mcp-launcher-tiers.test.js`'s real-subprocess tier tests and `mcp-cold-start.test.js`'s optional
+informational measurement against `target/debug/local-rag-proxy` — skip with a named reason if not
+built, `cargo build -p local-rag-hook -p local-rag-proxy`); real `claude` CLI checks
+(`manifest-validate.test.js`, `install-uninstall.test.js`, both gated on `claude` being on `PATH`).
+All `claude`-CLI-mutating round trips (`marketplace add`/`install`/`uninstall`/`details`) live in
+one file (`install-uninstall.test.js`) deliberately — Node's test runner parallelizes across files,
+and concurrent `claude` invocations against the same source repo path raced when split across
+files; tests within one file run sequentially by default, which avoids it. Every mutating round
+trip runs under an isolated `CLAUDE_CONFIG_DIR` (a real, respected env var — this project's own dev
+sessions run under one), the same isolation idiom `LOCAL_RAG_HOME` gives every Rust test here.
 
-Windows: the `${CLAUDE_PLUGIN_DATA}` symlink cache and the hooks.json shell-form command are not
-verified on Windows in this task (current CI is Ubuntu-only; the platform matrix is T17-03) — the
-same named, scoped deferral pattern the daemon's own Windows named-pipe gap already used (group
-16). The fallback path (`npx`) still runs correctly there; only the <50ms fast path is unverified.
+Windows: the `${CLAUDE_PLUGIN_DATA}` symlink cache, the hooks.json shell-form command, and the MCP
+launcher's real-subprocess tier tests are not verified on Windows in this task (current CI is
+Ubuntu-only; the platform matrix is T17-03) — the same named, scoped deferral pattern the daemon's
+own Windows named-pipe gap already used (group 16). The fallback path (`npx`) still runs correctly
+there; only the fast paths are unverified.
 
 ## Committing
 
