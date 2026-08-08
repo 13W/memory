@@ -15,9 +15,9 @@ use local_rag_store::{RequestRoot, ScopeKind, export_scope, resolve};
 
 use local_rag::daemon::gitroot;
 
-use super::index::open_state;
 use super::inspect::memory_inspection_json;
 use super::{fail, parse_scope_kind, resolve_layout_and_config, system_now_ms};
+use local_rag::indexing::open_state;
 
 const BIN: &str = "local-rag";
 

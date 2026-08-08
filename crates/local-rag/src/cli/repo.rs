@@ -15,8 +15,8 @@ use std::process::ExitCode;
 use local_rag::daemon::gitroot;
 use local_rag_store::{AttachError, Candidate, RequestRoot, Resolution, attach, resolve};
 
-use super::index::open_state;
 use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
+use local_rag::indexing::open_state;
 
 const BIN: &str = "local-rag";
 

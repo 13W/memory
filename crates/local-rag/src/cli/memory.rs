@@ -27,10 +27,10 @@ use local_rag_store::{
 
 use local_rag::daemon::gitroot;
 
-use super::index::open_state;
 use super::{
     EXIT_USAGE, block_on, fail, parse_scope_kind, resolve_layout_and_config, system_now_ms,
 };
+use local_rag::indexing::open_state;
 
 const BIN: &str = "local-rag";
 

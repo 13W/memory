@@ -4,8 +4,8 @@ use std::process::ExitCode;
 
 use local_rag_store::{all_worktree_ids, current_worktree_path, worktree_summary};
 
-use super::index::open_state;
 use super::{fail, resolve_layout_and_config};
+use local_rag::indexing::open_state;
 
 const BIN: &str = "local-rag";
 

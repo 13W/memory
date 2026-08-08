@@ -5,12 +5,13 @@
 //! convention).
 //!
 //! Most of these need no installed model at all: `run_index`/`run_reindex`
-//! resolve worktree identity *before* opening the embedder (`cli::index`'s
-//! own `open_state`/`resolve_facts`/`finish_index_ctx` split), so the
-//! `Ambiguous`/`GlobalOnly`-refusal/"not installed" paths are all reachable
-//! — and asserted here — without ONNX. The pipeline's own correctness
-//! (files indexed, vectors embedded, generation searchable) is unit-tested
-//! against a fixture `HashingEmbedder` directly in `src/cli/index.rs`; what
+//! resolve worktree identity *before* opening the embedder
+//! (`local_rag::indexing`'s own `open_state`/`resolve_facts`/
+//! `finish_index_ctx` split), so the `Ambiguous`/`GlobalOnly`-refusal/"not
+//! installed" paths are all reachable — and asserted here — without ONNX.
+//! The pipeline's own correctness (files indexed, vectors embedded,
+//! generation searchable) is unit-tested against a fixture `HashingEmbedder`
+//! directly in `src/indexing/mod.rs` (T20-02); what
 //! is only testable here, end to end through the real binary with the real
 //! default model, is env-gated below, following
 //! `local-rag-models`'s own `real_inference_when_the_runtime_and_weights_are_present`

@@ -18,8 +18,8 @@ use local_rag_store::privacy::{
 };
 use local_rag_store::{AuditEventRow, GenerationRow, PayloadStatus};
 
-use super::index::open_state;
 use super::{fail, resolve_layout_and_config, system_now_ms};
+use local_rag::indexing::open_state;
 
 const BIN: &str = "local-rag";
 
