@@ -75,6 +75,10 @@ pub struct McpHandler {
     /// shared instance every connection's `HandshakeContext::tool_calls`
     /// guard tracks; `dispatch::route_tools_call` records into it.
     tool_calls: super::tool_calls::ToolCallCounters,
+    /// Recent-call ring buffer + per-tool aggregate (spec 11 §7, T18-08) —
+    /// the same shared instance `HandshakeContext::telemetry` is recorded
+    /// into; `dispatch`'s `admin/tail_calls`/`admin/tool_stats` read it.
+    telemetry: super::telemetry::TelemetryState,
 }
 
 impl McpHandler {
@@ -84,6 +88,7 @@ impl McpHandler {
         mode: watch::Receiver<DaemonMode>,
         now: fn() -> i64,
         tool_calls: super::tool_calls::ToolCallCounters,
+        telemetry: super::telemetry::TelemetryState,
     ) -> Self {
         McpHandler {
             engine,
@@ -91,6 +96,7 @@ impl McpHandler {
             mode,
             now,
             tool_calls,
+            telemetry,
         }
     }
 }
@@ -105,6 +111,7 @@ impl RequestHandler for McpHandler {
             request_context: &ctx,
             now_ms: (self.now)(),
             tool_calls: &self.tool_calls,
+            telemetry: &self.telemetry,
         };
         let response_text = dispatch::dispatch(mcp.get(), &dispatch_ctx).await?;
         Some(RawValue::from_string(response_text).expect("dispatch always produces valid JSON"))

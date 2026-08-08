@@ -22,14 +22,16 @@ use super::{content, instructions, jsonrpc, tools};
 use crate::daemon::gitroot;
 use crate::daemon::memory::MemoryContext;
 use crate::daemon::mode::DaemonMode;
+use crate::daemon::telemetry::TelemetryState;
 use crate::daemon::tool_calls::ToolCallCounters;
 
 /// Everything one `dispatch` call needs. Built fresh per request by
 /// [`super::McpHandler::handle`] — `now_ms` in particular must be a live
 /// clock read, not a startup-frozen value, since the FTS staleness decision
-/// `SearchEngine` makes is clock-dependent. `tool_calls` is the one
-/// exception to "fresh per request": it borrows the daemon-lifetime shared
-/// counters (spec 11 §2, T19-05), the same instance every request shares.
+/// `SearchEngine` makes is clock-dependent. `tool_calls`/`telemetry` are the
+/// exception to "fresh per request": both borrow daemon-lifetime shared
+/// state (spec 11 §2/§7, T19-05/T18-08), the same instances every request
+/// shares.
 pub struct DispatchContext<'a> {
     pub engine: Option<&'a SearchEngine>,
     pub memory: Option<&'a MemoryContext>,
@@ -37,6 +39,7 @@ pub struct DispatchContext<'a> {
     pub request_context: &'a RequestContext,
     pub now_ms: i64,
     pub tool_calls: &'a ToolCallCounters,
+    pub telemetry: &'a TelemetryState,
 }
 
 /// Parse and answer one MCP JSON-RPC message. `None` means `text` was a
@@ -89,6 +92,15 @@ pub async fn dispatch(text: &str, ctx: &DispatchContext<'_>) -> Option<String> {
             Ok(result) => encode_success(id, result),
             Err((code, msg)) => encode_error(id, code, &msg),
         },
+        // TUI-only admin surface (spec 11 §7, T18-08) — not MCP tools, not
+        // in `tools::catalog()`/`tools/list`; independent of `DaemonMode`
+        // and `ctx.engine`/`ctx.memory` (in-memory telemetry, unrelated to
+        // the store), so it stays answerable in `MigrationOnly` too, the
+        // same way `local-rag-tui`'s Logs screen needs it to. Excluded
+        // from the telemetry it exposes by `handshake.rs::handle_connection`
+        // itself (self-exclusion), not here.
+        "admin/tail_calls" => encode_success(id, admin_tail_calls_result(ctx.telemetry)),
+        "admin/tool_stats" => encode_success(id, admin_tool_stats_result(ctx.telemetry)),
         other => encode_error(
             id,
             jsonrpc::METHOD_NOT_FOUND,
@@ -208,6 +220,30 @@ fn to_value(result: content::CallToolResult) -> Value {
     serde_json::to_value(result).expect("CallToolResult always serializes")
 }
 
+/// `{"calls": [CallRecord, ...]}`, oldest first — `admin/tail_calls`'s
+/// result (spec 11 §7, T18-08).
+fn admin_tail_calls_result(telemetry: &TelemetryState) -> Value {
+    serde_json::json!({ "calls": telemetry.tail_calls() })
+}
+
+#[derive(serde::Serialize)]
+struct ToolStatsEntry<'a> {
+    tool: &'a str,
+    #[serde(flatten)]
+    stats: &'a crate::daemon::telemetry::ToolStats,
+}
+
+/// `{"tools": [{"tool": ..., "calls": ..., ...}, ...]}`, sorted by tool
+/// name — `admin/tool_stats`'s result (spec 11 §7, T18-08).
+fn admin_tool_stats_result(telemetry: &TelemetryState) -> Value {
+    let snapshot = telemetry.tool_stats();
+    let tools: Vec<ToolStatsEntry> = snapshot
+        .iter()
+        .map(|(tool, stats)| ToolStatsEntry { tool, stats })
+        .collect();
+    serde_json::json!({ "tools": tools })
+}
+
 fn encode_success(id: Value, result: Value) -> String {
     serde_json::to_string(&jsonrpc::Response::new(id, result)).expect("Response always serializes")
 }
@@ -215,4 +251,115 @@ fn encode_success(id: Value, result: Value) -> String {
 fn encode_error(id: Value, code: i64, message: &str) -> String {
     serde_json::to_string(&jsonrpc::ErrorResponse::new(id, code, message))
         .expect("ErrorResponse always serializes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::telemetry::CallRecord;
+
+    fn ctx<'a>(
+        mode: &'a DaemonMode,
+        request_context: &'a RequestContext,
+        telemetry: &'a TelemetryState,
+        tool_calls: &'a ToolCallCounters,
+    ) -> DispatchContext<'a> {
+        DispatchContext {
+            engine: None,
+            memory: None,
+            mode,
+            request_context,
+            now_ms: 0,
+            tool_calls,
+            telemetry,
+        }
+    }
+
+    fn request_context() -> RequestContext {
+        RequestContext {
+            session_id: "sess-1".to_string(),
+            worktree_root: None,
+            repo_hint: None,
+        }
+    }
+
+    /// `admin/*` never touches `engine`/`memory` — this must answer
+    /// identically in `MigrationOnly` (no store built at all) as in
+    /// `Normal`, unlike `tools/call`.
+    #[tokio::test]
+    async fn admin_tail_calls_answers_even_without_a_store() {
+        let mode = DaemonMode::Normal;
+        let rc = request_context();
+        let telemetry = TelemetryState::new();
+        let tool_calls = ToolCallCounters::new();
+        telemetry.record(CallRecord {
+            at_ms: 1,
+            source: "claude-code".to_string(),
+            tool: "recall".to_string(),
+            duration_ms: 5,
+            bytes_in: 10,
+            bytes_out: 20,
+            is_error: false,
+        });
+        let dispatch_ctx = ctx(&mode, &rc, &telemetry, &tool_calls);
+
+        let text = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"admin/tail_calls"}"#,
+            &dispatch_ctx,
+        )
+        .await
+        .expect("a request always gets a response");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["result"]["calls"][0]["tool"], "recall");
+    }
+
+    #[tokio::test]
+    async fn admin_tool_stats_reflects_recorded_calls_sorted_by_tool() {
+        let mode = DaemonMode::Normal;
+        let rc = request_context();
+        let telemetry = TelemetryState::new();
+        let tool_calls = ToolCallCounters::new();
+        for tool in ["search_code", "recall"] {
+            telemetry.record(CallRecord {
+                at_ms: 1,
+                source: "claude-code".to_string(),
+                tool: tool.to_string(),
+                duration_ms: 5,
+                bytes_in: 10,
+                bytes_out: 20,
+                is_error: false,
+            });
+        }
+        let dispatch_ctx = ctx(&mode, &rc, &telemetry, &tool_calls);
+
+        let text = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"admin/tool_stats"}"#,
+            &dispatch_ctx,
+        )
+        .await
+        .expect("a request always gets a response");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["tool"], "recall", "sorted by tool name");
+        assert_eq!(tools[1]["tool"], "search_code");
+        assert_eq!(tools[0]["calls"], 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_telemetry_state_answers_with_empty_arrays() {
+        let mode = DaemonMode::Normal;
+        let rc = request_context();
+        let telemetry = TelemetryState::new();
+        let tool_calls = ToolCallCounters::new();
+        let dispatch_ctx = ctx(&mode, &rc, &telemetry, &tool_calls);
+
+        let text = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"admin/tail_calls"}"#,
+            &dispatch_ctx,
+        )
+        .await
+        .expect("a request always gets a response");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["result"]["calls"], serde_json::json!([]));
+    }
 }

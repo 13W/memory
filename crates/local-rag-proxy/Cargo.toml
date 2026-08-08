@@ -61,6 +61,17 @@ local-rag-test-support = { path = "../test-support" }
 # `target/<profile>/deps/`), the same "ships side by side" layout spec 13 §1
 # describes and `connect::resolve_daemon_binary_path` relies on at runtime.
 local-rag = { path = "../local-rag" }
+# Dev-only, same reasoning as `local-rag` immediately above — T18-08's
+# `tests/admin_telemetry.rs` needs a real `local-rag-hook` binary alongside
+# the real `local-rag serve`/`local-rag-proxy` it already spawns, to prove
+# the daemon's telemetry tells the hook's recall RPC and the proxy's relayed
+# calls apart by `source`. One new edge, not two: this crate already carries
+# the `local-rag` sibling-binary-path trick as a dev-dependency, so only
+# `local-rag-hook` itself is missing here (a test living in
+# `local-rag-hook/tests/` instead would need dev-deps on *both*
+# `local-rag-proxy` and `local-rag`, since `CARGO_BIN_EXE_<name>` never
+# resolves transitively through another package's own dev-dependency).
+local-rag-hook = { path = "../local-rag-hook" }
 # `test-util`: paused virtual time (`start_paused`/`advance`) for the
 # connect-backoff and 30s-upgrade-timeout tests — the only deterministic,
 # non-wall-clock way to exercise real `tokio::time::sleep`/`timeout`.

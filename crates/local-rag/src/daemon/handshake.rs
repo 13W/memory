@@ -64,11 +64,13 @@ use tokio::sync::{Notify, oneshot, watch};
 
 use super::mode::DaemonMode;
 use super::session::SessionRegistry;
+use super::telemetry::{self, CallRecord, TelemetryState};
 use super::tool_calls::ToolCallCounters;
 
 /// Everything a per-connection task needs — cheap to clone per accept
 /// (`Arc<str>`/`watch::Receiver`/`SessionRegistry`/`ToolCallCounters`/
-/// `Arc<Notify>` all already share their underlying state across clones).
+/// `TelemetryState`/`Arc<Notify>` all already share their underlying state
+/// across clones).
 #[derive(Clone)]
 pub struct HandshakeContext {
     pub instance_uuid: Arc<str>,
@@ -81,6 +83,15 @@ pub struct HandshakeContext {
     /// `SessionRegistry` registration below; `mcp::McpHandler` records into
     /// the same shared counters on every dispatched call.
     pub tool_calls: ToolCallCounters,
+    /// Recent-call ring buffer + per-tool aggregate (spec 11 §7, T18-08) —
+    /// recorded here, around every `handler.handle(...)` call; read back by
+    /// `mcp::dispatch`'s `admin/tail_calls`/`admin/tool_stats`.
+    pub telemetry: TelemetryState,
+    /// A live clock read for `telemetry`'s timestamps, not a value frozen
+    /// at connection-accept time — the same fn-pointer clock convention
+    /// `mcp::McpHandler::now` already uses, so tests can inject a fixed
+    /// clock instead of depending on `SystemTime::now()`.
+    pub now_ms: fn() -> i64,
     /// Signaled once when any connection sends `ShutdownRequest` (spec 02
     /// §4.2, 13 §4's upgrade flow) — `lifecycle::wait_for_shutdown_trigger`
     /// is the reader.
@@ -211,6 +222,7 @@ async fn handle_connection<H: RequestHandler>(
 
     let _session_guard = ctx.sessions.register(hello.session_id.clone());
     let _tool_call_guard = ctx.tool_calls.begin_session(hello.session_id.clone());
+    let harness = hello.harness.clone();
 
     loop {
         let Some(line) = read_bounded_line(&mut reader, MAX_MESSAGE_BYTES).await else {
@@ -221,11 +233,48 @@ async fn handle_connection<H: RequestHandler>(
         };
         match msg {
             Message::Request(env) => {
+                // Telemetry (spec 11 §7, T18-08): label the call before
+                // `env.mcp` moves into `handler.handle`, and skip every
+                // `admin/*` method — an `admin/tail_calls` poll must not
+                // show up inside its own tail.
+                let method = telemetry::method_of(env.mcp.get());
+                let is_admin = method.as_deref().is_some_and(|m| m.starts_with("admin/"));
+                let tool = (!is_admin).then(|| {
+                    telemetry::call_label(env.mcp.get(), method.as_deref().unwrap_or("?"))
+                });
+                let bytes_in = env.mcp.get().len() as u64;
+                let started = tokio::time::Instant::now();
+
                 let Some(response) = handler.handle(env.context, env.mcp).await else {
                     // A JSON-RPC notification: no response, by construction
-                    // — see this module's own doc for why.
+                    // — see this module's own doc for why. Still a real
+                    // call that passed through this connection, so it is
+                    // still worth a telemetry record (bytes_out: 0, never
+                    // an error) unless it was itself `admin/*`.
+                    if let Some(tool) = tool {
+                        ctx.telemetry.record(CallRecord {
+                            at_ms: (ctx.now_ms)(),
+                            source: harness.clone(),
+                            tool,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            bytes_in,
+                            bytes_out: 0,
+                            is_error: false,
+                        });
+                    }
                     continue;
                 };
+                if let Some(tool) = tool {
+                    ctx.telemetry.record(CallRecord {
+                        at_ms: (ctx.now_ms)(),
+                        source: harness.clone(),
+                        tool,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        bytes_in,
+                        bytes_out: response.get().len() as u64,
+                        is_error: telemetry::response_is_error(response.get()),
+                    });
+                }
                 let out = Message::Response(ResponseEnvelope { mcp: response });
                 if write_message(&mut write_half, &out).await.is_err() {
                     return;
@@ -306,6 +355,10 @@ mod tests {
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
 
+    fn fixed_now_ms() -> i64 {
+        1_700_000_000_000
+    }
+
     fn handshake_ctx(supported_proto: RangeInclusive<u16>) -> HandshakeContext {
         let (_mode_tx, mode_rx) = watch::channel(DaemonMode::Normal);
         HandshakeContext {
@@ -315,6 +368,8 @@ mod tests {
             mode: mode_rx,
             sessions: SessionRegistry::new(),
             tool_calls: ToolCallCounters::new(),
+            telemetry: TelemetryState::new(),
+            now_ms: fixed_now_ms,
             shutdown_requested: Arc::new(Notify::new()),
         }
     }
@@ -715,6 +770,121 @@ mod tests {
             }
             other => panic!("expected the real call's Response, got {other:?}"),
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_normal_request_is_recorded_with_source_and_tool() {
+        let home = TempHome::new().expect("temp home");
+        let (socket_path, listener) = bind(&home);
+        let ctx = handshake_ctx(1..=1);
+        let telemetry = ctx.telemetry.clone();
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_connections(
+            listener,
+            ctx,
+            EchoRequestHandler,
+            stop_rx,
+        ));
+
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&socket_path).expect("connect");
+            write_line(
+                &mut stream,
+                &Message::Hello(Hello {
+                    proto: 1,
+                    proxy_version: "0.0.0".to_string(),
+                    session_id: "sess-1".to_string(),
+                    worktree_root: None,
+                    harness: "claude-code-hook".to_string(),
+                }),
+            );
+            let mut reader = StdBufReader::new(stream.try_clone().unwrap());
+            let _welcome = read_line(&mut reader);
+            write_line(
+                &mut stream,
+                &Message::Request(local_rag_protocol::RequestEnvelope {
+                    context: RequestContext {
+                        session_id: "sess-1".to_string(),
+                        worktree_root: None,
+                        repo_hint: None,
+                    },
+                    mcp: RawValue::from_string(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{}}}"#
+                            .to_string(),
+                    )
+                    .unwrap(),
+                }),
+            );
+            let _response = read_line(&mut reader);
+        })
+        .await
+        .expect("blocking task");
+
+        let calls = telemetry.tail_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].source, "claude-code-hook");
+        assert_eq!(calls[0].tool, "recall");
+        assert!(calls[0].bytes_in > 0);
+        assert!(calls[0].bytes_out > 0);
+        assert!(!calls[0].is_error);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_methods_are_never_recorded() {
+        let home = TempHome::new().expect("temp home");
+        let (socket_path, listener) = bind(&home);
+        let ctx = handshake_ctx(1..=1);
+        let telemetry = ctx.telemetry.clone();
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_connections(
+            listener,
+            ctx,
+            EchoRequestHandler,
+            stop_rx,
+        ));
+
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(&socket_path).expect("connect");
+            write_line(
+                &mut stream,
+                &Message::Hello(Hello {
+                    proto: 1,
+                    proxy_version: "0.0.0".to_string(),
+                    session_id: "sess-1".to_string(),
+                    worktree_root: None,
+                    harness: "claude-code".to_string(),
+                }),
+            );
+            let mut reader = StdBufReader::new(stream.try_clone().unwrap());
+            let _welcome = read_line(&mut reader);
+            for method in ["admin/tail_calls", "admin/tool_stats"] {
+                write_line(
+                    &mut stream,
+                    &Message::Request(local_rag_protocol::RequestEnvelope {
+                        context: RequestContext {
+                            session_id: "sess-1".to_string(),
+                            worktree_root: None,
+                            repo_hint: None,
+                        },
+                        mcp: RawValue::from_string(format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#
+                        ))
+                        .unwrap(),
+                    }),
+                );
+                let _response = read_line(&mut reader);
+            }
+        })
+        .await
+        .expect("blocking task");
+
+        assert_eq!(
+            telemetry.tail_calls(),
+            vec![],
+            "polling admin/* must not pollute its own tail"
+        );
         server.abort();
     }
 }

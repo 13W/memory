@@ -1154,6 +1154,7 @@ dependencies = [
  "libc",
  "local-rag",
  "local-rag-core",
+ "local-rag-hook",
  "local-rag-protocol",
  "local-rag-test-support",
  "serde",
