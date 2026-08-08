@@ -70,7 +70,9 @@ subcommand wires the whole path end to end: every fallible step is a typed `Resu
 `panic = "abort"` profile override, so unwinding is real here), converging on `ExitCode::SUCCESS`
 unconditionally. The 200 ms budget (11 §3.1) is measured, not enforced as a hard deadline — killing
 mid-write would risk an inconsistent lock/file state — and reported via `eprintln!` only past the
-fact (no logging subsystem exists anywhere in this workspace yet). `worktree_root` is the hook
+fact (no logging subsystem exists in the hook binary; X-004 gave the daemon a `tracing` subscriber,
+but `local-rag-hook` stays deliberately `eprintln!`-only — it must stay exec-fast, 13 §1 "<50 ms
+cold," and a subscriber init is not free). `worktree_root` is the hook
 JSON's raw `cwd` field, uncanonicalized, and `commit` stays `null`: git introspection is a
 daemon-side concern (02 §3.3/03 §2.1's as-built notes: `local-rag-store` carries no git
 dependency), and the hook must stay exec-fast (13 §1 "<50 ms cold") — canonicalizing here would

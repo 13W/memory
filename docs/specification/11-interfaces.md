@@ -657,6 +657,13 @@ project-level init, no files written into `.claude/rules/`) carries over from v1
 the RECALL → SEARCH_CODE → THINK → ACT → REMEMBER protocol is delivered via MCP server
 instructions at handshake `[SPEC: keep v1 mechanism]`.
 
+As-built note (X-004, `[SPEC]`). `local-rag serve`, run manually in a terminal, now prints a live
+`tracing` log to stderr — see 02 §3.1's own as-built note for the full mechanism (subscriber,
+`RUST_LOG`/`log_level` priority, what is and is not logged). Every other command on this page —
+`index`/`reindex`/`watch`/`repo`/`worktree`/`rebuild`/`memory`/…/`stats` — is unaffected; none of
+them installs a subscriber, and their existing `eprintln!`-based diagnostics (e.g. `doctor`'s own
+report) are untouched.
+
 As-built note (T15-08, `[SPEC]`, D-025). `memory`/`gc`/`stats` are implemented in
 `crates/local-rag/src/cli/{memory,gc,stats}.rs`, the same hand-rolled-parsing, module-per-concern
 convention T15-07 established. `inspect <observation|memory|generation> <id>`, `export`, and

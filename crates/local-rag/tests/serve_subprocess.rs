@@ -39,6 +39,10 @@ fn open_layout() -> (TempHome, StoreLayout) {
 fn spawn_serve(home: &TempHome, extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = home.command(env!("CARGO_BIN_EXE_local-rag"));
     cmd.arg("serve");
+    // X-004: an ambient `RUST_LOG` in the developer's own shell would
+    // otherwise leak through `TempHome::command` (it only clears `HOME`)
+    // and could suppress the `warn!`/`error!` lines these tests assert on.
+    cmd.env("RUST_LOG", "info");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

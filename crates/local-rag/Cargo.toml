@@ -78,6 +78,25 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # `local-rag-hook`/`xtask` have no comparable command surface and stay on
 # `std::env::args()`.
 clap = { version = "4", features = ["derive"] }
+# X-004 (explicit product decision, post-G17): `local-rag serve` printed
+# nothing at all while running in a terminal — no logging subsystem exists
+# anywhere in this workspace. `tracing` is the emitter (already resolved
+# transitively via `local-rag-generate`/`local-rag-embed`'s `ort`/
+# `llama-cpp-2` — 0 new external sources for this edge). `tracing-subscriber`
+# (`default-features = false`, only `fmt`+`env-filter`) is the daemon's own
+# stderr sink, initialized once in `main.rs::logging::init` — see
+# CONTRIBUTING.md's dependency table for the transitive-set breakdown
+# (`matchers`/`sharded-slab`/`thread_local`/`lazy_static`, all new). `ansi`
+# is deliberately off (perturbs byte-exact stderr assertions in
+# `tests/serve_logging.rs`, useless once stderr is redirected); `tracing-log`/
+# `json` are out of this card's scope. Only `local-rag`'s binary target calls
+# `tracing_subscriber::fmt()` — no other crate in the workspace gains a
+# subscriber.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+] }
 
 [target.'cfg(unix)'.dependencies]
 # `kill(pid, SIGTERM)` is not exposed by `std::process::Child::kill` (unix-only

@@ -7,6 +7,7 @@
 //! `inspect`/`export`/`purge` are T16-02 (D-025); `doctor` is T16-03 (D-025).
 
 mod cli;
+mod logging;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -115,6 +116,13 @@ async fn serve() -> ExitCode {
         }
     };
     let _ = data_dir(&env); // resolved via `layout`; kept for a clearer error above if it fails
+
+    logging::init(&config.daemon.log_level);
+    tracing::info!(
+        daemon_version = %local_rag_core::VERSION,
+        pid = std::process::id(),
+        "daemon starting"
+    );
 
     let now_ms = system_now_ms();
     let code_embedder = code_query_embedder(&layout);

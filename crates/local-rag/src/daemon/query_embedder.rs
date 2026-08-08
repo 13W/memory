@@ -227,7 +227,7 @@ pub fn code_query_embedder(layout: &StoreLayout) -> Arc<dyn QueryEmbedder> {
         match OnnxEmbedder::open(&layout, entry) {
             Ok(embedder) => ProviderProbe::Ready(Arc::new(EmbedderQueryAdapter::new(embedder))),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "local-rag: {} is installed but could not be opened ({e}); \
                      search_code will stay lexical_only until this is fixed",
                     entry.model_id
@@ -263,7 +263,7 @@ pub fn memory_query_embedder(
                 ProviderProbe::Ready(Arc::new(MemoryEmbedderQueryAdapter::new(embedder)))
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "local-rag: {} is installed but could not be opened for its memory \
                      representation ({e}); recall will stay dense-degraded until this is fixed",
                     entry.model_id
