@@ -217,7 +217,7 @@ Gate следующей группы нельзя начинать до `PASS` �
 - [x] T18-07 Server settings: `Config::save` + экран
 - [x] T18-08 Демон-телеметрия (backend: ring buffer, admin JSON-RPC методы)
 - [x] T18-09 Logs + per-tool stats screen (TUI)
-- [~] G18 Сверка TUI dashboard
+- [x] G18 Сверка TUI dashboard
 
 ## Post-v0 — pre-GA release-gate decisions
 
@@ -430,6 +430,7 @@ v0-очередь (T00-01…G17) закрыта; задачи в этом раз
 | G15 | PASS after D-026 | строка G15 в «Task evidence» + трейс «G15 — трейс требование → artifact/test» ниже |
 | G16 | PASS | строка G16 в «Task evidence» + трейс «G16 — трейс требование → artifact/test» ниже |
 | G17 | PASS after D-029, D-033, D-034, D-035 | строка G17 в «Task evidence» + трейс «G17 — трейс требование → artifact/test» ниже |
+| G18 | PASS | строка G18 в «Task evidence» + трейс «G18 — трейс требование → artifact/test» ниже |
 | G19 | PASS | строка G19 в «Task evidence» + трейс «G19 — трейс требование → artifact/test» ниже |
 
 ### Task evidence
@@ -438,6 +439,7 @@ v0-очередь (T00-01…G17) закрыта; задачи в этом раз
 
 | ID | Commit/PR | Проверки | Результат/артефакт | Исполнитель/дата |
 | --- | --- | --- | --- | --- |
+| G18 | коммит `G18: gate — сверка TUI dashboard` (строка evidence в том же коммите) | ADR-0008 и spec 11 §7 перечитаны целиком, плюс 02 §3.1–§3.3/§5, 08, 04 §6; трейс по 6 экранам построен лично (первая попытка делегировать шести параллельным teammate-агентам не вернула содержательных результатов — только пустые idle-уведомления). `cargo test -p local-rag-tui` — **161/161 OK** (109 lib + 8 status_offline + 1 status_live + 5 repositories_offline + 12 memory_offline + 10 memory_mutations_offline + 7 repo_settings_offline + 5 server_settings_offline + 3 logs_live + 1 новый concurrent_write_with_live_serve). `cargo test -p local-rag --lib daemon::telemetry:: daemon::mcp::dispatch:: daemon::handshake::` — 21/21; `-p local-rag-proxy --test admin_telemetry` — 1/1; `-p local-rag --test mcp_contract --test mcp_tools` — 15/15; `-p local-rag --test serve_logging` — 2/2; `-p local-rag-hook` — 23/23; `-p xtask --test adr_links` — 11/11; `-p local-rag-core --lib config:: ` — 24/24 + `--features failpoints --test config_save_faults` — 3/3; полный regression-прогон `local-rag-store`/`-index`/`-projection`/`-embed`/`-search`/`-memory`/`-protocol` (все тестовые файлы, изолированно из-за транзиентного ресурсного конфликта с параллельной сессией в той же рабочей копии — см. трейс-секцию) — **0 логических провалов**. `cargo fmt -p local-rag-tui -- --check`/`cargo clippy -p local-rag-tui --all-targets -- -D warnings` — чисто. Workspace-wide fmt/clippy не запускались (несвязанные незакоммиченные правки параллельной сессии дали бы ложные срабатывания вне scope). rg-проверка плейграунда — 0 хитов реализации. Additive-only проверка (git show по каждому T18-XX/X-004 коммиту) — подтверждена, единственное поведенческое изменение существующего кода (harness-строка хука) задокументировано и безопасно. Ручной scripted pty-прогон всех 6 экранов офлайн — без паник, чистый выход. Новый тест `concurrent_write_with_live_serve.rs` закрывает пробел покрытия write-vs-write между TUI и живым демоном. | Полный `требование → код → тест` трейс — секция «G18 — трейс требование → artifact/test» ниже. `DEVIATIONS.md`: без новых записей. Group 18 (T18-00…T18-09) полностью закрыта, `groups/18-tui-dashboard.md`'s G18 — `[x]`. | Claude Sonnet 5 / 2026-08-08 |
 | T20-02 | коммит `T20-02: библиотечная половина indexing-пайплайна` (строка evidence в том же коммите) | `cargo test -p local-rag --lib indexing::` — **6/6 OK** (все переехавшие тесты, ни один ассерт не менялся); `cargo test -p local-rag --test indexing_api` — **1/1 OK** (новый smoke, доказывает публичность API компиляцией вне бинарника); `cargo test -p local-rag --test cli_index --test cli_watch --test cli_rebuild --test cli_export --test cli_gc --test cli_purge --test cli_inspect --test cli_memory --test cli_stats --test cli_repo --test cli_doctor` — **102/102 OK** (11 файлов, все восемь дополнительно найденных потребителей включены); полный `cargo test -p local-rag` — **32 тест-бинарника / 367 тестов, 0 failed, 0 panicked**, без единой регрессии; `cargo fmt --all -- --check` чисто; `cargo clippy --workspace --all-targets -- -D warnings` чисто, 0 warnings (workspace целиком — задета `crates/embed/src/policy.rs`); `git diff --stat Cargo.lock` — пусто, ни одной новой зависимости. `RUSTDOCFLAGS="-D warnings" cargo doc -p local-rag --no-deps` — **не чисто (16 ошибок intra-doc-link), но подтверждено `git stash`-сравнением с состоянием до этой задачи: те же 16 ошибок в тех же строках существуют и на `HEAD` (`1f8d898`, T18-09) до единого изменения T20-02** — все они в файлах `daemon/handshake.rs`/`daemon/probe.rs`/`daemon/mcp/mod.rs`/`daemon/resume/consolidation.rs`, которые эта задача не трогала; T20-02 не вносит ни одной новой doc-ошибки. Похоже на регрессию, доставленную группой 18 (T18-08/T18-09) до её собственного гейта `G18` — на момент этой задачи параллельная сессия как раз проводит `G18`-верификацию; не фиксится здесь как чужой, неоткрытый scope, но стоит зарегистрировать отдельным `D-NNN`, если `G18` не закроет его сам. | Перенос 11 элементов (`IndexCtx`, `IndexError`, `ProjectOutcome`, `project_generation`, `IndexOutcome`, `index_worktree`, `open_state`, `open_cache`, `resolve_facts`, `finish_index_ctx`, `register_new_worktree`) из бинарного `cli/index.rs` в новый `crates/local-rag/src/indexing/mod.rs` (`pub mod indexing;` в `lib.rs`, после `pub mod daemon;`), `pub(crate)` → `pub`, семантика не менялась. Единственная не чисто механическая правка — два места в переехавшем тестовом модуле (`local_rag::daemon::EmbedderQueryAdapter`/`local_rag::daemon::search::build_search_engine`) переписаны на `crate::daemon::...`, т.к. `local_rag::` не резолвится изнутри самого библиотечного крейта. `cli/index.rs` сокращён с 1068 до ~210 строк — остаются `print_ambiguous`, `run_pipeline`, `IndexArgs`/`run_index`/`run_reindex` (тонкая CLI-обвязка). **Критическая находка сверх карточки и предыдущего исследования**: карточка и Explore/Plan-агенты называли потребителями `open_state`/`open_cache` только `cli::watch` и `cli::rebuild`, но реально было ещё **8 файлов** — `cli/export.rs`, `cli/gc.rs`, `cli/purge.rs`, `cli/inspect.rs`, `cli/worktree.rs`, `cli/memory.rs`, `cli/stats.rs`, `cli/repo.rs` — тоже импортировавших `super::index::{open_state, open_cache}`; обнаружено на этапе сборки (`error[E0432]: unresolved import`/`error[E0603]: function import is private`, 41 каскадная ошибка), исправлено правкой `use` в этом же коммите. Новый `crates/local-rag/tests/indexing_api.rs` — единственный тест, который физически не скомпилируется, если хоть один элемент останется `pub(crate)` или в бинарнике; реальный сценарий `open_state`→регистрация представления→литерал `IndexCtx` по публичным полям→`resolve_facts`→`register_new_worktree`→`index_worktree`→повторный прямой вызов `project_generation` на уже активном поколении. Точечные doc-правки указателей на старый путь: `cli/doctor.rs`, `tests/cli_index.rs`, `tests/cli_watch.rs`, `crates/embed/src/policy.rs` (за пределами крейта, корректно). | Claude Sonnet 5 / 2026-08-08 |
 | X-004 | коммит `X-004: живой лог демона (tracing -> stderr)` (строка evidence в том же коммите) | `cargo test -p local-rag --bin local-rag logging::` — **6/6 OK** (вся матрица приоритетов `RUST_LOG`/`log_level`/дефолт/невалидных значений); `cargo test -p local-rag --test serve_logging` — **2/2 OK** (реальный subprocess, оба уровня `RUST_LOG`, вкл. негативный privacy-ассерт на сентинел); `cargo test -p local-rag --test serve_subprocess` — **2/2 OK** без фичи + `--features failpoints` — **3/3 OK** (регрессия, `RUST_LOG=info` добавлен в `spawn_serve`, тексты `stalled on import`/`failed to import` сохранены дословно); `cargo fmt --all -- --check` чисто; `cargo clippy -p local-rag --all-targets -- -D warnings` чисто, 0 warnings; `git diff --stat Cargo.lock` — ровно 5 новых пакетов (`lazy_static`, `matchers`, `sharded-slab`, `thread_local`, `tracing-subscriber`), проверено построчным `diff` имён пакетов до/после. | Новый бинарно-приватный `crates/local-rag/src/logging.rs` (`resolve_filter` — чистая функция, приоритет `RUST_LOG` > `config.daemon.log_level` > `"info"`, пустой `RUST_LOG` = unset, невалидная директива на любой стороне → откат на `"info"` + `warn!`; `init` — `tracing_subscriber::fmt().with_writer(stderr).with_ansi(false)`, `ansi` выключен намеренно — иначе ESC-последовательности сломали бы побайтовые substring-ассерты теста). `main.rs` — `mod logging;` рядом с `mod cli;`, вызов `logging::init(&config.daemon.log_level)` сразу после успешной загрузки конфига в `serve()`. Инструментация: `daemon/lifecycle.rs` (все пять шагов старта, старт/финиш каждого фонового джоба, шаги `shutdown`/`wait_for_shutdown_trigger`/причина в `run`, два продовых `eprintln!` → `warn!`/`error!` с сохранением токенов); `daemon/handshake.rs` (`accept failed`/`connection accepted`, `session opened`/`incompatible proto`, главное событие `request` — переиспользует уже вычисленные T18-08's `method`/`label`/`bytes_in`/`started`, новый общий `label: String` вместо `Option<String>` вычисляется один раз и клонируется в `tool` для телеметрии, `admin/*` логируется на `debug` а не пропускается — в отличие от телеметрии, где `admin/*` полностью исключён из ring buffer'а; `ShutdownRequest`/protocol-violation ветки); `daemon/jobs.rs` (`JobGuard` получил поле `kind: JobKind`, чтобы `Drop` мог залогировать, какая именно джоба финишировала — `begin`/`Drop` на `debug`); `daemon/query_embedder.rs` (два `eprintln!` → `warn!`, текст не менялся). Новые тесты: `crates/local-rag/tests/serve_logging.rs` (реальный `local-rag serve` subprocess, `Client` из `tests/support/mod.rs`, явный `RUST_LOG` в окружении спавна — детерминизм независим от шелла разработчика) — `info_level_shows_startup_daemon_ready_one_line_per_request_and_the_stop_reason` проверяет все 7 ключевых фраз лога плюс `duration_ms=`/`bytes_in=`/`bytes_out=` и негативно — что уникальный сентинел из аргумента `search_code`-запроса ни разу не попадает в stderr; `error_level_is_silent_about_per_request_lines` — при `RUST_LOG=error` ни `daemon ready`, ни имя инструмента, ни сентинел не появляются. `tests/serve_subprocess.rs::spawn_serve` — добавлен явный `cmd.env("RUST_LOG", "info")` (без него ambient `RUST_LOG` разработчика мог бы заглушить новые `warn!`/`error!`, ломая существующий ассерт на `stalled on import`). `[SPEC]`-амендменты: `02-architecture.md` §3.1 (as-built X-004 — первое потребление `log_level`, приоритет, sink, `logs_dir` остаётся зарезервированным); `07-observations-spool.md:73` (сужена фраза «no logging subsystem exists anywhere» — у хука по-прежнему нет, у демона появился); `11-interfaces.md` §6 (as-built про stderr-лог `serve`, остальные команды не затронуты). `CONTRIBUTING.md` — две новые строки в таблице зависимостей (`tracing`: 0 новых источников, уже резолвился транзитивно через `ort`/`llama-cpp-2`; `tracing-subscriber`: 5 новых пакетов, `regex` — не новый, тот же экземпляр, что уже тянут `tokenizers`/`tree-sitter`, подтверждено `cargo tree -i regex`). | Claude Sonnet 5 / 2026-08-08 |
 | T20-01 | коммит `T20-01: persisted-реестр managed_worktree (schema v10)` (строка evidence в том же коммите) | `cargo test -p local-rag-store --lib registry::managed::` — **9/9 OK**; `cargo test -p local-rag-store --test managed --test migrate --test migrate_fixtures --test registry --test schema_audit --test settings --test worktree` — **73/73 OK** (10 managed + 18 migrate вкл. новый `migration_10_adds_managed_worktree_to_an_existing_v9_store` + 3 migrate_fixtures + 12 registry вкл. обновлённый 10-элементный ассерт + 5 schema_audit + 11 settings + 14 worktree вкл. обновлённый 10-элементный ассерт), итого **82/82** новых+существующих тестов зелёные, без регрессий; `cargo fmt --all -- --check` чисто; `cargo clippy -p local-rag-store --all-targets -- -D warnings` чисто, 0 warnings; `RUSTDOCFLAGS="-D warnings" cargo doc -p local-rag-store --no-deps` чисто; `git diff --stat Cargo.lock` — пусто, ни одной новой внешней зависимости. | Новый `crates/store/src/registry/managed.rs` — DDL-константа `SCHEMA_V10` (byte-exact со spec 03 §2.1, проверено программной сверкой), `ManagedWorktree`, пять операций (`register_managed_worktree` — идемпотентный upsert, не переоткрывает выключенную запись и не сбрасывает `registered_at`; `unregister_managed_worktree`/`set_managed_enabled` — идемпотентны, `set_managed_enabled` — `UPDATE`, не upsert, регистрация только явная; `managed_worktrees` — все строки, `ORDER BY worktree_id`; `is_managed`), 9 юнит-тестов на голом `Connection::open_in_memory()`. `CHECK (enabled IN (0,1))` добавлен сверх буквального текста карточки — того требует нормативный spec 03 §1.1 boolean-паттерн (уже применяется к `worktree_path.is_current`/`model_space_representation.required`), сознательное усиление, не расхождение. `registry/mod.rs`/`lib.rs` — реэкспорт (`pub(crate) use managed::SCHEMA_V10`, `pub use managed::{...}`, отдельный `pub use registry::{...}` блок в `lib.rs`, симметрично `representation`/`projection_state`) + doc-бюллеты. `migrate/mod.rs` — миграция 10 добавлена в `ALL` + doc-нарратив. Обязательная сопутствующая находка: два существующих теста (`migrate.rs::state_db_open_bootstraps_and_is_idempotent`, `registry.rs::migration_produces_exact_registry_schema`) захардкоживали список/количество из 9 миграций — расширены 10-м элементом `(10,"managed_worktree")` в этом же коммите. Новые тесты: `crates/store/tests/managed.rs` (10 интеграционных через реальный `StateDb`/`TempHome`/`StateWriter::transaction`, вкл. `enrolling_a_brand_new_worktree_is_a_single_transaction` — доказывает claim ADR-0009 «транзакционно с созданием worktree», и `the_version_10_checksum_matches_the_frozen_migration_and_survives_reopen`); новый `migrate.rs::migration_10_adds_managed_worktree_to_an_existing_v9_store` — реальный forward-only апгрейд v9→v10 на сторе, поднятом строго до версии 9 (не только «свежий стор со всеми миграциями сразу»). `[SPEC]`-амендмент: `docs/specification/03-data-model.md` §2.1 — DDL-блок (byte-exact) + as-built заметка T20-01 (три отклонённые альтернативы из ADR-0009, консьюмеры T20-06/T20-08/T20-09 ещё не реализованы). Не в scope (по карточке, не реализовано): ссылки на реестр из демона/CLI, авто-регистрация — оставлены будущим `T20-06`/`T20-08`. Между началом и концом задачи параллельная сессия закоммитила `T18-08` (`50cf978`) в общий чекаут — рабочее дерево не пересекалось (только `crates/store/**` и документация), конфликтов не возникло. | Claude Sonnet 5 / 2026-08-08 |
@@ -2627,6 +2629,238 @@ evidence (три зелёных прогона на настоящем GitHub Ac
 18/18 внутри `ci.yml`, плюс focused-прогоны `local-rag-core`/`-hook`/`-proxy`/`-store` нативно
 на этой машине сразу после правок) строго более авторитетно, чем ещё одна локальная попытка.
 v0-очередь (T00-01…G17) закрыта.
+
+### G18 — трейс требование → artifact/test
+
+Дата 2026-08-08, исполнитель Claude Sonnet 5. Гейт группы 18 (TUI dashboard, post-v0,
+ADR-0008) — не переоткрывает G00–G17/G19. Методика: `docs/adr/0008-tui-dashboard.md` и
+`docs/specification/11-interfaces.md` §7 перечитаны целиком лично (не через агента), плюс
+`02-architecture.md` §3.1–§3.3/§5 и `08-memory.md`/`04-state-machines.md` §6 — для T18-04/05/06.
+Первая попытка делегировать построение трейса шести параллельным именованным
+teammate-агентам не доставила содержательных результатов (только пустые
+`idle_notification`, без текста ответа, несмотря на явные повторные запросы через
+SendMessage) — трейс построен лично: каждый файл экрана (`status.rs`, `repositories.rs`,
+`memory.rs`, `repo_settings.rs`, `server_settings.rs`, `logs.rs`, `admin_client.rs`,
+`daemon/telemetry.rs`) прочитан полностью или построчно сверен по ключевым функциям с
+as-built-текстом §7, каждый тестовый файл прочитан целиком (не только имена тестов) и
+прогнан лично.
+
+**Status (T18-02)**
+
+| Требование (маркер, откуда) | Artifact (файл/функция) | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| `DaemonStatus` — 3 состояния (NotRunning/Starting/Running), `probe_daemon` зеркалит `cli::status::compute_status` (spec 11 §7 as-built T18-02) | `status.rs:37-133` (`DaemonStatus`, `probe_daemon`) | `status_offline.rs::status_reflects_{absent,corrupt}_lock_file`, `::status_reflects_{not_running,starting}_when_*` — 5/5 сценариев | подтверждено |
+| Durable counts никогда не мигрируют неявно — `diagnose_versions`-перед-`open` (spec 11 §7) | `status.rs:138-188` (`read_durable_counts` → `store_read::open_read_offline_safe`) | `status_offline.rs::durable_counts_are_unavailable_before_the_store_is_ever_initialized`, `::durable_counts_are_independent_of_daemon_state` | подтверждено |
+| `render_status` — чистая функция без I/O, первое использование `TestBackend` в крейте | `status.rs:203-298` | 3 inline `#[cfg(test)]`: `renders_not_running_state`/`renders_running_state_with_durable_counts`/`renders_unavailable_reason_instead_of_crashing_on_missing_counts` | подтверждено |
+| Live-проба через реальный `local-rag serve` подпроцесс | `status_live.rs` (`local_rag_binary_path`/`spawn_serve`/`wait_until_ready`) | `status_live.rs::status_is_running_against_a_real_serve_subprocess` — read-only коннекшн не конфликтует с демоном-писателем (WAL+busy_timeout) | подтверждено |
+
+Тесты: `cargo test -p local-rag-tui --test status_offline --test status_live` — **9/9 OK**
+(8 offline + 1 live).
+
+**Repositories (T18-03)**
+
+| Требование (маркер, откуда) | Artifact (файл/функция) | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| Digit-based screen switching (`1..SCREENS.len()`), `RepositoriesNav::{Repos,Worktrees,WorktreeDetail}` drill-down | `repositories.rs:44-127`, `main.rs` (`Screen`/`SCREENS`) | `repositories.rs::enter_descends_repos_to_worktrees_to_detail`, `::backspace_ascends_each_level_resetting_selection` | подтверждено |
+| Карточка изначально называла `path_history` — исправлено на `worktree_path_history` (repo-уровневый vs worktree-уровневый примитив) | `repositories.rs:10-20` (модульная документация), `repositories.rs:33-35` (import `worktree_path_history`) | `repositories_offline.rs::renders_worktree_detail_with_history` использует реальный `worktree_path_history` | подтверждено, правка карточки уже отражена в `groups/18-tui-dashboard.md:48-52` |
+| Pure navigation (`moved`/`descend`/`ascend`) — без I/O, без `ListState` как источника истины | `repositories.rs:65-127` | `repositories.rs::down_and_up_clamp_at_both_ends`, `::enter_on_an_empty_list_or_at_worktree_detail_is_a_no_op` | подтверждено |
+| Diagnose-before-open предосторожность продублирована из `status.rs` (позже вынесена в T18-04) | `repositories.rs:271-284` (`compute_repositories_data` → `open_read_offline_safe`) | `repositories_offline.rs::repositories_are_unavailable_before_the_store_is_ever_initialized` | подтверждено |
+| Нет live-теста — ни один примитив не трогает демон | (нет `repositories_live.rs`) | подтверждено `ls crates/local-rag-tui/tests/` — файла нет | подтверждено |
+
+Тесты: `cargo test -p local-rag-tui --test repositories_offline` — **5/5 OK**.
+
+**Memory — browser + mutations (T18-04, T18-05, один экран `Screen::Memory`)**
+
+| Требование (маркер, откуда) | Artifact (файл/функция) | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| `compute_entry_list`/`compute_candidate_list` переносят `cli/memory.rs::run_list` verbatim, включая асимметрию пагинации | `memory.rs` (по grep `compute_entry_list`/`compute_candidate_list`) | `memory_offline.rs::entry_pagination_reports_has_more_across_two_pages`, `::candidate_pagination_reports_has_more` | подтверждено |
+| Unfiltered list включает terminal states (в отличие от `recall`) | там же | `memory_offline.rs::unfiltered_entry_list_includes_terminal_states_unlike_recall` | подтверждено |
+| `EntryDetail` восстанавливает весь `ListNav` verbatim при возврате | `memory.rs` (`MemoryNav::EntryDetail`) | `memory.rs::enter_descends_to_entry_detail_and_backspace_restores_list_verbatim` (inline) | подтверждено |
+| `execute_memory_action` — единственная функция, трогающая `.writer()`; зеркалит `cli/memory.rs`'s 5 `run_*` буквально (`Actor::User`) | `memory.rs:792-799` (окрестности `gate`), `execute_memory_action` | `memory_mutations_offline.rs::approve_materializes_the_proposed_create`, `::reject_moves_pending_candidate_to_rejected`, `::edit_updates_text_and_importance_and_bumps_version`, `::retract_transitions_active_fact_entry_to_retracted`, `::merge_supersedes_the_loser_pointing_at_the_survivor` | подтверждено, 5/5 сценариев |
+| Типизированные отказы без паники: `OptimisticConflict`/`IllegalTransition`/`EntryTerminal` | там же | `memory_mutations_offline.rs::optimistic_conflict_surfaces_without_panicking`, `::illegal_transition_surfaces_without_panicking`, `::entry_terminal_surfaces_without_panicking`, `::approve_on_a_rejected_candidate_surfaces_illegal_transition_without_panicking` | подтверждено |
+| **Confirm-modal — генуинно динамический**, читает реальный `local_rag::daemon::mcp::catalog()`, `unwrap_or(true)` fail-safe | `memory.rs:772-799` (`catalog_requires_confirmation`, `gate`) — прочитано построчно, дословно матчит as-built | `memory.rs::x_on_a_selected_entry_opens_confirm_action_using_the_real_catalog`; `crates/local-rag/src/daemon/mcp/tools.rs::catalog_destructive_hint_is_true_only_for_retract_memory` — ровно одна запись `destructiveHint: true` (`retract_memory`) | подтверждено, см. также раздел «Confirm-modal» ниже |
+| Confirm-modal НЕ появляется на `approve`/`reject`/`edit`/`merge` | `memory.rs:794-820` | `memory.rs::edit_and_merge_never_reach_confirm_action`, `::a_and_r_trigger_approve_and_reject_directly_in_candidates_mode`, `::edit_form_enter_with_valid_importance_executes_directly_no_confirm` | подтверждено |
+| Global-quit carve-out для `EditForm` (`q`/цифры как буфер, `Ctrl+C`/`Esc` всё равно quit'ят) | `memory.rs` (`captures_all_keys`, `is_text_entry_key`) | `memory.rs::edit_form_typing_appends_including_q_and_digits_backspace_deletes` | подтверждено |
+
+Тесты: `cargo test -p local-rag-tui --test memory_offline --test memory_mutations_offline` —
+**22/22 OK** (12+10); полный `--lib` крейта (включает 45+ `memory::tests::*`) — см. сводный
+прогон ниже, 109/109.
+
+**Repo Settings (T18-06)**
+
+| Требование (маркер, откуда) | Artifact (файл/функция) | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| `data_policy` — 4 значения, `p`/`P` пишет НЕМЕДЛЕННО, БЕЗ confirm-модала (`repo_settings` не имеет MCP catalog записи) | `repo_settings.rs:24-29` (модульная документация «No confirm-modal — there is nothing to gate against»), `cycle_data_policy` | `repo_settings.rs::p_on_repo_detail_executes_set_data_policy_directly_no_confirm`; `repo_settings_offline.rs::set_data_policy_round_trips_and_upserts` | подтверждено — архитектурная причина отсутствия confirm-модала, не недосмотр |
+| Generic `(key,value)` upsert, экран не предлагает delete (`local_rag_store` не имеет `delete_repo_setting`) | `repo_settings.rs` (`set_repo_setting`) | `repo_settings_offline.rs::set_setting_round_trips_and_upserts`, `::compute_repo_detail_separates_data_policy_from_generic_settings` | подтверждено; `rg -n 'delete_repo_setting' crates/store/` — 0 хитов |
+| Неизвестный `repo_id` → inline error, не паника | `repo_settings.rs` (`execute_repo_settings_action`) | `repo_settings_offline.rs::writing_to_an_unknown_repo_id_surfaces_an_inline_error` | подтверждено |
+| Offline-safe read/write отказы до инициализации store | `store_read.rs`/`store_write.rs` | `repo_settings_offline.rs::read_path_is_unavailable_before_the_store_is_ever_initialized`, `::write_path_refuses_before_the_store_is_ever_initialized` | подтверждено |
+| «most restrictive wins» (spec 02 §3.2) — T18-06 не переопределяет саму логику приоритета, только первый UI над T02-05 backend | `crates/core/src/config/mod.rs` (`DataPolicy::most_restrictive`), `crates/store/src/registry/settings.rs` | `rg -n 'most_restrictive'` — реализация не тронута коммитами группы 18 (git show по `db966e5` — только `repo_settings.rs`+тест, `crates/core`/`crates/store` не изменены) | подтверждено |
+
+Тесты: `cargo test -p local-rag-tui --test repo_settings_offline` — **7/7 OK**.
+
+**Server Settings (T18-07)**
+
+| Требование (маркер, откуда) | Artifact (файл/функция) | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| `Config` получил `Serialize`, `to_raw`/`to_toml_string`/`save` (атомарная запись `.tmp`+`rename`) | `crates/core/src/config/mod.rs` (diff `d084d88`: только derive-макросы расширены + новые методы, ничего не удалено) | `local-rag-core --lib config::` — `default_config_round_trips_through_to_toml_string`, `save_then_load_round_trips_a_customized_config`, `save_creates_a_missing_config_dir` | подтверждено |
+| Atomic-write crash guarantee (failpoint `config.save.between_write_and_rename`) | `crates/core/tests/config_save_faults.rs` | `a_crash_between_write_and_rename_leaves_the_old_file_untouched`, `a_retry_after_the_crash_succeeds_and_the_file_becomes_loadable`, `a_crash_on_a_first_ever_save_leaves_no_final_file` | подтверждено |
+| Staged-edit модель — ничего не пишется до `Ctrl+S`, working `Config` copy живёт на `nav` | `server_settings.rs` (`ServerSettingsNav::{FieldList,FieldForm,SavedPrompt}`) | `server_settings.rs::ctrl_s_on_field_list_emits_a_save_action`, `::ctrl_x_on_field_form_cancels_without_mutating_config` | подтверждено |
+| Ровно 16 полей, единая модель взаимодействия (даже `data_policy` — без `p`/`P`-шортката) | `server_settings.rs` (`FieldId`) | `server_settings.rs::compute_field_list_lists_all_sixteen_rows_in_order`, `::field_labels_are_unique_and_cover_every_field`, `::data_policy_round_trips_and_rejects_bogus_values` | подтверждено |
+| `Ctrl+S` → save + «вступит в силу после restart», `r`/`R` — реальный restart | `server_settings.rs` (`SavedPrompt`, `execute_server_settings_action`) | `server_settings.rs::saved_prompt_r_emits_a_restart_action`, `::render_saved_prompt_mentions_restart` | подтверждено |
+| Первый экран НЕ на базе `state.sqlite`/`StoreLayout` | `server_settings.rs` (`compute_server_settings_data(config_dir: &Path, …)`) | `server_settings_offline.rs::initial_nav_on_a_{missing,valid,invalid}_file_*`, `::execute_save_writes_a_real_config_toml_readable_back_through_load` | подтверждено |
+
+Тесты: `cargo test -p local-rag-tui --test server_settings_offline` — **5/5 OK**;
+`cargo test -p local-rag-core --lib config::` — **24/24 OK**;
+`cargo test -p local-rag-core --features failpoints --test config_save_faults` — **3/3 OK**.
+
+**Logs + демон-телеметрия (T18-08, T18-09)**
+
+| Требование (маркер, откуда) | Artifact (файл/функция) | Verifying test/report | Статус |
+| --- | --- | --- | --- |
+| `TelemetryState` — bounded ring buffer (`CAPACITY=500`, oldest evicted) + never-evicted per-tool `ToolStats` | `daemon/telemetry.rs:19-121` — прочитано целиком | `telemetry.rs::the_buffer_evicts_the_oldest_entry_once_full_but_the_aggregate_keeps_everything`, `::recording_appends_to_the_buffer_and_aggregates_by_tool` | подтверждено |
+| `admin/tail_calls`/`admin/tool_stats` — новые top-level методы, НЕ MCP tools, независимы от `DaemonMode`/`engine`/`memory` | `daemon/mcp/dispatch.rs:95-103,223-245` (diff `50cf978` — чисто аддитивные match-рукава перед `other =>`, ничего существующего не тронуто) | `dispatch.rs::admin_tail_calls_answers_even_without_a_store` (`engine: None, memory: None`), `::admin_tool_stats_reflects_recorded_calls_sorted_by_tool`, `::an_empty_telemetry_state_answers_with_empty_arrays` | подтверждено |
+| `admin/*` self-exclusion — проверяется в `handle_connection`, не в `telemetry.rs` | `daemon/handshake.rs:236-266` (diff `50cf978` — аддитивно, новые поля `telemetry`/`now_ms` на `HandshakeContext`, существующий control flow сохранён) | `handshake.rs::admin_methods_are_never_recorded`, `::a_normal_request_is_recorded_with_source_and_tool` | подтверждено |
+| `is_error` — только JSON-RPC-уровня (`response_is_error`), не `isError:true` внутри `CallToolResult` | `daemon/telemetry.rs:164-177` | `telemetry.rs::response_is_error_detects_the_top_level_error_key_only` | подтверждено |
+| `local-rag-hook`'s harness `"claude-code"`→`"claude-code-hook"` — гранулярная internal-label, не нарушает `01-overview.md`'s `[FIXED]` «Claude Code — единственный harness» (внешний coding agent, не internal label) | `crates/local-rag-hook/src/recall.rs:179-186` (diff `50cf978` — однострочное изменение + оба существующих теста в том же коммите обновлены на новое значение) | `recall.rs::a_session_start_request_is_well_formed` (`assert_eq!(hello.harness, "claude-code-hook")`); `crates/local-rag-hook/tests/recall_rpc.rs:167`'s `"claude-code"` — независимый hand-rolled raw-client фикстур, НЕ тестирует `recall.rs`'s собственный код (ложная тревога снята чтением) | подтверждено, не регрессия |
+| Реальный e2e: proxy `ping` + hook `recall` через один демон, `admin/tail_calls`/`admin/tool_stats` через тот же proxy stdin | `crates/local-rag-proxy/tests/admin_telemetry.rs` | `admin_endpoints_see_both_sources_and_do_not_self_pollute` — два различимых `source`, повторный poll byte-identical, `admin/tool_stats == ["ping","recall"]` sorted | подтверждено (первый прогон упал по таймауту из-за посторонней нагрузки — см. §«Ресурсный конфликт» ниже; чистый повторный прогон — `ok`, 0.62s) |
+| `AdminPoller`/`LogsSnapshot::{Unreachable,PollerStopped,Connected}` — 3 состояния, различимы через `mpsc::TryRecvError` | `admin_client.rs` | `admin_client.rs::latest_defaults_to_unreachable_before_anything_arrives`, `::latest_reports_poller_stopped_once_the_sender_is_dropped`, `mod live::{a_successful_cycle_yields_a_connected_snapshot,no_listener_at_all_is_unreachable_quickly,stop_cancels_a_connection_hung_mid_handshake}` | подтверждено |
+| Reconnect path (`error → Unreachable → retry`) — единственный сценарий, exercising его | `admin_client.rs` (`poll_loop`) | `logs_live.rs::the_poller_recovers_once_a_daemon_appears_after_it_started` | подтверждено |
+| `render_logs` — pure, newest-first display, явная деградация «not running» | `logs.rs:1-198` | `logs.rs::renders_not_running_stub`, `::renders_calls_newest_first_with_all_columns`, `logs_live.rs::unreachable_daemon_shows_up_as_unreachable` | подтверждено |
+| `Screen::Logs` — первая non-blocking ветка (`event::poll(LOGS_UI_TICK)`) | `main.rs` (`LOGS_UI_TICK`) | подтверждено чтением `main.rs`; см. также ручной pty-прогон ниже (экран 6 отрендерился без блокировки цикла событий) | подтверждено |
+
+Тесты: `cargo test -p local-rag --lib daemon::telemetry:: daemon::mcp::dispatch:: daemon::handshake::`
+— **21/21 OK** (9+3+9); `cargo test -p local-rag-proxy --test admin_telemetry` — **1/1 OK**;
+`cargo test -p local-rag-tui --test logs_live` — **3/3 OK**.
+
+**Additive-only проверка групп 00–17 (критерий гейта)**
+
+`git show --stat` по каждому коммиту T18-00…T18-09 + X-004, файлы вне
+`crates/local-rag-tui/`/`docs/`/`npm/`/`CONTRIBUTING.md` прочитаны построчно (`git show <hash> -- <file>`
+полный diff, не только имена):
+
+- `crates/local-rag/src/daemon/mcp/mod.rs` (T18-05, T18-08) — аддитивно: `pub use tools::{…, catalog}`
+  (расширение видимости), новое поле `telemetry` на `McpHandler`.
+- `crates/local-rag/src/daemon/mcp/tools.rs` (T18-05) — только doc-комментарий, 0 изменений
+  поведения.
+- `crates/local-rag/src/daemon/mcp/dispatch.rs` (T18-08) — два новых match-рукава перед
+  `other =>`, новое поле `DispatchContext::telemetry`; существующие рукава и `other`-ветка
+  байт-в-байт нетронуты.
+- `crates/local-rag/src/daemon/handshake.rs` (T18-08, X-004) — два новых поля
+  `HandshakeContext`, новая логика телеметрии/логирования вставлена вокруг существующего
+  `handler.handle(...)` без изменения его control flow; `Err((min_proto,max_proto)) => (...)`
+  ветка синтаксически превращена в блок с добавленным `tracing::warn!` перед той же самой
+  возвращаемой парой — поведенчески идентична.
+- `crates/local-rag/src/daemon/mod.rs` (T18-08) — `pub mod telemetry;` (новый модуль).
+- `crates/local-rag/src/daemon/lifecycle.rs`, `daemon/jobs.rs`, `daemon/query_embedder.rs`
+  (X-004) — только `tracing::*!` вызовы добавлены (два `eprintln!` заменены на
+  `tracing::warn!`/`error!` с **дословно тем же текстом сообщения**); `JobGuard` получил поле
+  `kind` исключительно для лог-строки. Существующая логика не изменена.
+- `crates/local-rag/src/main.rs` (X-004) — `mod logging;` + один вызов `logging::init` + один
+  `tracing::info!`, вставлены после существующей загрузки конфига, ничего не удалено.
+- `crates/local-rag-hook/src/recall.rs` (T18-08) — единственное подлинно **поведенческое**
+  изменение существующего (пре-группа-18) кода: harness-строка `"claude-code"` →
+  `"claude-code-hook"`. Задокументировано отдельно выше («Logs + демон-телеметрия»
+  таблица) — намеренное, безопасное, оба существующих теста файла обновлены в том же коммите,
+  не нарушает `01-overview.md`'s `[FIXED]`.
+- `crates/core/src/config/mod.rs` (T18-07) — `git diff` по удалённым строкам показывает только
+  расширение `#[derive(Deserialize)]` → `#[derive(Serialize, Deserialize)]` и один
+  doc-комментарий; никакой существующей функциональности не удалено.
+
+**Вывод: критерий «только аддитивные правки» выполнен.** Единственное поведенческое
+изменение существующего компонента (harness-строка хука) документировано, безопасно и не
+противоречит ни одному `[FIXED]`.
+
+**Плейграунд — rg-проверка**
+
+```
+rg -ni 'playground' .                     → только docs/adr/0008…, docs/specification/11…,
+                                             PROGRESS.md, crates/xtask/tests/adr_links.rs
+                                             (тест, ПРОВЕРЯЮЩИЙ упоминание исключения — не находка)
+rg -ni 'dynamic.?form|tool.?runner|...'     → 0 хитов в crates/local-rag-tui/{src,tests}
+rg -n 'catalog\(\)|tools::catalog|...'      → ровно 1 реальный вызов (memory.rs:777),
+                                             остальные — doc-комментарии/имя теста
+```
+
+Плейграунд нигде не реализован. Подтверждено.
+
+**Офлайн-работа 5 экранов + деградация Logs**
+
+Все шесть offline/live тестовых файлов уже сведены выше по разделам. Дополнительно — ручной
+scripted pty-прогон (Python `pty.openpty()`+`TIOCSWINSZ`, временный скрипт в scratchpad, не
+закоммичен): чистый `LOCAL_RAG_HOME` без `local-rag serve`, без `store.lock`, реальный
+`target/debug/local-rag-tui` под pty, последовательно `1`…`6`, затем `q`.
+
+Результат: экран 1 (Status) — «daemon: not running» + «store not yet initialized»; экран 2
+(Repositories) — «store not yet initialized»; экраны 3 (Memory) и 4 (Repo Settings) —
+отрендерились без паники (тонкий diff-рендер, т.к. рамки не менялись между кадрами); экран 5
+(Server Settings) — полный листинг всех 16 полей конфига (не зависит от стора); экран 6
+(Logs) — явное «daemon: not running» в обеих таблицах. Ни одной паники (`"panicked at"`
+отсутствует в захваченном выводе на всех 6 экранах), `q` — чистый выход, `exit_code=0`.
+Закрывает разрыв между поэкранными unit-тестами и одним непрерывным ручным прогоном всех 6
+экранов подряд без демона на неинициализированном сторе (более жёсткий кейс, чем валидный
+пустой стор).
+
+**TUI + живой `local-rag serve` — без конфликтов блокировок**
+
+`rg -n 'store\.lock|StoreLock|daemon::lock|LockLevel' crates/local-rag-tui/src` — 0 хитов
+(TUI никогда не участвует в L0–L4 иерархии; `read_store_lock_file` в `status.rs` — только
+best-effort ЧТЕНИЕ содержимого файла для отображения, не OS-лок). `status_live.rs` уже
+покрывал read-vs-write половину. Write-vs-write половина не была покрыта ни одним
+существующим тестом — новый файл
+`crates/local-rag-tui/tests/concurrent_write_with_live_serve.rs` (не изменение поведения,
+закрытие пробела покрытия, тот же прецедент, что дополнительный regression-тест G19):
+реальный `local-rag serve`, параллельно — 20 TUI-мутаций (`execute_repo_settings_action`,
+поток вне tokio-рантайма) и 20 реальных MCP `remember`-вызовов через демон (сырой UDS-клиент,
+HELLO/WELCOME по `local_rag_protocol`) против одного и того же `state.sqlite`. Assert: ни
+одного JSON-RPC/in-band tool-ошибки, финальные данные обеих сторон видны (`repo_settings` —
+последний upsert, ровно 1 строка; `memory_entry_counts` по kind=Fact — ровно 20), демон в
+конце `probe_daemon` → `Running`.
+
+`cargo test -p local-rag-tui --test concurrent_write_with_live_serve` — **1/1 OK**
+(`tui_writes_and_a_live_daemons_mcp_writes_never_conflict`).
+
+**Ресурсный конфликт с параллельной сессией (методическая заметка, не находка гейта)**
+
+В ходе прогона обнаружено: (1) один из фоновых Explore/general-purpose агентов этой же
+сессии по ошибке был запущен с `isolation: "worktree"`, что запустило полную пересборку
+workspace с нуля (включая `llama-cpp-sys-2`) в `.claude/worktrees/agent-*` и временно
+перегрузило машину — единственная причина первого таймаута `admin_telemetry`/зависания
+`serve_logging`; агент остановлен, worktree удалён (0 коммитов, чистый `git status`), после
+чего оба теста прошли чисто. (2) Независимо от этого, в рабочей копии в течение всего гейта
+активно работала **другая, не связанная с группой 18** параллельная сессия (незакоммиченные
+правки `crates/local-rag/src/cli/*.rs`, новый `crates/local-rag/src/indexing/` — судя по
+именам файлов, работа над группой 20/ADR-0009, T20-02+). Это объясняет: транзиентный сбой
+`serve_logging` (даемон однократно завис на несохранённом промежуточном состоянии чужого
+редактируемого файла — воспроизведён исчезнувшим при повторном прогоне) и систематические
+единичные зависания `cargo test -p <crate>`'s самого первого спавна тестового бинарника при
+прогоне множества test-крейтов подряд (`local-rag-store`/`-index`/`-projection`/`-embed`/
+`-search` — процесс-спаун зависает на 0% CPU, killed+retry немедленно проходит; один и тот же
+паттерн для каждого затронутого крейта, не специфичен ни одному тестовому файлу). Ни один такой сбой
+не был логической ошибкой теста — каждый воспроизведённый в изоляции прогон прошёл чисто.
+Задокументировано по прецеденту D-036/G17 (nextest-зависание — environment-артефакт, не
+код). Ни один файл параллельной сессии не тронут, не прочитан кроме `git show --stat`/имён;
+единственная выполненная операция — один безопасный `git stash`/`git stash pop`
+(без untracked-файлов) для диагностики, откат подтверждён идентичным `git status` до/после.
+
+**Полный regression-прогон остальных крейтов (chunked, per-crate/per-test-file изоляция
+из-за конфликта выше)**
+
+- `cargo fmt -p local-rag-tui -- --check` — чисто; `cargo clippy -p local-rag-tui --all-targets -- -D warnings` — 0 warnings. (Workspace-wide `fmt`/`clippy` не запускались — рабочая копия содержит несвязанные незакоммиченные правки параллельной сессии, которые давали бы ложные срабатывания вне scope этого гейта; см. заметку выше.)
+- `cargo test -p local-rag --test mcp_contract --test mcp_tools` — **15/15 OK** (8+7).
+- `cargo test -p local-rag --test serve_logging` — **2/2 OK** (после устранения ресурсного конфликта выше).
+- `cargo test -p local-rag-hook` — **23/23 OK** (payload 10, recall_rpc 9, segment_concurrency 1, segment_permissions 1, segment_rotation 2) + 0 doctests.
+- `cargo test -p xtask --test adr_links` — **11/11 OK**.
+- `cargo test -p local-rag-store` (по каждому из 39 файлов `crates/store/tests/*.rs`, изолированно после единичных зависаний спауна) — **все файлы OK, 0 логических провалов**: cache 14, cache_diagnosis 6, checkpoint 3, code 14, consolidation_runner 5, embedding_cache 11, fts 8, fts_corruption 6, fts_materialize 5, fts_query 16, fts_validate 12, generation 10, housekeeping 23, lock 8, managed 10, memory 44, memory_op 42, memory_review 16, migrate 18, migrate_fixtures 3, migrate_resumable 6, migrate_restore 1, normalized_text 6, observation_import 15, privacy_export 5, privacy_inspect 6, privacy_purge 10, projection_state 7, registry 12, representation 9, resolve 11, retention 12, retention_sweep 0 (пустой файл), schema_audit 5, settings 11, source 6, spool_kill_matrix 0 (пустой), spool_pending_bytes 5, spool_v1_fixture 1, state 7, subjects 8, worktree 14.
+- `cargo test -p local-rag-index -p local-rag-projection -p local-rag-embed -p local-rag-search -p local-rag-memory -p local-rag-protocol` (по каждому файлу, та же методика) — **все OK, 0 логических провалов**, включая lib-тесты (`local_rag_memory` 84, `local_rag_projection` 46, `local_rag_search` 45, `local_rag_protocol` 35) и doc-тесты всех шести крейтов (0 examples каждый).
+
+**Итоговый вердикт.** Ни одного нормативного расхождения с ADR-0008/spec 11 §7/02
+§3&5/08/04 §6. Ни одного логического сбоя теста ни в одном из проверенных файлов. Единственное
+найденное поведенческое изменение существующего кода (harness-строка хука) документировано
+и безопасно. Плейграунд не реализован. Confirm-модал — ровно на `destructiveHint: true`
+(сегодня — только `retract_memory`), нигде больше. Пять экранов работают офлайн, Logs
+корректно деградирует. TUI и живой демон не конфликтуют по блокировкам ни на чтении, ни на
+записи. `DEVIATIONS.md`: без новых записей. `docs/implementation-plan/groups/18-tui-dashboard.md`'s
+G18 закрыт. **`PASS`** — группа 18 (TUI dashboard) закрыта.
 
 ### G19 — трейс требование → artifact/test
 
