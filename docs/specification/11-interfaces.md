@@ -587,6 +587,7 @@ the same disposition this group already uses for `T19-06`.
 local-rag serve|status|stop|restart
 local-rag init [--download-models]
 local-rag index <path> | reindex | watch          # watch: standalone process, see the T15-07 note
+local-rag project add|remove|enable|disable|list|status|reindex <path>   # daemon-managed, see §8
 local-rag repo list | repo attach <repo_id> [--path P] [--worktree <id>] | worktree list
 local-rag rebuild --worktree <id> [--fts] [--dense]
 local-rag memory list|approve|reject|edit|retract|merge|evidence …
@@ -1186,3 +1187,56 @@ screen needs a second control chord (`Ctrl+S`) alongside the existing `Ctrl+X`. 
 invalid file and `execute_server_settings_action(Save)` writing a real, `Config::load`-readable
 file; plus inline `#[cfg(test)]` `TestBackend` render tests and pure unit tests for every field's
 parse/display round-trip and every nav/key transition in `server_settings.rs` itself.
+
+## 8. Daemon-managed indexing `[SPEC surface, post-v0 — ADR-0009]`
+
+A supervised background-indexing subsystem inside the daemon, alongside the read-only MCP tool
+surface (§2) and the standalone CLI indexing commands (§6). `docs/adr/0009-daemon-managed-
+indexing.md` is the product decision; `docs/implementation-plan/groups/20-daemon-managed-
+indexing.md` (`T20-00`–`T20-10`, gate `G20`) is the implementation record. Unlike §7's dashboard,
+this is not wholly new architecture — spec 02 §1's `[FIXED]` topology already lists `background
+workers (reconcile, embedding, consolidation, GC)` under the daemon; what this section adds is the
+persisted, per-project opt-in surface on top of it. This section is a forward sketch, the same
+convention §6/§7 used before their first task shipped — each `T20-NN` card appends its own as-built
+note here once implemented, not before.
+
+```
+local-rag project add <path>          # resolve → register worktree if needed → mark managed
+local-rag project remove <path>       # unmanage only; the index itself is untouched
+local-rag project enable|disable <path>
+local-rag project list [--json]
+local-rag project status [--json]     # durable state + live supervisor status; "daemon not running" is explicit
+local-rag project reindex [<path>]    # admin/reconcile_now; without a daemon, points at `local-rag reindex`
+```
+
+Persisted state, decided by ADR-0009: a new `managed_worktree` table in `state.sqlite` (schema
+version 10, spec 03 §2.1), keyed by `worktree_id` — never a path, per the system-wide "no durable
+ID is derived from a filesystem path" invariant. Writing this table never requires a live daemon
+(the same architecturally-sanctioned direct-`state.sqlite` access every `local-rag` CLI command
+already uses, §6's own as-built note); a live daemon is then notified best-effort over the
+existing UDS transport, and re-reads the table on a slow backstop poll regardless — the same
+"notify is a hint, the table is truth" discipline spec 06 §1 already fixes for the reconcile
+watcher itself.
+
+At daemon startup, one supervised task per **enabled** managed worktree composes the existing
+`local_rag_index::reconcile::{spawn_watcher, WorktreeReconciler}` primitives with the same
+embed → activate → materialize step `index`/`reindex`/`watch` already use — the identical pipeline
+§6's `watch` note describes, given a second, always-on caller. Each task's `JobGuard` is held only
+for the duration of an active reconcile cycle, never while merely watching (the same discipline
+D-024 fixed for the consolidation trigger), so enrolled-but-quiet projects do not change spec 02
+§4.3's `[FIXED]` idle-shutdown behavior: a quiet daemon still exits on idle, and freshness is
+restored by a forced `TriggerKind::Startup` reconcile the next time it starts.
+
+Control surface is CLI + three new `admin/*` JSON-RPC verbs (`admin/projects_list`,
+`admin/projects_reload`, `admin/reconcile_now`) on the existing UDS transport (§4) — the same
+non-catalog, TUI-only-precedent surface `admin/tail_calls`/`admin/tool_stats` (§7, `T18-08`)
+already established. Deliberately **not** MCP tools: §2's tool catalog just gained a byte budget
+(`T19-01`) specifically because Claude Code defers tool loading past a size threshold, and
+enrolling arbitrary filesystem paths for continuous background indexing is store administration,
+not a model-driven action (spec 12 §1).
+
+`local-rag index`/`reindex`/`watch` are unaffected beyond one stderr advisory line, printed only
+when the target worktree is daemon-managed and a live daemon answers the liveness probe, naming
+`local-rag project reindex` as the deduplicated path — and then proceed regardless (fail-open):
+running them concurrently with a daemon-managed worktree remains "wasteful, never unsafe," per
+§6's own as-built note, never refused.
