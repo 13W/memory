@@ -260,6 +260,7 @@ impl DaemonHandle {
             .expect("the lock-acquire task must not panic")
             .map_err(DaemonStartupError::Lock)?
         };
+        tracing::info!(instance_uuid = %instance_uuid, pid, "store lock acquired");
 
         // Step 2: open state.sqlite (runs migrations under L1 internally).
         let (mode_tx, mode_rx) = watch::channel(DaemonMode::Normal);
@@ -278,10 +279,12 @@ impl DaemonHandle {
                     // Step 3: open/validate cache.sqlite.
                     let cache_db = CacheDb::open(layout.cache_db(), &store_instance_uuid)
                         .map_err(DaemonStartupError::Cache)?;
+                    tracing::info!("state.sqlite and cache.sqlite opened");
                     (Some(Arc::new(state_db)), Some(Arc::new(cache_db)))
                 }
                 Err(OpenError::Migration(boxed)) => {
                     let reason = migration_only_reason(&boxed);
+                    tracing::warn!(?reason, "degraded to migration-only mode");
                     let _ = mode_tx.send(DaemonMode::MigrationOnly { reason });
                     (None, None)
                 }
@@ -320,10 +323,18 @@ impl DaemonHandle {
         // HELLO/WELCOME connection handler.
         let listener =
             UnixListener::bind(layout.socket_path()).map_err(DaemonStartupError::Bind)?;
+        tracing::info!(socket = %layout.socket_path().display(), "listening");
         lock_guard
             .mark_ready(now_ms, &layout.socket_path())
             .map_err(DaemonStartupError::MarkReady)?;
         let lock_info = lock_guard.info().clone();
+        tracing::info!(
+            socket = %layout.socket_path().display(),
+            pid,
+            daemon_version = %daemon_version,
+            instance_uuid = %instance_uuid,
+            "daemon ready"
+        );
 
         let sessions = SessionRegistry::new();
         let tool_calls = ToolCallCounters::new();
@@ -361,6 +372,7 @@ impl DaemonHandle {
         let jobs = JobRegistry::new();
         let mut resume_handles = Vec::new();
         if let Some(ref db) = state_db {
+            tracing::info!(job = "spool_resume", "background job spawned");
             resume_handles.push(tokio::spawn(spawn_spool_resume(
                 Arc::clone(db),
                 layout.clone(),
@@ -369,6 +381,7 @@ impl DaemonHandle {
                 now_ms,
                 payload_ttl_hours,
             )));
+            tracing::info!(job = "consolidation_resume", "background job spawned");
             resume_handles.push(tokio::spawn(spawn_consolidation_resume(
                 Arc::clone(db),
                 layout.clone(),
@@ -388,6 +401,7 @@ impl DaemonHandle {
         // not `resume_handles` — this loop never completes on its own.
         let (consolidation_trigger_stop, consolidation_trigger_join) = match state_db.as_ref() {
             Some(db) => {
+                tracing::info!(job = "consolidation_trigger", "background job spawned");
                 let (stop_tx, stop_rx) = oneshot::channel();
                 let join = tokio::spawn(spawn_consolidation_trigger(
                     Arc::clone(db),
@@ -456,6 +470,7 @@ impl DaemonHandle {
     /// never completes on its own), then checkpoint, close the cache, and
     /// release the lock.
     pub async fn shutdown(mut self) {
+        tracing::info!("daemon stopping");
         for handle in self.resume_handles.drain(..) {
             let _ = handle.await;
         }
@@ -465,6 +480,7 @@ impl DaemonHandle {
         if let Some(join) = self.consolidation_trigger_join.take() {
             let _ = join.await;
         }
+        tracing::debug!("background jobs stopped");
         if let Some(handshake_join) = self.handshake_join.take() {
             // `handshake_join` is only the *accept loop* — aborting it stops
             // new connections, matching spec 02 §4.3 step 1 ("stop
@@ -478,6 +494,7 @@ impl DaemonHandle {
             // a hard kill is (spec 02 §4.3).
             handshake_join.abort();
         }
+        tracing::debug!("no longer accepting connections");
         let lock_guard = self.lock_guard.take().expect("shutdown runs once");
         drain_and_shutdown(
             &self.layout,
@@ -487,6 +504,7 @@ impl DaemonHandle {
             self.handshake_stop.take(),
         )
         .await;
+        tracing::info!("daemon stopped");
     }
 }
 
@@ -510,11 +528,13 @@ async fn spawn_spool_resume(
         match outcome {
             Ok(outcome) => {
                 if let Some(reason) = outcome.stalled_on {
-                    eprintln!("local-rag: spool session {session_id} stalled on import: {reason}");
+                    tracing::warn!(
+                        "local-rag: spool session {session_id} stalled on import: {reason}"
+                    );
                 }
             }
             Err(e) => {
-                eprintln!("local-rag: spool session {session_id} failed to import: {e}");
+                tracing::error!("local-rag: spool session {session_id} failed to import: {e}");
             }
         }
     }
@@ -642,6 +662,7 @@ pub async fn wait_for_shutdown_trigger(
     idle_shutdown_secs: u64,
     poll_interval: Duration,
 ) -> ShutdownReason {
+    tracing::debug!(idle_shutdown_secs, "waiting for a shutdown trigger");
     let idle_budget = Duration::from_secs(idle_shutdown_secs);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let mut ticker = tokio::time::interval(poll_interval);
@@ -685,6 +706,7 @@ pub async fn run(
     let reason =
         wait_for_shutdown_trigger(&handle, &mut signal, idle_shutdown_secs, idle_poll_interval)
             .await;
+    tracing::info!(?reason, "shutdown triggered");
     handle.shutdown().await;
     Ok(reason)
 }

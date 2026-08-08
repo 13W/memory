@@ -142,6 +142,26 @@ MemoryConfig` (`recall_token_budget`, default `1500`) — 08 §6 names "token bu
 default 1500 tokens, config]`" without fixing a TOML layout, so this is as-built the same
 way `[spool]` was for T13-01.
 
+As-built note (X-004, `[SPEC]`): `daemon.log_level` — declared since T02-05, editable from the
+TUI since T18-07 — is consumed for the first time here: `local-rag serve` installs a process-wide
+`tracing`/`tracing-subscriber` subscriber (`local_rag::logging::init`, `crates/local-rag/src/
+logging.rs`), writing plain (non-ANSI) lines to **stderr**. Priority is `RUST_LOG` (when set and
+non-empty) `>` `config.daemon.log_level` `>` `"info"`; an invalid directive on either side falls
+back to `"info"` with a `warn!` explaining why (§6 "nothing degrades silently"), never a silent
+downgrade or a panic. Only `local-rag serve` installs this subscriber — the rest of the CLI
+(`index`/`watch`/…) is unaffected, and the library half of this crate never links
+`tracing-subscriber`. Logged events are daemon lifecycle steps (lock acquired, state/cache opened,
+listening, `daemon ready`, background jobs spawned/finished, the shutdown reason), one line per
+request/notification handled (`daemon/handshake.rs::handle_connection` — method/tool label,
+session harness, byte counts, duration, status; `admin/*` at `debug` so a future TUI's ~1s poll
+does not flood `info`), and the same warnings a few call sites previously wrote via `eprintln!`
+(a stalled/failed spool-resume session, an installed-but-unopenable embedding model). Never a
+request or response **payload** — CLAUDE.md: recalled memory and indexed repository content are
+untrusted data. `StoreLayout::logs_dir` remains reserved and unfilled — this is a live stderr
+stream, not a persisted file log, the same boundary `T18-08`'s own in-memory ring buffer already
+drew for a different consumer (a TUI dashboard, polled via `admin/tail_calls`/`admin/tool_stats`,
+11 §7 — this stderr stream and that ring buffer are independent, neither replaces the other).
+
 ### 3.2 Per-repository settings `[SPEC]`
 
 Stored in `state.sqlite` (`repo_settings` table, 03 §2.1), edited via CLI/dashboard-equivalent,

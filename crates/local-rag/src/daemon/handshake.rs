@@ -170,7 +170,14 @@ pub async fn serve_connections<H: RequestHandler>(
         tokio::select! {
             _ = &mut stop => return,
             accepted = listener.accept() => {
-                let Ok((stream, _addr)) = accepted else { continue };
+                let stream = match accepted {
+                    Ok((stream, _addr)) => stream,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed");
+                        continue;
+                    }
+                };
+                tracing::debug!("connection accepted");
                 let ctx = ctx.clone();
                 let handler = handler.clone();
                 tokio::spawn(async move {
@@ -207,14 +214,22 @@ async fn handle_connection<H: RequestHandler>(
             }),
             true,
         ),
-        Err((min_proto, max_proto)) => (
-            Message::Incompatible(Incompatible {
-                min_proto,
-                max_proto,
-                daemon_version: ctx.daemon_version.to_string(),
-            }),
-            false,
-        ),
+        Err((min_proto, max_proto)) => {
+            tracing::warn!(
+                client_proto = hello.proto,
+                min = min_proto,
+                max = max_proto,
+                "incompatible proto; refusing"
+            );
+            (
+                Message::Incompatible(Incompatible {
+                    min_proto,
+                    max_proto,
+                    daemon_version: ctx.daemon_version.to_string(),
+                }),
+                false,
+            )
+        }
     };
     if write_message(&mut write_half, &reply).await.is_err() || !accepted {
         return;
@@ -223,6 +238,12 @@ async fn handle_connection<H: RequestHandler>(
     let _session_guard = ctx.sessions.register(hello.session_id.clone());
     let _tool_call_guard = ctx.tool_calls.begin_session(hello.session_id.clone());
     let harness = hello.harness.clone();
+    tracing::info!(
+        session = %hello.session_id,
+        harness = %harness,
+        proto = hello.proto,
+        "session opened"
+    );
 
     loop {
         let Some(line) = read_bounded_line(&mut reader, MAX_MESSAGE_BYTES).await else {
@@ -233,15 +254,16 @@ async fn handle_connection<H: RequestHandler>(
         };
         match msg {
             Message::Request(env) => {
-                // Telemetry (spec 11 §7, T18-08): label the call before
-                // `env.mcp` moves into `handler.handle`, and skip every
-                // `admin/*` method — an `admin/tail_calls` poll must not
-                // show up inside its own tail.
+                // Telemetry (spec 11 §7, T18-08) + the live log (X-004) share
+                // this one label: computed before `env.mcp` moves into
+                // `handler.handle`. `admin/*` is skipped by the telemetry
+                // ring buffer (an `admin/tail_calls` poll must not show up
+                // inside its own tail) but still gets a log line, at DEBUG —
+                // otherwise a future TUI's ~1s admin poll would flood INFO.
                 let method = telemetry::method_of(env.mcp.get());
                 let is_admin = method.as_deref().is_some_and(|m| m.starts_with("admin/"));
-                let tool = (!is_admin).then(|| {
-                    telemetry::call_label(env.mcp.get(), method.as_deref().unwrap_or("?"))
-                });
+                let label = telemetry::call_label(env.mcp.get(), method.as_deref().unwrap_or("?"));
+                let tool = (!is_admin).then(|| label.clone());
                 let bytes_in = env.mcp.get().len() as u64;
                 let started = tokio::time::Instant::now();
 
@@ -249,8 +271,9 @@ async fn handle_connection<H: RequestHandler>(
                     // A JSON-RPC notification: no response, by construction
                     // — see this module's own doc for why. Still a real
                     // call that passed through this connection, so it is
-                    // still worth a telemetry record (bytes_out: 0, never
-                    // an error) unless it was itself `admin/*`.
+                    // still worth a log line and (unless `admin/*`) a
+                    // telemetry record (bytes_out: 0, never an error).
+                    log_request(is_admin, &label, &harness, started, bytes_in, 0, "ok");
                     if let Some(tool) = tool {
                         ctx.telemetry.record(CallRecord {
                             at_ms: (ctx.now_ms)(),
@@ -264,6 +287,17 @@ async fn handle_connection<H: RequestHandler>(
                     }
                     continue;
                 };
+                let is_error = telemetry::response_is_error(response.get());
+                let bytes_out = response.get().len() as u64;
+                log_request(
+                    is_admin,
+                    &label,
+                    &harness,
+                    started,
+                    bytes_in,
+                    bytes_out,
+                    if is_error { "error" } else { "ok" },
+                );
                 if let Some(tool) = tool {
                     ctx.telemetry.record(CallRecord {
                         at_ms: (ctx.now_ms)(),
@@ -271,8 +305,8 @@ async fn handle_connection<H: RequestHandler>(
                         tool,
                         duration_ms: started.elapsed().as_millis() as u64,
                         bytes_in,
-                        bytes_out: response.get().len() as u64,
-                        is_error: telemetry::response_is_error(response.get()),
+                        bytes_out,
+                        is_error,
                     });
                 }
                 let out = Message::Response(ResponseEnvelope { mcp: response });
@@ -281,6 +315,7 @@ async fn handle_connection<H: RequestHandler>(
                 }
             }
             Message::ShutdownRequest(_) => {
+                tracing::info!("shutdown requested by a connected proxy");
                 ctx.shutdown_requested.notify_one();
                 // Deliberately keep looping — see this module's own doc.
             }
@@ -290,9 +325,48 @@ async fn handle_connection<H: RequestHandler>(
             | Message::Welcome(_)
             | Message::Incompatible(_)
             | Message::Response(_) => {
+                tracing::warn!("protocol violation; dropping connection");
                 return;
             }
         }
+    }
+}
+
+/// Log one request/notification (X-004): `admin/*` at DEBUG (a future TUI's
+/// ~1s poll would otherwise flood INFO), everything else at INFO. Never
+/// carries the request/response body — CLAUDE.md: recalled memory and
+/// indexed repository content are untrusted data, so only metadata (method
+/// label, session harness, byte counts, duration, status) is emitted.
+fn log_request(
+    is_admin: bool,
+    tool: &str,
+    harness: &str,
+    started: tokio::time::Instant,
+    bytes_in: u64,
+    bytes_out: u64,
+    status: &str,
+) {
+    let duration_ms = started.elapsed().as_millis() as u64;
+    if is_admin {
+        tracing::debug!(
+            tool,
+            harness,
+            duration_ms,
+            bytes_in,
+            bytes_out,
+            status,
+            "request"
+        );
+    } else {
+        tracing::info!(
+            tool,
+            harness,
+            duration_ms,
+            bytes_in,
+            bytes_out,
+            status,
+            "request"
+        );
     }
 }
 

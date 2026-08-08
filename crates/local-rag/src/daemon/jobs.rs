@@ -67,8 +67,10 @@ impl JobRegistry {
             .lock()
             .expect("job registry mutex poisoned")
             .insert(token, kind);
+        tracing::debug!(?kind, token, "job started");
         JobGuard {
             inner: Arc::clone(&self.inner),
+            kind,
             token,
         }
     }
@@ -92,6 +94,7 @@ impl JobRegistry {
 #[derive(Debug)]
 pub struct JobGuard {
     inner: Arc<Inner>,
+    kind: JobKind,
     token: u64,
 }
 
@@ -102,6 +105,7 @@ impl Drop for JobGuard {
             .lock()
             .expect("job registry mutex poisoned")
             .remove(&self.token);
+        tracing::debug!(kind = ?self.kind, token = self.token, "job finished");
     }
 }
 
