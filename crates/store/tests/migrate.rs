@@ -356,6 +356,11 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         ] {
             assert!(table_exists(&read, t), "memory table {t} created");
         }
+        // … and v10 (daemon-managed indexing registry, T20-01, §2.1).
+        assert!(
+            table_exists(&read, "managed_worktree"),
+            "managed_worktree table created"
+        );
         // The v4 seed: the default model space is `active` and pointed at by
         // `store_settings.default_model_space_id` (spec 04 §3).
         let default_id: String = read
@@ -375,15 +380,16 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(name, "default", "default model space display_name");
         assert_eq!(state, "active", "default model space MUST be active");
 
-        // Recorded as exactly nine rows: (1,"registry"), (2,"worktree"),
+        // Recorded as exactly ten rows: (1,"registry"), (2,"worktree"),
         // (3,"code"), (4,"projection"), (5,"worktree_state_clock"),
         // (6,"representation"), (7,"observation"),
-        // (8,"observation_redaction_version"), (9,"memory").
+        // (8,"observation_redaction_version"), (9,"memory"),
+        // (10,"managed_worktree").
         let rows = migration_rows(&read);
         assert_eq!(
             rows.len(),
-            9,
-            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9] at T14-01"
+            10,
+            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9,v10] at T20-01"
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
@@ -403,6 +409,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[7].1, "observation_redaction_version");
         assert_eq!(rows[8].0, 9);
         assert_eq!(rows[8].1, "memory");
+        assert_eq!(rows[9].0, 10);
+        assert_eq!(rows[9].1, "managed_worktree");
     }
     drop(db);
 
@@ -412,7 +420,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 9, "reopen adds no new migration rows");
+    assert_eq!(applied, 10, "reopen adds no new migration rows");
 }
 
 /// D-007: migration 5 adds `worktree.state_changed_at` and backfills every
@@ -520,6 +528,77 @@ async fn migration_8_adds_the_envelope_redaction_version_column_with_no_backfill
         redaction_version, None,
         "a pre-existing row is left NULL, never backfilled to a fabricated version"
     );
+}
+
+/// T20-01: migration 10 adds `managed_worktree` to an **existing** v9 store —
+/// the real forward-only upgrade path, not merely a fresh full-set open.
+///
+/// Applied against a store first migrated to version 9 only, with a real
+/// `worktree` row already present, so the assertion exercises "an existing
+/// store gains the table and can immediately enroll a pre-existing
+/// worktree", which is what a user upgrading into daemon-managed indexing
+/// actually does. Purely additive: nothing pre-existing needs a backfill
+/// (unlike migration 5).
+#[tokio::test]
+async fn migration_10_adds_managed_worktree_to_an_existing_v9_store() {
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+
+    // 1) Bring the store up to version 9 only, and seed a real worktree using
+    // the raw connection (no managed_worktree table exists yet at this point).
+    let up_to_v9: Vec<_> = local_rag_store::ALL
+        .iter()
+        .filter(|m| m.version <= 9)
+        .copied()
+        .collect();
+    {
+        let mut conn = rusqlite::Connection::open(layout.state_db()).expect("raw conn");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        conn.pragma_update(None, "foreign_keys", true)
+            .expect("fk on");
+        let report =
+            run(&mut conn, &up_to_v9, &layout.migration_lock(), 1000).expect("migrate to v9");
+        assert_eq!(report.store_version, 9);
+        assert!(
+            !table_exists(&conn, "managed_worktree"),
+            "managed_worktree must not exist before migration 10"
+        );
+
+        conn.execute(
+            "INSERT INTO repository (repo_id, created_at, last_seen_at) \
+             VALUES ('repo-pre-v10', 1000, 1000)",
+            [],
+        )
+        .expect("seed repository");
+        conn.execute(
+            "INSERT INTO worktree \
+               (worktree_id, repo_id, kind, current_generation_id, state, created_at, \
+                last_seen_at, state_changed_at) \
+             VALUES ('wt-pre-v10', 'repo-pre-v10', 'main', NULL, 'active', 1000, 1000, 1000)",
+            [],
+        )
+        .expect("seed worktree");
+    }
+
+    // 2) Opening with the full production set applies migration 10, and the
+    // pre-existing worktree can be enrolled immediately.
+    let db = StateDb::open(layout.state_db()).expect("open applies v10");
+    let read = db.open_read().expect("read conn");
+    assert!(table_exists(&read, "managed_worktree"));
+
+    db.writer()
+        .transaction(|tx| {
+            local_rag_store::registry::register_managed_worktree(tx, "wt-pre-v10", 2000)
+        })
+        .await
+        .expect("enroll the pre-existing worktree");
+
+    let read = db.open_read().expect("read conn");
+    let rows = local_rag_store::registry::managed_worktrees(&read).expect("list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].worktree_id, "wt-pre-v10");
 }
 
 /// A version-4-shaped `worktree` INSERT: the column list migration 5 has not

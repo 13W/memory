@@ -343,6 +343,20 @@
 //! inconsistent frame is caught here rather than poisoning T13-04's
 //! transactional importer, which is this module's only consumer.
 //!
+//! T20-01 adds the **daemon-managed indexing registry**
+//! ([`registry::managed_worktrees`] and friends, spec 03 §2.1, ADR-0009): the
+//! version-10 migration creates `managed_worktree`, the persisted, explicit
+//! opt-in list of the worktrees the daemon indexes in the background — keyed
+//! by `worktree_id` with a foreign key into `worktree`, never by a path
+//! (spec 01 §5). The table is the *truth*; a live daemon is only notified of
+//! a change and re-reads it on a backstop poll, the same "notify is a hint"
+//! discipline spec 06 §1 fixes for the reconcile watcher. It carries no
+//! runtime columns — `running`/`last_error` are in-memory supervisor state —
+//! and `enabled = 0` keeps a row enrolled but dormant, with
+//! [`registry::managed_worktrees`] returning every row so the run/skip
+//! decision lives in one place. The consumers (daemon supervisor, `local-rag
+//! project` CLI, double-indexing advisory) are T20-06/T20-08/T20-09.
+//!
 //! `rusqlite` is re-exported so downstream crates share one SQLite vocabulary
 //! (`local_rag_store::rusqlite`).
 
@@ -487,6 +501,10 @@ pub use registry::{
     ProjectionStateChange, ProjectionStateError, ProjectionStateRow, ProjectionStatus,
     check_invariants, default_model_space_id, insert_projection_state, projection_state,
     referenced_model_space_ids, set_default_model_space_id, write_projection_state,
+};
+pub use registry::{
+    ManagedWorktree, is_managed, managed_worktrees, register_managed_worktree, set_managed_enabled,
+    unregister_managed_worktree,
 };
 pub use retention::{
     ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,

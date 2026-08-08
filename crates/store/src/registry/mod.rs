@@ -48,6 +48,12 @@
 //! restrictive* of the global and every involved repository's policy (spec 02
 //! §3.2, 12 §1).
 //!
+//! The **daemon-managed indexing registry** (T20-01, version-10 `SCHEMA_V10`,
+//! module [`managed`]): `managed_worktree` (spec 03 §2.1, ADR-0009) — the
+//! persisted, explicit opt-in list of the worktrees the daemon indexes in the
+//! background, keyed by `worktree_id` and never by a path. The table is the
+//! truth; a live daemon is only notified of a change (T20-06/T20-07).
+//!
 //! The **generation lifecycle** (T05-01, module [`generation`]) sits on top of the
 //! `generation` table `SCHEMA_V2` shipped: [`allocate_generation`] (per-worktree
 //! monotone number, born `building`), the [`GenerationState`] machine
@@ -62,6 +68,7 @@
 
 mod generation;
 mod instance;
+mod managed;
 mod projection_state;
 mod repository;
 mod representation;
@@ -76,6 +83,12 @@ pub use generation::{
 };
 
 pub use instance::{ensure_store_instance_uuid, store_instance_uuid};
+
+pub(crate) use managed::SCHEMA_V10;
+pub use managed::{
+    ManagedWorktree, is_managed, managed_worktrees, register_managed_worktree, set_managed_enabled,
+    unregister_managed_worktree,
+};
 
 pub(crate) use projection_state::SCHEMA_V4;
 pub use projection_state::{

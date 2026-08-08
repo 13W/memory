@@ -208,6 +208,15 @@ CREATE TABLE generation (
   UNIQUE (worktree_id, generation_number),
   UNIQUE (generation_id, worktree_id)                 -- target for composite FKs
 );
+
+CREATE TABLE managed_worktree (                        -- migration 10; ADR-0009 opt-in list [SPEC]
+  worktree_id    TEXT PRIMARY KEY REFERENCES worktree(worktree_id),
+  enabled        INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  registered_at  INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+-- Keyed by the stable worktree UUID, never a path [FIXED]. No runtime columns
+-- (running/last_error): supervisor state is in-memory, surfaced by admin/projects_list.
 ```
 
 `retiring` exists for GC/audit only, never for routing `[FIXED]`: the per-worktree lock
@@ -309,6 +318,38 @@ merged snapshot) and a repository can only *tighten*, never relax, the global po
 remote-policy guard that consumes the effective value (provider pool, spec 10 §1, 12 §1) is a later
 group (T11/T16); T02-05 supplies only the stored values and the merge. The global config side is
 `local_rag_core::config` (see 02 §3.1).
+
+As-built note (T20-01, `[SPEC]`): `managed_worktree` is **migration 10** (`schema_migrations`
+version `10`, name `managed_worktree`, `local_rag_store::registry::SCHEMA_V10`, reproduced
+byte-for-byte from this section so its checksum is stable) — the persisted, explicit opt-in list
+of the worktrees the daemon indexes in the background, decided by ADR-0009 (see 11 §8). Keyed by
+`worktree_id` with a foreign key into `worktree`: the key is the stable UUID, never a path (01
+§5), and an unknown id is rejected by that FK and rolls the transaction back rather than leaving a
+dangling enrollment. Three alternatives were rejected for normative reasons, recorded here so they
+are not silently revisited: a `repo_settings` key (wrong granularity — repository, not worktree —
+and 02 §3.2 defines that table as the mirror of the global `[models]`/`[index]` config sections,
+not as a work queue); reusing `worktree.state` (04 §7's `active|detached|removing` machine answers
+"does this path still resolve", an orthogonal axis — conflating them would make "the user paused
+indexing" indistinguishable from "the path vanished" and would require editing `[SPEC]`
+transitions); and a JSON blob in `store_settings` (bootstrap framework storage for singletons — no
+foreign key, no per-row query, and one toggle would rewrite the whole value). The table carries
+**no runtime columns** (`running`, `last_error`): those are in-memory supervisor state surfaced by
+`admin/projects_list` (11 §8), never persisted. `enabled = 0` keeps a row enrolled but **dormant**;
+`managed_worktrees` returns every row and the supervisor filters, the same "return everything,
+decide in one pure place" discipline `worktree_state_clocks` already uses. `enabled` follows
+§1.1's boolean convention (`INTEGER` 0/1 with `CHECK`), like `worktree_path.is_current` and
+`model_space_representation.required`. The operations are `local_rag_store::registry::managed`:
+`register_managed_worktree` (idempotent upsert — a repeat bumps `updated_at` only, never
+re-enabling a deliberately disabled row nor resetting `registered_at`, because enabling is its own
+verb), `unregister_managed_worktree` and `set_managed_enabled` (both report whether a row matched;
+`set_managed_enabled` is an `UPDATE`, never an upsert, because registration is explicit per
+ADR-0009 and a toggle must not implicitly enroll), plus the reads `managed_worktrees` (all rows,
+`ORDER BY worktree_id`) and `is_managed` (enrolled at all, regardless of `enabled` — the question
+11 §6's double-indexing advisory asks). Writes compose in a `StateWriter::transaction`, so
+enrolling a brand-new path is *one* transaction alongside `create_repository`/`create_worktree`.
+The consumers — the daemon supervisor, the `local-rag project` CLI, and the advisory warning — are
+`T20-06`/`T20-08`/`T20-09`; T20-01 ships exactly the table and its typed accessors, the same
+division T02-05 drew relative to the policy guard that followed it.
 
 ### 2.2 Projection state & model registry
 

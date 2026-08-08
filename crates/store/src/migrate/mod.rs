@@ -166,7 +166,11 @@ impl Migration {
 /// `memory_entry`/`memory_evidence`/`pending_memory_candidate`/
 /// `candidate_evidence`/`processing_cursor`/`consolidation_run`/`audit_event`,
 /// the remainder of spec 03 §2.5's "Memory side" block version 7 left for this
-/// task (`memory::SCHEMA_V9`). Each checksum is frozen once shipped (see
+/// task (`memory::SCHEMA_V9`); version 10 (T20-01, ADR-0009) is the
+/// daemon-managed indexing registry — `managed_worktree`, the persisted,
+/// explicit opt-in list of the worktrees the daemon indexes in the
+/// background, keyed by `worktree_id` and never by a path
+/// (`registry::SCHEMA_V10`). Each checksum is frozen once shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
 pub const ALL: &[Migration] = &[
@@ -183,6 +187,7 @@ pub const ALL: &[Migration] = &[
         crate::observation::SCHEMA_V8,
     ),
     Migration::sql(9, "memory", crate::memory::SCHEMA_V9),
+    Migration::sql(10, "managed_worktree", crate::registry::SCHEMA_V10),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.
