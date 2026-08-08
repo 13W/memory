@@ -3,7 +3,8 @@
 //! `run_cli`/seeding helpers (duplicated here per this crate's established
 //! per-file-fixture convention).
 //!
-//! `watch` shares `cli::index`'s own `open_state`/`resolve_facts` split, so
+//! `watch` shares `local_rag::indexing`'s own `open_state`/`resolve_facts`
+//! split (T20-02), so
 //! everything except the actual watch loop (`GlobalOnly`/`Ambiguous`
 //! refusal, the "model not installed" gate) is reachable and asserted here
 //! without ONNX. The live reconcile → embed → activate → materialize loop

@@ -19,8 +19,8 @@ use local_rag_store::{
     run_payload_ttl_sweep, run_spool_session_sweep, run_unreferenced_space_sweep,
 };
 
-use super::index::open_state;
 use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
+use local_rag::indexing::open_state;
 
 const BIN: &str = "local-rag";
 

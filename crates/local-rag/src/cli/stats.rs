@@ -14,8 +14,8 @@ use local_rag_store::{
 
 use local_rag::daemon::gitroot;
 
-use super::index::{open_cache, open_state};
 use super::{block_on, fail, resolve_layout_and_config};
+use local_rag::indexing::{open_cache, open_state};
 
 const BIN: &str = "local-rag";
 

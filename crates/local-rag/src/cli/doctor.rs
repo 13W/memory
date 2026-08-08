@@ -5,7 +5,7 @@
 //! # `doctor` never mutates — the fixed call order this relies on
 //!
 //! Every normal constructor this crate has (`StateDb::open`, `CacheDb::open`,
-//! `StoreLayout::ensure`/`cli::index::open_state`) either applies pending
+//! `StoreLayout::ensure`/`local_rag::indexing::open_state`) either applies pending
 //! migrations, rebuilds an incompatible cache, or **re-asserts** permissions
 //! as a side effect of opening — exactly the machinery this command exists to
 //! diagnose, not to run. `build_report` therefore follows one fixed order,

@@ -10,8 +10,9 @@
 //! elsewhere (`local_rag_store::effective_data_policy`, T02-05, which folds the
 //! global value with every involved repository's stricter setting — wired into
 //! the real call sites by T16-01: `local_rag_memory::router::route` folds over
-//! a consolidation window's involved repositories; `cli::index::project_
-//! generation` folds over the worktree being indexed), and this guard only
+//! a consolidation window's involved repositories; `local_rag::indexing::
+//! project_generation` folds over the worktree being indexed, T20-02), and
+//! this guard only
 //! answers "may a provider of this locality be selected under this effective
 //! policy?".
 //!

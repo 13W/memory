@@ -4,7 +4,7 @@
 //! Neither leg needs a live embedder: `--fts` re-derives the FTS view from
 //! already-indexed content, and `--dense` (`local_rag_projection::
 //! force_rebuild`, T15-07) reads vectors already sitting in `embedding_cache`
-//! — the same `CacheVectorSource` seam `cli::index::project_generation`
+//! — the same `CacheVectorSource` seam `local_rag::indexing::project_generation`
 //! uses, never re-running `run_backfill`. A model space with no registered
 //! `code_raw` representation still refuses (`ShardParams` has nowhere to
 //! come from), but that refusal is about the registry, not about whether
@@ -12,6 +12,7 @@
 
 use std::process::ExitCode;
 
+use local_rag::indexing::{open_cache, open_state};
 use local_rag_core::identity::{Uuid, UuidSource};
 use local_rag_projection::{
     BruteForceProjectionStore, CacheVectorSource, ModelSwitchError, force_rebuild, shard_dir,
@@ -20,7 +21,6 @@ use local_rag_store::{
     DEFAULT_MODEL_SPACE_ID, current_generation, materialize_fts, projection_state,
 };
 
-use super::index::{open_cache, open_state};
 use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
@@ -225,8 +225,9 @@ mod tests {
     };
     use local_rag_test_support::TempHome;
 
+    use local_rag::indexing::{IndexCtx, index_worktree, register_new_worktree};
+
     use super::*;
-    use crate::cli::index::{IndexCtx, index_worktree, register_new_worktree};
 
     struct SeqUuids {
         counter: AtomicU64,

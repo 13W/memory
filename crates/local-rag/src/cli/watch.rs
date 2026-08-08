@@ -2,8 +2,8 @@
 //! process that keeps one worktree's generation continuously fresh: the
 //! filesystem watcher schedules reconciles, the debounced [`WorktreeReconciler`]
 //! runs them, and every successfully built generation is embedded/activated/
-//! materialized (`cli::index`'s own [`project_generation`]) before the next
-//! one is considered.
+//! materialized (the library pipeline's own [`project_generation`], T20-02)
+//! before the next one is considered.
 //!
 //! # Why a standalone process, not daemon-IPC
 //!
@@ -19,6 +19,9 @@
 use std::process::ExitCode;
 
 use local_rag::daemon::gitroot;
+use local_rag::indexing::{
+    IndexCtx, finish_index_ctx, open_state, project_generation, resolve_facts,
+};
 use local_rag_core::identity::Uuid;
 use local_rag_core::redaction::Scanner;
 use local_rag_index::reconcile::{
@@ -27,9 +30,7 @@ use local_rag_index::reconcile::{
 };
 use local_rag_store::Resolution;
 
-use super::index::{
-    IndexCtx, finish_index_ctx, open_state, print_ambiguous, project_generation, resolve_facts,
-};
+use super::index::print_ambiguous;
 use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
