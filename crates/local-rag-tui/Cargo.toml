@@ -24,9 +24,10 @@ local-rag-core = { path = "../core" }
 # scope; the skeleton itself opens no database. Already resolved throughout the workspace — 0 new
 # external sources.
 local-rag-store = { path = "../store" }
-# T18-08/T18-09's Logs/live-stats screens speak the two new `admin/tail_calls`/`admin/tool_stats`
-# JSON-RPC methods over the existing UDS transport this crate already defines. Declared here per
-# this task's own card scope; unused by the skeleton itself. Already resolved throughout the
+# T18-09's `admin_client` module speaks the two new `admin/tail_calls`/`admin/tool_stats`
+# JSON-RPC methods over this crate's own long-lived UDS client — `Hello`/`Message`/
+# `RequestEnvelope`/`encode_message`/`decode_message`/`MAX_MESSAGE_BYTES`, the same transport
+# `local-rag`/`local-rag-proxy`/`local-rag-hook` already speak. Already resolved throughout the
 # workspace — 0 new external sources.
 local-rag-protocol = { path = "../protocol" }
 # Library half only (`pub mod daemon;`, `crates/local-rag/src/lib.rs`) — a Cargo path dependency
@@ -99,15 +100,33 @@ crossterm = "0.29"
 # `#[tokio::test]` seed helpers; that is no longer literally true (see `rt.rs`'s own doc), though
 # `run_app` itself still never becomes an async fn — only a single mutation's own `rt::block_on`
 # call ever enters an async context, exactly like the CLI's own one-shot-runtime-per-invocation
-# shape. Same feature set as before this promotion; 0 new external sources — this exact version
-# and feature set was already resolved workspace-wide via `local-rag`/`local-rag-store`'s own
-# normal `tokio` dependency.
+# shape. `rt-multi-thread`/`macros`/`sync`/`time` were already resolved workspace-wide via
+# `local-rag`/`local-rag-store`'s own normal `tokio` dependency — 0 new external sources for those.
+# `net` (`tokio::net::UnixStream`) and `io-util` (`AsyncBufReadExt`/`AsyncWriteExt`/`BufReader`)
+# are new as of T18-09's `admin_client` module — again 0 new external sources, the identical pair
+# `local-rag`/`local-rag-proxy` already carry for the same reason. T18-09 is also this crate's
+# first *long-lived* tokio runtime: `admin_client::AdminPoller` spawns a dedicated OS thread that
+# builds one `Builder::new_current_thread()` runtime and keeps it alive for as long as the Logs
+# screen is open (polling `admin/tail_calls`/`admin/tool_stats` on a real, persistent UDS
+# connection), unlike `rt::block_on`'s deliberately one-shot-per-call runtime above — `main.rs`'s
+# own event loop still never becomes an async fn itself.
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "sync",
     "time",
+    "net",
+    "io-util",
 ] }
+# `admin_client::{CallRow, ToolStatRow}` deserialize `admin/tail_calls`/`admin/tool_stats`'s JSON
+# result bodies (T18-09) — a real (non-dev) dependency as of this task; already resolved
+# workspace-wide via every other crate's own `serde`/`serde_json` — 0 new external sources.
+# `raw_value`: building the outbound `{"jsonrpc":"2.0","id":1,"method":"admin/tail_calls"}`
+# request body as `Box<RawValue>` for `RequestEnvelope::mcp`, the same reason every other crate
+# that speaks this transport declares the feature explicitly (see `local-rag-protocol`'s own
+# `handshake` module doc).
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
 
 [dev-dependencies]
 # T18-02's fixture-store tests need an isolated LOCAL_RAG_HOME (`TempHome`), and its live-subprocess
@@ -117,11 +136,6 @@ tokio = { version = "1", default-features = false, features = [
 # crates' own tests; `local-rag` is already a *normal* dependency of this crate as of T18-01, so no
 # new edge is added here for the subprocess binary itself — only for `TempHome`).
 local-rag-test-support = { path = "../test-support" }
-# Hand-crafting a `store.lock` JSON fixture directly (bypassing `acquire()`'s flock — the same
-# "pure read" contract `read_store_lock_file` itself relies on) and polling `store.lock` in the
-# live-subprocess test both need it. Already resolved throughout the workspace — 0 new external
-# sources.
-serde_json = "1"
 
 [lints]
 workspace = true

@@ -29,9 +29,17 @@
 //! `keys` (crate-internal, not re-exported) is T18-07's extraction of `step`/`is_ctrl` — identical
 //! or near-identical logic that had accumulated independently in [`repositories`], [`memory`],
 //! and [`repo_settings`] by the time a third occurrence appeared, this crate's own threshold for
-//! sharing rather than duplicating a small helper.
+//! sharing rather than duplicating a small helper. [`admin_client`] is T18-09's — a long-lived
+//! async UDS client polling the daemon's `admin/tail_calls`/`admin/tool_stats` on a background OS
+//! thread, publishing snapshots over a channel; `pub`, unlike `rt`/`keys`, because
+//! `tests/logs_live.rs` (a separate compilation unit) drives it directly against a real daemon.
+//! [`logs`] is T18-09's own screen — the Logs screen: recent per-call telemetry (newest first)
+//! plus per-tool aggregates, or an explicit "daemon not running" stub, backed entirely by
+//! [`admin_client::AdminPoller`].
 
+pub mod admin_client;
 mod keys;
+pub mod logs;
 pub mod memory;
 pub mod repo_settings;
 pub mod repositories;

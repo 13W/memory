@@ -1214,6 +1214,7 @@ dependencies = [
  "local-rag-store",
  "local-rag-test-support",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
 ]
