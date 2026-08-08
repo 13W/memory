@@ -6,11 +6,11 @@
 | Спецификация | Основные группы/gates | End-to-end повторная проверка | Report-артефакт |
 | --- | --- | --- | --- |
 | 01 Overview, correctness budget, identity ladders | G00, G02, G03 | G17 | — |
-| 02 Architecture/lifecycle/locking | G01, G09, G15 | G17 | — |
+| 02 Architecture/lifecycle/locking | G01, G09, G15 | G17, G20 | — |
 | 03 Data model/DDL/hash rules | G01–G04, G07, G08, G11, G13, G14 | G17 schema lint | — |
 | 04 State machines | G05, G07, G11, G14 | G15, G17 | — |
 | 05 Projection protocol | G07, G09, G10 | G11, G12, G17 | — |
-| 06 Reconcile/FTS/GC | G05, G06, G08 | G12, G17 | — |
+| 06 Reconcile/FTS/GC | G05, G06, G08 | G12, G17, G20 | — |
 | 07 Observation spool | G13 | G15, G17 | — |
 | 08 Memory | G14 | G15, G16, G17 | `fixtures/memory/baseline/run-2026-07-29-g14-verify.json` |
 | 09 Search | G12 | G15, G17 | `fixtures/search/baseline/run-v2-2026-07-27-g12-verify.{json,report.md}` |
@@ -48,3 +48,9 @@ multi-harness, FreeBSD и win32-arm64 не входят в очередь T00–
 (`groups/18-tui-dashboard.md`, гейт `G18`) вне закрытой очереди `T00–T17`, а не последовательностью
 `X-NNN`. Выбор между лёгким путём (`X-NNN`) и тяжёлым (новая группа) — за владельцем, документируется
 ADR-ом в каждом случае, когда выбран тяжёлый путь.
+
+Второй прецедент —
+`docs/adr/0009-daemon-managed-indexing.md`: та же планка, но с дополнительным нюансом — часть
+scope (daemon-hosted background workers) уже была `[FIXED]` в spec 02 §1's топологии и не
+реализована ни одной карточкой (гейт `G20`, `groups/20-daemon-managed-indexing.md`), что ADR
+регистрирует как `D-043`, а не как новую scope.
