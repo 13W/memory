@@ -1188,6 +1188,98 @@ invalid file and `execute_server_settings_action(Save)` writing a real, `Config:
 file; plus inline `#[cfg(test)]` `TestBackend` render tests and pure unit tests for every field's
 parse/display round-trip and every nav/key transition in `server_settings.rs` itself.
 
+As-built note (T18-08, `[SPEC]`). Daemon telemetry is real: `crates/local-rag/src/daemon/
+telemetry.rs` (new), `TelemetryState` (`Arc<Inner>` over two `std::sync::Mutex` fields, cheaply
+cloneable like `SessionRegistry`/`ToolCallCounters`) — a bounded `VecDeque<CallRecord>` ring buffer
+(`CAPACITY = 500`, oldest evicted first) plus a `HashMap<String, ToolStats>` per-tool aggregate that
+is never evicted (a running total since the daemon started, like `ToolCallCounters::aggregate`).
+`CallRecord { at_ms, source, tool, duration_ms, bytes_in, bytes_out, is_error }`; `ToolStats { calls,
+errors, bytes_in, bytes_out, total_ms }`; both `derive(Serialize)` directly (no separate wire type),
+consumed by `admin/tail_calls` (`{"calls": [CallRecord, ...]}`, oldest first) and `admin/tool_stats`
+(`{"tools": [{"tool": ..., "calls": ..., ...}, ...]}`, sorted by tool name — `ToolStatsEntry` in
+`daemon/mcp/dispatch.rs` flattens the tool name alongside the aggregate). Both are new top-level
+JSON-RPC methods, siblings of `initialize`/`ping`/`tools/list` in `dispatch()`'s own match, **not**
+MCP tools — absent from `tools::catalog()`/`tools/list`, visible only to a caller that speaks raw
+JSON-RPC methods directly (T18-09's own long-lived TUI client, or — since `local-rag-proxy` is a
+thin, method-agnostic pass-through — any client relaying an arbitrary method through it, exactly
+like `initialize`/`ping`). Neither depends on `DaemonMode`/`ctx.engine`/`ctx.memory`: telemetry is
+in-memory and store-independent, so both answer identically in `MigrationOnly` as in `Normal` —
+required for T18-09's Logs screen to work whenever the daemon is reachable at all, unlike
+`tools/call`'s own `MigrationOnly` short-circuit.
+
+Recording happens at exactly the point this section's forward-sketch above named:
+`daemon/handshake.rs::handle_connection`, wrapping `handler.handle(env.context, env.mcp).await`
+inside the `Message::Request` arm. `HandshakeContext` gained two fields — `telemetry:
+TelemetryState` and `now_ms: fn() -> i64` (the same fn-pointer clock convention
+`mcp::McpHandler::now` already established, newly threaded one layer earlier so
+`handle_connection` itself can stamp `at_ms` without depending on `SystemTime::now()` inline;
+`lifecycle.rs` wires both from the same `system_now_ms`/`TelemetryState::new()` it already
+constructs `sessions`/`tool_calls` from, cloned into both `handshake_ctx` and `McpHandler::new`'s
+new `telemetry` parameter, mirroring the existing `tool_calls` double-clone). `hello.harness` is
+captured into a local the moment it is still alive (`let harness = hello.harness.clone();`,
+alongside the existing `sessions`/`tool_calls` guards) since `hello` itself is consumed before the
+request loop starts. `source` is stored as that **raw harness string**, never normalized into a
+closed `mcp`/`hook` enum — the same "free string, not an enum, forward-compatible" design
+`local_rag_protocol::handshake::Hello::harness`'s own doc comment already states; a future
+multi-harness value (deferred, 01 §1 `[FIXED]`) needs no telemetry change.
+
+Two small, tolerant (never-panicking) JSON probes in `telemetry.rs` itself — not in
+`handshake.rs`, which stays MCP-agnostic otherwise — extract what recording needs from the still-
+opaque `mcp: Box<RawValue>` text: `method_of` (the top-level `"method"` field) and `call_label`
+(for `"tools/call"`, the inner `params.name`; every other method is its own label — so `"tool"` in
+`CallRecord`/`ToolStats` is really "MCP tool name, or JSON-RPC method when there is no tool").
+`admin/*` methods are detected by this same `method_of` result (`starts_with("admin/")`) and are
+**never** recorded — self-exclusion, checked once in `handle_connection` before either the
+ring-buffer push or the aggregate update, so an `admin/tail_calls`/`admin/tool_stats` poll can
+never show up inside its own tail or stats. A JSON-RPC **notification** (`handler.handle` returns
+`None`) still gets a `CallRecord` (`bytes_out: 0, is_error: false`) unless it was itself
+`admin/*` — it genuinely passed through this connection and is meaningful on the Logs screen (e.g.
+`notifications/initialized`, once per session), even though nothing is written back to the client.
+
+`is_error` is deliberately **JSON-RPC-level only** — `response_is_error` checks for a top-level
+`"error"` key in the response body, nothing more — reusing `dispatch.rs`'s own documented "two
+error channels" split (its module doc, verbatim: a JSON-RPC error means the wire message itself is
+malformed or names something unknown; an in-band `isError: true` inside a successful
+`CallToolResult` means the message was valid and the tool ran, but the operation failed). T18-08
+counts only the former. Telemetry does not parse `content`/`isError` — that shape lives in
+`mcp::content`, a module telemetry has no reason to depend on — so a tool that legitimately answers
+`WORKTREE_NOT_INDEXED` or a `MigrationOnly` degradation is not counted as a telemetry error, only a
+malformed request or an unknown method/tool is.
+
+`local-rag-hook`'s own `Hello.harness` changed from `"claude-code"` (identical to
+`local-rag-proxy`'s) to `"claude-code-hook"` (`crates/local-rag-hook/src/recall.rs`, the one call
+site plus its two test literals) — the two connection kinds were otherwise indistinguishable in
+`admin/tail_calls`'s own `source` column. Still unambiguously "Claude Code" (01 §1's `[FIXED]`
+"Claude Code is the only supported harness" is about the external coding agent, not this more
+granular internal-component label); no `local_rag_protocol` change, since `harness: String` was
+already a free string. `local-rag-proxy`'s own `"claude-code"` is unchanged.
+
+Explicitly out of scope, per this card: the file log under `logs_dir()` (still reserved, still
+unfilled); any push/`broadcast` transport (both methods are polled, matching this section's own
+forward-sketch reasoning about `local_rag_protocol::handshake` being deliberately request/response
+only); any change to `local_rag_protocol` itself.
+
+Tests: `telemetry.rs`'s own `#[cfg(test)]` module covers bounded-buffer eviction (the 501st record
+evicts the oldest, the aggregate keeps all 501 distinct tool names), per-tool aggregation across
+repeated/distinct tool names, clones observing shared state, and both JSON probes' tolerance of
+garbage/malformed input. `dispatch.rs` gained a `#[cfg(test)]` module exercising `admin/tail_calls`/
+`admin/tool_stats` directly against a hand-built `DispatchContext` with `engine`/`memory: None`
+(proving the `MigrationOnly`-independence claim above without a real store), including the
+empty-state and sorted-by-name cases. `handshake.rs`'s existing test module gained two round-trip
+tests against a real `serve_connections` + `EchoRequestHandler` loop: one proving a normal call is
+recorded with the right `source`/`tool`/`bytes_in`/`bytes_out`, one proving two consecutive
+`admin/*` calls leave `tail_calls()` empty. The card's own end-to-end requirement — real
+`local-rag-proxy`/`local-rag-hook` subprocesses against a real `local-rag serve` — is
+`crates/local-rag-proxy/tests/admin_telemetry.rs` (new; `local-rag-hook` added as a same-crate
+dev-dependency, the one new edge needed since `local-rag-proxy` already carries `local-rag`'s own
+sibling-binary-path dev-dependency for the identical reason): a real `ping` through a real proxy
+connection, a real hook `SessionStart` recall RPC against the same running daemon, then
+`admin/tail_calls`/`admin/tool_stats` relayed through the very same proxy stdin (the proxy is a
+thin, method-agnostic pass-through, so no separate raw UDS client was needed) — asserting both
+`source` values are present and distinct, a second `admin/tail_calls` poll returns byte-identical
+`calls`, and `admin/tool_stats` lists exactly `["ping", "recall"]`, sorted, with no `admin/*` entry
+of its own.
+
 ## 8. Daemon-managed indexing `[SPEC surface, post-v0 — ADR-0009]`
 
 A supervised background-indexing subsystem inside the daemon, alongside the read-only MCP tool

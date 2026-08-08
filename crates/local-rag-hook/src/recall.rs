@@ -176,7 +176,14 @@ fn build_request(event: &ParsedEvent) -> (Message, Message) {
         proxy_version: local_rag_core::VERSION.to_string(),
         session_id: event.session_id.clone(),
         worktree_root: event.cwd.clone(),
-        harness: "claude-code".to_string(),
+        // Distinct from `local-rag-proxy`'s own "claude-code" (spec 11 §7,
+        // T18-08) — the daemon's telemetry (`admin/tail_calls`/
+        // `admin/tool_stats`) derives `source` straight from this free
+        // string, so the two connection kinds must not collide. Still
+        // unambiguously "Claude Code" (`01-overview.md`'s `[FIXED]`
+        // "Claude Code is the only supported harness" is about the
+        // external coding agent, not this internal component label).
+        harness: "claude-code-hook".to_string(),
     });
 
     let mut arguments = serde_json::Map::new();
@@ -361,7 +368,7 @@ mod tests {
         };
         assert_eq!(hello.session_id, "sess-1");
         assert_eq!(hello.worktree_root.as_deref(), Some("/repo"));
-        assert_eq!(hello.harness, "claude-code");
+        assert_eq!(hello.harness, "claude-code-hook");
 
         let Message::Request(env) = request else {
             panic!("expected Request")
@@ -467,7 +474,7 @@ mod tests {
             proxy_version: "0.0.0".to_string(),
             session_id: "s".to_string(),
             worktree_root: None,
-            harness: "claude-code".to_string(),
+            harness: "claude-code-hook".to_string(),
         });
         write_message(&mut buf, &hello).unwrap();
         assert_eq!(buf, encode_message(&hello).unwrap());
