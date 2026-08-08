@@ -1287,6 +1287,83 @@ thin, method-agnostic pass-through, so no separate raw UDS client was needed) �
 `calls`, and `admin/tool_stats` lists exactly `["ping", "recall"]`, sorted, with no `admin/*` entry
 of its own.
 
+As-built note (T18-09, `[SPEC]`, last card of group 18 before `G18`). The Logs screen is real:
+`local_rag_tui::logs::render_logs` — the sixth and final top-level screen (`Screen::Logs`, digit
+`6`, appended to `SCREENS` rather than inserted at this section's own second-listed position —
+this crate's established "append a variant, append a `SCREENS` entry" convention). Backend: new
+`local_rag_tui::admin_client` (`pub`, unlike `keys`/`rt` — a separate compilation unit,
+`tests/logs_live.rs`, drives it directly) — `AdminPoller`, a long-lived async UDS client polling
+`admin/tail_calls`/`admin/tool_stats` on a background OS thread's own single `tokio::runtime::
+Builder::new_current_thread()` (built once, kept alive for as long as the Logs screen is open —
+this crate's first long-lived runtime, unlike `rt::block_on`'s deliberately one-shot-per-call
+runtime every write screen already uses), publishing `LogsSnapshot` values
+(`Unreachable`/`PollerStopped`/`Connected{calls, tools}`) to the synchronous `main.rs` loop over a
+`std::sync::mpsc` channel. `PollerStopped` is distinct from `Unreachable` (a panicked background
+thread is visible on-screen, not silently indistinguishable from "daemon not running") —
+`AdminPoller::latest` tells them apart via `mpsc::TryRecvError::{Empty vs Disconnected}`. Two
+independent liveness mechanisms, deliberately not conflated: `tokio::select!` races a stop
+`Notify` against the *entire* per-connection cycle (connect+HELLO/WELCOME+every poll), so dropping
+`AdminPoller` is always fast regardless of which I/O the background task was mid-await on, with no
+per-operation timeout needed for that; a separate `CYCLE_TIMEOUT` (2s, picked-not-derived, same
+precedent as `LIVENESS_PROBE_TIMEOUT_MS`/`RECALL_BUDGET`) bounds connect/handshake and each
+`admin/tail_calls`+`admin/tool_stats` pair, for self-healing against a daemon that accepts the
+connection and then stops answering — a concern `select!`'s own responsiveness does not address.
+`CallRow`/`ToolStatRow` are `Deserialize`-only mirrors of T18-08's own wire contract
+(`local_rag::daemon::telemetry::{CallRecord, ToolStats}`, which derive only `Serialize`) — this
+crate does not couple to the daemon's internal Rust types at the wire level. `Hello.harness` for
+this client is `"local-rag-tui"`, the fourth distinct value in the workspace alongside proxy's
+`"claude-code"`, hook's `"claude-code-hook"` (T18-08), and the store-lock liveness probe's
+`"local-rag-liveness-probe"`.
+
+An accepted, explicitly documented consequence: every connection `AdminPoller` holds registers a
+live session in `SessionRegistry` for as long as it stays open, so a Logs screen left open keeps
+the daemon from idle-shutting-down (`daemon/idle.rs`'s own gate keys off `SessionRegistry::len()`)
+— `logs_poller` is dropped (stopping the thread, closing the connection) the instant `screen`
+changes away from `Logs` or the app quits, so idle-shutdown resumes normally the moment nobody is
+actually watching the screen.
+
+`render_logs` is pure (`now_ms` injected by the caller, not read internally) and renders two
+`ratatui::widgets::Table`s with no `TableState`/row selection (this crate's own established
+pattern for non-drill-down tabular data — `repositories.rs`'s path-history table is the closest
+precedent) — with headers, a deliberate first departure from every prior table in this crate,
+which has none: five-to-six numeric columns are materially harder to read unlabeled than the
+2-column tables that set the no-header precedent. `calls` (wire order oldest-first, exactly as
+`admin/tail_calls` answers) is reversed to newest-first for display only — a live-tail screen with
+no scrolling in v1 is still useful precisely because the freshest calls are always the ones shown.
+Columns: time (relative "{N}s ago"), source, tool, duration (ms), bytes (`"{in}/{out}"`, the
+card's own single "bytes" column), status (`"ok"`/`"error"`); the tool-stats table: tool, calls,
+errors, bytes, total_ms.
+
+`main.rs`'s loop gains its first non-blocking branch: `Screen::Logs` uses `event::poll
+(LOGS_UI_TICK)` (200ms) instead of the blocking `event::read()` every other screen still uses
+unchanged — background snapshots can arrive at any time, independent of keypresses, and the loop
+must keep redrawing on that cadence. `crossterm`'s `events` feature (already this crate's default
+dependency) backs `poll`/`read` with a real epoll/kqueue queue, so a real keypress makes `poll`
+return `true` immediately rather than waiting out the bound — no keystroke is ever delayed or
+dropped by it. `Cargo.toml`: `tokio` gained `net`/`io-util` (0 new external sources — the same
+pair `local-rag`/`local-rag-proxy` already carry); `serde`/`serde_json` were promoted from
+dev-only to real dependencies (`CallRow`/`ToolStatRow`'s `Deserialize`); the `local-rag-protocol`
+dependency comment, stale since T18-01 ("unused by the skeleton itself"), is corrected — this task
+is its first real call site.
+
+Tests: `admin_client`'s own `#[cfg(test)]` covers JSON-body parsing (a successful `calls`/`tools`
+result, a JSON-RPC-level error response, garbage — never panics), a hand-rolled `tokio::net::
+UnixListener` fake daemon (mirroring `daemon/probe.rs`'s own synchronous `bind_greeter`, ported to
+tokio) proving a real successful poll cycle, a no-listener-at-all case, and — the test that proves
+`select!`'s cancellation claim rather than merely asserting it — a listener that accepts and never
+answers WELCOME, where `stop()` still returns within a tight bound. `logs.rs`'s own tests cover all
+three `LogsSnapshot` variants via `TestBackend`, including an empty `Connected` (placeholder rows,
+not a panic) and newest-first ordering. `tests/logs_live.rs` (new, mirrors `status_live.rs`'s own
+`local_rag_binary_path`/`spawn_serve`/`wait_until_ready`/`stop_serve`) has three independent
+scenarios rather than one growing test: no daemon at all → `Unreachable`; a real daemon plus one
+real call made through a second, independent connection (mirroring how T18-08's own
+`admin_telemetry.rs` proves cross-connection visibility) → the poller observes it in both tables;
+the poller started *before* any daemon exists, which then appears → the only scenario that
+exercises the reconnect path (`error → Unreachable → retry`), which the other two individually
+never reach.
+
+This is group 18's last planned card before `G18` (spec 11 §7's own gate, ADR-0008).
+
 ## 8. Daemon-managed indexing `[SPEC surface, post-v0 — ADR-0009]`
 
 A supervised background-indexing subsystem inside the daemon, alongside the read-only MCP tool

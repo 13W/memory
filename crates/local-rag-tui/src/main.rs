@@ -17,9 +17,19 @@
 //! config_dir` rather than `StoreLayout`, so `run_app` now also takes a `config_dir: &Path`; its
 //! `server_settings_nav` starts from `server_settings::initial_nav(config_dir)` (a real on-disk
 //! read), not `::default()`, unlike every other screen's own nav — see that function's own doc.
+//! T18-09 adds Logs (`local_rag_tui::logs`), the sixth and final screen ADR-0008 names — the first
+//! whose data arrives from a background source rather than a synchronous read, so it is also the
+//! first (and only) branch of this loop that swaps the otherwise-universal blocking `event::read()`
+//! for a bounded `event::poll(LOGS_UI_TICK)`: `local_rag_tui::admin_client::AdminPoller` polls the
+//! daemon's `admin/tail_calls`/`admin/tool_stats` on its own background thread and publishes
+//! snapshots over a channel, and this loop needs to keep redrawing on that cadence even with no
+//! keypress at all. The poller is started lazily on first entering the Logs screen and stopped
+//! (dropped) the moment `screen` changes away from it — see `logs_poller`'s own handling below.
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use local_rag_core::paths::{StoreLayout, SystemEnv};
+use local_rag_tui::admin_client::AdminPoller;
+use local_rag_tui::logs;
 use local_rag_tui::memory::{self, MemoryNav};
 use local_rag_tui::repo_settings::{self, RepoSettingsNav};
 use local_rag_tui::repositories::{self, RepositoriesNav};
@@ -28,16 +38,29 @@ use local_rag_tui::status::{compute_status_data, render_status};
 use ratatui::DefaultTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = "local-rag-tui";
+
+/// How long the Logs screen's `event::poll` waits for a real key event before looping back to
+/// redraw with whatever fresh snapshot `AdminPoller::latest` has by then — bounded well under
+/// `admin_client::POLL_INTERVAL` (~1s) so a new snapshot is picked up promptly, but long enough not
+/// to busy-loop. `crossterm`'s `events` feature backs `event::poll`/`event::read` with a real
+/// epoll/kqueue queue (see this crate's own `Cargo.toml` comment on that feature) — a real keypress
+/// makes `poll` return `true` immediately, it does not wait out this timeout, so no keystroke is
+/// ever delayed or dropped by this bound.
+const LOGS_UI_TICK: Duration = Duration::from_millis(200);
 
 /// Which top-level screen is active. Position i (0-based) in [`SCREENS`] is selected by digit key
 /// `i + 1` (see [`screen_for_key`]) — ADR-0008 names six screens total (Status, Logs, Memory,
 /// Repositories, Repo Settings, Server Settings); each later T18-0N card appends one variant here
 /// plus one [`SCREENS`] entry, no dispatcher rewrite. Digit keys were chosen over `Tab`-cycling for
 /// direct addressability and because they never collide with the `Up`/`Down`/`Enter`/`Backspace`
-/// keys Repositories/Memory/Repo Settings need for their own drill-down.
+/// keys Repositories/Memory/Repo Settings need for their own drill-down. `Logs` is appended last
+/// (digit `6`) rather than inserted at its ADR-named position (second) — this crate's own
+/// established convention is "append a variant, append a `SCREENS` entry," and renumbering every
+/// other screen's digit key for ADR-order fidelity would be a bigger, purely cosmetic change with
+/// no behavioral benefit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Status,
@@ -45,14 +68,16 @@ enum Screen {
     Memory,
     RepoSettings,
     ServerSettings,
+    Logs,
 }
 
-const SCREENS: [Screen; 5] = [
+const SCREENS: [Screen; 6] = [
     Screen::Status,
     Screen::Repositories,
     Screen::Memory,
     Screen::RepoSettings,
     Screen::ServerSettings,
+    Screen::Logs,
 ];
 
 fn main() -> ExitCode {
@@ -109,6 +134,9 @@ fn run_app(
     let mut memory_nav = MemoryNav::default();
     let mut repo_settings_nav = RepoSettingsNav::default();
     let mut server_settings_nav = server_settings::initial_nav(config_dir);
+    // Lazily started on first entering `Screen::Logs`, stopped (dropped) the moment `screen`
+    // changes away from it — see the tail of this loop, after `screen_for_key`.
+    let mut logs_poller: Option<AdminPoller> = None;
 
     loop {
         // `Terminal::draw` calls `Terminal::autoresize` on every call, so a terminal resize needs
@@ -206,6 +234,23 @@ fn run_app(
                 }
                 (ev, force_local)
             }
+            Screen::Logs => {
+                let poller =
+                    logs_poller.get_or_insert_with(|| AdminPoller::start(layout.socket_path()));
+                let snapshot = poller.latest();
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                terminal.draw(|frame| logs::render_logs(frame, &snapshot, now_ms))?;
+                // Unlike every other screen, this one must keep redrawing even with no keypress
+                // at all (a fresh snapshot can arrive from the background poller at any time) —
+                // see `LOGS_UI_TICK`'s own doc for why a bounded `poll` never delays real input.
+                if !event::poll(LOGS_UI_TICK)? {
+                    continue;
+                }
+                (event::read()?, false)
+            }
         };
 
         if suppress_global {
@@ -215,6 +260,12 @@ fn run_app(
             return Ok(());
         }
         if let Some(next) = screen_for_key(ev) {
+            if screen == Screen::Logs && next != Screen::Logs {
+                // Drop stops the background poller thread and closes its UDS connection — see
+                // `admin_client`'s own module doc on why this also releases the idle-shutdown-
+                // blocking session the connection was holding.
+                logs_poller = None;
+            }
             screen = next;
         }
     }
@@ -346,6 +397,10 @@ mod tests {
         assert_eq!(
             screen_for_key(press(KeyCode::Char('5'))),
             Some(Screen::ServerSettings)
+        );
+        assert_eq!(
+            screen_for_key(press(KeyCode::Char('6'))),
+            Some(Screen::Logs)
         );
     }
 
