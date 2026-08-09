@@ -185,7 +185,7 @@ refusal exists precisely so an unowned required kind cannot read as "covered").
 As-built note (T15-07, `[SPEC]`): the `code_raw` half above is now closed — `cli::init` registers it
 (`crates/local-rag/src/cli/init.rs`), gated on the default model's `.ok` marker rather than the
 `--download-models` flag (11 §6's own T15-07 note has the full rationale), and `main.rs::serve`
-wires a real `EmbedderQueryAdapter<OnnxEmbedder>` into `search_code`'s dense leg whenever that
+wires a real `EmbedderQueryAdapter` into `search_code`'s dense leg whenever that
 representation is installed and opens cleanly, falling back to the pre-existing `UnavailableEmbedder`
 degradation otherwise. The **`memory` half is still open**, and closing it turned out not to be in
 this task's reach: `ModelCatalogEntry::representation_key()` (`crates/models/src/catalog.rs`)
@@ -214,6 +214,22 @@ lexical-only query still never touches the marker. Once a provider is open the f
 lock and an `Arc` clone; an installed model that fails to open is terminal for the process (a
 corrupt install or a missing ONNX Runtime does not clear itself, and reopening an ONNX session per
 query is not a price the query path can pay), so that case degrades exactly as before.
+
+As-built note (T20-03, `[SPEC]`): `code_query_embedder`/`memory_query_embedder` no longer open
+their own ONNX sessions. `daemon::embedder_provider::LazyEmbedderProvider` is now the daemon's
+single owner of its `code_raw`/`memory` sessions — at most two per process — and both query
+constructors read from it instead. This exists so a daemon that manages indexing for several
+projects in-process (group 20) does not multiply sessions per worktree: the same
+`Arc<dyn Embedder>` this provider hands to a query adapter is the one indexing's backfill pool
+reads too. The shared mechanism is `daemon::embedder_provider::LazyProvider<T>`, generic over the
+policy a caller wants on a miss: `LazyQueryEmbedder<T>` (query side) is now a thin fail-open
+facade over it, unchanged in its public shape and in D-037's behavior above; `LazyEmbedderProvider`
+(session side) fails honest with `None` instead of a placeholder `Arc<dyn Embedder>` — there is no
+meaningful stand-in value for a session (`Embedder::key()` is not fallible, so a fabricated key
+would silently mislabel whichever `RepresentationKey` a backfill caller wrote vectors under).
+`code`/`memory` are two independent `LazyProvider` cells, not one shared probe, preserving D-036's
+"one physical model, two sessions, one per kind" — a broken/missing model on one leg never blocks
+the other.
 
 As-built note (T11-04, `[SPEC]`): the backfill worker is `local_rag_embed::backfill`
 (`run_backfill`), and it fixes the two things §3/§4 leave to the implementation.

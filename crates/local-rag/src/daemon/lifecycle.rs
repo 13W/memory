@@ -16,6 +16,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use super::embedder_provider::LazyEmbedderProvider;
 use super::error::migration_only_reason;
 #[cfg(unix)]
 use super::handshake::{HandshakeContext, serve_connections};
@@ -27,6 +28,7 @@ use super::memory::build_memory_context;
 use super::mode::DaemonMode;
 #[cfg(unix)]
 use super::probe::SocketLivenessProbe;
+use super::query_embedder::{code_query_embedder, memory_query_embedder};
 use super::resume::{build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs};
 use super::search::build_search_engine;
 use super::session::SessionRegistry;
@@ -107,19 +109,26 @@ pub struct StartOptions {
     /// The MCP code-query tools' shard cache bound (`config.daemon.
     /// max_open_shards`, T15-03).
     pub max_open_shards: u32,
-    /// The MCP code-query tools' dense-leg query embedder. Production
-    /// callers pass `local_rag_search::UnavailableEmbedder` today (a real
-    /// provider is T15-07's job — the same "type before backend" precedent
-    /// `RequestHandler` itself already set).
-    pub query_embedder: Arc<dyn QueryEmbedder>,
+    /// The daemon's single owner of its ONNX sessions (T20-03) — at most two
+    /// per process (`code_raw` + `memory`), shared between `query_embedder`/
+    /// `memory_query_embedder` below and (T20-05/T20-06) indexing's backfill
+    /// pool. Production callers pass `Arc::new(LazyEmbedderProvider::new(
+    /// &layout))`.
+    pub embedder_provider: Arc<LazyEmbedderProvider>,
+    /// The MCP code-query tools' dense-leg query embedder. `None` — the
+    /// production case — derives it from `embedder_provider` via
+    /// `code_query_embedder`, so "one session per kind" holds by
+    /// construction rather than by caller discipline. `Some(..)` exists only
+    /// so tests can inject a fixed provider without ONNX (the same seam
+    /// `supported_proto` already offers).
+    pub query_embedder: Option<Arc<dyn QueryEmbedder>>,
     /// The MCP `recall` tool's dense-leg query embedder (T15-04) — a
     /// **different** trait from `query_embedder` above (`local_rag_memory::
     /// recall::QueryEmbedder`, not `local_rag_search::QueryEmbedder`: the
     /// two seams embed under different `RepresentationKind`s, `memory` vs
-    /// `code_raw`). Production callers pass `local_rag_memory::recall::
-    /// UnavailableEmbedder` today, the same "type before backend, T15-07's
-    /// job" precedent as `query_embedder`.
-    pub memory_query_embedder: Arc<dyn local_rag_memory::recall::QueryEmbedder>,
+    /// `code_raw`). Same `None`-derives-from-`embedder_provider` contract as
+    /// `query_embedder` above.
+    pub memory_query_embedder: Option<Arc<dyn local_rag_memory::recall::QueryEmbedder>>,
     /// `recall`'s token budget (`config.memory.recall_token_budget`, spec 08
     /// §6 `[SPEC default 1500 tokens, config]`).
     pub recall_token_budget: u32,
@@ -155,6 +164,12 @@ pub struct DaemonHandle {
     /// §4's upgrade flow) — [`wait_for_shutdown_trigger`] races this
     /// against the OS signal and the idle gate.
     pub shutdown_requested: Arc<Notify>,
+    /// This process's ONNX sessions (T20-03) — outlives `start()` because the
+    /// sessions live as long as the daemon does. T20-05's per-worktree
+    /// indexing task takes its own `Arc::clone` of this instead of
+    /// `indexing::finish_index_ctx`'s CLI-only pattern of opening a third and
+    /// fourth session.
+    pub embedder_provider: Arc<LazyEmbedderProvider>,
     state_db: Option<Arc<StateDb>>,
     cache_db: Option<Arc<CacheDb>>,
     lock_guard: Option<StoreLockGuard>,
@@ -218,13 +233,23 @@ impl DaemonHandle {
             data_policy,
             supported_proto,
             max_open_shards,
-            query_embedder,
-            memory_query_embedder,
+            embedder_provider,
+            query_embedder: query_embedder_override,
+            memory_query_embedder: memory_query_embedder_override,
             recall_token_budget,
             consolidation_batch_size,
             consolidation_queue_threshold,
             consolidation_poll_interval,
         } = opts;
+
+        // T20-03: derive the two query-facing embedders from the shared
+        // `embedder_provider` unless a test injected a fixed one — keeps
+        // "at most one ONNX session per kind" a construction guarantee
+        // rather than a caller convention.
+        let query_embedder =
+            query_embedder_override.unwrap_or_else(|| code_query_embedder(&embedder_provider));
+        let memory_query_embedder = memory_query_embedder_override
+            .unwrap_or_else(|| memory_query_embedder(&embedder_provider));
 
         layout.ensure().map_err(DaemonStartupError::Path)?;
 
@@ -430,6 +455,7 @@ impl DaemonHandle {
             jobs,
             lock_info,
             shutdown_requested,
+            embedder_provider,
             state_db,
             cache_db,
             lock_guard: Some(lock_guard),

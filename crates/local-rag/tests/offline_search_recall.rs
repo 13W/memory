@@ -230,10 +230,11 @@ mod with_real_model {
             "the real model must be installed on disk by now"
         );
         let embedder = OnnxEmbedder::open(&layout, entry).expect("open the real onnx embedder");
-        let query_embedder: Arc<dyn QueryEmbedder> = Arc::new(EmbedderQueryAdapter::new(embedder));
+        let query_embedder: Arc<dyn QueryEmbedder> =
+            Arc::new(EmbedderQueryAdapter::new(Arc::new(embedder)));
 
         let mut opts = start_options(layout.clone());
-        opts.query_embedder = query_embedder;
+        opts.query_embedder = Some(query_embedder);
         let socket_path = layout.socket_path();
         let handle = DaemonHandle::start(opts)
             .await

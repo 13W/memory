@@ -11,40 +11,45 @@
 //! stays independent of `crates/search` for a 15-line trait — see
 //! `local_rag_memory::recall::dense`'s own module doc), so [`EmbedderQueryAdapter`]
 //! and [`MemoryEmbedderQueryAdapter`] each implement one. Both wrap an
-//! `Embedder` opened under the matching `RepresentationKind` (`OnnxEmbedder::
-//! open`/`open_for_memory`, D-036) — one physical model, two sessions, one
-//! per `kind`, since `Embedder::key()` is a single-key contract.
+//! `Arc<dyn Embedder>` handed out by [`super::embedder_provider::LazyEmbedderProvider`]
+//! (T20-03) — the daemon's single owner of its `code_raw`/`memory` ONNX
+//! sessions, shared with indexing's backfill pool — rather than opening their
+//! own session.
 //!
 //! [`code_query_embedder`]/[`memory_query_embedder`] are the daemon's own
 //! production constructors for the two `StartOptions` fields, deferred behind
 //! [`LazyQueryEmbedder`] so a model installed *after* the daemon started is
-//! picked up without a restart (D-037).
+//! picked up without a restart (D-037); [`LazyQueryEmbedder`] is now a thin
+//! fail-open facade over [`super::embedder_provider::LazyProvider`]'s shared
+//! probe-and-latch mechanism.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use local_rag_core::paths::StoreLayout;
 use local_rag_embed::{EmbedRequest, Embedder};
 use local_rag_memory::recall::UnavailableEmbedder as UnavailableMemoryEmbedder;
-use local_rag_models::{DEFAULT_MODEL_ID, OnnxEmbedder, find, is_installed};
 use local_rag_search::{QueryEmbedError, QueryEmbedder, UnavailableEmbedder};
 use local_rag_store::RepresentationKey;
 
-/// Wraps any [`Embedder`] as a [`QueryEmbedder`]: one-text batch, unwrapped
-/// back to a single vector. Refuses (rather than silently answering under
-/// the wrong model) whenever the caller's requested `key` does not exactly
-/// match the wrapped provider's own [`Embedder::key`] — the same "MUST honor
-/// `key`" contract `QueryEmbedder`'s own trait doc already states.
-pub struct EmbedderQueryAdapter<E> {
-    embedder: E,
+use super::embedder_provider::{LazyEmbedderProvider, LazyProvider, ProviderProbe};
+
+/// Wraps an [`Embedder`] session (shared with indexing's backfill pool via
+/// [`LazyEmbedderProvider`], T20-03) as a [`QueryEmbedder`]: one-text batch,
+/// unwrapped back to a single vector. Refuses (rather than silently answering
+/// under the wrong model) whenever the caller's requested `key` does not
+/// exactly match the wrapped provider's own [`Embedder::key`] — the same
+/// "MUST honor `key`" contract `QueryEmbedder`'s own trait doc already
+/// states.
+pub struct EmbedderQueryAdapter {
+    embedder: Arc<dyn Embedder>,
 }
 
-impl<E: Embedder> EmbedderQueryAdapter<E> {
-    pub fn new(embedder: E) -> Self {
+impl EmbedderQueryAdapter {
+    pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         Self { embedder }
     }
 }
 
-impl<E: Embedder> QueryEmbedder for EmbedderQueryAdapter<E> {
+impl QueryEmbedder for EmbedderQueryAdapter {
     fn embed_query(
         &self,
         query: &str,
@@ -71,17 +76,17 @@ impl<E: Embedder> QueryEmbedder for EmbedderQueryAdapter<E> {
 /// `local_rag_memory::recall::QueryEmbedder` instead of
 /// `local_rag_search::QueryEmbedder` — same key-match-or-refuse contract,
 /// different (nominally distinct) trait/error type.
-pub struct MemoryEmbedderQueryAdapter<E> {
-    embedder: E,
+pub struct MemoryEmbedderQueryAdapter {
+    embedder: Arc<dyn Embedder>,
 }
 
-impl<E: Embedder> MemoryEmbedderQueryAdapter<E> {
-    pub fn new(embedder: E) -> Self {
+impl MemoryEmbedderQueryAdapter {
+    pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         Self { embedder }
     }
 }
 
-impl<E: Embedder> local_rag_memory::recall::QueryEmbedder for MemoryEmbedderQueryAdapter<E> {
+impl local_rag_memory::recall::QueryEmbedder for MemoryEmbedderQueryAdapter {
     fn embed_query(
         &self,
         query: &str,
@@ -110,22 +115,6 @@ impl<E: Embedder> local_rag_memory::recall::QueryEmbedder for MemoryEmbedderQuer
     }
 }
 
-/// What probing the store's on-disk model state found.
-pub enum ProviderProbe<T: ?Sized> {
-    /// No usable model on disk yet. Re-probed on the next query that needs a
-    /// vector: `local-rag init --download-models` may still be running, or may
-    /// not have been run at all when this daemon started.
-    NotInstalled,
-    /// A model is installed but the provider would not open (corrupt install,
-    /// no ONNX Runtime on `PATH`/`ORT_DYLIB_PATH`, unregistered
-    /// representation). Terminal for this process: reopening an ONNX session
-    /// on every query is not a price a hot path can pay, and none of those
-    /// causes clears itself.
-    Unusable,
-    /// A live provider.
-    Ready(Arc<T>),
-}
-
 /// A `QueryEmbedder` that opens its real backend on the first query that
 /// needs one, and keeps re-probing the store until one exists (D-037).
 ///
@@ -141,10 +130,13 @@ pub enum ProviderProbe<T: ?Sized> {
 /// `local_rag_embed::require_model_assets` reads. Once a provider is open, or
 /// once one has proven unopenable, the fast path is a read lock and an `Arc`
 /// clone: there is no background poll and no timer to configure.
+///
+/// A thin fail-open facade (T20-03) over [`LazyProvider`]'s shared
+/// probe-and-latch mechanism — falls back to `unavailable` on anything but
+/// `Ready`, instead of [`LazyEmbedderProvider`]'s fail-honest `None`.
 pub struct LazyQueryEmbedder<T: ?Sized> {
-    state: RwLock<ProviderProbe<T>>,
+    inner: LazyProvider<T>,
     unavailable: Arc<T>,
-    probe: Box<dyn Fn() -> ProviderProbe<T> + Send + Sync>,
 }
 
 impl<T: ?Sized> LazyQueryEmbedder<T> {
@@ -156,29 +148,15 @@ impl<T: ?Sized> LazyQueryEmbedder<T> {
         probe: impl Fn() -> ProviderProbe<T> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            state: RwLock::new(ProviderProbe::NotInstalled),
+            inner: LazyProvider::new(probe),
             unavailable,
-            probe: Box::new(probe),
         }
     }
 
     fn provider(&self) -> Arc<T> {
-        {
-            let state = self.state.read().expect("query-embedder state lock");
-            match &*state {
-                ProviderProbe::Ready(provider) => return Arc::clone(provider),
-                ProviderProbe::Unusable => return Arc::clone(&self.unavailable),
-                ProviderProbe::NotInstalled => {}
-            }
-        }
-        let mut state = self.state.write().expect("query-embedder state lock");
-        if matches!(*state, ProviderProbe::NotInstalled) {
-            *state = (self.probe)();
-        }
-        match &*state {
-            ProviderProbe::Ready(provider) => Arc::clone(provider),
-            _ => Arc::clone(&self.unavailable),
-        }
+        self.inner
+            .ready()
+            .unwrap_or_else(|| Arc::clone(&self.unavailable))
     }
 }
 
@@ -204,9 +182,10 @@ impl local_rag_memory::recall::QueryEmbedder
     }
 }
 
-/// `search_code`'s dense-leg provider, gated on the same signal `cli::init`
-/// uses — the default model's `.ok` marker — not on any flag or config
-/// toggle, and re-checked per query until it appears (D-037).
+/// `search_code`'s dense-leg provider — its ONNX session comes from `provider`
+/// ([`LazyEmbedderProvider`], T20-03), the same one indexing's backfill pool
+/// uses, instead of opening one of its own. Re-checked per query until the
+/// shared session appears (D-037).
 ///
 /// A missing model, or one that fails to open, degrades to
 /// [`UnavailableEmbedder`] rather than failing daemon startup: `search_code`
@@ -214,64 +193,43 @@ impl local_rag_memory::recall::QueryEmbedder
 /// case (`daemon::search::build_search_engine`'s own doc), and a store the
 /// operator has not run `local-rag init --download-models` against yet must
 /// still serve lexical search.
-pub fn code_query_embedder(layout: &StoreLayout) -> Arc<dyn QueryEmbedder> {
-    let layout = layout.clone();
+pub fn code_query_embedder(provider: &Arc<LazyEmbedderProvider>) -> Arc<dyn QueryEmbedder> {
+    let provider = Arc::clone(provider);
     let unavailable: Arc<dyn QueryEmbedder> = Arc::new(UnavailableEmbedder);
-    Arc::new(LazyQueryEmbedder::new(unavailable, move || {
-        let Some(entry) = find(DEFAULT_MODEL_ID) else {
-            return ProviderProbe::Unusable;
-        };
-        if !is_installed(&layout, entry.model_id) {
-            return ProviderProbe::NotInstalled;
-        }
-        match OnnxEmbedder::open(&layout, entry) {
-            Ok(embedder) => ProviderProbe::Ready(Arc::new(EmbedderQueryAdapter::new(embedder))),
-            Err(e) => {
-                tracing::warn!(
-                    "local-rag: {} is installed but could not be opened ({e}); \
-                     search_code will stay lexical_only until this is fixed",
-                    entry.model_id
-                );
-                ProviderProbe::Unusable
+    Arc::new(LazyQueryEmbedder::new(
+        unavailable,
+        move || match provider.code_probe() {
+            ProviderProbe::Ready(embedder) => {
+                ProviderProbe::Ready(Arc::new(EmbedderQueryAdapter::new(embedder)))
             }
-        }
-    }))
+            ProviderProbe::Unusable => ProviderProbe::Unusable,
+            ProviderProbe::NotInstalled => ProviderProbe::NotInstalled,
+        },
+    ))
 }
 
-/// `recall`'s dense-leg provider (D-036) — the same disk-state gate and
-/// fail-open-to-degraded shape as [`code_query_embedder`], but opened under
-/// the `memory` representation key (`OnnxEmbedder::open_for_memory`) and
-/// wrapped in [`MemoryEmbedderQueryAdapter`] instead. A missing/uninstalled
-/// model, or one `local-rag init` never ran against, degrades to
+/// `recall`'s dense-leg provider (D-036) — the same shared-session shape as
+/// [`code_query_embedder`], but reading `provider`'s `memory` leg and wrapped
+/// in [`MemoryEmbedderQueryAdapter`] instead. A missing/uninstalled model, or
+/// one `local-rag init` never ran against, degrades to
 /// [`UnavailableMemoryEmbedder`] — `recall`'s own tested `dense_degraded:
 /// NoRepresentation`/`EmbedFailed` fallback, not a daemon startup failure.
 pub fn memory_query_embedder(
-    layout: &StoreLayout,
+    provider: &Arc<LazyEmbedderProvider>,
 ) -> Arc<dyn local_rag_memory::recall::QueryEmbedder> {
-    let layout = layout.clone();
+    let provider = Arc::clone(provider);
     let unavailable: Arc<dyn local_rag_memory::recall::QueryEmbedder> =
         Arc::new(UnavailableMemoryEmbedder);
-    Arc::new(LazyQueryEmbedder::new(unavailable, move || {
-        let Some(entry) = find(DEFAULT_MODEL_ID) else {
-            return ProviderProbe::Unusable;
-        };
-        if !is_installed(&layout, entry.model_id) {
-            return ProviderProbe::NotInstalled;
-        }
-        match OnnxEmbedder::open_for_memory(&layout, entry) {
-            Ok(embedder) => {
+    Arc::new(LazyQueryEmbedder::new(
+        unavailable,
+        move || match provider.memory_probe() {
+            ProviderProbe::Ready(embedder) => {
                 ProviderProbe::Ready(Arc::new(MemoryEmbedderQueryAdapter::new(embedder)))
             }
-            Err(e) => {
-                tracing::warn!(
-                    "local-rag: {} is installed but could not be opened for its memory \
-                     representation ({e}); recall will stay dense-degraded until this is fixed",
-                    entry.model_id
-                );
-                ProviderProbe::Unusable
-            }
-        }
-    }))
+            ProviderProbe::Unusable => ProviderProbe::Unusable,
+            ProviderProbe::NotInstalled => ProviderProbe::NotInstalled,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -312,10 +270,10 @@ mod tests {
 
     #[test]
     fn embeds_the_query_when_the_key_matches() {
-        let adapter = EmbedderQueryAdapter::new(FixedEmbedder {
+        let adapter = EmbedderQueryAdapter::new(Arc::new(FixedEmbedder {
             key: key("test-model"),
             vector: vec![1.0, 0.0, 0.0],
-        });
+        }));
         let out = adapter
             .embed_query("hello", &key("test-model"))
             .expect("matching key succeeds");
@@ -324,10 +282,10 @@ mod tests {
 
     #[test]
     fn refuses_a_mismatched_key_rather_than_silently_answering() {
-        let adapter = EmbedderQueryAdapter::new(FixedEmbedder {
+        let adapter = EmbedderQueryAdapter::new(Arc::new(FixedEmbedder {
             key: key("test-model"),
             vector: vec![1.0, 0.0, 0.0],
-        });
+        }));
         let err = adapter
             .embed_query("hello", &key("some-other-model"))
             .expect_err("mismatched key must refuse");
@@ -349,10 +307,10 @@ mod tests {
     fn memory_adapter_embeds_the_query_when_the_key_matches() {
         use local_rag_memory::recall::QueryEmbedder as MemoryQueryEmbedder;
 
-        let adapter = MemoryEmbedderQueryAdapter::new(FixedEmbedder {
+        let adapter = MemoryEmbedderQueryAdapter::new(Arc::new(FixedEmbedder {
             key: memory_key("test-model"),
             vector: vec![0.0, 1.0, 0.0],
-        });
+        }));
         let out = MemoryQueryEmbedder::embed_query(&adapter, "hello", &memory_key("test-model"))
             .expect("matching key succeeds");
         assert_eq!(out, vec![0.0, 1.0, 0.0]);
@@ -362,10 +320,10 @@ mod tests {
     fn memory_adapter_refuses_a_mismatched_key_rather_than_silently_answering() {
         use local_rag_memory::recall::QueryEmbedder as MemoryQueryEmbedder;
 
-        let adapter = MemoryEmbedderQueryAdapter::new(FixedEmbedder {
+        let adapter = MemoryEmbedderQueryAdapter::new(Arc::new(FixedEmbedder {
             key: memory_key("test-model"),
             vector: vec![0.0, 1.0, 0.0],
-        });
+        }));
         let err =
             MemoryQueryEmbedder::embed_query(&adapter, "hello", &memory_key("some-other-model"))
                 .expect_err("mismatched key must refuse");
@@ -502,20 +460,66 @@ mod tests {
         let home = TempHome::new().expect("temp home");
         let layout = local_rag_core::paths::StoreLayout::new(home.join("local-rag"));
         layout.ensure().expect("ensure store tree");
+        let provider = Arc::new(LazyEmbedderProvider::new(&layout));
 
         assert!(
-            code_query_embedder(&layout)
+            code_query_embedder(&provider)
                 .embed_query("q", &key("test-model"))
                 .is_err(),
             "an empty store must degrade, not panic or block"
         );
         assert!(
             MemoryQueryEmbedder::embed_query(
-                memory_query_embedder(&layout).as_ref(),
+                memory_query_embedder(&provider).as_ref(),
                 "q",
                 &memory_key("test-model")
             )
             .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // T20-03: the query adapters and indexing's backfill pool must share the
+    // same ONNX session per kind, not open one each.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_query_adapters_and_the_backfill_share_one_session() {
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&opens);
+        let provider = Arc::new(LazyEmbedderProvider::with_probes(
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ProviderProbe::Ready(Arc::new(FixedEmbedder {
+                    key: key("m"),
+                    vector: vec![1.0, 0.0, 0.0],
+                }))
+            },
+            || ProviderProbe::NotInstalled,
+        ));
+
+        let query = code_query_embedder(&provider);
+        for _ in 0..3 {
+            query
+                .embed_query("q", &key("m"))
+                .expect("the query leg serves");
+        }
+        let backfill = provider
+            .code()
+            .expect("the backfill leg must see the same session");
+        assert!(
+            backfill
+                .embed(EmbedRequest::new(
+                    RepresentationKind::CodeRaw,
+                    vec!["x".to_string()]
+                ))
+                .is_ok()
+        );
+
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "query adapters and the backfill pool must share one ONNX session per kind"
         );
     }
 }
