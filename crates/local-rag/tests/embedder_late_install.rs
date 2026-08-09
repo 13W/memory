@@ -113,7 +113,7 @@ async fn search_code_leaves_lexical_only_once_the_model_lands_without_a_restart(
     assert!(!marker.exists());
 
     let mut opts = start_options(layout.clone());
-    opts.query_embedder = lazy_code_embedder(marker.clone());
+    opts.query_embedder = Some(lazy_code_embedder(marker.clone()));
     let socket_path = layout.socket_path();
     let handle = DaemonHandle::start(opts).await.expect("start");
 
@@ -221,7 +221,7 @@ async fn recall_leaves_its_degraded_dense_leg_once_the_model_lands_without_a_res
 
     let marker = home.join("model-installed.ok");
     let mut opts = start_options(layout.clone());
-    opts.memory_query_embedder = lazy_memory_embedder(marker.clone());
+    opts.memory_query_embedder = Some(lazy_memory_embedder(marker.clone()));
     let socket_path = layout.socket_path();
     let handle = DaemonHandle::start(opts).await.expect("start");
 

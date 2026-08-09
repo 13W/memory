@@ -51,11 +51,12 @@ impl VectorSource for NoRebuildVectorSource {
 /// Build the `SearchEngine` the MCP code-query tools call.
 ///
 /// `max_open_shards` comes from `config.daemon.max_open_shards`; `embedder`
-/// is `main.rs::build_query_embedder`'s result (T15-07): a real
-/// `EmbedderQueryAdapter<OnnxEmbedder>` when the default model is installed
-/// and opens cleanly, `UnavailableEmbedder` otherwise (spec-correctly
-/// producing `degraded: "lexical_only"` with an explicit reason) — the same
-/// "type before backend" precedent `RequestHandler` itself already set.
+/// is `daemon::query_embedder::code_query_embedder`'s result (T15-07,
+/// T20-03): a real `EmbedderQueryAdapter` reading a session off the shared
+/// `LazyEmbedderProvider` when the default model is installed and opens
+/// cleanly, `UnavailableEmbedder` otherwise (spec-correctly producing
+/// `degraded: "lexical_only"` with an explicit reason) — the same "type
+/// before backend" precedent `RequestHandler` itself already set.
 /// `ShardParams::with_dimensions(LOCAL_BOOTSTRAP_DIMENSIONS)` is only a
 /// bootstrap fallback for a worktree with no active model space at all —
 /// `ShardManager::acquire` resolves the real dimensions from the worktree's

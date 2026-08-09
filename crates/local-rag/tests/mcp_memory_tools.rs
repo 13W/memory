@@ -752,10 +752,10 @@ async fn recall_dense_leg_returns_a_hit_once_memory_representation_is_registered
 
     let socket_path = layout.socket_path();
     let mut opts = start_options(layout.clone());
-    opts.memory_query_embedder = Arc::new(FixedMemoryEmbedder {
+    opts.memory_query_embedder = Some(Arc::new(FixedMemoryEmbedder {
         key: memory_key,
         vector,
-    });
+    }));
     let handle = DaemonHandle::start(opts).await.expect("start");
 
     let body = tokio::task::spawn_blocking(move || {

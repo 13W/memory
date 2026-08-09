@@ -341,6 +341,12 @@ pub fn resolve_facts(state: &StateDb, facts: &WorktreeRootFacts) -> Result<Resol
 /// lexical-only fallback: `index`/`reindex` write real, permanent state, so a
 /// half-configured store must refuse rather than write vectors under a
 /// representation nothing will ever query with).
+///
+/// Opens its own two ONNX sessions — correct for this function's only caller
+/// today, a one-shot CLI process. A future daemon-side caller (T20-05) MUST
+/// NOT repeat that here: it should pass the sessions already open on
+/// `daemon::embedder_provider::LazyEmbedderProvider` (T20-03) instead,
+/// keeping the daemon's own two-session ceiling.
 pub async fn finish_index_ctx(
     state: Arc<StateDb>,
     layout: &StoreLayout,
@@ -595,9 +601,9 @@ mod tests {
         // Prove it end to end through the real production `SearchEngine` —
         // the same `build_search_engine` `main.rs::serve` itself uses.
         let query_embedder: Arc<dyn QueryEmbedder> =
-            Arc::new(crate::daemon::EmbedderQueryAdapter::new(
+            Arc::new(crate::daemon::EmbedderQueryAdapter::new(Arc::new(
                 HashingEmbedder::new(RepresentationKind::CodeRaw),
-            ));
+            )));
         let engine = crate::daemon::search::build_search_engine(
             ctx.state.clone(),
             ctx.cache.clone(),

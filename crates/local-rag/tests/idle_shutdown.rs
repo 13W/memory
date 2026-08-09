@@ -7,12 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use local_rag::daemon::{DaemonHandle, SessionGuard, StartOptions};
+use local_rag::daemon::{DaemonHandle, LazyEmbedderProvider, SessionGuard, StartOptions};
 use local_rag_core::DataPolicy;
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
-use local_rag_search::UnavailableEmbedder;
 use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
 use local_rag_test_support::TempHome;
 
@@ -41,6 +40,7 @@ fn open_layout() -> (TempHome, StoreLayout) {
 }
 
 fn start_options(layout: StoreLayout) -> StartOptions {
+    let embedder_provider = Arc::new(LazyEmbedderProvider::new(&layout));
     StartOptions {
         layout,
         daemon_version: "0.0.0".to_string(),
@@ -53,8 +53,9 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         data_policy: DataPolicy::LocalOnly,
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: 8,
-        query_embedder: Arc::new(UnavailableEmbedder),
-        memory_query_embedder: Arc::new(local_rag_memory::recall::UnavailableEmbedder),
+        embedder_provider,
+        query_embedder: None,
+        memory_query_embedder: None,
         recall_token_budget: 1500,
         consolidation_batch_size: 20,
         consolidation_queue_threshold: 50,

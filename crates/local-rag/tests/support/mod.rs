@@ -575,7 +575,7 @@ pub async fn seed_pending_candidate(
 use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
 
-use local_rag::daemon::{DaemonHandle, StartOptions};
+use local_rag::daemon::{DaemonHandle, LazyEmbedderProvider, StartOptions};
 use local_rag_protocol::{Hello, Message, RequestContext, RequestEnvelope};
 use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
 
@@ -587,6 +587,7 @@ pub fn open_layout() -> (TempHome, StoreLayout) {
 }
 
 pub fn start_options(layout: StoreLayout) -> StartOptions {
+    let embedder_provider = std::sync::Arc::new(LazyEmbedderProvider::new(&layout));
     StartOptions {
         layout,
         daemon_version: "0.0.0".to_string(),
@@ -599,8 +600,9 @@ pub fn start_options(layout: StoreLayout) -> StartOptions {
         data_policy: local_rag_core::DataPolicy::LocalOnly,
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: 8,
-        query_embedder: std::sync::Arc::new(local_rag_search::UnavailableEmbedder),
-        memory_query_embedder: std::sync::Arc::new(local_rag_memory::recall::UnavailableEmbedder),
+        embedder_provider,
+        query_embedder: None,
+        memory_query_embedder: None,
         recall_token_budget: 1500,
         consolidation_batch_size: 20,
         consolidation_queue_threshold: 50,

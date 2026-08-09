@@ -13,8 +13,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use local_rag::daemon::{
-    DaemonStartupError, ShutdownReason, StartOptions, StoreLockError, code_query_embedder,
-    memory_query_embedder,
+    DaemonStartupError, LazyEmbedderProvider, ShutdownReason, StartOptions, StoreLockError,
 };
 use local_rag_core::identity::SystemUuidV7;
 use local_rag_core::paths::{StoreLayout, SystemEnv, config_dir, data_dir};
@@ -125,8 +124,7 @@ async fn serve() -> ExitCode {
     );
 
     let now_ms = system_now_ms();
-    let code_embedder = code_query_embedder(&layout);
-    let memory_embedder = memory_query_embedder(&layout);
+    let embedder_provider = Arc::new(LazyEmbedderProvider::new(&layout));
 
     let opts = StartOptions {
         layout,
@@ -141,8 +139,9 @@ async fn serve() -> ExitCode {
         data_policy: config.models.data_policy,
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: config.daemon.max_open_shards,
-        query_embedder: code_embedder,
-        memory_query_embedder: memory_embedder,
+        embedder_provider,
+        query_embedder: None,
+        memory_query_embedder: None,
         recall_token_budget: config.memory.recall_token_budget,
         consolidation_batch_size: config.memory.consolidation_batch_size,
         consolidation_queue_threshold: config.memory.consolidation_queue_threshold,

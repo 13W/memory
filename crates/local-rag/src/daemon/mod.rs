@@ -18,15 +18,17 @@
 //! `RequestHandler` `lifecycle` wires in place of T15-02's
 //! `EchoRequestHandler`. [`consolidation_trigger`] is the continuous
 //! consolidation-trigger background worker (spec 07 §6, D-024) —
-//! [`resume`]'s missing continuous quarter. [`query_embedder`] adapts a real
-//! `local_rag_embed::Embedder` into `search`'s `QueryEmbedder` seam (T15-07)
-//! and owns the daemon's two production providers, opened lazily so a model
-//! installed after startup needs no restart (D-037).
+//! [`resume`]'s missing continuous quarter. [`embedder_provider`] is the
+//! daemon's single owner of its ONNX sessions — at most two per process
+//! (T20-03) — opened lazily so a model installed after startup needs no
+//! restart (D-037); [`query_embedder`] adapts those sessions'
+//! `local_rag_embed::Embedder`s into `search`'s `QueryEmbedder` seam (T15-07).
 //! [`lifecycle`] composes all of the above into the five startup steps and
 //! the shutdown sequence ([`shutdown`]) — [`lifecycle::run`] is what
 //! `main.rs`'s `serve` command drives.
 
 pub mod consolidation_trigger;
+pub mod embedder_provider;
 pub mod error;
 pub mod gitroot;
 pub mod handshake;
@@ -50,6 +52,7 @@ pub use consolidation_trigger::{
     ConsolidationTriggerParams, SessionTickOutcome, consolidation_trigger_tick,
     run_consolidation_trigger,
 };
+pub use embedder_provider::{LazyEmbedderProvider, LazyProvider, ProviderProbe};
 pub use error::{error_envelope, migration_only_reason};
 pub use gitroot::{case_sensitivity, probe as probe_worktree_root, request_root};
 #[cfg(unix)]
@@ -71,8 +74,8 @@ pub use probe::{LIVENESS_PROBE_TIMEOUT_MS, LivenessOutcome, LivenessProbe};
 #[cfg(unix)]
 pub use probe::{SocketLivenessProbe, fetch_welcome};
 pub use query_embedder::{
-    EmbedderQueryAdapter, LazyQueryEmbedder, MemoryEmbedderQueryAdapter, ProviderProbe,
-    code_query_embedder, memory_query_embedder,
+    EmbedderQueryAdapter, LazyQueryEmbedder, MemoryEmbedderQueryAdapter, code_query_embedder,
+    memory_query_embedder,
 };
 pub use resume::{
     ConsolidationResumeError, ResumeOutcome, build_best_effort_pool, resume_spool_import,
