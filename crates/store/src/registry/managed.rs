@@ -304,8 +304,8 @@ mod tests {
         }
 
         let rows = managed_worktrees(&conn).unwrap();
-        assert_eq!(
-            rows[0].enabled, false,
+        assert!(
+            !rows[0].enabled,
             "the ON CONFLICT clause touches updated_at only, never enabled"
         );
     }
@@ -320,7 +320,7 @@ mod tests {
 
         let rows = managed_worktrees(&conn).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].enabled, false);
+        assert!(!rows[0].enabled);
         assert!(is_managed(&conn, "wt-a").unwrap());
     }
 

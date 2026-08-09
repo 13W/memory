@@ -147,7 +147,7 @@ async fn a_disabled_row_stays_visible_to_readers() {
 
     let read = db.open_read().expect("read conn");
     let row = &managed_worktrees(&read).expect("list")[0];
-    assert_eq!(row.enabled, false, "enabled=0 must be visible to readers");
+    assert!(!row.enabled, "enabled=0 must be visible to readers");
     assert_eq!(row.updated_at, 3000);
     assert!(
         is_managed(&read, &worktree_id).expect("is_managed"),
