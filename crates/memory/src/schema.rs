@@ -97,10 +97,18 @@ impl Signal {
 /// `kind`/`scope_kind` stay plain `String` here, exactly like
 /// [`local_rag_store::ProposedOperation`] — parsed against
 /// [`local_rag_store::MemoryKind`]/[`local_rag_store::ScopeKind`]'s CHECK
-/// domains in [`crate::guard`], not here. An out-of-domain value is a
-/// per-op semantic failure (`crate::guard` degrades that one op to `noop`),
-/// never a whole-response parse failure — see [`crate::parse`]'s module doc
-/// for the two-tier malformed-output split this preserves.
+/// domains in [`crate::guard`], not here. An out-of-domain **or missing**
+/// value is a per-op semantic failure (`crate::guard` degrades that one op
+/// to `noop`), never a whole-response parse failure — see [`crate::parse`]'s
+/// module doc for the two-tier malformed-output split this preserves. D-048:
+/// `scope_kind` carries `#[serde(default)]` (empty string on omission) for
+/// exactly this reason — a small local model occasionally emits a `create`/
+/// `propose_candidate` op with every other field but this one; without the
+/// default, that single op's missing field failed the *entire* batch's
+/// deserialization (tier 1) instead of just this one op's `guard::
+/// handle_create` (which already turns an unrecognized `scope_kind` —
+/// `ScopeKind::from_db` returns `None` for anything outside its three known
+/// values, `""` included — into `Noop`, no crash, no per-op regression).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RawRouterOp {
@@ -109,6 +117,7 @@ pub enum RawRouterOp {
         text: String,
         #[serde(default)]
         canonical_key: Option<String>,
+        #[serde(default)]
         scope_kind: String,
         confidence_signal: Signal,
         importance_signal: Signal,
@@ -122,6 +131,7 @@ pub enum RawRouterOp {
         text: String,
         #[serde(default)]
         canonical_key: Option<String>,
+        #[serde(default)]
         scope_kind: String,
         confidence_signal: Signal,
         importance_signal: Signal,
@@ -260,6 +270,33 @@ mod tests {
         let json = r#"{"op":"noop"}"#;
         let op: RawRouterOp = serde_json::from_str(json).expect("valid noop");
         assert!(matches!(op, RawRouterOp::Noop { reason: None }));
+    }
+
+    /// D-048 regression: a `create` op missing `scope_kind` entirely must
+    /// not fail the whole batch's deserialization (tier 1) — the field
+    /// defaults to `""`, leaving `guard::handle_create`'s existing
+    /// out-of-domain check (tier 2) to degrade just this one op to `Noop`.
+    #[test]
+    fn create_defaults_scope_kind_to_empty_when_omitted() {
+        let json = r#"{"op":"create","kind":"fact","text":"uses pnpm","confidence_signal":"high","importance_signal":"medium"}"#;
+        let op: RawRouterOp = serde_json::from_str(json).expect("valid create despite the gap");
+        match op {
+            RawRouterOp::Create { scope_kind, .. } => assert_eq!(scope_kind, ""),
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    /// Same gap, same fix, `propose_candidate` variant — an independently
+    /// declared enum variant with its own `scope_kind` field.
+    #[test]
+    fn propose_candidate_defaults_scope_kind_to_empty_when_omitted() {
+        let json = r#"{"op":"propose_candidate","kind":"fact","text":"uses pnpm","confidence_signal":"high","importance_signal":"medium"}"#;
+        let op: RawRouterOp =
+            serde_json::from_str(json).expect("valid propose_candidate despite the gap");
+        match op {
+            RawRouterOp::ProposeCandidate { scope_kind, .. } => assert_eq!(scope_kind, ""),
+            other => panic!("expected ProposeCandidate, got {other:?}"),
+        }
     }
 
     #[test]

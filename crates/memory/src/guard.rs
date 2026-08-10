@@ -791,6 +791,22 @@ mod tests {
         assert_eq!(outcome, GeneratedOp::Noop);
     }
 
+    /// D-048 regression: `scope_kind` now carries `#[serde(default)]`
+    /// (`crate::schema`), so a `create` op missing it entirely deserializes
+    /// with `scope_kind == ""` instead of failing the whole batch — this
+    /// proves the end-to-end degrade path already handles that empty value
+    /// exactly like any other out-of-domain string, same as the sibling test
+    /// above for an invalid `kind`.
+    #[tokio::test]
+    async fn create_with_an_empty_scope_kind_noops() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = create_raw("fact", "", None, vec![]);
+        let outcome = materialize(&read, &HashMap::new(), &[], &uuids, raw).expect("materialize");
+        assert_eq!(outcome, GeneratedOp::Noop);
+    }
+
     #[tokio::test]
     async fn create_repository_scoped_with_no_repo_id_anywhere_noops() {
         let (_home, db) = open_state();

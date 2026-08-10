@@ -226,6 +226,14 @@ for the identical livelock reason. §4's two placement rules (below) are enforce
 `local_rag_memory::guard` independently of what the model claims, using each window observation's
 own `evidence_kind` (set at write time, T13-04) — never the model's self-report.
 
+As-built note (D-048, `[SPEC]`): "a semantically-valid but referentially-hallucinated value…
+degrades only that one op to `noop`" (above) also covers a `create`/`propose_candidate` op that
+omits `scope_kind` entirely, not only one present but out-of-domain — `crate::schema::RawRouterOp`
+gives it `#[serde(default)]` (empty string on omission) specifically so a small local model
+skipping the field on one op never fails the whole window's deserialization (tier 1); the empty
+string then degrades through the same out-of-domain check (`ScopeKind::from_db`, tier 2) as any
+other unrecognized value.
+
 ## 5. Explicit tool-initiated memory (`remember`, review tools)
 
 `remember` (11 §2) is an explicit durable operation: creates an `active` entry, `actor='user'`
