@@ -11,7 +11,7 @@ use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_search::QueryEmbedder;
 use local_rag_store::{
-    CacheDb, CacheOpenError, OpenError, StateDb, WorktreeLockRegistry, WriteError,
+    CacheDb, CacheOpenError, OpenError, RunOutcome, StateDb, WorktreeLockRegistry, WriteError,
 };
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -31,7 +31,9 @@ use super::mode::DaemonMode;
 #[cfg(unix)]
 use super::probe::SocketLivenessProbe;
 use super::query_embedder::{code_query_embedder, memory_query_embedder};
-use super::resume::{build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs};
+use super::resume::{
+    ResumeOutcome, build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs,
+};
 use super::search::build_search_engine;
 use super::session::SessionRegistry;
 #[cfg(unix)]
@@ -514,13 +516,13 @@ impl DaemonHandle {
     pub async fn shutdown(mut self) {
         tracing::info!("daemon stopping");
         for handle in self.resume_handles.drain(..) {
-            let _ = handle.await;
+            log_if_task_panicked("a startup resume task", handle.await);
         }
         if let Some(stop) = self.consolidation_trigger_stop.take() {
             let _ = stop.send(());
         }
         if let Some(join) = self.consolidation_trigger_join.take() {
-            let _ = join.await;
+            log_if_task_panicked("the consolidation-trigger worker", join.await);
         }
         tracing::debug!("background jobs stopped");
         if let Some(handshake_join) = self.handshake_join.take() {
@@ -547,6 +549,22 @@ impl DaemonHandle {
         )
         .await;
         tracing::info!("daemon stopped");
+    }
+}
+
+/// D-046: `JoinHandle::await`'s `Err` is a lost background-task panic —
+/// discarding it outright (`let _ = …await`, as `shutdown` used to) means a
+/// fatal bug in a startup-resume pass or the consolidation-trigger worker
+/// leaves zero trace anywhere, ever. `label` names the task for the log
+/// line. None of the handles `shutdown` joins are ever `.abort()`'d (unlike
+/// `handshake_join`), so `is_panic()` is expected to always hold on `Err`
+/// here — checked explicitly anyway, rather than assumed, since silently
+/// logging a non-panic `Err` under a "panicked" label would misdiagnose it.
+fn log_if_task_panicked(label: &str, result: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = result
+        && e.is_panic()
+    {
+        tracing::error!("local-rag: {label} panicked: {e}");
     }
 }
 
@@ -582,6 +600,10 @@ async fn spawn_spool_resume(
     }
 }
 
+/// D-046: report each stale run's resume outcome via `tracing`, the same
+/// per-outcome-reporting shape [`spawn_spool_resume`] already uses — before
+/// this, the sweep's `Vec<(String, ResumeOutcome)>` (and the sweep's own
+/// enumeration failure) were both discarded outright (`let _ = …await`).
 #[allow(clippy::too_many_arguments)]
 async fn spawn_consolidation_resume(
     db: Arc<StateDb>,
@@ -596,9 +618,38 @@ async fn spawn_consolidation_resume(
     let pool = build_best_effort_pool(&layout);
     let generate =
         |window| local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window);
-    let _ =
-        resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
-            .await;
+    match resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
+        .await
+    {
+        Ok(results) => {
+            for (session_id, outcome) in results {
+                match outcome {
+                    ResumeOutcome::Ran(RunOutcome::Failed(reason)) => {
+                        tracing::error!(
+                            "local-rag: consolidation resume run failed for session \
+                             {session_id}: {reason}"
+                        );
+                    }
+                    ResumeOutcome::RetryWriteFailed(e) => {
+                        tracing::error!(
+                            "local-rag: consolidation resume retry-write failed for session \
+                             {session_id}: {e}"
+                        );
+                    }
+                    ResumeOutcome::RetryRefused(e) => {
+                        tracing::warn!(
+                            "local-rag: consolidation resume retry refused for session \
+                             {session_id}: {e}"
+                        );
+                    }
+                    ResumeOutcome::Ran(RunOutcome::Applied(_)) => {}
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("local-rag: consolidation resume sweep failed: {e:?}");
+        }
+    }
 }
 
 /// D-024: the continuous consolidation-trigger worker (spec 07 §6).
@@ -767,4 +818,59 @@ pub async fn run(
         std::io::ErrorKind::Unsupported,
         "local-rag daemon IPC is not yet implemented on Windows (named pipes; tracked separately)",
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Write` sink that appends into a shared buffer — same minimal
+    /// capture technique `daemon::consolidation_trigger`'s own D-046 test
+    /// uses, duplicated per this crate's established per-file-fixture
+    /// convention rather than factored into a shared test-support helper.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// D-046 regression: before this, `shutdown()` discarded every
+    /// `JoinHandle::await` outright (`let _ = …await`) — a panic inside a
+    /// startup-resume pass or the consolidation-trigger worker left zero
+    /// trace anywhere. A clean `Ok(())` (the overwhelmingly common case,
+    /// since these handles are never `.abort()`'d) must stay silent.
+    #[tokio::test]
+    async fn log_if_task_panicked_reports_a_panic_but_stays_silent_on_success() {
+        let panicked: Result<(), tokio::task::JoinError> =
+            tokio::spawn(async { panic!("boom") }).await;
+        assert!(panicked.is_err(), "the spawned task was expected to panic");
+
+        let buf = SharedBuf(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_if_task_panicked("the doomed task", panicked);
+            log_if_task_panicked("a healthy task", Ok(()));
+        });
+
+        let logged = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(logged.contains("the doomed task"), "{logged}");
+        assert!(logged.contains("panicked"), "{logged}");
+        assert!(
+            !logged.contains("a healthy task"),
+            "a clean join must not be logged: {logged}"
+        );
+    }
 }
