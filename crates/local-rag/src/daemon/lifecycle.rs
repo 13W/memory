@@ -10,7 +10,9 @@ use local_rag_core::DataPolicy;
 use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_search::QueryEmbedder;
-use local_rag_store::{CacheDb, CacheOpenError, OpenError, StateDb, WriteError};
+use local_rag_store::{
+    CacheDb, CacheOpenError, OpenError, StateDb, WorktreeLockRegistry, WriteError,
+};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Notify, oneshot, watch};
@@ -115,6 +117,12 @@ pub struct StartOptions {
     /// pool. Production callers pass `Arc::new(LazyEmbedderProvider::new(
     /// &layout))`.
     pub embedder_provider: Arc<LazyEmbedderProvider>,
+    /// The daemon's single `L2` write/read lock registry (spec 02 §5,
+    /// T20-04) — one `Arc<WorktreeLockRegistry>` per daemon process, shared
+    /// between `build_search_engine`'s `SearchEngine` (read side, T09-03)
+    /// and `local_rag::indexing::write_locked` (write side, T20-04/T20-05).
+    /// Production callers pass `Arc::new(WorktreeLockRegistry::new())`.
+    pub locks: Arc<WorktreeLockRegistry>,
     /// The MCP code-query tools' dense-leg query embedder. `None` — the
     /// production case — derives it from `embedder_provider` via
     /// `code_query_embedder`, so "one session per kind" holds by
@@ -170,6 +178,11 @@ pub struct DaemonHandle {
     /// `indexing::finish_index_ctx`'s CLI-only pattern of opening a third and
     /// fourth session.
     pub embedder_provider: Arc<LazyEmbedderProvider>,
+    /// This process's single `L2` lock registry (T20-04) — outlives `start()`
+    /// for the same reason `embedder_provider` does: T20-05's per-worktree
+    /// indexing task takes its own `Arc::clone` of this rather than
+    /// constructing a second, unshared registry.
+    pub locks: Arc<WorktreeLockRegistry>,
     state_db: Option<Arc<StateDb>>,
     cache_db: Option<Arc<CacheDb>>,
     lock_guard: Option<StoreLockGuard>,
@@ -234,6 +247,7 @@ impl DaemonHandle {
             supported_proto,
             max_open_shards,
             embedder_provider,
+            locks,
             query_embedder: query_embedder_override,
             memory_query_embedder: memory_query_embedder_override,
             recall_token_budget,
@@ -332,6 +346,7 @@ impl DaemonHandle {
                     Arc::clone(&uuids),
                     query_embedder,
                     max_open_shards,
+                    Arc::clone(&locks),
                 )),
                 Some(build_memory_context(
                     Arc::clone(state),
@@ -456,6 +471,7 @@ impl DaemonHandle {
             lock_info,
             shutdown_requested,
             embedder_provider,
+            locks,
             state_db,
             cache_db,
             lock_guard: Some(lock_guard),

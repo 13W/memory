@@ -14,7 +14,7 @@ use local_rag_core::DataPolicy;
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
-use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
+use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, WorktreeLockRegistry};
 use local_rag_test_support::TempHome;
 
 struct SeqUuidV7 {
@@ -43,6 +43,7 @@ fn open_layout() -> (TempHome, StoreLayout) {
 
 fn start_options(layout: StoreLayout) -> StartOptions {
     let embedder_provider = Arc::new(LazyEmbedderProvider::new(&layout));
+    let locks = Arc::new(WorktreeLockRegistry::new());
     StartOptions {
         layout,
         daemon_version: "0.0.0".to_string(),
@@ -56,6 +57,7 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: 8,
         embedder_provider,
+        locks,
         query_embedder: None,
         memory_query_embedder: None,
         recall_token_budget: 1500,

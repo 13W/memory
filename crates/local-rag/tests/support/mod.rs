@@ -577,7 +577,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 
 use local_rag::daemon::{DaemonHandle, LazyEmbedderProvider, StartOptions};
 use local_rag_protocol::{Hello, Message, RequestContext, RequestEnvelope};
-use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
+use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, WorktreeLockRegistry};
 
 pub fn open_layout() -> (TempHome, StoreLayout) {
     let home = TempHome::new().expect("temp home");
@@ -588,6 +588,7 @@ pub fn open_layout() -> (TempHome, StoreLayout) {
 
 pub fn start_options(layout: StoreLayout) -> StartOptions {
     let embedder_provider = std::sync::Arc::new(LazyEmbedderProvider::new(&layout));
+    let locks = std::sync::Arc::new(WorktreeLockRegistry::new());
     StartOptions {
         layout,
         daemon_version: "0.0.0".to_string(),
@@ -601,6 +602,7 @@ pub fn start_options(layout: StoreLayout) -> StartOptions {
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: 8,
         embedder_provider,
+        locks,
         query_embedder: None,
         memory_query_embedder: None,
         recall_token_budget: 1500,

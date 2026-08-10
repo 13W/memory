@@ -63,6 +63,13 @@ impl VectorSource for NoRebuildVectorSource {
 /// own active space for every other case, and a worktree with no active
 /// space returns `WORKTREE_NOT_INDEXED` before ever reaching the dense leg,
 /// so this fallback value is otherwise unobservable.
+///
+/// `locks` is the daemon's single `Arc<WorktreeLockRegistry>` (T20-04,
+/// `daemon::lifecycle::{StartOptions, DaemonHandle}`), the same instance
+/// `local_rag::indexing::write_locked` guards the write side with — this
+/// function no longer constructs its own private registry, so the read side
+/// built here actually observes a concurrent writer's `L2.write` instead of
+/// racing a lock object nobody else can see.
 pub fn build_search_engine(
     state: Arc<StateDb>,
     cache: Arc<CacheDb>,
@@ -70,6 +77,7 @@ pub fn build_search_engine(
     uuids: Arc<dyn UuidSource + Send + Sync>,
     embedder: Arc<dyn QueryEmbedder>,
     max_open_shards: u32,
+    locks: Arc<WorktreeLockRegistry>,
 ) -> Arc<SearchEngine> {
     let shards = Arc::new(ShardManager::new(
         Arc::clone(&state),
@@ -80,7 +88,6 @@ pub fn build_search_engine(
         uuids,
         max_open_shards,
     ));
-    let locks = Arc::new(WorktreeLockRegistry::new());
     Arc::new(SearchEngine::with_embedder(
         state,
         cache,
