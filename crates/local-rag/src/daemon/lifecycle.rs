@@ -11,7 +11,7 @@ use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_search::QueryEmbedder;
 use local_rag_store::{
-    CacheDb, CacheOpenError, OpenError, RunOutcome, StateDb, WorktreeLockRegistry, WriteError,
+    CacheDb, CacheOpenError, OpenError, StateDb, WorktreeLockRegistry, WriteError,
 };
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -32,7 +32,7 @@ use super::mode::DaemonMode;
 use super::probe::SocketLivenessProbe;
 use super::query_embedder::{code_query_embedder, memory_query_embedder};
 use super::resume::{
-    ResumeOutcome, build_best_effort_pool, resume_spool_import, resume_stale_consolidation_runs,
+    build_best_effort_pool, log_resume_sweep, resume_spool_import, resume_stale_consolidation_runs,
 };
 use super::search::build_search_engine;
 use super::session::SessionRegistry;
@@ -600,16 +600,11 @@ async fn spawn_spool_resume(
     }
 }
 
-/// D-046: report each stale run's resume outcome via `tracing`, the same
-/// per-outcome-reporting shape [`spawn_spool_resume`] already uses — before
-/// this, the sweep's `Vec<(String, ResumeOutcome)>` (and the sweep's own
-/// enumeration failure) were both discarded outright (`let _ = …await`).
-/// The `String` [`resume_stale_consolidation_runs`] keys its results by is a
-/// `run_id` (`results.push((run_id, outcome))` there), not a `session_id` —
-/// caught live against the real machine's daemon log during this same
-/// deviation's verification, where the printed identifier didn't match any
-/// known `session_id`; `ResumeOutcome`'s variants carry no session identity
-/// of their own to log instead.
+/// D-046/D-047: report this stale-run resume sweep's outcome via `tracing` —
+/// [`log_resume_sweep`] (shared with `consolidation_trigger.rs`'s own
+/// per-tick stale-run-recovery call, D-047's own reason for existing: before
+/// it, that second call site kept discarding this exact sweep's result on
+/// every tick, not just here at startup).
 #[allow(clippy::too_many_arguments)]
 async fn spawn_consolidation_resume(
     db: Arc<StateDb>,
@@ -624,36 +619,10 @@ async fn spawn_consolidation_resume(
     let pool = build_best_effort_pool(&layout);
     let generate =
         |window| local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window);
-    match resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
-        .await
-    {
-        Ok(results) => {
-            for (run_id, outcome) in results {
-                match outcome {
-                    ResumeOutcome::Ran(RunOutcome::Failed(reason)) => {
-                        tracing::error!(
-                            "local-rag: consolidation resume run {run_id} failed: {reason}"
-                        );
-                    }
-                    ResumeOutcome::RetryWriteFailed(e) => {
-                        tracing::error!(
-                            "local-rag: consolidation resume retry-write failed for run \
-                             {run_id}: {e}"
-                        );
-                    }
-                    ResumeOutcome::RetryRefused(e) => {
-                        tracing::warn!(
-                            "local-rag: consolidation resume retry refused for run {run_id}: {e}"
-                        );
-                    }
-                    ResumeOutcome::Ran(RunOutcome::Applied(_)) => {}
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("local-rag: consolidation resume sweep failed: {e:?}");
-        }
-    }
+    log_resume_sweep(
+        resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
+            .await,
+    );
 }
 
 /// D-024: the continuous consolidation-trigger worker (spec 07 §6).

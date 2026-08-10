@@ -69,7 +69,7 @@ use local_rag_store::{
 use tokio::sync::oneshot;
 
 use super::jobs::{JobKind, JobRegistry};
-use super::resume::resume_stale_consolidation_runs;
+use super::resume::{log_resume_sweep, resume_stale_consolidation_runs};
 
 /// `consolidation_run.router_version` for every window this worker opens —
 /// the one value actually used anywhere in this codebase today (every
@@ -119,6 +119,12 @@ pub enum SessionTickOutcome {
 
 /// One tick: stale-run recovery, then per-session import + checkpoint-gated
 /// new-run open (spec 07 §6, D-024). No internal sleeping.
+///
+/// D-047: the stale-run recovery step's own outcome is reported via
+/// [`log_resume_sweep`] — before this, it was discarded (`let _ = …await`)
+/// separately from the `SessionTickOutcome` vector this function returns
+/// (which D-046 already logs), so a run stuck failing here kept retrying
+/// silently on every tick, forever, even after D-046 landed.
 pub async fn consolidation_trigger_tick<G, Fut>(
     db: &StateDb,
     layout: &StoreLayout,
@@ -132,15 +138,17 @@ where
     G: Fn(ConsolidationWindow) -> Fut,
     Fut: Future<Output = Result<Vec<GeneratedOp>, String>>,
 {
-    let _ = resume_stale_consolidation_runs(
-        db,
-        jobs,
-        params.lease_ms,
-        params.renew_interval_ms,
-        now_ms,
-        generate,
-    )
-    .await;
+    log_resume_sweep(
+        resume_stale_consolidation_runs(
+            db,
+            jobs,
+            params.lease_ms,
+            params.renew_interval_ms,
+            now_ms,
+            generate,
+        )
+        .await,
+    );
 
     // Two independent session sources, unioned (D-040): the spool directory
     // sees a session the moment a hook writes for it (even before any of its
@@ -944,6 +952,85 @@ mod tests {
         assert!(
             !logged.contains("sess-quiet"),
             "a routine NoCheckpoint outcome must not be logged: {logged}"
+        );
+    }
+
+    /// D-047 regression: `consolidation_trigger_tick`'s own stale-run
+    /// recovery step (its first line, ahead of the per-session loop
+    /// `log_session_tick_outcomes` already covers) must report a run that
+    /// fails again on retry — before D-047 this was a second, un-instrumented
+    /// discard site, so a run stuck failing here retried silently forever,
+    /// even after D-046 landed.
+    #[tokio::test]
+    async fn consolidation_trigger_tick_reports_a_still_failing_stale_run() {
+        let (_home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+        db.writer()
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO observation_envelope \
+                       (observation_id, source_event_id, payload_hash, event_type, \
+                        evidence_kind, trust, session_id) \
+                     VALUES ('obs-seed-2', 'evt-seed-2', 'deadbeef', 'Stop', 'user_statement', \
+                             'normal', 'sess-still-broken')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed envelope");
+        db.writer()
+            .transaction(|tx| {
+                create_consolidation_run(
+                    tx,
+                    &NewConsolidationRun {
+                        run_id: "run-still-broken",
+                        session_id: "sess-still-broken",
+                        from_received_seq: 1,
+                        to_received_seq: 1,
+                        router_version: "v1",
+                    },
+                    500,
+                )?;
+                transition_run(tx, "run-still-broken", RunState::Running, 500)?.expect("legal");
+                transition_run(tx, "run-still-broken", RunState::Failed, 600)?.expect("legal");
+                Ok(())
+            })
+            .await
+            .expect("seed a stale failed run");
+
+        let buf = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        // `set_default` (not `with_default`, which needs a sync closure) so
+        // the guard can stay live across the `.await` below — sound because
+        // `#[tokio::test]` here is single-threaded (this crate carries no
+        // tokio `test-util`/multi-thread feature), so no other task can
+        // observe a different subscriber mid-poll.
+        let guard = tracing::subscriber::set_default(subscriber);
+        let _ = consolidation_trigger_tick(
+            &db,
+            &layout,
+            &uuids,
+            &jobs,
+            &default_params(),
+            1_000,
+            &|_window| async { Err("no generation provider configured".to_string()) },
+        )
+        .await;
+        drop(guard);
+
+        let logged = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(logged.contains("run-still-broken"), "{logged}");
+        assert!(
+            logged.contains("no generation provider configured"),
+            "{logged}"
         );
     }
 }

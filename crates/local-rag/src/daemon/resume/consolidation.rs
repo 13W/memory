@@ -75,6 +75,48 @@ pub enum ConsolidationResumeError {
     Sqlite(rusqlite::Error),
 }
 
+/// D-047: report a [`resume_stale_consolidation_runs`] sweep's outcome via
+/// `tracing`, shared by both of its call sites — the one-shot startup pass
+/// (`daemon::lifecycle::spawn_consolidation_resume`) and the continuous
+/// trigger's own per-tick stale-run-recovery step
+/// (`daemon::consolidation_trigger::consolidation_trigger_tick`, which
+/// D-046 left un-instrumented: it discarded this same sweep's result
+/// separately from the `SessionTickOutcome` vector D-046 did log, so a
+/// stale run retried every tick — not just once at startup — kept failing
+/// silently). Mirrors `lifecycle::spawn_spool_resume`'s per-outcome shape:
+/// routine outcomes (`Ran(Applied(_))`) stay silent, everything else is
+/// logged — this sweep runs on every tick, forever.
+pub fn log_resume_sweep(sweep: Result<Vec<(String, ResumeOutcome)>, ConsolidationResumeError>) {
+    match sweep {
+        Ok(results) => {
+            for (run_id, outcome) in results {
+                match outcome {
+                    ResumeOutcome::Ran(RunOutcome::Failed(reason)) => {
+                        tracing::error!(
+                            "local-rag: consolidation resume run {run_id} failed: {reason}"
+                        );
+                    }
+                    ResumeOutcome::RetryWriteFailed(e) => {
+                        tracing::error!(
+                            "local-rag: consolidation resume retry-write failed for run \
+                             {run_id}: {e}"
+                        );
+                    }
+                    ResumeOutcome::RetryRefused(e) => {
+                        tracing::warn!(
+                            "local-rag: consolidation resume retry refused for run {run_id}: {e}"
+                        );
+                    }
+                    ResumeOutcome::Ran(RunOutcome::Applied(_)) => {}
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("local-rag: consolidation resume sweep failed: {e:?}");
+        }
+    }
+}
+
 /// Resume every stale consolidation run (spec 02 §4.1 step 5, 08 §4), one
 /// [`JobRegistry`]-tracked job per run.
 ///

@@ -8,7 +8,7 @@ pub mod consolidation;
 pub mod spool;
 
 pub use consolidation::{
-    ConsolidationResumeError, ResumeOutcome, build_best_effort_pool,
+    ConsolidationResumeError, ResumeOutcome, build_best_effort_pool, log_resume_sweep,
     resume_stale_consolidation_runs,
 };
 pub use spool::resume_spool_import;
