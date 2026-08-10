@@ -23,9 +23,13 @@
 //! (T20-03) — opened lazily so a model installed after startup needs no
 //! restart (D-037); [`query_embedder`] adapts those sessions'
 //! `local_rag_embed::Embedder`s into `search`'s `QueryEmbedder` seam (T15-07).
-//! [`lifecycle`] composes all of the above into the five startup steps and
-//! the shutdown sequence ([`shutdown`]) — [`lifecycle::run`] is what
-//! `main.rs`'s `serve` command drives.
+//! [`indexing`] is the daemon's own per-worktree background indexer (spec 06
+//! §1, T20-05) — the second caller of `local_rag_index::reconcile::
+//! {spawn_reconciler, spawn_watcher}` after `local-rag watch`, projecting
+//! under `L2.write` (`local_rag::indexing::write_locked`, T20-04).
+//! [`lifecycle`] composes all of the above into the
+//! five startup steps and the shutdown sequence ([`shutdown`]) —
+//! [`lifecycle::run`] is what `main.rs`'s `serve` command drives.
 
 pub mod consolidation_trigger;
 pub mod embedder_provider;
@@ -33,6 +37,7 @@ pub mod error;
 pub mod gitroot;
 pub mod handshake;
 pub mod idle;
+pub mod indexing;
 pub mod jobs;
 pub mod lifecycle;
 pub mod lock;
@@ -59,6 +64,10 @@ pub use gitroot::{case_sensitivity, probe as probe_worktree_root, request_root};
 pub use handshake::serve_connections;
 pub use handshake::{EchoRequestHandler, HandshakeContext, RequestHandler};
 pub use idle::{IdleGateInputs, idle_eligible};
+pub use indexing::{
+    WorktreeTaskHandle, WorktreeTaskParams, WorktreeTaskStartError, WorktreeTaskStatus,
+    spawn_worktree_task,
+};
 pub use jobs::{JobGuard, JobKind, JobRegistry};
 #[cfg(unix)]
 pub use lifecycle::wait_for_shutdown_trigger;
