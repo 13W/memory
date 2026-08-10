@@ -254,8 +254,45 @@ pub async fn run_consolidation_trigger<G, Fut>(
             _ = &mut stop => return,
             _ = ticker.tick() => {
                 let now_ms = system_now_ms();
-                let _ = consolidation_trigger_tick(&db, &layout, &*uuids, &jobs, &params, now_ms, &generate).await;
+                let results = consolidation_trigger_tick(&db, &layout, &*uuids, &jobs, &params, now_ms, &generate).await;
+                log_session_tick_outcomes(&results);
             }
+        }
+    }
+}
+
+/// D-046: report each session's tick outcome via `tracing`, mirroring
+/// `lifecycle::spawn_spool_resume`'s per-outcome logging — the only existing
+/// precedent in this codebase for turning a per-session outcome vector into
+/// log lines. Before this, [`run_consolidation_trigger`]'s loop discarded
+/// [`consolidation_trigger_tick`]'s return value outright (`let _ = …await`)
+/// every 15s, forever; a session stuck permanently `Failed` left no trace in
+/// `local-rag serve`'s stderr, only discoverable by reading `state.sqlite`
+/// directly. Routine outcomes stay silent — this runs on every tick, so
+/// logging `NoCheckpoint`/`SkippedExisting`/`NothingPending`/a successful
+/// `Applied` would be pure noise.
+fn log_session_tick_outcomes(results: &[(String, SessionTickOutcome)]) {
+    for (session_id, outcome) in results {
+        match outcome {
+            SessionTickOutcome::Ran(RunOutcome::Failed(reason)) => {
+                tracing::error!(
+                    "local-rag: consolidation run failed for session {session_id}: {reason}"
+                );
+            }
+            SessionTickOutcome::OpenFailed(e) => {
+                tracing::error!(
+                    "local-rag: consolidation run-open failed for session {session_id}: {e}"
+                );
+            }
+            SessionTickOutcome::ImportFailed(e) => {
+                tracing::warn!(
+                    "local-rag: consolidation tail-import failed for session {session_id}: {e}"
+                );
+            }
+            SessionTickOutcome::NoCheckpoint
+            | SessionTickOutcome::SkippedExisting
+            | SessionTickOutcome::NothingPending
+            | SessionTickOutcome::Ran(RunOutcome::Applied(_)) => {}
         }
     }
 }
@@ -835,5 +872,78 @@ mod tests {
 
         let _ = unblock_tx.send(());
         handle.await.expect("no panic");
+    }
+
+    /// A `Write` sink that appends into a shared buffer — enough to capture
+    /// `tracing` output for an assertion, no new dependency (`fmt`'s blanket
+    /// `MakeWriter` impl for `Fn() -> W where W: io::Write` already covers a
+    /// closure returning this).
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// D-046 regression: a failed run is reported, a routine `NoCheckpoint`
+    /// is not — logging every tick's routine outcomes would be pure noise
+    /// (this loop runs every 15s in production, forever).
+    #[tokio::test]
+    async fn log_session_tick_outcomes_reports_failures_but_stays_silent_on_routine_outcomes() {
+        let (_home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+        write_spool_segment(
+            &layout,
+            "sess-fail",
+            1,
+            &spool_fixture("sess-fail", "se:fail:1", "SessionEnd", 1_000),
+        );
+        write_spool_segment(
+            &layout,
+            "sess-quiet",
+            1,
+            &spool_fixture("sess-quiet", "pt:quiet:1", "UserPromptSubmit", 1_000),
+        );
+        let mut params = default_params();
+        params.queue_threshold = 50;
+
+        let results = consolidation_trigger_tick(
+            &db,
+            &layout,
+            &uuids,
+            &jobs,
+            &params,
+            1_000,
+            &|_window| async { Err("router refused".to_string()) },
+        )
+        .await;
+        assert_eq!(results.len(), 2, "{results:?}");
+
+        let buf = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_session_tick_outcomes(&results);
+        });
+
+        let logged = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(logged.contains("sess-fail"), "{logged}");
+        assert!(logged.contains("router refused"), "{logged}");
+        assert!(
+            !logged.contains("sess-quiet"),
+            "a routine NoCheckpoint outcome must not be logged: {logged}"
+        );
     }
 }
