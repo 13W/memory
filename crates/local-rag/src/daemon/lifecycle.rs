@@ -604,6 +604,12 @@ async fn spawn_spool_resume(
 /// per-outcome-reporting shape [`spawn_spool_resume`] already uses — before
 /// this, the sweep's `Vec<(String, ResumeOutcome)>` (and the sweep's own
 /// enumeration failure) were both discarded outright (`let _ = …await`).
+/// The `String` [`resume_stale_consolidation_runs`] keys its results by is a
+/// `run_id` (`results.push((run_id, outcome))` there), not a `session_id` —
+/// caught live against the real machine's daemon log during this same
+/// deviation's verification, where the printed identifier didn't match any
+/// known `session_id`; `ResumeOutcome`'s variants carry no session identity
+/// of their own to log instead.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_consolidation_resume(
     db: Arc<StateDb>,
@@ -622,24 +628,22 @@ async fn spawn_consolidation_resume(
         .await
     {
         Ok(results) => {
-            for (session_id, outcome) in results {
+            for (run_id, outcome) in results {
                 match outcome {
                     ResumeOutcome::Ran(RunOutcome::Failed(reason)) => {
                         tracing::error!(
-                            "local-rag: consolidation resume run failed for session \
-                             {session_id}: {reason}"
+                            "local-rag: consolidation resume run {run_id} failed: {reason}"
                         );
                     }
                     ResumeOutcome::RetryWriteFailed(e) => {
                         tracing::error!(
-                            "local-rag: consolidation resume retry-write failed for session \
-                             {session_id}: {e}"
+                            "local-rag: consolidation resume retry-write failed for run \
+                             {run_id}: {e}"
                         );
                     }
                     ResumeOutcome::RetryRefused(e) => {
                         tracing::warn!(
-                            "local-rag: consolidation resume retry refused for session \
-                             {session_id}: {e}"
+                            "local-rag: consolidation resume retry refused for run {run_id}: {e}"
                         );
                     }
                     ResumeOutcome::Ran(RunOutcome::Applied(_)) => {}
