@@ -18,7 +18,9 @@ use local_rag::daemon::{
 use local_rag_core::identity::SystemUuidV7;
 use local_rag_core::paths::{StoreLayout, SystemEnv, config_dir, data_dir};
 use local_rag_protocol::ErrorEnvelope;
-use local_rag_store::{DEFAULT_WRITE_QUEUE_CAPACITY, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS};
+use local_rag_store::{
+    DEFAULT_WRITE_QUEUE_CAPACITY, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, WorktreeLockRegistry,
+};
 
 const BIN: &str = "local-rag";
 
@@ -125,6 +127,7 @@ async fn serve() -> ExitCode {
 
     let now_ms = system_now_ms();
     let embedder_provider = Arc::new(LazyEmbedderProvider::new(&layout));
+    let locks = Arc::new(WorktreeLockRegistry::new());
 
     let opts = StartOptions {
         layout,
@@ -140,6 +143,7 @@ async fn serve() -> ExitCode {
         supported_proto: local_rag_protocol::SUPPORTED_PROTO_RANGE,
         max_open_shards: config.daemon.max_open_shards,
         embedder_provider,
+        locks,
         query_embedder: None,
         memory_query_embedder: None,
         recall_token_budget: config.memory.recall_token_budget,

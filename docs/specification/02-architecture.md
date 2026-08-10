@@ -592,6 +592,28 @@ read from global config by the lock itself. `L3` is adopted the same call: `Shar
 is invoked once per search, inside the held `L2.read`, exactly as this section's read-path rule
 requires ("L3 held only for the map lookup, released before the query"; unchanged from T09-02).
 
+As-built note (T20-04, `[SPEC]`): the write side's first production adopter now exists.
+`daemon::lifecycle::{StartOptions, DaemonHandle}` carry the daemon's single
+`Arc<WorktreeLockRegistry>` (field `locks`) — production callers construct exactly one
+(`main.rs::serve`), the same instance `build_search_engine` receives instead of constructing
+its own private registry (superseding the T09-03 note above on this point only: the read side's
+registry is no longer privately owned by `daemon::search`). `local_rag::indexing::write_locked`
+is the typed entry point for the write side — a thin wrapper over `WorktreeLockRegistry::write`
+that names the policy once ("the whole `reconcile_once → project_generation` cycle is one
+`L2.write`-held unit") rather than leaving it to each future caller's own discipline; T20-05's
+per-worktree indexing task is its first real caller. Adopting the registry *inside*
+`local_rag_index::reconcile::driver` or the `projection` crate's own `switch` remains explicitly
+out of scope, unchanged since the T09-01 note above — both stay the caller's job. The eviction
+`[OPEN]` question (T09-01 note, above) is now resolved: **no eviction** — entry count is bounded
+by the number of distinct worktrees one daemon process ever touches, and the process itself
+exits on idle (§4.3 below), so the bound resets on its own; eviction would additionally need a
+refcount against guards a caller might still be holding, complexity this bound never pays for.
+CLI (`cli::index`/`cli::watch`) is unaffected — it never took `L0`/`L2` and continues to rely
+solely on `state.sqlite`/`cache.sqlite`'s own WAL `busy_timeout` for cross-process safety
+(`cli/mod.rs`'s own module doc), since `L2` is an in-process `RwLock`, not a cross-process
+primitive (T20-09 covers the resulting double-indexing risk with an advisory warning, not a
+shared lock).
+
 ## 6. Degraded modes & error taxonomy `[SPEC]`
 
 Degradation is always **explicit** in responses; nothing degrades silently `[FIXED]`.

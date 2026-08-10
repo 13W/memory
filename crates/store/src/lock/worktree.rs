@@ -1,12 +1,16 @@
 //! The per-worktree `RwLock` registry realizing L2 (spec 02 §5).
 //!
-//! The write side of L2 already exists *structurally* today — one reconcile
-//! task per worktree (`local_rag_index::reconcile::driver`) serializes writes
-//! without an explicit lock object. This registry is the actual lock object:
-//! adopting it into the projection switch is later work (T11-05, group 11);
-//! the reconcile driver's own adoption has no dedicated task yet in the
-//! current plan. [`WorktreeLockRegistry::read_bounded`] (T09-03) is the entry
-//! point `local_rag_search`'s pipeline uses for the read side (spec 06 §3).
+//! [`WorktreeLockRegistry::read_bounded`] (T09-03) is the entry point
+//! `local_rag_search`'s pipeline uses for the read side (spec 06 §3). The
+//! write side's first production adopter is T20-04: `daemon::lifecycle`
+//! holds the one `Arc<WorktreeLockRegistry>` a daemon process ever
+//! constructs (`StartOptions`/`DaemonHandle::locks`), shared between
+//! `SearchEngine` and `local_rag::indexing::write_locked` — the typed entry
+//! point the per-worktree indexing task (T20-05) wraps its whole
+//! `reconcile_once → project_generation` cycle in. Adopting this registry
+//! *inside* `local_rag_index::reconcile::driver` or the `projection` crate's
+//! own `switch` is still explicitly not done — both stay the caller's job,
+//! unchanged since T09-01/T11-05.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,9 +27,14 @@ use super::order::checked_scope_async;
 /// Entries are created on first use and kept for the registry's lifetime —
 /// `worktree_id`s are UUIDv7s, never reused, so a stale entry after a worktree
 /// is detached/removed is at worst a few dozen bytes, never a correctness
-/// issue. Whether to evict entries is `[OPEN]`: left for whichever task first
-/// owns a long-lived registry instance to revisit if it is ever observed to
-/// matter in practice.
+/// issue. Eviction was `[OPEN]`, left for whichever task first owns a
+/// long-lived registry instance — T20-04 is that task, and its decision is
+/// **not to introduce eviction**: entry count is bounded by the number of
+/// distinct worktrees one daemon process ever touches, and the process itself
+/// exits on idle (spec 02 §4.3), so the bound resets on its own. Eviction
+/// would additionally need a refcount against guards a caller might still be
+/// holding when its entry would otherwise be dropped — real complexity this
+/// bound never pays for in practice.
 #[derive(Debug, Default)]
 pub struct WorktreeLockRegistry {
     entries: Mutex<HashMap<String, Arc<RwLock<()>>>>,

@@ -28,6 +28,7 @@
 //! Nothing here prints: rendering an outcome (a summary line, an exit code, a
 //! tracing event) belongs to the caller.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use local_rag_core::config::Config;
@@ -49,9 +50,10 @@ use local_rag_projection::{
 };
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, FtsMaterializeError, FtsMaterializeOutcome, RequestRoot,
-    Resolution, RetentionParams, StateDb, WorktreeRootFacts, WriteError, create_repository,
-    create_worktree, effective_data_policy, ensure_store_instance_uuid, insert_projection_state,
-    materialize_fts, observe_repository_path, observe_worktree_path, resolve, worktree_summary,
+    Resolution, RetentionParams, StateDb, WorktreeLockRegistry, WorktreeRootFacts, WriteError,
+    create_repository, create_worktree, effective_data_policy, ensure_store_instance_uuid,
+    insert_projection_state, materialize_fts, observe_repository_path, observe_worktree_path,
+    resolve, worktree_summary,
 };
 
 /// Everything the pipeline needs, built once per invocation and threaded
@@ -283,6 +285,28 @@ pub async fn index_worktree(
     })
 }
 
+/// Run `body` — the full write cycle for one worktree (`reconcile_once` →
+/// [`project_generation`], or [`index_worktree`], which is exactly that pair)
+/// — inside `locks`'s `L2.write` guard (spec 02 §5: "`L2.write` → compute →
+/// L4a tx"; "only one writer per worktree ever exists `[FIXED]`").
+///
+/// T20-04's typed entry point for the daemon's per-worktree indexing task
+/// (T20-05): callers should never reach for
+/// `local_rag_store::lock::WorktreeLockRegistry::write` directly for this
+/// cycle, so the "the whole reconcile→project cycle is one write-locked unit"
+/// policy lives in one place instead of being each future caller's own
+/// discipline to remember.
+pub async fn write_locked<Fut>(
+    locks: &WorktreeLockRegistry,
+    worktree_id: &str,
+    body: Fut,
+) -> Fut::Output
+where
+    Fut: Future,
+{
+    locks.write(worktree_id, body).await
+}
+
 /// Open `state.sqlite` — the one piece of [`IndexCtx`] needed before worktree
 /// identity is even known, split out so resolution (and the `Ambiguous`/
 /// `GlobalOnly`-refusal exits) never pays for opening the embedder first.
@@ -434,7 +458,7 @@ mod tests {
     use local_rag_core::identity::uuidv7_from;
     use local_rag_embed::HashingEmbedder;
     use local_rag_index::reconcile::load_worktree_meta;
-    use local_rag_protocol::SearchMode;
+    use local_rag_protocol::{ErrorCode, SearchMode};
     use local_rag_search::{QueryEmbedder, SearchRequest};
     use local_rag_store::{
         GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, RepresentationKind, ScopeKind,
@@ -575,13 +599,25 @@ mod tests {
         .expect("worktree exists");
         let mut stat_cache = StatCache::new();
         let scanner = Scanner::new();
-        let outcome = index_worktree(
-            &ctx,
-            &meta,
-            &mut stat_cache,
-            &ctx.classifier,
-            &scanner,
-            now_ms,
+        // T20-04: the full `reconcile_once → project_generation` cycle
+        // (`index_worktree`) runs inside `write_locked` — the production
+        // write path's own required shape (spec 02 §5). A lock-order
+        // violation between `L2.write` and any `L4a` write-queue job
+        // `index_worktree` triggers along the way would panic under this
+        // `cargo test` debug build (`checked_scope_async`'s `debug_assert!`),
+        // failing this test rather than silently passing.
+        let locks = Arc::new(WorktreeLockRegistry::new());
+        let outcome = write_locked(
+            &locks,
+            &worktree_id.to_string(),
+            index_worktree(
+                &ctx,
+                &meta,
+                &mut stat_cache,
+                &ctx.classifier,
+                &scanner,
+                now_ms,
+            ),
         )
         .await
         .expect("index");
@@ -599,7 +635,9 @@ mod tests {
         );
 
         // Prove it end to end through the real production `SearchEngine` —
-        // the same `build_search_engine` `main.rs::serve` itself uses.
+        // the same `build_search_engine` `main.rs::serve` itself uses — and
+        // the same `locks` the write side just used, per T20-04's "one
+        // registry, shared" contract.
         let query_embedder: Arc<dyn QueryEmbedder> =
             Arc::new(crate::daemon::EmbedderQueryAdapter::new(Arc::new(
                 HashingEmbedder::new(RepresentationKind::CodeRaw),
@@ -611,6 +649,7 @@ mod tests {
             ctx.uuids.clone(),
             query_embedder,
             8,
+            locks,
         );
         let response = engine
             .search_code(
@@ -634,6 +673,166 @@ mod tests {
             "{:?}",
             response.results
         );
+    }
+
+    /// T20-04: `write_locked` — the typed write-cycle wrapper T20-05's
+    /// per-worktree indexing task will use — inherits
+    /// `WorktreeLockRegistry::write`'s per-worktree granularity: two
+    /// different worktrees' write cycles run concurrently, neither blocking
+    /// the other. Mirrors `crates/store/tests/lock.rs::
+    /// separate_worktrees_do_not_serialize`, but drives the actual wrapper
+    /// production code calls, not the bare registry.
+    #[tokio::test]
+    async fn write_locked_does_not_serialize_across_different_worktrees() {
+        let locks = Arc::new(WorktreeLockRegistry::new());
+
+        let (entered_a_tx, entered_a_rx) = std::sync::mpsc::channel::<()>();
+        let (proceed_a_tx, proceed_a_rx) = std::sync::mpsc::channel::<()>();
+        let locks_a = locks.clone();
+        let task_a = tokio::spawn(async move {
+            write_locked(&locks_a, "wt-1", async move {
+                entered_a_tx.send(()).ok();
+                tokio::task::spawn_blocking(move || proceed_a_rx.recv().ok())
+                    .await
+                    .ok();
+            })
+            .await;
+        });
+
+        let (entered_b_tx, entered_b_rx) = std::sync::mpsc::channel::<()>();
+        let (proceed_b_tx, proceed_b_rx) = std::sync::mpsc::channel::<()>();
+        let locks_b = locks.clone();
+        let task_b = tokio::spawn(async move {
+            write_locked(&locks_b, "wt-2", async move {
+                entered_b_tx.send(()).ok();
+                tokio::task::spawn_blocking(move || proceed_b_rx.recv().ok())
+                    .await
+                    .ok();
+            })
+            .await;
+        });
+
+        // Both must be observed entered *without releasing either* — if
+        // `write_locked` regressed to one global lock, the second `recv()`
+        // would never fire while the first task still holds its (different)
+        // worktree's lock, and this test would hang rather than flake.
+        tokio::task::spawn_blocking(move || entered_a_rx.recv().expect("A entered"))
+            .await
+            .expect("join A-entered wait");
+        tokio::task::spawn_blocking(move || entered_b_rx.recv().expect("B entered"))
+            .await
+            .expect("join B-entered wait");
+
+        proceed_a_tx.send(()).ok();
+        proceed_b_tx.send(()).ok();
+        task_a.await.expect("join A");
+        task_b.await.expect("join B");
+    }
+
+    /// T20-04 (closes D-043): `build_search_engine`'s `SearchEngine` and
+    /// `write_locked`'s writer must share the very same
+    /// `Arc<WorktreeLockRegistry>`, not two independently constructed ones —
+    /// the actual production wiring `daemon::lifecycle::{StartOptions,
+    /// DaemonHandle}` sets up. If a regression reintroduced
+    /// `build_search_engine`'s own private registry (the exact bug D-043
+    /// named — `daemon/search.rs` used to construct
+    /// `WorktreeLockRegistry::new()` itself), the reader below would never
+    /// observe the writer holding `L2.write` at all, and this test would
+    /// time out waiting for a `BUSY_RETRY` that never comes, rather than
+    /// observing one promptly.
+    ///
+    /// No indexed content is needed: `search_code` resolves the worktree
+    /// (spec 09 §1) and only then reaches `L2.read` — `resolve()` succeeds
+    /// off `register_new_worktree`'s own rows alone (spec 02 §3.3), so the
+    /// bounded wait times out before the pipeline would ever need a real
+    /// generation. Mirrors `crates/store/tests/lock.rs::
+    /// read_bounded_times_out_while_a_writer_holds_the_lock` and
+    /// `crates/search/tests/pipeline.rs::
+    /// writer_holding_l2_write_delays_search_past_bound_yields_busy_retry`,
+    /// but through `local-rag`'s own production `build_search_engine`/
+    /// `write_locked`, not a hand-assembled `SearchEngine` — with one
+    /// difference forced by that production path: this crate's `Cargo.toml`
+    /// deliberately curates tokio's feature set without `test-util` (see
+    /// `daemon::consolidation_trigger`'s own tests for the same constraint),
+    /// so `DEFAULT_L2_READ_WAIT_BUDGET` elapses for real here rather than via
+    /// paused virtual time — a real, bounded (`tokio::time::timeout` inside
+    /// `read_bounded` itself) wait, not a flaky guess at "long enough."
+    #[tokio::test]
+    async fn write_locked_blocks_the_shared_search_engines_bounded_read_until_busy_retry() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).expect("repo dir");
+
+        let ctx = open_ctx(&layout);
+        let now_ms = 1_000;
+        register_code_raw(&ctx, now_ms).await;
+
+        let repo_id = ctx.uuids.next_uuid();
+        let worktree_id = ctx.uuids.next_uuid();
+        let facts = facts_for(&root);
+        register_new_worktree(&ctx.state, repo_id, worktree_id, &facts, now_ms)
+            .await
+            .expect("register worktree");
+
+        let locks = Arc::new(WorktreeLockRegistry::new());
+        let query_embedder: Arc<dyn QueryEmbedder> =
+            Arc::new(crate::daemon::EmbedderQueryAdapter::new(Arc::new(
+                HashingEmbedder::new(RepresentationKind::CodeRaw),
+            )));
+        let engine = crate::daemon::search::build_search_engine(
+            ctx.state.clone(),
+            ctx.cache.clone(),
+            ctx.layout.clone(),
+            ctx.uuids.clone(),
+            query_embedder,
+            8,
+            locks.clone(),
+        );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+        let worktree_id_str = worktree_id.to_string();
+        let writer_task = tokio::spawn(async move {
+            write_locked(&locks, &worktree_id_str, async move {
+                entered_tx.send(()).ok();
+                tokio::task::spawn_blocking(move || proceed_rx.recv().ok())
+                    .await
+                    .ok();
+            })
+            .await;
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("writer entered"))
+            .await
+            .expect("join entered-wait");
+
+        let request = SearchRequest {
+            root: RequestRoot {
+                worktree_root: Some(facts),
+                repo_hint: None,
+            },
+            query: "anything".to_string(),
+            mode: SearchMode::Hybrid,
+            limit: 5,
+            name_pattern: None,
+        };
+        // No `test-util`/paused clock in this crate (see the doc comment
+        // above): `search_code`'s own `tokio::time::timeout` genuinely waits
+        // out `DEFAULT_L2_READ_WAIT_BUDGET` before this resolves — a real
+        // but bounded wait, not a sleep guessing at "long enough."
+        let search_task = tokio::spawn(async move { engine.search_code(request, now_ms).await });
+        let outcome = search_task
+            .await
+            .expect("join search task")
+            .expect("no infrastructure error");
+        let err = outcome
+            .expect_err("must be a BUSY_RETRY error envelope while the writer holds L2.write");
+        assert_eq!(err.code, ErrorCode::BusyRetry);
+        assert!(err.retryable);
+
+        proceed_tx.send(()).ok();
+        writer_task.await.expect("join writer task");
     }
 
     /// D-036: `finish_index_ctx`/`project_generation`'s backfill pool now
