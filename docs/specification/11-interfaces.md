@@ -603,6 +603,18 @@ As-built note (T11-06, `[SPEC]`). `init --download-models` exists as a **typed l
 a caller-supplied sink, no prompting — so the command stays scriptable. Wiring it to the `local-rag`
 binary is T15-07's card, which owns `serve/status/stop/restart/init`.
 
+As-built note (D-045, `[SPEC]`). `init --download-models` installs **two** catalogued default
+models, not one: the embedding model above (`local_rag_models::install_model`) and the default
+generative model the memory-router needs to consolidate spool observations into memory
+(`local_rag_generate::install_model`, same pinned-digest atomic install policy, its own catalog
+and `HttpFetcher`). The two installs are independent — neither's success/failure gates the
+other, and only the embedder's install participates in the `code_raw`/`memory` representation
+registration below, since the generative model has no database registration step at all
+(`daemon::resume::consolidation::build_best_effort_pool` opens it straight off disk by catalog
+`model_id`, never through `model_space`/`representation`). Before D-045, no CLI command ever
+installed the generative model — `local_rag_generate::install_model` existed but was unwired,
+so a fresh `init --download-models` left memory consolidation permanently unable to run.
+
 As-built note (T15-07, `[SPEC]`). `serve/status/stop/restart/init/index/reindex/watch/repo/
 worktree/rebuild` are implemented in `crates/local-rag/src/cli/`, hand-parsed (`std::env::args()`,
 the same convention `main.rs`/`local-rag-proxy`/`xtask::run_bench` already use — no CLI-parsing

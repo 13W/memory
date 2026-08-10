@@ -1,6 +1,6 @@
-//! `local-rag init [--download-models]` acceptance tests (spec 11 §6, D-013),
-//! driving the real compiled binary — mirrors `tests/cli_service.rs`'s own
-//! `open_layout`/`run_cli` helpers (duplicated here per this crate's
+//! `local-rag init [--download-models]` acceptance tests (spec 11 §6, D-013,
+//! D-045), driving the real compiled binary — mirrors `tests/cli_service.rs`'s
+//! own `open_layout`/`run_cli` helpers (duplicated here per this crate's
 //! established per-file-fixture convention).
 //!
 //! Registration itself (the transaction, idempotency, the effect on
@@ -13,6 +13,12 @@
 //! prerequisite (spec 14 §1) — that path is env-gated below, following
 //! `local-rag-models`'s own `real_inference_when_the_runtime_and_weights_are_present`
 //! precedent exactly: skip loudly when the environment does not supply both.
+//!
+//! D-045: the generative model gets the same disk-state-gate coverage as the
+//! embedder. Unlike the embedder, `is_installed` is all its install status
+//! ever needs (no ONNX/database registration step), so a fixture `.ok`
+//! marker is enough to exercise "already installed" — no llama.cpp runtime
+//! or multi-gigabyte weights required for that path either.
 
 #![cfg(unix)]
 
@@ -20,6 +26,7 @@ use std::path::PathBuf;
 use std::process::{Output, Stdio};
 
 use local_rag_core::paths::StoreLayout;
+use local_rag_generate::DEFAULT_MODEL_ID as GENERATOR_MODEL_ID;
 use local_rag_models::DEFAULT_MODEL_ID;
 use local_rag_test_support::TempHome;
 
@@ -54,16 +61,53 @@ fn bare_init_without_download_models_is_a_light_no_op() {
     let (home, layout) = open_layout();
     let output = run_cli(&home, &["init"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // D-045: both catalogued default models must get their own "not
+    // installed yet" hint by name, not just a single coincidental substring
+    // match — the generator's hint is independent of the embedder's.
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("is not installed yet"),
-        "{:?}",
-        output.stdout
+        stdout.contains(&format!("{DEFAULT_MODEL_ID} is not installed yet")),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains(&format!("{GENERATOR_MODEL_ID} is not installed yet")),
+        "{stdout:?}"
     );
     // `init` never even opens `state.sqlite` on this path — nothing to
     // register against an uninstalled model — so the file must not exist.
     assert!(
         !layout.state_db().exists(),
         "a bare init on an uninstalled model must not touch state.sqlite"
+    );
+}
+
+/// D-045: a fixture `.ok` marker is enough to prove the generator's hint is
+/// gated on its own disk state, independent of the embedder — no llama.cpp
+/// runtime or real weights needed, since `is_installed` only checks for the
+/// marker file.
+#[test]
+fn generator_install_marker_suppresses_only_the_generators_hint() {
+    let (home, layout) = open_layout();
+    let generator_dir = layout.model_dir(GENERATOR_MODEL_ID);
+    std::fs::create_dir_all(&generator_dir).expect("create generator model dir");
+    std::fs::write(generator_dir.join(".ok"), b"").expect("write fixture .ok marker");
+
+    let output = run_cli(&home, &["init"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(&format!("{GENERATOR_MODEL_ID} is not installed yet")),
+        "the generator hint must not print once its marker is on disk: {stdout:?}"
+    );
+    // The embedder is still uninstalled in this fixture — its own hint (and
+    // early return before any registration) must be unaffected.
+    assert!(
+        stdout.contains(&format!("{DEFAULT_MODEL_ID} is not installed yet")),
+        "{stdout:?}"
+    );
+    assert!(
+        !layout.state_db().exists(),
+        "the embedder's own early return must still hold — nothing to register yet"
     );
 }
 
