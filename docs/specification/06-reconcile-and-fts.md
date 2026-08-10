@@ -85,6 +85,39 @@ it prints the reconcile's `last_error`/`consecutive_failures` and keeps watching
 does not stop the watch loop — the next trigger gets its own attempt). See 11 §6's own T15-07 note
 for why `watch` is a standalone process rather than daemon-IPC.
 
+As-built note (T20-05, `[SPEC]`): the daemon itself is now the second caller of
+`spawn_watcher`/`WorktreeReconciler`, after `local-rag watch` (T15-07) —
+`crates/local-rag/src/daemon/indexing/worktree_task.rs::spawn_worktree_task`, one task per
+worktree, directly constructible/testable, not yet wired into `daemon::lifecycle`/`DaemonHandle`
+(that composition is T20-06's). It mirrors `cli::watch`'s own composition (forced
+`TriggerKind::Startup`, `select!` over `successes`/`failures`/shutdown, a shutdown-time flush of
+any success published after the loop's last observed change) with one addition `cli::watch` never
+needed: every successful `project_generation` call runs inside `local_rag::indexing::write_locked`
+(T20-04, spec 02 §5 `L2.write`) — **only** around `project_generation`, never around
+`reconcile_once` itself, which this section's own "one writer per worktree" note above already
+realizes structurally inside `WorktreeReconciler`'s single owning task; `L2.write`'s value for this
+task is giving a concurrent `SearchEngine::search_code` call `BUSY_RETRY` (spec 02 §6) while a
+generation is being projected, not writer/writer exclusion (there is only ever one writer for a
+given worktree in a daemon process already, by the driver's own design). A new
+`daemon::jobs::JobKind::Reconcile` guard is held only across that `write_locked` call (D-024's
+discipline — active-span-only, never while the loop merely waits on its next trigger).
+
+`project_generation`'s embedding step (`local_rag_embed::run_backfill`) deliberately holds one
+`state.sqlite` read connection open across its whole pass (one consistent snapshot for both the
+start-of-pass expected-set read and the end-of-pass `write_coverage` read) — correct and
+load-bearing, but it makes the pipeline's own future `!Send`, unlike reconcile's (line 69 above:
+tightened to `Send`-spawnable at T05-04). A plain `tokio::spawn` of the daemon's per-worktree loop
+therefore does not compile. `spawn_worktree_task` instead runs the whole loop on one dedicated OS
+thread with its own single-threaded Tokio runtime (`Builder::new_current_thread`) plus a
+`tokio::task::LocalSet`/`spawn_local`'d inner task — nothing ever needs to cross threads, so the
+`!Send` future is legal, and the inner task still gets a real `AbortHandle` (unlike a bare
+`std::thread`, which cannot be preempted, or `spawn_blocking`, whose closure keeps running to
+completion regardless of `abort()`), giving genuine preemptive cancellation
+(`WorktreeTaskHandle::abort`) for spec 06 §1's own drop-safety guarantee (line 60 above) to be
+exercised end to end, not just assumed. Not in scope: adopting `L2.write`/`L2.read` inside
+`local_rag_index::reconcile::driver` or the `projection` crate itself — both remain the caller's
+job, unchanged since T09-01/T20-04.
+
 ## 2. Reconcile pipeline `[FIXED]`
 
 Under the per-worktree write lock (single writer per worktree; store-level lockfile at L0):

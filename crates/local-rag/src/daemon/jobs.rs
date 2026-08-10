@@ -32,6 +32,11 @@ pub enum JobKind {
     /// [`JobKind::ConsolidationResume`], which only recovers crashed/expired
     /// runs.
     ConsolidationTrigger,
+    /// A per-worktree indexing task (T20-05, spec 06 §1) projecting a newly
+    /// reconciled generation (embed → activate → materialize) under
+    /// `L2.write` — held only for that active span, not while the task
+    /// merely waits for its next `successes`/`failures` trigger.
+    Reconcile,
 }
 
 #[derive(Debug, Default)]

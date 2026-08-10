@@ -123,7 +123,18 @@ local-rag-test-support = { path = "../test-support" }
 # process configured two ways stands in for "two binary versions" in the
 # cross-binary-version upgrade test (`local-rag-proxy/tests/subprocess.rs`),
 # since there is no real second historical binary/machine available.
-failpoints = ["local-rag-store/failpoints"]
+#
+# T20-05: also forwards to `local-rag-index/failpoints` (`reconcile.build.*`)
+# and `local-rag-projection/failpoints` (`projection.switch.*`) — the
+# per-worktree indexing task's own tests need a deterministic reconcile
+# failure ("падение reconcile не останавливает цикл") without depending on a
+# real filesystem fault, reusing named injection points those crates already
+# declared for exactly this purpose.
+failpoints = [
+    "local-rag-store/failpoints",
+    "local-rag-index/failpoints",
+    "local-rag-projection/failpoints",
+]
 
 [lints]
 workspace = true

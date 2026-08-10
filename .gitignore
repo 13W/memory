@@ -41,3 +41,5 @@ npm/**/*.tgz
 npm/memory-*/bin/
 
 # NOTE: Cargo.lock IS committed (workspace with binaries / dependency policy).
+
+AGENTS.md

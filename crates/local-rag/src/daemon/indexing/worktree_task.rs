@@ -1,0 +1,844 @@
+//! One worktree's continuous background indexing task (spec 06 §1 `[FIXED]`:
+//! "watcher = hint, reconcile = truth") — T20-05.
+//!
+//! [`spawn_worktree_task`] composes the same primitives `cli::watch`'s
+//! `run_watch_loop` already does (`local_rag_index::reconcile::
+//! {spawn_reconciler, spawn_watcher}`, forced `TriggerKind::Startup`, a
+//! `tokio::select!` over `successes`/`failures`/shutdown), but as a
+//! standalone daemon background task instead of a foreground CLI loop, and
+//! with one addition `cli::watch` never needed: every successful
+//! `project_generation` call runs inside `local_rag::indexing::write_locked`
+//! (T20-04) — `L2.write` held for that call only, **not** around
+//! `reconcile_once` itself, which runs on its own debounced schedule inside
+//! the separately-spawned `WorktreeReconciler` task and is never called
+//! directly from here (spec 02 §5's write path is realized structurally for
+//! the reconcile step by that task's own single-owner design, per its
+//! module doc; `L2.write`'s practical value here is giving a concurrent
+//! `SearchEngine::search_code` call the `BUSY_RETRY` spec 02 §6 promises
+//! while a generation is being projected).
+//!
+//! # Why a dedicated OS thread, not a plain `tokio::spawn`
+//!
+//! `project_generation`'s embedding step (`local_rag_embed::run_backfill`)
+//! deliberately keeps one `state.sqlite` read connection open across the
+//! whole backfill pass — `state_read` is read at the start and used again
+//! for `write_coverage` at the end, so every subject sees one consistent
+//! snapshot. `rusqlite::Connection` is `!Sync`, so a `&Connection` held
+//! across an `.await` makes the enclosing future `!Send`; that is a correct,
+//! load-bearing property of `run_backfill`, not a bug to route around by
+//! editing `crates/embed`. `tokio::spawn` requires `F: Send`, so this task's
+//! loop cannot be handed to it directly.
+//!
+//! The fix is the same one `local-rag-tui`'s `admin_client.rs` already uses
+//! for its own long-lived, independently-cancellable background work: run
+//! everything on one dedicated OS thread with its own single-threaded Tokio
+//! runtime (`Builder::new_current_thread`), where nothing ever needs to move
+//! across threads, so `!Send` futures are legal. The loop itself still runs
+//! as a real, independently cancellable task — `tokio::task::LocalSet` +
+//! `spawn_local` give a `!Send`-friendly task with the same
+//! `JoinHandle`/`AbortHandle` semantics `tokio::spawn` would, which is what
+//! makes `WorktreeTaskHandle::abort` a genuine preemptive cancel (unlike
+//! `std::thread`, which cannot be preempted from outside, or
+//! `spawn_blocking`, whose task keeps running to completion regardless of
+//! `abort()`).
+//!
+//! `IndexCtx` is assembled by hand from already-open daemon state (never via
+//! `local_rag::indexing::finish_index_ctx`, which opens its own ONNX
+//! sessions — correct for a one-shot CLI process, explicitly wrong for a
+//! daemon that must keep to at most two sessions per process, T20-03):
+//! `embedder`/`memory_embedder` are read fresh from the shared
+//! `LazyEmbedderProvider` on every tick, so a model installed after the
+//! daemon started is picked up without a restart (D-037), same as the query
+//! side.
+//!
+//! This module deliberately does not wire itself into `daemon::lifecycle`/
+//! `DaemonHandle` — that composition (N tasks, started from the
+//! `managed_worktree` registry, `reload()`, shutdown) is T20-06's scope.
+
+use std::sync::{Arc, Mutex};
+
+use local_rag_core::config::DataPolicy;
+use local_rag_core::identity::{Uuid, UuidSource};
+use local_rag_core::paths::StoreLayout;
+use local_rag_core::redaction::Scanner;
+use local_rag_index::classify::ClassifierConfig;
+use local_rag_index::reconcile::{
+    MetaError, ReconcileHandle, ScheduleConfig, TriggerKind, WorktreeReconciler,
+    load_worktree_meta, spawn_reconciler, spawn_watcher,
+};
+use local_rag_store::{CacheDb, RetentionParams, StateDb, WorktreeLockRegistry};
+use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
+
+use crate::daemon::embedder_provider::LazyEmbedderProvider;
+use crate::daemon::jobs::{JobKind, JobRegistry};
+use crate::indexing::{IndexCtx, project_generation, write_locked};
+
+/// Everything one worktree's task needs — connection handles shared with the
+/// rest of the daemon, plus the indexing defaults a future caller (T20-06)
+/// derives from `config.toml`/`X-001`'s fixed retention values.
+pub struct WorktreeTaskParams {
+    pub state: Arc<StateDb>,
+    pub cache: Arc<CacheDb>,
+    pub layout: StoreLayout,
+    pub uuids: Arc<dyn UuidSource + Send + Sync>,
+    /// The daemon's single `L2` lock registry (T20-04) — shared with
+    /// `SearchEngine`, not constructed here.
+    pub locks: Arc<WorktreeLockRegistry>,
+    /// The daemon's single ONNX-session owner (T20-03) — `embedder`/
+    /// `memory_embedder` are read from this on every tick, never opened here.
+    pub embedder_provider: Arc<LazyEmbedderProvider>,
+    pub jobs: JobRegistry,
+    pub worktree_id: Uuid,
+    pub model_space_id: Uuid,
+    pub retention: RetentionParams,
+    pub data_policy: DataPolicy,
+    pub classifier: ClassifierConfig,
+}
+
+/// In-memory status of a running (or just-stopped) worktree task — read by a
+/// future admin surface (T20-07), not persisted anywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeTaskStatus {
+    /// The most recently *projected* (embedded/activated/materialized)
+    /// generation — distinct from the reconciler's own `successes` watch,
+    /// which only means "built," not yet "served."
+    pub last_generation_id: Option<String>,
+    /// When [`Self::last_generation_id`] last changed, Unix milliseconds.
+    pub last_success_ms: Option<i64>,
+    /// Consecutive reconcile/project failures since the last success.
+    pub consecutive_failures: u32,
+    /// The most recent failure's human-readable cause, if any.
+    pub last_error: Option<String>,
+}
+
+/// Why [`spawn_worktree_task`] could not start.
+#[derive(Debug)]
+pub enum WorktreeTaskStartError {
+    /// Loading the worktree's registry metadata failed.
+    Meta(MetaError),
+    /// The worktree row (or its current path) no longer resolves.
+    WorktreeVanished,
+    /// The filesystem watcher could not be started (`notify`'s error,
+    /// captured as text — this crate does not depend on `notify` directly,
+    /// the same trade-off `cli::watch.rs` already makes for the identical
+    /// error).
+    Watcher(String),
+    /// This task's dedicated single-threaded Tokio runtime could not be
+    /// built (resource exhaustion) — vanishingly rare, kept typed rather
+    /// than panicking the background OS thread over it.
+    Runtime(String),
+    /// The background OS thread ended (panicked) before it could report
+    /// either outcome above.
+    ThreadPanicked,
+}
+
+impl std::fmt::Display for WorktreeTaskStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorktreeTaskStartError::Meta(e) => write!(f, "could not load worktree metadata: {e}"),
+            WorktreeTaskStartError::WorktreeVanished => {
+                write!(f, "the worktree vanished from the registry")
+            }
+            WorktreeTaskStartError::Watcher(e) => {
+                write!(f, "could not start the filesystem watcher: {e}")
+            }
+            WorktreeTaskStartError::Runtime(e) => {
+                write!(f, "could not build the worktree task's runtime: {e}")
+            }
+            WorktreeTaskStartError::ThreadPanicked => {
+                write!(
+                    f,
+                    "the worktree task's background thread panicked during startup"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorktreeTaskStartError {}
+
+/// What the background OS thread reports back once it has finished starting
+/// up (whether or not startup succeeded).
+struct StartedTask {
+    status: Arc<Mutex<WorktreeTaskStatus>>,
+    abort_handle: AbortHandle,
+}
+
+/// A running worktree task: read [`WorktreeTaskHandle::status`] at any time,
+/// [`WorktreeTaskHandle::stop`] it gracefully, or [`WorktreeTaskHandle::abort`]
+/// it immediately.
+#[derive(Debug)]
+pub struct WorktreeTaskHandle {
+    status: Arc<Mutex<WorktreeTaskStatus>>,
+    stop: oneshot::Sender<()>,
+    abort_handle: AbortHandle,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl WorktreeTaskHandle {
+    /// A snapshot of the task's current status.
+    pub fn status(&self) -> WorktreeTaskStatus {
+        self.status
+            .lock()
+            .expect("worktree task status mutex poisoned")
+            .clone()
+    }
+
+    /// Signal the task to stop, then wait for its background thread to
+    /// finish — including its own final flush of any generation the
+    /// reconciler published after the loop last observed the channel
+    /// (mirrors `cli::watch.rs`'s own shutdown-time flush).
+    pub async fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = tokio::task::spawn_blocking(move || self.thread.join()).await;
+    }
+
+    /// Cancel the task's loop immediately, mid-cycle if one is in flight —
+    /// unlike [`Self::stop`], this does not wait for an in-progress
+    /// `project_generation` call to finish. Safe to call any number of
+    /// times; a caller that also wants to wait for the background thread to
+    /// fully exit afterward may still call [`Self::stop`] (harmless once the
+    /// loop is already gone).
+    pub fn abort(&self) {
+        self.abort_handle.abort();
+    }
+}
+
+/// A callback fired synchronously, right after `project_one` takes its
+/// `JobGuard` — [`spawn_worktree_task`]'s production callers get a no-op;
+/// tests use [`spawn_worktree_task_instrumented`] to observe that instant
+/// deterministically (`JobRegistry::len()` is already incremented by the
+/// time this fires), instead of racing a real, possibly sub-millisecond
+/// window with a poll loop.
+type JobStartedHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Start one worktree's continuous reconcile/project cycle on its own
+/// dedicated background thread (see the module doc for why). Returns once
+/// the cold-start `TriggerKind::Startup` trigger has been *sent* (not once
+/// it has finished projecting) — the returned handle's status starts empty
+/// and fills in as the background task makes progress.
+pub async fn spawn_worktree_task(
+    params: WorktreeTaskParams,
+) -> Result<WorktreeTaskHandle, WorktreeTaskStartError> {
+    spawn_worktree_task_instrumented(params, Arc::new(|| {})).await
+}
+
+/// [`spawn_worktree_task`], plus a [`JobStartedHook`] — the seam
+/// `#[cfg(test)]` uses to synchronize with the task's own `JobGuard` window
+/// exactly, mirroring `local_rag_search::SearchEngine::
+/// search_code_instrumented`'s identical "same logic, plus an observer only
+/// tests use" shape.
+async fn spawn_worktree_task_instrumented(
+    params: WorktreeTaskParams,
+    on_job_started: JobStartedHook,
+) -> Result<WorktreeTaskHandle, WorktreeTaskStartError> {
+    let (start_tx, start_rx) = oneshot::channel::<Result<StartedTask, WorktreeTaskStartError>>();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let worktree_id = params.worktree_id;
+
+    let thread = std::thread::Builder::new()
+        .name(format!("worktree-task-{worktree_id}"))
+        .spawn(move || run_on_dedicated_thread(params, stop_rx, start_tx, on_job_started))
+        .expect("spawn the worktree task's background OS thread");
+
+    match start_rx.await {
+        Ok(Ok(started)) => Ok(WorktreeTaskHandle {
+            status: started.status,
+            stop: stop_tx,
+            abort_handle: started.abort_handle,
+            thread,
+        }),
+        Ok(Err(e)) => {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+            Err(e)
+        }
+        Err(_recv_error) => {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+            Err(WorktreeTaskStartError::ThreadPanicked)
+        }
+    }
+}
+
+/// The body of the dedicated OS thread: build a single-threaded Tokio
+/// runtime, do the (`!Send`-free) setup, then hand the loop itself to a
+/// `LocalSet`-spawned task so it stays independently abortable, and finally
+/// block on that task until it returns (gracefully or via [`AbortHandle::abort`]).
+fn run_on_dedicated_thread(
+    params: WorktreeTaskParams,
+    stop_rx: oneshot::Receiver<()>,
+    start_tx: oneshot::Sender<Result<StartedTask, WorktreeTaskStartError>>,
+    on_job_started: JobStartedHook,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = start_tx.send(Err(WorktreeTaskStartError::Runtime(e.to_string())));
+            return;
+        }
+    };
+
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        let case = crate::daemon::gitroot::case_sensitivity();
+        let meta = match load_worktree_meta(&params.state, &params.worktree_id.to_string(), case)
+        {
+            Ok(Some(meta)) => meta,
+            Ok(None) => {
+                let _ = start_tx.send(Err(WorktreeTaskStartError::WorktreeVanished));
+                return;
+            }
+            Err(e) => {
+                let _ = start_tx.send(Err(WorktreeTaskStartError::Meta(e)));
+                return;
+            }
+        };
+
+        let reconciler = WorktreeReconciler::new(
+            params.state.clone(),
+            meta.clone(),
+            params.classifier,
+            Scanner::new(),
+            params.uuids.clone(),
+            ScheduleConfig::default(),
+        );
+        let ReconcileHandle {
+            sender,
+            join: reconciler_join,
+            failures,
+            successes,
+        } = spawn_reconciler(reconciler, 8);
+
+        let watcher = match spawn_watcher(&meta.root, meta.is_git(), sender.clone()) {
+            Ok(w) => w,
+            Err(e) => {
+                drop(sender);
+                let _ = reconciler_join.await;
+                let _ = start_tx.send(Err(WorktreeTaskStartError::Watcher(e.to_string())));
+                return;
+            }
+        };
+
+        // Cold start: reconcile once immediately, mirroring `cli::watch.rs`'s
+        // own forced first trigger — never wait for the first real change or
+        // the periodic 6h backstop.
+        let _ = sender.send(TriggerKind::Startup).await;
+
+        let status = Arc::new(Mutex::new(WorktreeTaskStatus::default()));
+        let status_for_loop = Arc::clone(&status);
+
+        let inner = tokio::task::spawn_local(async move {
+            let mut successes = successes;
+            let mut failures = failures;
+            let mut stop = stop_rx;
+            loop {
+                tokio::select! {
+                    _ = &mut stop => {
+                        drop(watcher);
+                        drop(sender);
+                        let _ = reconciler_join.await;
+                        // Flush: the shutdown-time reconcile
+                        // `WorktreeReconciler::run`'s own doc promises ("any
+                        // scheduled reconcile is flushed before returning")
+                        // may have published one more success after the
+                        // last time this loop observed the channel.
+                        let final_generation = successes.borrow().clone();
+                        let last = status_for_loop
+                            .lock()
+                            .expect("worktree task status mutex poisoned")
+                            .last_generation_id
+                            .clone();
+                        if final_generation.is_some() && final_generation != last {
+                            project_one(&params, &status_for_loop, final_generation, &on_job_started).await;
+                        }
+                        return;
+                    }
+                    changed = successes.changed() => {
+                        if changed.is_err() {
+                            // The reconciler task ended on its own (should
+                            // only happen once every sender is dropped, i.e.
+                            // shutdown); fall through to the next iteration,
+                            // which observes `stop`.
+                            continue;
+                        }
+                        let generation_id = successes.borrow().clone();
+                        let last = status_for_loop
+                            .lock()
+                            .expect("worktree task status mutex poisoned")
+                            .last_generation_id
+                            .clone();
+                        if generation_id != last {
+                            project_one(&params, &status_for_loop, generation_id, &on_job_started).await;
+                        }
+                    }
+                    changed = failures.changed() => {
+                        if changed.is_ok()
+                            && let Some(f) = failures.borrow().clone()
+                        {
+                            let mut s = status_for_loop
+                                .lock()
+                                .expect("worktree task status mutex poisoned");
+                            s.consecutive_failures = f.consecutive_failures;
+                            s.last_error = Some(f.last_error);
+                        }
+                    }
+                }
+            }
+        });
+
+        let abort_handle = inner.abort_handle();
+        let _ = start_tx.send(Ok(StartedTask { status, abort_handle }));
+        let _ = inner.await;
+    });
+}
+
+/// Project `generation_id` (embed → activate → materialize) under `L2.write`,
+/// recording the outcome on `status` — never panics, never propagates an
+/// error to the caller: a transient failure here must not stop the task from
+/// reacting to the *next* trigger (spec 02 §6: nothing degrades silently, but
+/// nothing here is fatal either).
+///
+/// [`JobGuard`](crate::daemon::jobs::JobGuard) is taken immediately before
+/// [`write_locked`] and dropped at the end of this function — D-024's
+/// discipline: held only for the active span, never while the outer loop
+/// merely waits on its next `select!`.
+async fn project_one(
+    params: &WorktreeTaskParams,
+    status: &Arc<Mutex<WorktreeTaskStatus>>,
+    generation_id: Option<String>,
+    on_job_started: &JobStartedHook,
+) {
+    let Some(generation_id) = generation_id else {
+        return;
+    };
+    let Ok(gid) = generation_id.parse::<Uuid>() else {
+        let mut s = status.lock().expect("worktree task status mutex poisoned");
+        s.consecutive_failures += 1;
+        s.last_error = Some(format!(
+            "internal error: generation id {generation_id} is not a UUID"
+        ));
+        return;
+    };
+
+    // Re-probed every tick, not cached at task-start: a model installed
+    // after this daemon started must be picked up without a restart (D-037),
+    // the same contract the query side already gets from
+    // `LazyEmbedderProvider`. Neither leg has a meaningful placeholder value
+    // (`Embedder::key()` is not fallible), so a not-yet-ready model skips
+    // this tick's projection entirely rather than writing under a fabricated
+    // representation key — no `JobGuard` is taken for a skip, and no retry
+    // is scheduled here: the next successful reconcile trigger (a real
+    // change, or the periodic 6h backstop, spec 06 §1 `[FIXED]`) tries
+    // again on its own.
+    let (Some(embedder), Some(memory_embedder)) = (
+        params.embedder_provider.code(),
+        params.embedder_provider.memory(),
+    ) else {
+        let mut s = status.lock().expect("worktree task status mutex poisoned");
+        s.last_error = Some(
+            "embedding model not installed/opened yet; will retry on the next trigger".to_string(),
+        );
+        return;
+    };
+
+    let ctx = IndexCtx {
+        state: params.state.clone(),
+        cache: params.cache.clone(),
+        layout: params.layout.clone(),
+        uuids: params.uuids.clone(),
+        embedder,
+        memory_embedder,
+        model_space_id: params.model_space_id,
+        retention: params.retention,
+        data_policy: params.data_policy,
+        classifier: params.classifier,
+    };
+
+    let _job = params.jobs.begin(JobKind::Reconcile);
+    on_job_started();
+    let now_ms = system_now_ms();
+    let worktree_id_str = params.worktree_id.to_string();
+    let result = write_locked(
+        &params.locks,
+        &worktree_id_str,
+        project_generation(&ctx, params.worktree_id, gid, now_ms),
+    )
+    .await;
+
+    let mut s = status.lock().expect("worktree task status mutex poisoned");
+    match result {
+        Ok(_outcome) => {
+            s.last_generation_id = Some(generation_id);
+            s.last_success_ms = Some(now_ms);
+            s.consecutive_failures = 0;
+            s.last_error = None;
+        }
+        Err(e) => {
+            s.consecutive_failures += 1;
+            s.last_error = Some(e.to_string());
+        }
+    }
+    // `_job` drops here — before control returns to the outer `select!`.
+}
+
+/// The current wall-clock time as Unix milliseconds — mirrors
+/// `lifecycle::system_now_ms`/`main.rs::system_now_ms`/
+/// `daemon::consolidation_trigger::system_now_ms`'s own established
+/// convention: each call site carries its own trivial copy rather than a
+/// shared helper.
+fn system_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use local_rag_core::identity::domain::path_fingerprint;
+    use local_rag_core::identity::uuidv7_from;
+    use local_rag_embed::{Embedder, HashingEmbedder};
+    use local_rag_store::{
+        DEFAULT_MODEL_SPACE_ID, RepresentationKind, WorktreeKind, WorktreeRootFacts,
+        register_representation, set_model_space_representation,
+    };
+    use local_rag_test_support::TempHome;
+
+    use super::*;
+    use crate::daemon::embedder_provider::ProviderProbe;
+    use crate::indexing::register_new_worktree;
+
+    /// A deterministic, non-random UUID source — same "monotone UUIDv7"
+    /// convention `crates/local-rag/src/indexing/mod.rs`'s own test fixture
+    /// (`SeqUuids`) already establishes.
+    struct SeqUuids {
+        counter: AtomicU64,
+    }
+
+    impl SeqUuids {
+        fn new() -> Self {
+            SeqUuids {
+                counter: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl UuidSource for SeqUuids {
+        fn next_uuid(&self) -> Uuid {
+            let n = self.counter.fetch_add(1, Ordering::Relaxed);
+            uuidv7_from(9_500_000 + n, [0x51; 10])
+        }
+    }
+
+    fn facts_for(root: &std::path::Path) -> WorktreeRootFacts {
+        let path = root.display().to_string();
+        WorktreeRootFacts {
+            observed_canonical_path: path.clone(),
+            display_path: path.clone(),
+            path_fingerprint: path_fingerprint(&path),
+            kind: WorktreeKind::NonGit,
+            common_dir_fingerprint: None,
+            remote_fingerprint: None,
+        }
+    }
+
+    async fn register_representations(state: &StateDb, now_ms: i64) {
+        let code_key = HashingEmbedder::new(RepresentationKind::CodeRaw).key();
+        let memory_key = HashingEmbedder::new(RepresentationKind::Memory).key();
+        state
+            .writer()
+            .transaction(move |tx| {
+                let code_id = register_representation(tx, "test-code-raw", &code_key, now_ms)?;
+                set_model_space_representation(
+                    tx,
+                    DEFAULT_MODEL_SPACE_ID,
+                    RepresentationKind::CodeRaw,
+                    &code_id,
+                    true,
+                    now_ms,
+                )?;
+                let memory_id = register_representation(tx, "test-memory", &memory_key, now_ms)?;
+                set_model_space_representation(
+                    tx,
+                    DEFAULT_MODEL_SPACE_ID,
+                    RepresentationKind::Memory,
+                    &memory_id,
+                    true,
+                    now_ms,
+                )
+            })
+            .await
+            .expect("register representations");
+    }
+
+    /// A real temp store with one registered worktree (one seed file already
+    /// on disk), ready to hand to [`spawn_worktree_task`]. Kept alive for the
+    /// whole test — dropping `home` deletes the temp tree.
+    struct Fixture {
+        _home: TempHome,
+        state: Arc<StateDb>,
+        cache: Arc<CacheDb>,
+        layout: StoreLayout,
+        uuids: Arc<dyn UuidSource + Send + Sync>,
+        locks: Arc<WorktreeLockRegistry>,
+        embedder_provider: Arc<LazyEmbedderProvider>,
+        jobs: JobRegistry,
+        worktree_id: Uuid,
+        root: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        async fn new(dir_name: &str) -> Self {
+            let home = TempHome::new().expect("temp home");
+            let layout = StoreLayout::new(home.join("local-rag"));
+            layout.ensure().expect("ensure store tree");
+            let root = home.join(dir_name);
+            std::fs::create_dir_all(&root).expect("create worktree root");
+            std::fs::write(
+                root.join("main.rs"),
+                "fn parse_config(path: &Path) -> Config { unimplemented!() }",
+            )
+            .expect("seed file");
+
+            let state = Arc::new(StateDb::open(layout.state_db()).expect("open state.sqlite"));
+            let cache = Arc::new(
+                CacheDb::open(layout.cache_db(), "test-instance").expect("open cache.sqlite"),
+            );
+            let now_ms = 1_000;
+            register_representations(&state, now_ms).await;
+
+            let uuids: Arc<dyn UuidSource + Send + Sync> = Arc::new(SeqUuids::new());
+            let repo_id = uuids.next_uuid();
+            let worktree_id = uuids.next_uuid();
+            let facts = facts_for(&root);
+            register_new_worktree(&state, repo_id, worktree_id, &facts, now_ms)
+                .await
+                .expect("register worktree");
+
+            let embedder_provider = Arc::new(LazyEmbedderProvider::with_probes(
+                || {
+                    ProviderProbe::Ready(Arc::new(HashingEmbedder::new(
+                        RepresentationKind::CodeRaw,
+                    )))
+                },
+                || ProviderProbe::Ready(Arc::new(HashingEmbedder::new(RepresentationKind::Memory))),
+            ));
+
+            Fixture {
+                _home: home,
+                state,
+                cache,
+                layout,
+                uuids,
+                locks: Arc::new(WorktreeLockRegistry::new()),
+                embedder_provider,
+                jobs: JobRegistry::new(),
+                worktree_id,
+                root,
+            }
+        }
+
+        fn params(&self) -> WorktreeTaskParams {
+            WorktreeTaskParams {
+                state: self.state.clone(),
+                cache: self.cache.clone(),
+                layout: self.layout.clone(),
+                uuids: self.uuids.clone(),
+                locks: self.locks.clone(),
+                embedder_provider: self.embedder_provider.clone(),
+                jobs: self.jobs.clone(),
+                worktree_id: self.worktree_id,
+                model_space_id: DEFAULT_MODEL_SPACE_ID.parse().expect("valid UUID"),
+                retention: RetentionParams {
+                    keep_last_k: 2,
+                    window_ms: 7 * 24 * 60 * 60 * 1000,
+                },
+                data_policy: DataPolicy::LocalOnly,
+                classifier: ClassifierConfig::new(1024 * 1024),
+            }
+        }
+    }
+
+    /// Bounded, event-driven wait: polls `check` on a short real interval
+    /// until it becomes `true` or `deadline` elapses — this crate carries no
+    /// `tokio` `test-util` feature (see `daemon::consolidation_trigger`'s own
+    /// tests), so there is no paused virtual clock; `tokio::time::sleep`/
+    /// `timeout` need only the plain `time` feature already enabled. Mirrors
+    /// `crates/local-rag/tests/idle_shutdown.rs::wait_until_idle_eligible`'s
+    /// established idiom: a real but tiny poll interval, bounded convergence,
+    /// never a fixed sleep standing in for "enough time must have passed."
+    async fn wait_for(deadline: Duration, mut check: impl FnMut() -> bool) {
+        tokio::time::timeout(deadline, async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("condition did not become true within the bound");
+    }
+
+    #[tokio::test]
+    async fn starting_the_task_indexes_and_projects_the_worktree_without_any_external_process() {
+        let fx = Fixture::new("repo").await;
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+
+        let status = handle.status();
+        assert!(status.last_generation_id.is_some());
+        assert!(status.last_success_ms.is_some());
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(status.last_error.is_none());
+
+        // Prove it end to end through the real production `SearchEngine` —
+        // the same `build_search_engine` the daemon itself uses.
+        let query_embedder: Arc<dyn local_rag_search::QueryEmbedder> =
+            Arc::new(crate::daemon::EmbedderQueryAdapter::new(Arc::new(
+                HashingEmbedder::new(RepresentationKind::CodeRaw),
+            )));
+        let engine = crate::daemon::search::build_search_engine(
+            fx.state.clone(),
+            fx.cache.clone(),
+            fx.layout.clone(),
+            fx.uuids.clone(),
+            query_embedder,
+            8,
+            fx.locks.clone(),
+        );
+        let response = engine
+            .search_code(
+                local_rag_search::SearchRequest {
+                    root: local_rag_store::RequestRoot {
+                        worktree_root: Some(facts_for(&fx.root)),
+                        repo_hint: None,
+                    },
+                    query: "parse_config".to_string(),
+                    mode: local_rag_protocol::SearchMode::Hybrid,
+                    limit: 5,
+                    name_pattern: None,
+                },
+                system_now_ms(),
+            )
+            .await
+            .expect("no infra error")
+            .expect("no domain error");
+        assert!(
+            response.results.iter().any(|r| r.path.ends_with("main.rs")),
+            "{:?}",
+            response.results
+        );
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_file_change_produces_a_new_generation_observed_via_the_tasks_own_status() {
+        let fx = Fixture::new("repo").await;
+        let root = fx.root.clone();
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        let first_generation = handle.status().last_generation_id;
+
+        std::fs::write(root.join("main.rs"), "fn parse_config() {}\nfn two() {}")
+            .expect("modify file");
+
+        wait_for(Duration::from_secs(10), || {
+            let s = handle.status();
+            s.last_generation_id.is_some() && s.last_generation_id != first_generation
+        })
+        .await;
+
+        handle.stop().await;
+    }
+
+    /// Synchronizes on `project_one`'s own `JobGuard` window exactly (via
+    /// [`spawn_worktree_task_instrumented`]'s [`JobStartedHook`]) instead of
+    /// racing a real, possibly sub-millisecond in-progress window with a poll
+    /// loop — the same `entered_tx`/blocking-`recv` handshake idiom
+    /// `crates/store/tests/lock.rs` already uses for "prove a lock is held
+    /// right now," adapted to a one-shot signal.
+    async fn spawn_and_wait_for_job_started(params: WorktreeTaskParams) -> WorktreeTaskHandle {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let hook: JobStartedHook = Arc::new(move || {
+            entered_tx.send(()).ok();
+        });
+        let handle = spawn_worktree_task_instrumented(params, hook)
+            .await
+            .expect("start task");
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("job started"))
+            .await
+            .expect("join entered-wait");
+        handle
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_task_mid_cycle_leaves_the_store_valid_and_reusable() {
+        let fx = Fixture::new("repo").await;
+        let jobs = fx.jobs.clone();
+
+        let handle = spawn_and_wait_for_job_started(fx.params()).await;
+        // The hook fired strictly after `jobs.begin(...)` — no race.
+        assert!(!jobs.is_empty(), "a job must be in flight right now");
+        handle.abort();
+        handle.stop().await;
+        assert_eq!(jobs.len(), 0, "the aborted job's guard must still drop");
+
+        // Strong drop-safety proof: run a fresh, uninterrupted cycle against
+        // the very same store afterward and confirm it still builds and
+        // activates a generation normally — corruption from the abort would
+        // surface here, not as a special assertion about internal state.
+        let handle2 = spawn_worktree_task(fx.params()).await.expect("start task");
+        wait_for(Duration::from_secs(10), || {
+            handle2.status().last_generation_id.is_some()
+        })
+        .await;
+        assert_eq!(handle2.status().consecutive_failures, 0);
+        handle2.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_job_registry_is_nonempty_only_during_an_active_projection() {
+        let fx = Fixture::new("repo").await;
+        let jobs = fx.jobs.clone();
+        assert_eq!(jobs.len(), 0, "no work before the task starts");
+
+        let handle = spawn_and_wait_for_job_started(fx.params()).await;
+        assert!(!jobs.is_empty(), "a job must be in flight right now");
+
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        // The tick that set `last_generation_id` has, by definition, already
+        // dropped its guard (T20-05's own project_one drops `_job` before
+        // updating `status`).
+        assert_eq!(jobs.len(), 0, "idle again once the tick has finished");
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_vanished_worktree_is_a_typed_start_error() {
+        let fx = Fixture::new("repo").await;
+        let mut params = fx.params();
+        params.worktree_id = fx.uuids.next_uuid(); // never registered
+        let err = spawn_worktree_task(params)
+            .await
+            .expect_err("no such worktree");
+        assert!(matches!(err, WorktreeTaskStartError::WorktreeVanished));
+    }
+}
