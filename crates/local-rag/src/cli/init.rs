@@ -1,4 +1,4 @@
-//! `local-rag init [--download-models]` (spec 11 §6, D-013, D-036).
+//! `local-rag init [--download-models]` (spec 11 §6, D-013, D-036, D-045).
 //!
 //! Registration is gated on **disk state**, not on the `--download-models`
 //! flag: both bare `init` and `init --download-models` attempt to register
@@ -16,11 +16,27 @@
 //! representations come from the same installed model, opened twice under
 //! different `RepresentationKey`s (`OnnxEmbedder::open`/`open_for_memory`,
 //! D-036) — `kind` does not change tokenization or inference, only identity.
+//!
+//! D-045: `--download-models` also installs the default generative model
+//! (`local_rag_generate`, spec 10 §5's install policy applied a second time
+//! to a second catalog) — the memory-router
+//! (`daemon::resume::consolidation::build_best_effort_pool`) needs it on disk
+//! to consolidate spool observations into memory at all, and before D-045 no
+//! CLI command ever installed it. Unlike the embedder, the generator has no
+//! database registration step (`build_best_effort_pool` opens it straight off
+//! disk, never through `model_space`/`representation`), so its install is
+//! independent of the embedder's disk-state gate below: it neither blocks on,
+//! nor is blocked by, whether the embedder ends up installed.
 
 use std::process::ExitCode;
 
 use local_rag_core::identity::{SystemUuidV7, UuidSource};
 use local_rag_embed::Embedder;
+use local_rag_generate::{
+    DEFAULT_MODEL_ID as GENERATOR_MODEL_ID, HttpFetcher as GeneratorHttpFetcher,
+    find as find_generator, install_model as install_generator_model,
+    is_installed as generator_is_installed,
+};
 use local_rag_models::{
     DEFAULT_MODEL_ID, HttpFetcher, OnnxEmbedder, find, install_model, is_installed,
 };
@@ -35,8 +51,9 @@ const BIN: &str = "local-rag";
 
 #[derive(Debug, clap::Args)]
 pub struct InitArgs {
-    /// Fetch and install the default embedding model's weights before
-    /// checking whether `code_raw` can be registered.
+    /// Fetch and install the default embedding model's and the default
+    /// generative model's weights (D-045) before checking whether `code_raw`
+    /// can be registered.
     #[arg(long)]
     download_models: bool,
 }
@@ -67,6 +84,36 @@ pub fn run(args: InitArgs) -> ExitCode {
         && let Err(e) = install_model(&layout, entry, &HttpFetcher::new(), &mut std::io::stdout())
     {
         return fail(BIN, &format!("could not install {DEFAULT_MODEL_ID}: {e}"));
+    }
+
+    // D-045: the generative model, independent of the embedder above — it
+    // has no `is_installed` early-return of its own because nothing below
+    // (representation registration) depends on it; a missing catalog entry
+    // is still fatal, since `GENERATOR_MODEL_ID` is a compiled-in constant
+    // and its absence would mean a build-catalog inconsistency, not a
+    // runtime condition.
+    let Some(generator_entry) = find_generator(GENERATOR_MODEL_ID) else {
+        return fail(
+            BIN,
+            &format!("model {GENERATOR_MODEL_ID:?} is not in this build's catalog"),
+        );
+    };
+    if download
+        && let Err(e) = install_generator_model(
+            &layout,
+            generator_entry,
+            &GeneratorHttpFetcher::new(),
+            &mut std::io::stdout(),
+        )
+    {
+        return fail(BIN, &format!("could not install {GENERATOR_MODEL_ID}: {e}"));
+    }
+    if !generator_is_installed(&layout, GENERATOR_MODEL_ID) {
+        println!(
+            "{BIN}: {GENERATOR_MODEL_ID} is not installed yet; run `local-rag init \
+             --download-models` to fetch it. Until then, memory consolidation stays disabled: \
+             spool observations are imported but never turn into memory entries."
+        );
     }
 
     if !is_installed(&layout, DEFAULT_MODEL_ID) {
@@ -381,6 +428,21 @@ mod tests {
         assert!(
             find(DEFAULT_MODEL_ID).is_some(),
             "the default model must be catalogued for this check to mean anything"
+        );
+    }
+
+    /// D-045: mirrors the embedder check above for the generative model —
+    /// same disk-state gate, same "no process spawn needed" reasoning.
+    #[test]
+    fn bare_init_without_download_models_is_a_light_no_op_for_the_generator_too() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        assert!(!generator_is_installed(&layout, GENERATOR_MODEL_ID));
+
+        assert!(
+            find_generator(GENERATOR_MODEL_ID).is_some(),
+            "the default generative model must be catalogued for this check to mean anything"
         );
     }
 
