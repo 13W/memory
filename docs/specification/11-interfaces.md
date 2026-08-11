@@ -1462,3 +1462,44 @@ when the target worktree is daemon-managed and a live daemon answers the livenes
 `local-rag project reindex` as the deduplicated path — and then proceed regardless (fail-open):
 running them concurrently with a daemon-managed worktree remains "wasteful, never unsafe," per
 §6's own as-built note, never refused.
+
+As-built note (T20-07, `[SPEC]`): the three `admin/*` verbs' concrete request/response shapes.
+
+- **`admin/projects_list`** — no params. Result: `{"available": bool, "projects": [ProjectEntry,
+  ...]}`. Each `ProjectEntry` joins one `managed_worktree` row (durable, T20-01) with its worktree
+  task's live status (T20-05), if a task is currently running for it: `{"worktree_id", "enabled",
+  "registered_at", "updated_at", "task": TaskStatus | null}`. `TaskStatus` (`null` for a disabled
+  row, or transiently for an `enabled` one whose task has not finished starting) is
+  `WorktreeTaskStatus` verbatim: `{"last_generation_id", "last_success_ms",
+  "consecutive_failures", "last_error", "in_progress_since"}` — the last field is D-049's forward
+  note, `Some` only while an embed/activate/materialize cycle is actually in flight, letting a
+  future `local-rag stats` compute elapsed/ETA the same way it already does for consolidation.
+- **`admin/projects_reload`** — no params. Result: `{"available": bool, "started": usize,
+  "stopped": usize}` — the supervisor's own `ReloadOutcome` (T20-06), flattened.
+- **`admin/reconcile_now`** — params `{"worktree_id": string}`. Result: `{"available": bool}` on
+  success. A malformed/missing `worktree_id` is a JSON-RPC `-32602 Invalid params` (the request
+  itself is bad, checked before any supervisor lookup); a syntactically valid but
+  unknown-or-currently-unmanaged `worktree_id` (never registered, `enabled = 0`, or an `enabled`
+  row whose task has not started yet — deliberately not distinguished any further) is also
+  `-32602`, the same JSON-RPC error channel `tools/call`'s own "unknown tool" case already uses,
+  never `isError` content (this is admin surface, not a tool result). Injects
+  `local_rag_index::reconcile::TriggerKind::Manual` directly into that worktree's already-running
+  task — fire-and-forget: the response confirms the trigger was accepted, not that the resulting
+  reconcile has finished.
+- **`available: false` is the uniform `DaemonMode::MigrationOnly` answer for all three verbs**
+  (no usable `state.sqlite` for the supervisor to exist at all) — `admin/projects_list` pairs it
+  with an empty `projects: []`, `admin/projects_reload` with `started: 0, stopped: 0`,
+  `admin/reconcile_now` with no separate error even though the exact `worktree_id` could not be
+  judged managed or not. `available: true` always means a real supervisor answered — never a
+  fabricated healthy-looking number standing in for "cannot tell."
+- **`DispatchContext.indexing_supervisor: Option<&SupervisorClient>`** carries the wiring:
+  `SupervisorClient` (`daemon::indexing::supervisor`) is a cheap `Clone`-able handle over the
+  supervisor actor's command channel, derived via `SupervisorHandle::client()` — `McpHandler` is
+  constructed (and starts serving connections) independently of `DaemonHandle`'s own lifetime, so
+  it holds this owned client rather than a borrowed `&SupervisorHandle`. `None` in exactly the
+  same condition `engine`/`memory` are `None` in (`MigrationOnly`).
+- `tools::catalog()`/`tools/list` are untouched by this task (T19-01's byte budget is unaffected)
+  — `admin/*` is dispatched directly by method name, the same non-catalog surface `admin/
+  tail_calls`/`admin/tool_stats` (§7, T18-08) already established; `admin/*`'s self-exclusion from
+  `ctx.telemetry` is a prefix match in `handshake.rs`, already covering these three verbs without
+  any change there.

@@ -410,6 +410,45 @@ impl DaemonHandle {
             "daemon ready"
         );
 
+        // `jobs` and the indexing supervisor are constructed here — still
+        // within step 4 ("start workers", spec 02 §4.1 step 4, the same
+        // clause `daemon::indexing::supervisor`'s own module doc already
+        // cites) — rather than down among the step-5 resume passes below,
+        // specifically so `McpHandler::new` (built a few lines down) can be
+        // handed a `SupervisorClient` (T20-07): `McpHandler` starts serving
+        // connections independently of this function's own remaining
+        // lifetime, so it can only hold an owned, `Clone`-able client, never
+        // a borrowed `&SupervisorHandle` built later.
+        let jobs = JobRegistry::new();
+        // T20-06: the daemon-managed indexing supervisor — one `T20-05` task
+        // per `enabled` `managed_worktree` row. Same "both present or
+        // neither" store-availability guard `engine`/`memory_ctx` above
+        // already use (no usable `state.sqlite`/`cache.sqlite` in
+        // `MigrationOnly`).
+        let indexing_supervisor = match (&state_db, &cache_db) {
+            (Some(state), Some(cache)) => {
+                tracing::info!(job = "indexing_supervisor", "background job spawned");
+                let model_space_id: Uuid = local_rag_store::DEFAULT_MODEL_SPACE_ID
+                    .parse()
+                    .expect("DEFAULT_MODEL_SPACE_ID is a valid UUID");
+                Some(spawn_supervisor(SupervisorParams {
+                    state: Arc::clone(state),
+                    cache: Arc::clone(cache),
+                    layout: layout.clone(),
+                    uuids: Arc::clone(&uuids),
+                    locks: Arc::clone(&locks),
+                    embedder_provider: Arc::clone(&embedder_provider),
+                    jobs: jobs.clone(),
+                    model_space_id,
+                    retention,
+                    data_policy,
+                    classifier,
+                    backstop_poll_interval: indexing_backstop_poll_interval,
+                }))
+            }
+            _ => None,
+        };
+
         let sessions = SessionRegistry::new();
         let tool_calls = ToolCallCounters::new();
         let telemetry = TelemetryState::new();
@@ -432,6 +471,7 @@ impl DaemonHandle {
             system_now_ms,
             tool_calls,
             telemetry,
+            indexing_supervisor.as_ref().map(SupervisorHandle::client),
         );
         let (handshake_stop_tx, handshake_stop_rx) = oneshot::channel();
         let handshake_join = tokio::spawn(serve_connections(
@@ -459,7 +499,6 @@ impl DaemonHandle {
         let pool = state_db
             .as_ref()
             .map(|_| Arc::new(build_best_effort_pool(&layout)));
-        let jobs = JobRegistry::new();
         let mut resume_handles = Vec::new();
         if let Some(ref db) = state_db {
             tracing::info!(job = "spool_resume", "background job spawned");
@@ -511,35 +550,6 @@ impl DaemonHandle {
                 (Some(stop_tx), Some(join))
             }
             None => (None, None),
-        };
-
-        // T20-06: the daemon-managed indexing supervisor — one `T20-05` task
-        // per `enabled` `managed_worktree` row. Same "both present or
-        // neither" store-availability guard `engine`/`memory_ctx` above
-        // already use (no usable `state.sqlite`/`cache.sqlite` in
-        // `MigrationOnly`).
-        let indexing_supervisor = match (&state_db, &cache_db) {
-            (Some(state), Some(cache)) => {
-                tracing::info!(job = "indexing_supervisor", "background job spawned");
-                let model_space_id: Uuid = local_rag_store::DEFAULT_MODEL_SPACE_ID
-                    .parse()
-                    .expect("DEFAULT_MODEL_SPACE_ID is a valid UUID");
-                Some(spawn_supervisor(SupervisorParams {
-                    state: Arc::clone(state),
-                    cache: Arc::clone(cache),
-                    layout: layout.clone(),
-                    uuids: Arc::clone(&uuids),
-                    locks: Arc::clone(&locks),
-                    embedder_provider: Arc::clone(&embedder_provider),
-                    jobs: jobs.clone(),
-                    model_space_id,
-                    retention,
-                    data_policy,
-                    classifier,
-                    backstop_poll_interval: indexing_backstop_poll_interval,
-                }))
-            }
-            _ => None,
         };
 
         Ok(DaemonHandle {

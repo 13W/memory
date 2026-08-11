@@ -67,7 +67,7 @@ use local_rag_index::reconcile::{
     load_worktree_meta, spawn_reconciler, spawn_watcher,
 };
 use local_rag_store::{CacheDb, RetentionParams, StateDb, WorktreeLockRegistry};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::daemon::embedder_provider::LazyEmbedderProvider;
@@ -96,9 +96,10 @@ pub struct WorktreeTaskParams {
     pub classifier: ClassifierConfig,
 }
 
-/// In-memory status of a running (or just-stopped) worktree task — read by a
-/// future admin surface (T20-07), not persisted anywhere.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// In-memory status of a running (or just-stopped) worktree task — read by
+/// the admin surface (T20-07's `admin/projects_list`), not persisted
+/// anywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct WorktreeTaskStatus {
     /// The most recently *projected* (embedded/activated/materialized)
     /// generation — distinct from the reconciler's own `successes` watch,
@@ -110,6 +111,15 @@ pub struct WorktreeTaskStatus {
     pub consecutive_failures: u32,
     /// The most recent failure's human-readable cause, if any.
     pub last_error: Option<String>,
+    /// When the *current* embed/activate/materialize cycle started, Unix
+    /// milliseconds — `None` whenever the task is idle, waiting on its next
+    /// trigger (D-049's forward note): without this, a future progress
+    /// indicator (`local-rag stats`, already given consolidation's own
+    /// elapsed/ETA the same way by D-049) has no way to compute either for
+    /// indexing. Set at [`JobGuard`](crate::daemon::jobs::JobGuard)
+    /// acquisition in [`project_one`], cleared back to `None` once that call
+    /// returns — success or failure alike.
+    pub in_progress_since: Option<i64>,
 }
 
 /// Why [`spawn_worktree_task`] could not start.
@@ -163,17 +173,26 @@ impl std::error::Error for WorktreeTaskStartError {}
 struct StartedTask {
     status: Arc<Mutex<WorktreeTaskStatus>>,
     abort_handle: AbortHandle,
+    trigger: mpsc::Sender<TriggerKind>,
 }
 
 /// A running worktree task: read [`WorktreeTaskHandle::status`] at any time,
-/// [`WorktreeTaskHandle::stop`] it gracefully, or [`WorktreeTaskHandle::abort`]
-/// it immediately.
+/// [`WorktreeTaskHandle::stop`] it gracefully, [`WorktreeTaskHandle::abort`]
+/// it immediately, or [`WorktreeTaskHandle::trigger`] an out-of-band reconcile
+/// (T20-07's `admin/reconcile_now`).
 #[derive(Debug)]
 pub struct WorktreeTaskHandle {
     status: Arc<Mutex<WorktreeTaskStatus>>,
     stop: oneshot::Sender<()>,
     abort_handle: AbortHandle,
     thread: std::thread::JoinHandle<()>,
+    /// A clone of the reconciler's own trigger sender (T20-07) — the
+    /// original is moved into the loop's `spawn_local` closure (used there
+    /// only to `drop` it on shutdown, signaling the reconciler to flush and
+    /// exit); this clone is `mpsc`, so cloning it costs nothing structurally
+    /// and does not change when the reconciler task itself sees every sender
+    /// dropped.
+    trigger: mpsc::Sender<TriggerKind>,
 }
 
 impl WorktreeTaskHandle {
@@ -185,12 +204,41 @@ impl WorktreeTaskHandle {
             .clone()
     }
 
+    /// Send `kind` to this worktree's reconciler directly — T20-07's
+    /// `admin/reconcile_now` injects [`TriggerKind::Manual`] this way.
+    /// Fire-and-forget: returns once the trigger is *enqueued*, not once the
+    /// resulting reconcile (if any) has finished — the same "next trigger
+    /// tries again on its own" contract [`project_one`]'s own doc already
+    /// establishes for every other trigger source. `Err` means the
+    /// reconciler task has already ended (the worktree task is mid-shutdown);
+    /// harmless to ignore, same as every other `sender.send(..)` call site in
+    /// this module.
+    pub async fn trigger(
+        &self,
+        kind: TriggerKind,
+    ) -> Result<(), mpsc::error::SendError<TriggerKind>> {
+        self.trigger.send(kind).await
+    }
+
     /// Signal the task to stop, then wait for its background thread to
     /// finish — including its own final flush of any generation the
     /// reconciler published after the loop last observed the channel
     /// (mirrors `cli::watch.rs`'s own shutdown-time flush).
+    ///
+    /// Drops [`Self::trigger`] explicitly, **before** waiting on the thread:
+    /// `WorktreeReconciler::run` only returns once *every* clone of its
+    /// trigger sender is dropped (`crates/index/src/reconcile/driver.rs`'s
+    /// own `ReconcileHandle` doc — "drop all senders to shut the task
+    /// down"), and the dedicated thread's own shutdown branch already
+    /// `drop`s its copy and awaits that exact return. Leaving this handle's
+    /// clone alive across the `spawn_blocking` `.await` below — the field
+    /// would otherwise sit unused-but-live in this async fn's own state
+    /// machine — would make that a deadlock every `stop()` call would hit,
+    /// not a rare race: the thread can never observe "every sender dropped"
+    /// while this one is still held here.
     pub async fn stop(self) {
         let _ = self.stop.send(());
+        drop(self.trigger);
         let _ = tokio::task::spawn_blocking(move || self.thread.join()).await;
     }
 
@@ -248,6 +296,7 @@ async fn spawn_worktree_task_instrumented(
             stop: stop_tx,
             abort_handle: started.abort_handle,
             thread,
+            trigger: started.trigger,
         }),
         Ok(Err(e)) => {
             let _ = tokio::task::spawn_blocking(move || thread.join()).await;
@@ -327,6 +376,14 @@ fn run_on_dedicated_thread(
         // the periodic 6h backstop.
         let _ = sender.send(TriggerKind::Startup).await;
 
+        // T20-07: a clone kept *outside* the loop's own `spawn_local`
+        // closure below, for `WorktreeTaskHandle::trigger` (`admin/
+        // reconcile_now`) to send into directly. Cloned before `sender`
+        // itself moves into that closure, where it is used only to `drop`
+        // (never to send) — see `WorktreeTaskHandle::stop`'s own doc for why
+        // this clone must not outlive that `drop`.
+        let trigger_sender = sender.clone();
+
         let status = Arc::new(Mutex::new(WorktreeTaskStatus::default()));
         let status_for_loop = Arc::clone(&status);
 
@@ -390,7 +447,11 @@ fn run_on_dedicated_thread(
         });
 
         let abort_handle = inner.abort_handle();
-        let _ = start_tx.send(Ok(StartedTask { status, abort_handle }));
+        let _ = start_tx.send(Ok(StartedTask {
+            status,
+            abort_handle,
+            trigger: trigger_sender,
+        }));
         let _ = inner.await;
     });
 }
@@ -460,6 +521,10 @@ async fn project_one(
     let _job = params.jobs.begin(JobKind::Reconcile);
     on_job_started();
     let now_ms = system_now_ms();
+    {
+        let mut s = status.lock().expect("worktree task status mutex poisoned");
+        s.in_progress_since = Some(now_ms);
+    }
     let worktree_id_str = params.worktree_id.to_string();
     let result = write_locked(
         &params.locks,
@@ -469,6 +534,7 @@ async fn project_one(
     .await;
 
     let mut s = status.lock().expect("worktree task status mutex poisoned");
+    s.in_progress_since = None;
     match result {
         Ok(_outcome) => {
             s.last_generation_id = Some(generation_id);
@@ -765,6 +831,74 @@ mod tests {
         handle.stop().await;
     }
 
+    /// T20-07: `admin/reconcile_now`'s own mechanism, exercised directly —
+    /// `trigger(Manual)` must force a fresh reconcile without depending on
+    /// the filesystem watcher's own debounce window to eventually pick the
+    /// change up on its own.
+    #[tokio::test]
+    async fn a_manual_trigger_forces_a_new_generation_without_the_watcher() {
+        let fx = Fixture::new("repo").await;
+        let root = fx.root.clone();
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        let first_generation = handle.status().last_generation_id;
+
+        std::fs::write(root.join("main.rs"), "fn parse_config() {}\nfn three() {}")
+            .expect("modify file");
+        handle
+            .trigger(TriggerKind::Manual)
+            .await
+            .expect("reconciler still alive");
+
+        wait_for(Duration::from_secs(10), || {
+            let s = handle.status();
+            s.last_generation_id.is_some() && s.last_generation_id != first_generation
+        })
+        .await;
+
+        handle.stop().await;
+    }
+
+    /// Regression for the deadlock a naive `trigger`-sender-clone design
+    /// introduces: `WorktreeReconciler::run` only returns once *every* clone
+    /// of its trigger sender is dropped, so `WorktreeTaskHandle::stop` must
+    /// drop its own clone before waiting on the background thread — proven
+    /// here by actually calling `trigger()` first (the ordinary
+    /// `handle.stop()` calls elsewhere in this file never exercise the
+    /// held-clone path at all) and bounding `stop()` itself with a timeout,
+    /// not just trusting "the test finished eventually."
+    #[tokio::test]
+    async fn stop_completes_promptly_even_after_a_manual_trigger_was_sent() {
+        let fx = Fixture::new("repo").await;
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+
+        wait_for(Duration::from_secs(30), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        handle
+            .trigger(TriggerKind::Manual)
+            .await
+            .expect("reconciler still alive");
+
+        // 45s, not a tight bound: this asserts "does not hang forever," not
+        // "is fast" — under heavy contention on this machine, a genuinely
+        // non-deadlocked `stop()` has still been observed taking tens of
+        // seconds (thread-scheduling delay, not the cyclic wait this test
+        // guards against). A real deadlock never completes at all, so any
+        // generous bound still catches it.
+        tokio::time::timeout(Duration::from_secs(45), handle.stop())
+            .await
+            .expect(
+                "stop() must not deadlock on its own retained trigger-sender clone \
+                 after a trigger() call",
+            );
+    }
+
     /// Synchronizes on `project_one`'s own `JobGuard` window exactly (via
     /// [`spawn_worktree_task_instrumented`]'s [`JobStartedHook`]) instead of
     /// racing a real, possibly sub-millisecond in-progress window with a poll
@@ -827,6 +961,33 @@ mod tests {
         // dropped its guard (T20-05's own project_one drops `_job` before
         // updating `status`).
         assert_eq!(jobs.len(), 0, "idle again once the tick has finished");
+
+        handle.stop().await;
+    }
+
+    /// D-049's forward note (T20-07): `in_progress_since` is `Some` strictly
+    /// while a cycle is active and `None` at rest — same
+    /// `JobStartedHook`-driven synchronization as the `JobRegistry` test
+    /// right above, applied to the new status field instead.
+    #[tokio::test]
+    async fn in_progress_since_is_some_only_during_an_active_projection() {
+        let fx = Fixture::new("repo").await;
+
+        let handle = spawn_and_wait_for_job_started(fx.params()).await;
+        assert!(
+            handle.status().in_progress_since.is_some(),
+            "a cycle must be in flight right now"
+        );
+
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        assert_eq!(
+            handle.status().in_progress_since,
+            None,
+            "idle again once the tick has finished"
+        );
 
         handle.stop().await;
     }

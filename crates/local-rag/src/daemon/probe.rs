@@ -19,7 +19,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use local_rag_core::process::pid_exists;
-use local_rag_protocol::{Hello, Message, PROTO_VERSION, Welcome, decode_message, encode_message};
+use local_rag_protocol::{
+    Hello, Message, PROTO_VERSION, RequestContext, RequestEnvelope, Welcome, decode_message,
+    encode_message,
+};
+use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// The result of probing a candidate store-lock owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +116,136 @@ impl LivenessProbe for SocketLivenessProbe {
 #[cfg(unix)]
 pub fn fetch_welcome(socket_path: &Path, timeout: Duration) -> Option<Welcome> {
     read_welcome(socket_path, timeout)
+}
+
+/// The `session_id` [`call_admin`]'s own synthetic HELLO carries — distinct
+/// from [`PROBE_SESSION_ID`] so the two one-shot client roles (liveness
+/// probe vs. admin verb call) stay greppable apart in any future log/debug
+/// output, even though neither is ever read back by anything today.
+const ADMIN_CLIENT_SESSION_ID: &str = "local-rag-admin-client";
+
+/// Why [`call_admin`] could not return a result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallAdminError {
+    /// Could not connect, or the daemon did not complete the HELLO/WELCOME
+    /// handshake at all — no live daemon at `socket_path`, or something is
+    /// seriously wrong with the one that is there.
+    Unreachable,
+    /// The handshake completed, but the verb's own response did not arrive
+    /// within `timeout`.
+    Timeout,
+    /// The daemon answered with a JSON-RPC error — e.g. `-32602` for
+    /// `admin/reconcile_now`'s own unknown/unmanaged-worktree case (T20-07).
+    JsonRpcError { code: i64, message: String },
+}
+
+impl std::fmt::Display for CallAdminError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallAdminError::Unreachable => write!(f, "the daemon is unreachable"),
+            CallAdminError::Timeout => write!(f, "the daemon did not answer in time"),
+            CallAdminError::JsonRpcError { code, message } => {
+                write!(f, "JSON-RPC error {code}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallAdminError {}
+
+/// Call one `admin/*` JSON-RPC verb (spec 11 §8, T20-07) synchronously over a
+/// fresh UDS connection: the same HELLO/WELCOME preamble [`read_welcome`]
+/// sends — but, unlike that function, the connection stays open afterward,
+/// so the `RequestEnvelope`/`ResponseEnvelope` round trip that carries the
+/// actual verb can follow on the same stream. A fresh, one-shot connection
+/// per call (this client has no proxy session of its own to relay through,
+/// nor any reason to keep one alive) — the minimal synchronous client
+/// `local-rag project` (T20-08, not implemented here) is expected to build
+/// typed wrappers on top of.
+#[cfg(unix)]
+pub fn call_admin(
+    socket_path: &Path,
+    timeout: Duration,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, CallAdminError> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
+        .map_err(|_| CallAdminError::Unreachable)?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| CallAdminError::Unreachable)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|_| CallAdminError::Unreachable)?;
+
+    let hello = Message::Hello(Hello {
+        proto: PROTO_VERSION,
+        proxy_version: local_rag_core::VERSION.to_string(),
+        session_id: ADMIN_CLIENT_SESSION_ID.to_string(),
+        worktree_root: None,
+        harness: "local-rag-admin-client".to_string(),
+    });
+    let bytes = encode_message(&hello).map_err(|_| CallAdminError::Unreachable)?;
+    stream
+        .write_all(&bytes)
+        .map_err(|_| CallAdminError::Unreachable)?;
+
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|_| CallAdminError::Unreachable)?,
+    );
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|_| CallAdminError::Unreachable)?;
+    match decode_message(line.trim_end()).map_err(|_| CallAdminError::Unreachable)? {
+        Message::Welcome(_) => {}
+        _ => return Err(CallAdminError::Unreachable),
+    }
+
+    let mcp_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let mcp_raw = RawValue::from_string(mcp_request.to_string())
+        .expect("a serde_json::Value always serializes to valid JSON");
+    let envelope = Message::Request(RequestEnvelope {
+        context: RequestContext {
+            session_id: ADMIN_CLIENT_SESSION_ID.to_string(),
+            worktree_root: None,
+            repo_hint: None,
+        },
+        mcp: mcp_raw,
+    });
+    let bytes = encode_message(&envelope).map_err(|_| CallAdminError::Unreachable)?;
+    stream
+        .write_all(&bytes)
+        .map_err(|_| CallAdminError::Unreachable)?;
+
+    line.clear();
+    reader
+        .read_line(&mut line)
+        .map_err(|_| CallAdminError::Timeout)?;
+    let response: Value = match decode_message(line.trim_end()) {
+        Ok(Message::Response(env)) => {
+            serde_json::from_str(env.mcp.get()).map_err(|_| CallAdminError::Timeout)?
+        }
+        _ => return Err(CallAdminError::Timeout),
+    };
+
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return Err(CallAdminError::JsonRpcError { code, message });
+    }
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
 /// Connect to `socket_path`, send this probe's own synthetic HELLO, and read
