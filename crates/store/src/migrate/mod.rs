@@ -170,7 +170,11 @@ impl Migration {
 /// daemon-managed indexing registry — `managed_worktree`, the persisted,
 /// explicit opt-in list of the worktrees the daemon indexes in the
 /// background, keyed by `worktree_id` and never by a path
-/// (`registry::SCHEMA_V10`). Each checksum is frozen once shipped (see
+/// (`registry::SCHEMA_V10`); version 11 (D-050) adds five nullable,
+/// unbackfilled columns to `consolidation_run` — `last_failure_kind`/
+/// `last_failure_reason`/`last_failure_fingerprint`/`attempt_count`/
+/// `next_retry_at`, the retry-storm circuit breaker's own bookkeeping
+/// (`memory::SCHEMA_V11`). Each checksum is frozen once shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
 pub const ALL: &[Migration] = &[
@@ -188,6 +192,11 @@ pub const ALL: &[Migration] = &[
     ),
     Migration::sql(9, "memory", crate::memory::SCHEMA_V9),
     Migration::sql(10, "managed_worktree", crate::registry::SCHEMA_V10),
+    Migration::sql(
+        11,
+        "consolidation_run_failure_tracking",
+        crate::memory::SCHEMA_V11,
+    ),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

@@ -23,9 +23,9 @@ use local_rag_core::paths::StoreLayout;
 #[cfg(feature = "failpoints")]
 use local_rag_store::memory::RunnerError;
 use local_rag_store::memory::{
-    ApplyReport, ConsolidationWindow, GeneratedOp, NewMemoryEntry, ProposedOperation, RunOutcome,
-    RunOutcomeError, RunState, SnapshotOutcome, commit_apply_run, consolidation_run_state,
-    create_memory_entry, open_next_run, processing_cursor, run_once,
+    ApplyReport, ClassifiedFailure, ConsolidationWindow, GeneratedOp, NewMemoryEntry,
+    ProposedOperation, RunOutcome, RunOutcomeError, RunState, SnapshotOutcome, commit_apply_run,
+    consolidation_run_state, create_memory_entry, open_next_run, processing_cursor, run_once,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, MemoryKind, ScopeKind, StateDb};
@@ -203,7 +203,7 @@ async fn generator_runs_outside_any_tx_writer_queue_stays_free_while_it_is_pendi
     let generate = move |_window: ConsolidationWindow| async move {
         let _ = started_tx.send(());
         let _ = unblock_rx.await;
-        Ok::<Vec<GeneratedOp>, String>(vec![GeneratedOp::Noop])
+        Ok::<Vec<GeneratedOp>, ClassifiedFailure>(vec![GeneratedOp::Noop])
     };
 
     let run_fut = run_once(
@@ -213,6 +213,7 @@ async fn generator_runs_outside_any_tx_writer_queue_stays_free_while_it_is_pendi
         LEASE_DURATION_MS,
         LEASE_RENEW_INTERVAL_MS,
         1_000,
+        "build-test",
         generate,
     );
 
@@ -265,7 +266,7 @@ async fn lease_renews_on_cadence_while_the_generator_runs() {
         // Longer than one lease duration (120s): only completes without the
         // run's lease going stale if renewal actually happens every ~30s.
         tokio::time::sleep(Duration::from_millis(150_000)).await;
-        Ok::<Vec<GeneratedOp>, String>(vec![GeneratedOp::Noop])
+        Ok::<Vec<GeneratedOp>, ClassifiedFailure>(vec![GeneratedOp::Noop])
     };
 
     let run_fut = run_once(
@@ -275,6 +276,7 @@ async fn lease_renews_on_cadence_while_the_generator_runs() {
         LEASE_DURATION_MS,
         LEASE_RENEW_INTERVAL_MS,
         0,
+        "build-test",
         generate,
     );
 
@@ -504,7 +506,7 @@ fn disarm(name: &str) {
 }
 
 #[cfg(feature = "failpoints")]
-async fn noop_generator(_w: ConsolidationWindow) -> Result<Vec<GeneratedOp>, String> {
+async fn noop_generator(_w: ConsolidationWindow) -> Result<Vec<GeneratedOp>, ClassifiedFailure> {
     Ok(vec![GeneratedOp::Noop])
 }
 
@@ -528,6 +530,7 @@ async fn crash_after_snapshot_leaves_the_run_untouched_and_retry_converges() {
         LEASE_DURATION_MS,
         LEASE_RENEW_INTERVAL_MS,
         1_000,
+        "build-test",
         noop_generator,
     )
     .await;
@@ -553,6 +556,7 @@ async fn crash_after_snapshot_leaves_the_run_untouched_and_retry_converges() {
         LEASE_DURATION_MS,
         LEASE_RENEW_INTERVAL_MS,
         1_000,
+        "build-test",
         noop_generator,
     )
     .await
@@ -580,6 +584,7 @@ async fn crash_after_generate_leaves_the_run_untouched_and_retry_converges() {
         LEASE_DURATION_MS,
         LEASE_RENEW_INTERVAL_MS,
         1_000,
+        "build-test",
         noop_generator,
     )
     .await;
@@ -606,6 +611,7 @@ async fn crash_after_generate_leaves_the_run_untouched_and_retry_converges() {
         LEASE_DURATION_MS,
         LEASE_RENEW_INTERVAL_MS,
         1_000,
+        "build-test",
         noop_generator,
     )
     .await

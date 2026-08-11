@@ -21,7 +21,8 @@ use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::UuidSource;
 use local_rag_embed::{GenMessage, GenRequest, GenRole, GeneratorPool};
 use local_rag_store::{
-    ConsolidationWindow, GeneratedOp, StateDb, WindowObservation, effective_data_policy,
+    ClassifiedFailure, ConsolidationWindow, GeneratedOp, StateDb, WindowObservation,
+    effective_data_policy,
 };
 
 use crate::{guard, parse, prompt, recall, schema};
@@ -56,16 +57,33 @@ fn trace_raw_response(text: &str) {
 /// stricter than the global default actually blocks a remote generator here
 /// — not just in the isolated fold+pool tests. A repository can only
 /// tighten, never relax, this effective value.
+///
+/// D-050: every failure point below is classified `Transient` or
+/// `Mechanical` (`local_rag_store::memory::consolidation::FailureKind`'s own
+/// doc has the full rationale) — this is what lets
+/// `local_rag_store::memory::runner::run_once`'s caller dead-letter a
+/// deterministically-broken window instead of retrying it every daemon tick
+/// forever. Everything up through the *first* generator call, plus the
+/// corrective re-prompt's own generator call, is `Transient`: a db-read
+/// hiccup or a model/infra failure is not expected to reproduce identically
+/// on an unchanged retry. Only the two failure points that are actually
+/// *about the model's output content* — the corrective-re-prompt's parse
+/// still failing, and a per-op materialization rejection — are `Mechanical`:
+/// greedy decoding makes the model's response to the *same* window
+/// deterministic, so these two reproduce byte-for-byte on every retry until
+/// the code (schema, prompt, or generation budget) actually changes.
 pub async fn route(
     state_db: &StateDb,
     pool: &GeneratorPool,
     global_policy: DataPolicy,
     uuids: &(dyn UuidSource + Send + Sync),
     window: ConsolidationWindow,
-) -> Result<Vec<GeneratedOp>, String> {
-    let conn = state_db.open_read().map_err(|e| e.to_string())?;
-    let existing =
-        recall::candidate_conflict_set(&conn, &window.observations).map_err(|e| e.to_string())?;
+) -> Result<Vec<GeneratedOp>, ClassifiedFailure> {
+    let conn = state_db
+        .open_read()
+        .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
+    let existing = recall::candidate_conflict_set(&conn, &window.observations)
+        .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
 
     let repo_ids: BTreeSet<&str> = window
         .observations
@@ -73,13 +91,15 @@ pub async fn route(
         .filter_map(|o| o.repo_id.as_deref())
         .collect();
     let repo_ids: Vec<&str> = repo_ids.into_iter().collect();
-    let policy =
-        effective_data_policy(global_policy, &conn, &repo_ids).map_err(|e| e.to_string())?;
+    let policy = effective_data_policy(global_policy, &conn, &repo_ids)
+        .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
 
     let messages = prompt::initial_messages(&window, &existing);
     let request = GenRequest::new(messages.clone(), MAX_GENERATION_TOKENS)
         .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
-    let response = pool.generate(policy, request).map_err(|e| e.to_string())?;
+    let response = pool
+        .generate(policy, request)
+        .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
     trace_raw_response(&response.text);
 
     let raw_ops = match parse::parse_ops(&response.text) {
@@ -98,9 +118,11 @@ pub async fn route(
                 .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
             let retry_response = pool
                 .generate(policy, retry_request)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
             parse::parse_ops(&retry_response.text).map_err(|e| {
-                format!("router output still malformed after one corrective re-prompt: {e}")
+                ClassifiedFailure::mechanical(format!(
+                    "router output still malformed after one corrective re-prompt: {e}"
+                ))
             })?
         }
     };
@@ -114,7 +136,7 @@ pub async fn route(
     let mut ops = Vec::with_capacity(raw_ops.len());
     for raw in raw_ops {
         let op = guard::materialize(&conn, &by_id, &window.observations, uuids, raw)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ClassifiedFailure::mechanical(e.to_string()))?;
         ops.push(op);
     }
     Ok(ops)
@@ -128,8 +150,8 @@ mod tests {
     use local_rag_core::identity::{Uuid, uuidv7_from};
     use local_rag_core::paths::StoreLayout;
     use local_rag_embed::{FinishReason, GenError, GenResponse, Generator};
-    use local_rag_store::EvidenceKind;
     use local_rag_store::rusqlite::params;
+    use local_rag_store::{EvidenceKind, FailureKind};
     use local_rag_test_support::TempHome;
 
     use super::*;
@@ -268,6 +290,12 @@ mod tests {
         assert_eq!(ops, vec![GeneratedOp::Noop]);
     }
 
+    /// D-050: a parse failure surviving the one corrective re-prompt is the
+    /// exact shape the live retry-storm incident hit (`missing field
+    /// confidence_signal`, `trailing characters`, `EOF while parsing a
+    /// string`) — greedy decoding makes it reproduce byte-for-byte on every
+    /// retry, so it must classify `Mechanical`, not `Transient` (which would
+    /// keep retrying it every daemon tick forever).
     #[tokio::test]
     async fn a_response_still_malformed_after_the_reprompt_fails_the_window() {
         let (_home, db) = open_state();
@@ -275,9 +303,18 @@ mod tests {
         let pool = pool_with(vec!["not json", "still not json"]);
         let uuids = SeqUuidV7::new();
         let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
-        assert!(result.is_err());
+        let failure = result.expect_err("still malformed after the corrective re-prompt");
+        assert_eq!(
+            failure.kind,
+            FailureKind::Mechanical,
+            "reproduces identically on an unchanged retry: dead-letter it, don't retry-storm"
+        );
     }
 
+    /// D-050: a generator/infra failure (model unavailable, transport error)
+    /// is not expected to reproduce on an unchanged retry the way a parse
+    /// defect does — it must classify `Transient`, eligible for
+    /// exponential-backoff retry rather than a fingerprint-gated dead-letter.
     #[tokio::test]
     async fn a_generator_error_surfaces_as_the_window_error() {
         let (_home, db) = open_state();
@@ -285,7 +322,8 @@ mod tests {
         let pool = pool_with(vec![]);
         let uuids = SeqUuidV7::new();
         let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
-        assert!(result.is_err());
+        let failure = result.expect_err("no provider configured for an empty pool");
+        assert_eq!(failure.kind, FailureKind::Transient);
     }
 
     #[tokio::test]

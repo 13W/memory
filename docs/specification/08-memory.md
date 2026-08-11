@@ -234,6 +234,29 @@ skipping the field on one op never fails the whole window's deserialization (tie
 string then degrades through the same out-of-domain check (`ScopeKind::from_db`, tier 2) as any
 other unrecognized value.
 
+As-built note (D-050, `[SPEC]`): "run retried after lease expiry" (step 5, and 04 §4's own
+`stale_runs`/`retry_run` sweep, run every daemon tick forever by the continuous trigger, D-024)
+does not by itself bound how many times a `failed` run is retried, or distinguish *why* it failed
+— live dogfooding found this exact gap: a window whose router output deterministically fails to
+parse (greedy decoding — the same window, model, and code reproduce the identical malformed
+response byte-for-byte) was retried every ~15s tick, hours on end, each attempt a real local-model
+inference call. `local_rag_store::memory::consolidation::FailureKind` closes it by classifying
+every `generate`-closure failure as `Mechanical` (the corrective-re-prompt's parse still failing,
+or a per-op materialization rejection — reproduces identically on an unchanged retry) or
+`Transient` (a db-read hiccup, or the generator/model call itself failing — not expected to
+reproduce). `stale_runs` excludes a `Mechanical` failure whose `last_failure_fingerprint`
+(`local_rag_core::BUILD_ID`, a `git describe --always --dirty` captured at compile time, distinct
+from the workspace's own fixed-placeholder `VERSION`) matches the running binary's — a rebuild
+earns it exactly one more attempt, never an unlimited budget — and gates a `Transient` failure on
+`next_retry_at`, an exponential backoff (`transient_backoff_delay_ms`, the same 250ms-base-doubling
+shape `local-rag-proxy::connect::DEFAULT_BACKOFF` already established for "wait, then retry a call
+that might just be temporarily down"). Apply-time rejections (`RunnerApplyError`) are classified
+`Transient` by default, not split per variant — none of the live retry-storm incidents that
+motivated this task went through that path. `consolidation_run` gains five nullable, unbackfilled
+columns (`last_failure_kind`/`last_failure_reason`/`last_failure_fingerprint`/`attempt_count`/
+`next_retry_at`, schema v11): a pre-existing `failed` row with none of them set is never classified
+`Mechanical`, so it stays retry-eligible — the safe default, not a special case.
+
 ## 5. Explicit tool-initiated memory (`remember`, review tools)
 
 `remember` (11 §2) is an explicit durable operation: creates an `active` entry, `actor='user'`

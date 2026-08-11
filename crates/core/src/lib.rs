@@ -32,6 +32,19 @@ pub use config::{Config, ConfigError, DataPolicy};
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A build identifier that changes on every commit (D-050) — `git describe
+/// --always --dirty`, captured at compile time by `build.rs`; falls back to
+/// `"unknown"` outside a git checkout, never fails the build. Unlike
+/// [`VERSION`] (this workspace's `Cargo.toml` pins a fixed `"0.0.0"`
+/// placeholder, never bumped per commit), this always changes when the
+/// source does — used to fingerprint "the code that produced this
+/// deterministic failure" (`local_rag_store::memory::consolidation`).
+///
+/// ```
+/// assert!(!local_rag_core::BUILD_ID.is_empty());
+/// ```
+pub const BUILD_ID: &str = env!("LOCAL_RAG_BUILD_ID");
+
 /// Format the canonical `version` line for a binary named `bin`.
 ///
 /// ```
