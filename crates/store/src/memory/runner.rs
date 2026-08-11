@@ -92,7 +92,8 @@ use rusqlite::Transaction;
 use super::audit::Actor;
 use super::candidate::candidate_state;
 use super::consolidation::{
-    RunState, RunWindow, run_state_and_lease, transition_run, upsert_processing_cursor,
+    ClassifiedFailure, RunState, RunWindow, record_run_failure, run_state_and_lease,
+    transition_run, upsert_processing_cursor,
 };
 use super::op::{EvidenceInput, MemoryOpOutcome, apply_noop};
 use super::review::{
@@ -512,15 +513,30 @@ async fn load_window(
 
 /// Mark `run_id` `Failed` (spec 04 §4: "router/LLM error ⇒ failed
 /// (retryable)", generalized to any apply-time rejection — see the module
-/// doc). `running -> failed` is always legal; if some other racer already
-/// moved the row elsewhere this is silently left alone rather than treated
-/// as an error, matching this crate's other best-effort cleanup sweeps.
-async fn mark_failed(state_db: &StateDb, run_id: &str, now_ms: i64) -> Result<(), RunnerError> {
+/// doc) and record D-050's retry-storm circuit-breaker bookkeeping
+/// (`failure`'s kind/reason, `build_id` for a `Mechanical` fingerprint) in
+/// the same write via
+/// [`record_run_failure`](super::consolidation::record_run_failure).
+/// `running -> failed` is always legal; if some other racer already moved
+/// the row elsewhere, both the transition and the bookkeeping are silently
+/// left alone rather than treated as an error, matching this crate's other
+/// best-effort cleanup sweeps (and `record_run_failure`'s own "never
+/// overwrite an already-applied row" contract).
+async fn mark_failed(
+    state_db: &StateDb,
+    run_id: &str,
+    failure: &ClassifiedFailure,
+    build_id: &str,
+    now_ms: i64,
+) -> Result<(), RunnerError> {
     let run_id = run_id.to_string();
+    let kind = failure.kind;
+    let reason = failure.reason.clone();
+    let build_id = build_id.to_string();
     state_db
         .writer()
         .transaction(move |tx| {
-            let _ = transition_run(tx, &run_id, RunState::Failed, now_ms)?;
+            let _ = record_run_failure(tx, &run_id, kind, &reason, Some(&build_id), now_ms)?;
             Ok(())
         })
         .await
@@ -596,6 +612,7 @@ pub enum RunOutcome {
 /// time). Then commits via [`commit_apply_run`]. A generator error or an
 /// apply-time rejection transitions the run to `Failed` in its own short
 /// follow-up transaction (see the module doc).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_once<G, Fut>(
     state_db: &StateDb,
     window: RunWindow,
@@ -603,11 +620,12 @@ pub async fn run_once<G, Fut>(
     lease_ms: i64,
     renew_interval_ms: i64,
     now_ms: i64,
+    build_id: &str,
     generate: G,
 ) -> Result<RunOutcome, RunnerError>
 where
     G: FnOnce(ConsolidationWindow) -> Fut,
-    Fut: Future<Output = Result<Vec<GeneratedOp>, String>>,
+    Fut: Future<Output = Result<Vec<GeneratedOp>, ClassifiedFailure>>,
 {
     let observations = load_window(state_db, &window).await?;
     let consolidation_window = ConsolidationWindow {
@@ -659,9 +677,9 @@ where
 
     let ops = match generated {
         Ok(ops) => ops,
-        Err(generator_error) => {
-            mark_failed(state_db, &window.run_id, now_ms).await?;
-            return Ok(RunOutcome::Failed(generator_error));
+        Err(failure) => {
+            mark_failed(state_db, &window.run_id, &failure, build_id, now_ms).await?;
+            return Ok(RunOutcome::Failed(failure.reason));
         }
     };
 
@@ -677,8 +695,21 @@ where
     {
         Ok(report) => Ok(RunOutcome::Applied(report)),
         Err(rejected) => {
-            mark_failed(state_db, &window.run_id, now_ms).await?;
-            Ok(RunOutcome::Failed(rejected.to_string()))
+            // Apply-time rejections (a stale lease fencing race, an
+            // op-engine precondition) are classified `Transient` by default
+            // (D-050): unlike a router/parse failure, none of the three
+            // `RunnerApplyError` variants reproduce deterministically from
+            // the *same* input on a *same-code* retry the way a schema/parse
+            // defect does — `Superseded` and an optimistic-conflict-shaped
+            // `Materialization` are inherently timing-dependent, and even
+            // the more code-looking ones are rare enough in practice (0 of
+            // the live retry-storm incidents that motivated this task went
+            // through this path) that a fingerprint-gated dead-letter is not
+            // yet justified here — a future deviation can split
+            // `RunnerApplyError` per-variant if that changes.
+            let failure = ClassifiedFailure::transient(rejected.to_string());
+            mark_failed(state_db, &window.run_id, &failure, build_id, now_ms).await?;
+            Ok(RunOutcome::Failed(failure.reason))
         }
     }
 }

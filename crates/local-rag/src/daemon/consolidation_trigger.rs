@@ -62,9 +62,9 @@ use std::time::Duration;
 use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    ConsolidationWindow, GeneratedOp, ImportError, RequestRoot, RunOutcome, SnapshotOutcome,
-    StateDb, WriteError, import_session_tail, known_spool_sessions, open_next_run, pending_backlog,
-    run_once, sessions_with_pending_backlog,
+    ClassifiedFailure, ConsolidationWindow, GeneratedOp, ImportError, RequestRoot, RunOutcome,
+    SnapshotOutcome, StateDb, WriteError, import_session_tail, known_spool_sessions, open_next_run,
+    pending_backlog, run_once, sessions_with_pending_backlog,
 };
 use tokio::sync::oneshot;
 
@@ -125,6 +125,7 @@ pub enum SessionTickOutcome {
 /// separately from the `SessionTickOutcome` vector this function returns
 /// (which D-046 already logs), so a run stuck failing here kept retrying
 /// silently on every tick, forever, even after D-046 landed.
+#[allow(clippy::too_many_arguments)]
 pub async fn consolidation_trigger_tick<G, Fut>(
     db: &StateDb,
     layout: &StoreLayout,
@@ -132,11 +133,12 @@ pub async fn consolidation_trigger_tick<G, Fut>(
     jobs: &JobRegistry,
     params: &ConsolidationTriggerParams,
     now_ms: i64,
+    build_id: &str,
     generate: &G,
 ) -> Vec<(String, SessionTickOutcome)>
 where
     G: Fn(ConsolidationWindow) -> Fut,
-    Fut: Future<Output = Result<Vec<GeneratedOp>, String>>,
+    Fut: Future<Output = Result<Vec<GeneratedOp>, ClassifiedFailure>>,
 {
     log_resume_sweep(
         resume_stale_consolidation_runs(
@@ -145,6 +147,7 @@ where
             params.lease_ms,
             params.renew_interval_ms,
             now_ms,
+            build_id,
             generate,
         )
         .await,
@@ -218,6 +221,7 @@ where
                     params.lease_ms,
                     params.renew_interval_ms,
                     now_ms,
+                    build_id,
                     generate,
                 )
                 .await
@@ -249,11 +253,12 @@ pub async fn run_consolidation_trigger<G, Fut>(
     jobs: JobRegistry,
     params: ConsolidationTriggerParams,
     poll_interval: Duration,
+    build_id: &'static str,
     generate: G,
     mut stop: oneshot::Receiver<()>,
 ) where
     G: Fn(ConsolidationWindow) -> Fut,
-    Fut: Future<Output = Result<Vec<GeneratedOp>, String>>,
+    Fut: Future<Output = Result<Vec<GeneratedOp>, ClassifiedFailure>>,
 {
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -262,7 +267,7 @@ pub async fn run_consolidation_trigger<G, Fut>(
             _ = &mut stop => return,
             _ = ticker.tick() => {
                 let now_ms = system_now_ms();
-                let results = consolidation_trigger_tick(&db, &layout, &*uuids, &jobs, &params, now_ms, &generate).await;
+                let results = consolidation_trigger_tick(&db, &layout, &*uuids, &jobs, &params, now_ms, build_id, &generate).await;
                 log_session_tick_outcomes(&results);
             }
         }
@@ -423,6 +428,7 @@ mod tests {
             &jobs,
             &default_params(),
             1_000,
+            "build-test",
             &|_window| async { Ok(noop_ops()) },
         )
         .await;
@@ -464,6 +470,7 @@ mod tests {
             &jobs,
             &params,
             1_000,
+            "build-test",
             &|_window| async { Ok(noop_ops()) },
         )
         .await;
@@ -496,6 +503,7 @@ mod tests {
             &jobs,
             &params,
             1_000,
+            "build-test",
             &|_window| async { Ok(noop_ops()) },
         )
         .await;
@@ -523,7 +531,8 @@ mod tests {
             &jobs,
             &default_params(),
             1_000,
-            &|_window| async { Err("router refused".to_string()) },
+            "build-test",
+            &|_window| async { Err(ClassifiedFailure::transient("router refused")) },
         )
         .await;
 
@@ -576,6 +585,7 @@ mod tests {
             &jobs,
             &default_params(),
             1_000,
+            "build-test",
             &|_window| async { Ok(noop_ops()) },
         )
         .await;
@@ -642,6 +652,7 @@ mod tests {
             &jobs,
             &default_params(),
             1_000,
+            "build-test",
             &|_window| async { Ok(noop_ops()) },
         )
         .await;
@@ -714,6 +725,7 @@ mod tests {
             &jobs,
             &params,
             1_000,
+            "build-test",
             &|_window| async { Ok(noop_ops()) },
         )
         .await;
@@ -755,6 +767,7 @@ mod tests {
             &jobs,
             &default_params(),
             1_000,
+            "build-test",
             &|_window| async { Ok(noop_ops()) },
         )
         .await;
@@ -798,6 +811,7 @@ mod tests {
             jobs,
             default_params(),
             Duration::from_millis(5),
+            "build-test",
             |_window: ConsolidationWindow| async { Ok(noop_ops()) },
             stop_rx,
         ));
@@ -855,6 +869,7 @@ mod tests {
             jobs,
             default_params(),
             Duration::from_millis(1),
+            "build-test",
             move |_window: ConsolidationWindow| {
                 let started_tx = Arc::clone(&started_tx);
                 let unblock_rx = Arc::clone(&unblock_rx);
@@ -929,7 +944,8 @@ mod tests {
             &jobs,
             &params,
             1_000,
-            &|_window| async { Err("router refused".to_string()) },
+            "build-test",
+            &|_window| async { Err(ClassifiedFailure::transient("router refused")) },
         )
         .await;
         assert_eq!(results.len(), 2, "{results:?}");
@@ -1021,7 +1037,12 @@ mod tests {
             &jobs,
             &default_params(),
             1_000,
-            &|_window| async { Err("no generation provider configured".to_string()) },
+            "build-test",
+            &|_window| async {
+                Err(ClassifiedFailure::transient(
+                    "no generation provider configured",
+                ))
+            },
         )
         .await;
         drop(guard);

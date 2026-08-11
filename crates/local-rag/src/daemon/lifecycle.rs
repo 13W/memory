@@ -620,8 +620,16 @@ async fn spawn_consolidation_resume(
     let generate =
         |window| local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window);
     log_resume_sweep(
-        resume_stale_consolidation_runs(&db, &jobs, lease_ms, renew_interval_ms, now_ms, generate)
-            .await,
+        resume_stale_consolidation_runs(
+            &db,
+            &jobs,
+            lease_ms,
+            renew_interval_ms,
+            now_ms,
+            local_rag_core::BUILD_ID,
+            generate,
+        )
+        .await,
     );
 }
 
@@ -679,6 +687,7 @@ async fn spawn_consolidation_trigger(
         jobs,
         params,
         poll_interval,
+        local_rag_core::BUILD_ID,
         generate,
         stop,
     )

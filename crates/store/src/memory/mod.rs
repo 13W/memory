@@ -106,11 +106,13 @@ pub use candidate::{
     pending_candidate_ages, transition_candidate,
 };
 pub use consolidation::{
-    IllegalRunTransition, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, NewConsolidationRun,
-    RenewError, RunState, RunTransitionError, RunWindow, SnapshotOutcome, StaleRun, acquire_lease,
-    consolidation_run_state, create_consolidation_run, lease_expired, open_next_run,
-    pending_backlog, processing_cursor, renew_lease, retry_run, sessions_with_pending_backlog,
-    stale_runs, transition_run, upsert_processing_cursor,
+    ClassifiedFailure, FailureKind, IllegalRunTransition, LEASE_DURATION_MS,
+    LEASE_RENEW_INTERVAL_MS, NewConsolidationRun, RenewError, RunState, RunTransitionError,
+    RunWindow, SnapshotOutcome, StaleRun, TRANSIENT_BACKOFF_BASE_MS, TRANSIENT_BACKOFF_CAP_MS,
+    acquire_lease, consolidation_run_state, create_consolidation_run, lease_expired, open_next_run,
+    pending_backlog, processing_cursor, record_run_failure, renew_lease, retry_run,
+    sessions_with_pending_backlog, stale_runs, transient_backoff_delay_ms, transition_run,
+    upsert_processing_cursor,
 };
 pub(crate) use entry::all_memory_entry_ids;
 pub use entry::{
@@ -233,6 +235,32 @@ CREATE TABLE audit_event (
   created_at       INTEGER NOT NULL,
   UNIQUE (entity_kind, entity_id, entity_version)
 );
+";
+
+/// Version-11 migration DDL (D-050): five nullable, unbackfilled columns on
+/// `consolidation_run` for the mechanical/transient retry-storm circuit
+/// breaker (`super::consolidation::{FailureKind, record_run_failure,
+/// stale_runs}`) — a `failed` run's last classified failure (kind/reason),
+/// the build fingerprint that produced a `Mechanical` one (so a rebuild gets
+/// exactly one more attempt before going quiet again), how many times it has
+/// been retried, and when a `Transient` one becomes eligible again
+/// (exponential backoff). No backfill (mirrors `observation::SCHEMA_V8`'s
+/// `redaction_version` precedent): every pre-migration `failed` row simply
+/// has all five `NULL`/`0`, which `stale_runs` already treats as "never
+/// classified, always retry-eligible" — the safe default, not a special
+/// case. Referenced by [`crate::migrate::ALL`] as migration version 11.
+///
+/// **Frozen once shipped.** Like the earlier `SCHEMA_V*` constants, the
+/// checksum is the SHA-256 of this text; any edit trips
+/// [`ChecksumDrift`](crate::migrate::MigrationError::ChecksumDrift) on an
+/// existing store. Future schema changes are new numbered migrations.
+pub(crate) const SCHEMA_V11: &str = "\
+ALTER TABLE consolidation_run ADD COLUMN last_failure_kind TEXT
+  CHECK (last_failure_kind IN ('mechanical','transient'));
+ALTER TABLE consolidation_run ADD COLUMN last_failure_reason TEXT;
+ALTER TABLE consolidation_run ADD COLUMN last_failure_fingerprint TEXT;
+ALTER TABLE consolidation_run ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE consolidation_run ADD COLUMN next_retry_at INTEGER;
 ";
 
 /// The global singleton `memory_entry.scope_owner_id` for `scope_kind='global'`

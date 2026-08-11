@@ -144,7 +144,7 @@ pub async fn run(options: &Options) -> Result<MemoryBenchReport, String> {
                     expected: case.expected.op_kinds.clone(),
                     predicted: Vec::new(),
                     correct: false,
-                    error: Some(e),
+                    error: Some(e.reason),
                 },
                 CaseTally {
                     true_positive: 0,

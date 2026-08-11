@@ -16,8 +16,8 @@ use std::sync::Arc;
 use local_rag_core::paths::StoreLayout;
 use local_rag_embed::{GeneratorEntry, GeneratorPool};
 use local_rag_store::{
-    RunOutcome, RunTransitionError, RunWindow, RunnerError, StaleRun, StateDb, WriteError,
-    retry_run, run_once, stale_runs,
+    ClassifiedFailure, RunOutcome, RunTransitionError, RunWindow, RunnerError, StaleRun, StateDb,
+    WriteError, retry_run, run_once, stale_runs,
 };
 
 use super::super::jobs::{JobKind, JobRegistry};
@@ -127,21 +127,23 @@ pub fn log_resume_sweep(sweep: Result<Vec<(String, ResumeOutcome)>, Consolidatio
 /// value serves every run in the sweep (mirrors `run_once`'s own
 /// `FnOnce(ConsolidationWindow) -> Fut` shape: `&G` also satisfies
 /// `FnOnce` for any `G: Fn`).
+#[allow(clippy::too_many_arguments)]
 pub async fn resume_stale_consolidation_runs<G, Fut>(
     db: &StateDb,
     jobs: &JobRegistry,
     lease_ms: i64,
     renew_interval_ms: i64,
     now_ms: i64,
+    build_id: &str,
     generate: G,
 ) -> Result<Vec<(String, ResumeOutcome)>, ConsolidationResumeError>
 where
     G: Fn(local_rag_store::ConsolidationWindow) -> Fut,
-    Fut: Future<Output = Result<Vec<local_rag_store::GeneratedOp>, String>>,
+    Fut: Future<Output = Result<Vec<local_rag_store::GeneratedOp>, ClassifiedFailure>>,
 {
     let stale: Vec<StaleRun> = {
         let conn = db.open_read().map_err(ConsolidationResumeError::Open)?;
-        stale_runs(&conn, now_ms).map_err(ConsolidationResumeError::Sqlite)?
+        stale_runs(&conn, now_ms, build_id).map_err(ConsolidationResumeError::Sqlite)?
     };
 
     let mut results = Vec::with_capacity(stale.len());
@@ -175,6 +177,7 @@ where
                     lease_ms,
                     renew_interval_ms,
                     now_ms,
+                    build_id,
                     &generate,
                 )
                 .await;
@@ -285,6 +288,7 @@ mod tests {
             LEASE_DURATION_MS,
             LEASE_RENEW_INTERVAL_MS,
             5_000,
+            "build-test",
             |_window| async { Ok(noop_ops()) },
         )
         .await
@@ -305,6 +309,7 @@ mod tests {
             LEASE_DURATION_MS,
             LEASE_RENEW_INTERVAL_MS,
             5_000,
+            "build-test",
             |_window| async { Ok(noop_ops()) },
         )
         .await
@@ -331,6 +336,7 @@ mod tests {
             LEASE_DURATION_MS,
             LEASE_RENEW_INTERVAL_MS,
             5_000,
+            "build-test",
             |_window| async { Ok(noop_ops()) },
         )
         .await
@@ -355,7 +361,8 @@ mod tests {
             LEASE_DURATION_MS,
             LEASE_RENEW_INTERVAL_MS,
             5_000,
-            |_window| async { Err("router refused".to_string()) },
+            "build-test",
+            |_window| async { Err(ClassifiedFailure::transient("router refused")) },
         )
         .await
         .expect("resume must not hard-fail on a generator rejection");
@@ -399,10 +406,83 @@ mod tests {
             LEASE_DURATION_MS,
             LEASE_RENEW_INTERVAL_MS,
             5_000,
+            "build-test",
             |_window| async { Ok(noop_ops()) },
         )
         .await
         .expect("resume");
         assert!(results.is_empty());
+    }
+
+    /// D-050: the actual retry-storm bug this task fixes. Before this task,
+    /// `daemon::consolidation_trigger_tick` called this exact function every
+    /// 15s, forever, with no attempt counter or dead-letter — a
+    /// deterministically-failing generator (the live incident: `missing
+    /// field confidence_signal`, `trailing characters`, `EOF while parsing a
+    /// string`, all byte-for-byte identical on every retry) burned a real
+    /// local-model inference call on every single tick, hours on end, across
+    /// a daemon restart. This proves the fix: a `Mechanical` failure is
+    /// retried exactly once per build — the sweep that classifies it — never
+    /// again on the same `build_id`, no matter how many more sweeps run;
+    /// only a rebuild (a new `build_id`) earns it one more attempt.
+    #[tokio::test]
+    async fn a_mechanical_failure_is_retried_once_then_dead_lettered_until_the_build_changes() {
+        let (_home, _layout, db) = open_state();
+        let jobs = JobRegistry::new();
+        seed_failed_run(&db, "run-broken", "sess-1").await;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let generate = {
+            let calls = std::sync::Arc::clone(&calls);
+            move |_window| {
+                let calls = std::sync::Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(local_rag_store::ClassifiedFailure::mechanical(
+                        "missing field confidence_signal",
+                    ))
+                }
+            }
+        };
+
+        // Three sweeps on the same build: the first one classifies the run
+        // Mechanical and burns the one real attempt; the next two must find
+        // it dead-lettered and never call the generator again.
+        for _ in 0..3 {
+            resume_stale_consolidation_runs(
+                &db,
+                &jobs,
+                LEASE_DURATION_MS,
+                LEASE_RENEW_INTERVAL_MS,
+                5_000,
+                "build-1",
+                &generate,
+            )
+            .await
+            .expect("resume");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "retry-storm: a mechanical failure must not be re-invoked every sweep on the same build"
+        );
+
+        // A rebuild (new build_id) earns it exactly one more attempt.
+        resume_stale_consolidation_runs(
+            &db,
+            &jobs,
+            LEASE_DURATION_MS,
+            LEASE_RENEW_INTERVAL_MS,
+            5_000,
+            "build-2",
+            &generate,
+        )
+        .await
+        .expect("resume");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a rebuild gets exactly one more attempt, not a fresh unlimited retry budget"
+        );
     }
 }

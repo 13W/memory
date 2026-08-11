@@ -556,6 +556,158 @@ pub fn retry_run(
     }
 }
 
+/// `consolidation_run.last_failure_kind` (D-050's retry-storm circuit
+/// breaker): whether a `failed` run's most recent failure is expected to
+/// reproduce **identically** on an unchanged rebuild (`Mechanical` — a
+/// router/schema/prompt code defect, or a fixed generation token budget too
+/// small for this window's content; retrying with the same code changes
+/// nothing) or might resolve on its own by simply waiting (`Transient` — the
+/// generator/model unavailable, an infra error, a concurrent-write race).
+/// [`stale_runs`] uses this to stop retrying a `Mechanical` failure every
+/// tick forever — dead-lettered until the build fingerprint changes — while
+/// still backing off-and-retrying a `Transient` one on a timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Mechanical,
+    Transient,
+}
+
+impl FailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureKind::Mechanical => "mechanical",
+            FailureKind::Transient => "transient",
+        }
+    }
+
+    /// Parse a stored value; `None` for anything the CHECK constraint
+    /// forbids (or a pre-D-050 row that predates this column, `NULL`).
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "mechanical" => Some(FailureKind::Mechanical),
+            "transient" => Some(FailureKind::Transient),
+            _ => None,
+        }
+    }
+}
+
+/// A `generate`-closure failure, classified for [`record_run_failure`]'s
+/// retry-storm bookkeeping (D-050) — [`crate::memory::runner::run_once`]'s
+/// generic `Fut::Output` error type. The actual router
+/// (`local_rag_memory::router::route`) constructs one at each of its own
+/// failure points; this crate only constructs one itself for the
+/// apply-time-rejection default (see `run_once`'s own module doc).
+#[derive(Debug, Clone)]
+pub struct ClassifiedFailure {
+    pub kind: FailureKind,
+    pub reason: String,
+}
+
+impl ClassifiedFailure {
+    pub fn mechanical(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Mechanical,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn transient(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Transient,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ClassifiedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for ClassifiedFailure {}
+
+/// D-050's transient-failure backoff table — the same shape (250ms base,
+/// doubling, capped) `local-rag-proxy::connect::DEFAULT_BACKOFF` already
+/// established for "wait, then retry a call that might just be temporarily
+/// down" (a daemon binary never depends on the proxy binary, so this is the
+/// same well-tested progression reproduced at this call site, not shared
+/// code across that boundary).
+pub const TRANSIENT_BACKOFF_BASE_MS: i64 = 250;
+pub const TRANSIENT_BACKOFF_CAP_MS: i64 = 4_000;
+
+/// `attempt_count` (1-based: the first recorded failure is attempt 1) to a
+/// backoff delay in ms: `0` for the first attempt (most transient failures
+/// are momentary — retry promptly), then [`TRANSIENT_BACKOFF_BASE_MS`]
+/// doubling, capped at [`TRANSIENT_BACKOFF_CAP_MS`].
+pub fn transient_backoff_delay_ms(attempt_count: i64) -> i64 {
+    if attempt_count <= 1 {
+        return 0;
+    }
+    let exponent = (attempt_count - 2).clamp(0, 62) as u32;
+    TRANSIENT_BACKOFF_BASE_MS
+        .saturating_mul(1_i64 << exponent)
+        .min(TRANSIENT_BACKOFF_CAP_MS)
+}
+
+/// Transition `run_id` to `Failed` (spec 04 §4: "router/LLM error ⇒ failed
+/// (retryable)") and record D-050's retry-storm circuit-breaker bookkeeping
+/// in the same write: `last_failure_kind`/`last_failure_reason`, the build
+/// fingerprint that produced a `Mechanical` failure (`current_fingerprint`
+/// is ignored for `Transient` — fingerprint-gating never applies to it,
+/// [`stale_runs`] always stores `NULL`), the bumped `attempt_count`, and —
+/// `Transient` only — `next_retry_at` computed from the new attempt count
+/// via [`transient_backoff_delay_ms`]. `Mechanical`'s `next_retry_at` is
+/// always `NULL`: it is gated by [`stale_runs`]'s fingerprint comparison,
+/// not by time — a `Mechanical` failure that would still fail identically
+/// in 4 seconds would still fail identically in 4 years, on the same build.
+///
+/// Mirrors [`transition_run`]'s own "silently left alone, not an error"
+/// contract for a rejected transition (a racing attempt already moved the
+/// row elsewhere) — the bookkeeping columns are only written when the
+/// transition itself actually lands; a run some other attempt already
+/// carried to `applied` must never be overwritten with stale failure info.
+pub fn record_run_failure(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    kind: FailureKind,
+    reason: &str,
+    current_fingerprint: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<Result<(), RunTransitionError>> {
+    if let Err(e) = transition_run(tx, run_id, RunState::Failed, now_ms)? {
+        return Ok(Err(e));
+    }
+    let prior_attempts: i64 = tx.query_row(
+        "SELECT attempt_count FROM consolidation_run WHERE run_id = ?1",
+        params![run_id],
+        |r| r.get(0),
+    )?;
+    let attempt_count = prior_attempts + 1;
+    let (fingerprint, next_retry_at) = match kind {
+        FailureKind::Mechanical => (current_fingerprint, None),
+        FailureKind::Transient => (
+            None,
+            Some(now_ms + transient_backoff_delay_ms(attempt_count)),
+        ),
+    };
+    tx.execute(
+        "UPDATE consolidation_run SET \
+           last_failure_kind = ?2, last_failure_reason = ?3, last_failure_fingerprint = ?4, \
+           attempt_count = ?5, next_retry_at = ?6 \
+         WHERE run_id = ?1",
+        params![
+            run_id,
+            kind.as_str(),
+            reason,
+            fingerprint,
+            attempt_count,
+            next_retry_at
+        ],
+    )?;
+    Ok(Ok(()))
+}
+
 /// One run eligible for a retry sweep (spec 04 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleRun {
@@ -573,7 +725,27 @@ pub struct StaleRun {
 }
 
 /// Every run eligible for a startup/checkpoint retry: `failed` (spec 04 §4's
-/// own "(retryable)" label), or `running` with an expired lease.
+/// own "(retryable)" label), or `running` with an expired lease — **minus**
+/// D-050's retry-storm circuit breaker's two exclusions:
+///
+/// - A `failed` row whose last failure was [`FailureKind::Mechanical`] **and**
+///   whose `last_failure_fingerprint` matches `current_build_id` is
+///   dead-lettered: retrying it would re-run the exact same code against the
+///   exact same window and reproduce the exact same failure (already proven —
+///   that is what `Mechanical` means). It becomes eligible again the moment
+///   `current_build_id` changes (a rebuild), for exactly one more attempt.
+/// - A `failed` row still short of its `next_retry_at` (set only for
+///   [`FailureKind::Transient`] — [`record_run_failure`]'s exponential
+///   backoff) is skipped until that deadline passes.
+///
+/// A row with `last_failure_kind IS NULL` (a pre-D-050 row this migration
+/// left un-backfilled, or a `failed` row from a version-9-vintage code path
+/// that never called [`record_run_failure`]) matches neither exclusion — the
+/// safe default is "never classified, always retry-eligible," not a special
+/// case. `current_build_id` is assumed non-empty (`local_rag_core::BUILD_ID`
+/// always is — real `git describe` output or the literal fallback
+/// `"unknown"`), which is what makes `COALESCE(last_failure_fingerprint, '')`
+/// a safe "never accidentally matches" sentinel for a `NULL` fingerprint.
 ///
 /// As-built decision (T14-06, `[SPEC]`): the runner (`crate::memory::runner`)
 /// routes *any* apply-time rejection straight to `failed` rather than leaving
@@ -582,16 +754,27 @@ pub struct StaleRun {
 /// deterministically reproducing the same rejection for up to
 /// [`LEASE_DURATION_MS`]. Consequently this sweep must select both cases, not
 /// lease-expiry alone, or a `failed` run would never be picked back up.
-pub fn stale_runs(conn: &Connection, now_ms: i64) -> rusqlite::Result<Vec<StaleRun>> {
+pub fn stale_runs(
+    conn: &Connection,
+    now_ms: i64,
+    current_build_id: &str,
+) -> rusqlite::Result<Vec<StaleRun>> {
     let mut stmt = conn.prepare(
         "SELECT run_id, session_id, state, lease_until, from_received_seq, to_received_seq \
          FROM consolidation_run \
-         WHERE state = 'failed' \
-            OR (state = 'running' AND (lease_until IS NULL OR lease_until <= ?1)) \
+         WHERE (state = 'running' AND (lease_until IS NULL OR lease_until <= ?1)) \
+            OR ( \
+                 state = 'failed' \
+                 AND NOT ( \
+                       COALESCE(last_failure_kind, '') = 'mechanical' \
+                       AND COALESCE(last_failure_fingerprint, '') = ?2 \
+                     ) \
+                 AND (next_retry_at IS NULL OR next_retry_at <= ?1) \
+               ) \
          ORDER BY created_at",
     )?;
     let rows = stmt
-        .query_map(params![now_ms], |r| {
+        .query_map(params![now_ms, current_build_id], |r| {
             let run_id: String = r.get(0)?;
             let session_id: String = r.get(1)?;
             let raw_state: String = r.get(2)?;
@@ -981,7 +1164,7 @@ mod tests {
             .expect("seed runs");
 
         let read = db.open_read().expect("read conn");
-        let stale = stale_runs(&read, 5_000).expect("stale runs");
+        let stale = stale_runs(&read, 5_000, "build-x").expect("stale runs");
         let mut ids: Vec<String> = stale.iter().map(|r| r.run_id.clone()).collect();
         ids.sort();
         assert_eq!(
@@ -1104,5 +1287,351 @@ mod tests {
                 .expect("enumerate")
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-050: retry-storm circuit breaker
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn failure_kind_round_trips() {
+        for kind in [FailureKind::Mechanical, FailureKind::Transient] {
+            assert_eq!(FailureKind::from_db(kind.as_str()), Some(kind));
+        }
+        assert_eq!(FailureKind::from_db("bogus"), None);
+        assert_eq!(
+            FailureKind::from_db("bogus"),
+            None,
+            "a pre-D-050 NULL row's absence must parse as None, not panic"
+        );
+    }
+
+    #[test]
+    fn transient_backoff_doubles_from_the_base_and_caps() {
+        assert_eq!(transient_backoff_delay_ms(0), 0, "no negative attempt");
+        assert_eq!(
+            transient_backoff_delay_ms(1),
+            0,
+            "first attempt: retry promptly"
+        );
+        assert_eq!(transient_backoff_delay_ms(2), 250);
+        assert_eq!(transient_backoff_delay_ms(3), 500);
+        assert_eq!(transient_backoff_delay_ms(4), 1_000);
+        assert_eq!(transient_backoff_delay_ms(5), 2_000);
+        assert_eq!(transient_backoff_delay_ms(6), 4_000);
+        assert_eq!(transient_backoff_delay_ms(7), 4_000, "capped");
+        assert_eq!(
+            transient_backoff_delay_ms(1_000),
+            4_000,
+            "still capped, no overflow"
+        );
+    }
+
+    async fn seed_running_run(db: &crate::StateDb, run_id: &str, session_id: &str, now_ms: i64) {
+        db.writer()
+            .transaction({
+                let run_id = run_id.to_string();
+                let session_id = session_id.to_string();
+                move |tx| {
+                    create_consolidation_run(
+                        tx,
+                        &NewConsolidationRun {
+                            run_id: &run_id,
+                            session_id: &session_id,
+                            from_received_seq: 1,
+                            to_received_seq: 5,
+                            router_version: "v1",
+                        },
+                        now_ms,
+                    )?;
+                    transition_run(tx, &run_id, RunState::Running, now_ms)?.expect("legal");
+                    acquire_lease(tx, &run_id, now_ms + LEASE_DURATION_MS)?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("seed running run");
+    }
+
+    #[tokio::test]
+    async fn record_run_failure_writes_mechanical_bookkeeping_with_no_backoff() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-1", "sess-1", 1_000).await;
+
+        db.writer()
+            .transaction(|tx| {
+                record_run_failure(
+                    tx,
+                    "run-1",
+                    FailureKind::Mechanical,
+                    "missing field confidence_signal",
+                    Some("build-abc"),
+                    5_000,
+                )
+            })
+            .await
+            .expect("record tx")
+            .expect("legal running -> failed");
+
+        let read = db.open_read().expect("read conn");
+        let row: (String, String, String, Option<String>, i64, Option<i64>) = read
+            .query_row(
+                "SELECT state, last_failure_kind, last_failure_reason, last_failure_fingerprint, \
+                        attempt_count, next_retry_at \
+                 FROM consolidation_run WHERE run_id = 'run-1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .expect("read bookkeeping");
+        assert_eq!(row.0, "failed");
+        assert_eq!(row.1, "mechanical");
+        assert_eq!(row.2, "missing field confidence_signal");
+        assert_eq!(row.3, Some("build-abc".to_string()));
+        assert_eq!(row.4, 1, "first recorded failure");
+        assert_eq!(
+            row.5, None,
+            "mechanical is gated by fingerprint, never by time"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_run_failure_writes_transient_backoff_with_no_fingerprint() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-1", "sess-1", 1_000).await;
+
+        db.writer()
+            .transaction(|tx| {
+                record_run_failure(
+                    tx,
+                    "run-1",
+                    FailureKind::Transient,
+                    "no generation provider configured",
+                    Some("build-abc"),
+                    5_000,
+                )
+            })
+            .await
+            .expect("record tx")
+            .expect("legal running -> failed");
+
+        let read = db.open_read().expect("read conn");
+        let row: (String, Option<String>, i64, Option<i64>) = read
+            .query_row(
+                "SELECT last_failure_kind, last_failure_fingerprint, attempt_count, next_retry_at \
+                 FROM consolidation_run WHERE run_id = 'run-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("read bookkeeping");
+        assert_eq!(row.0, "transient");
+        assert_eq!(
+            row.1, None,
+            "transient never stores a fingerprint, even if the caller passed one"
+        );
+        assert_eq!(row.2, 1);
+        assert_eq!(
+            row.3,
+            Some(5_000 + transient_backoff_delay_ms(1)),
+            "next_retry_at = now + backoff(attempt_count)"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_run_failure_increments_attempt_count_across_retries() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-1", "sess-1", 1_000).await;
+
+        for (attempt, now_ms) in [(1, 5_000), (2, 6_000), (3, 7_000)] {
+            db.writer()
+                .transaction(move |tx| {
+                    // failed -> running (retry_run's own edge) before each
+                    // subsequent failure, mirroring the runner's real cycle.
+                    if attempt > 1 {
+                        retry_run(tx, "run-1", LEASE_DURATION_MS, now_ms - 500)?.expect("legal");
+                    }
+                    record_run_failure(
+                        tx,
+                        "run-1",
+                        FailureKind::Transient,
+                        "transient",
+                        None,
+                        now_ms,
+                    )
+                })
+                .await
+                .expect("record tx")
+                .expect("legal");
+
+            let read = db.open_read().expect("read conn");
+            let count: i64 = read
+                .query_row(
+                    "SELECT attempt_count FROM consolidation_run WHERE run_id = 'run-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("read attempt_count");
+            assert_eq!(count, attempt, "attempt {attempt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn record_run_failure_leaves_an_already_applied_run_untouched() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-1", "sess-1", 1_000).await;
+        db.writer()
+            .transaction(|tx| transition_run(tx, "run-1", RunState::Applied, 2_000))
+            .await
+            .expect("transition tx")
+            .expect("running -> applied is legal");
+
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                record_run_failure(tx, "run-1", FailureKind::Mechanical, "late", None, 5_000)
+            })
+            .await
+            .expect("record tx");
+        assert!(
+            matches!(
+                outcome,
+                Err(RunTransitionError::Illegal(IllegalRunTransition {
+                    from: RunState::Applied,
+                    to: RunState::Failed,
+                }))
+            ),
+            "a racing applied run must not be overwritten with stale failure info: {outcome:?}"
+        );
+
+        let read = db.open_read().expect("read conn");
+        let state: String = read
+            .query_row(
+                "SELECT state FROM consolidation_run WHERE run_id = 'run-1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read state");
+        assert_eq!(state, "applied", "the applied row was never touched");
+    }
+
+    /// The actual bug this whole task fixes: a `Mechanical` failure on the
+    /// current build is retried exactly once (the attempt that classified it
+    /// as `Mechanical` in the first place), then never again — no matter how
+    /// many sweeps run — until the build fingerprint changes.
+    #[tokio::test]
+    async fn stale_runs_excludes_a_mechanical_failure_on_the_current_build_only() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-mech", "sess-1", 1_000).await;
+        db.writer()
+            .transaction(|tx| {
+                record_run_failure(
+                    tx,
+                    "run-mech",
+                    FailureKind::Mechanical,
+                    "missing field confidence_signal",
+                    Some("build-1"),
+                    2_000,
+                )
+            })
+            .await
+            .expect("record tx")
+            .expect("legal");
+
+        let read = db.open_read().expect("read conn");
+        let stale_same_build = stale_runs(&read, 100_000, "build-1").expect("stale runs");
+        assert!(
+            stale_same_build.is_empty(),
+            "dead-lettered: same build, same fingerprint, no matter how much time passes"
+        );
+
+        let stale_new_build = stale_runs(&read, 100_000, "build-2").expect("stale runs");
+        assert_eq!(
+            stale_new_build.len(),
+            1,
+            "a rebuild gets exactly one more attempt"
+        );
+        assert_eq!(stale_new_build[0].run_id, "run-mech");
+    }
+
+    #[tokio::test]
+    async fn stale_runs_gates_a_transient_failure_on_next_retry_at_not_the_fingerprint() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-trans", "sess-1", 1_000).await;
+        db.writer()
+            .transaction(|tx| {
+                record_run_failure(
+                    tx,
+                    "run-trans",
+                    FailureKind::Transient,
+                    "no generation provider configured",
+                    Some("build-1"),
+                    2_000,
+                )
+            })
+            .await
+            .expect("record tx")
+            .expect("legal");
+        // attempt_count is now 1, so next_retry_at = 2_000 + backoff(1) = 2_000 + 0 = 2_000.
+
+        let read = db.open_read().expect("read conn");
+        assert!(
+            stale_runs(&read, 1_999, "build-1")
+                .expect("stale runs")
+                .is_empty(),
+            "still before next_retry_at"
+        );
+        let ready = stale_runs(&read, 2_000, "build-1").expect("stale runs");
+        assert_eq!(ready.len(), 1, "at next_retry_at, eligible again");
+        assert_eq!(ready[0].run_id, "run-trans");
+
+        // Same build id does NOT dead-letter a transient failure — only
+        // mechanical failures are fingerprint-gated.
+        let still_ready = stale_runs(&read, 2_000, "build-1").expect("stale runs");
+        assert_eq!(still_ready.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_runs_treats_a_legacy_unclassified_failed_row_as_always_eligible() {
+        let (_home, db) = open_state();
+        // A `failed` row with none of D-050's columns ever written (as if it
+        // predates this migration, or failed via a code path that still only
+        // calls the plain `transition_run` — the safe default must not
+        // silently dead-letter it).
+        db.writer()
+            .transaction(|tx| {
+                create_consolidation_run(
+                    tx,
+                    &NewConsolidationRun {
+                        run_id: "run-legacy",
+                        session_id: "sess-1",
+                        from_received_seq: 1,
+                        to_received_seq: 5,
+                        router_version: "v1",
+                    },
+                    1_000,
+                )?;
+                transition_run(tx, "run-legacy", RunState::Running, 1_000)?.expect("legal");
+                transition_run(tx, "run-legacy", RunState::Failed, 1_500)?.expect("legal");
+                Ok(())
+            })
+            .await
+            .expect("seed legacy failed run");
+
+        let read = db.open_read().expect("read conn");
+        let stale = stale_runs(&read, 5_000, "any-build").expect("stale runs");
+        assert_eq!(
+            stale.len(),
+            1,
+            "NULL last_failure_kind is never classified as mechanical"
+        );
+        assert_eq!(stale[0].run_id, "run-legacy");
     }
 }

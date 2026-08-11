@@ -380,16 +380,16 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(name, "default", "default model space display_name");
         assert_eq!(state, "active", "default model space MUST be active");
 
-        // Recorded as exactly ten rows: (1,"registry"), (2,"worktree"),
+        // Recorded as exactly eleven rows: (1,"registry"), (2,"worktree"),
         // (3,"code"), (4,"projection"), (5,"worktree_state_clock"),
         // (6,"representation"), (7,"observation"),
         // (8,"observation_redaction_version"), (9,"memory"),
-        // (10,"managed_worktree").
+        // (10,"managed_worktree"), (11,"consolidation_run_failure_tracking").
         let rows = migration_rows(&read);
         assert_eq!(
             rows.len(),
-            10,
-            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9,v10] at T20-01"
+            11,
+            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11] at D-050"
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
@@ -411,6 +411,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[8].1, "memory");
         assert_eq!(rows[9].0, 10);
         assert_eq!(rows[9].1, "managed_worktree");
+        assert_eq!(rows[10].0, 11);
+        assert_eq!(rows[10].1, "consolidation_run_failure_tracking");
     }
     drop(db);
 
@@ -420,7 +422,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 10, "reopen adds no new migration rows");
+    assert_eq!(applied, 11, "reopen adds no new migration rows");
 }
 
 /// D-007: migration 5 adds `worktree.state_changed_at` and backfills every
@@ -599,6 +601,80 @@ async fn migration_10_adds_managed_worktree_to_an_existing_v9_store() {
     let rows = local_rag_store::registry::managed_worktrees(&read).expect("list");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].worktree_id, "wt-pre-v10");
+}
+
+/// D-050: migration 11 adds `consolidation_run`'s five failure-tracking
+/// columns with **no** backfill — mirrors migration 8's `redaction_version`
+/// precedent (`migration_8_adds_the_envelope_redaction_version_column_with_no_backfill`
+/// above): a pre-existing `failed` row simply has no classified failure yet,
+/// which `stale_runs` already treats as "never classified, always
+/// retry-eligible" — the safe default, not a special case needing a
+/// fabricated value.
+///
+/// Applied against a store first migrated to version 10 only, with a real
+/// `failed` `consolidation_run` row inserted using the pre-migration column
+/// list, so the assertion exercises "an existing stuck run survives the
+/// upgrade with the safe defaults", not merely "a fresh row can store a
+/// value".
+#[tokio::test]
+async fn migration_11_adds_consolidation_run_failure_tracking_columns_with_no_backfill() {
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+
+    // 1) Bring the store up to version 10 only, and seed a failed run using
+    // the pre-migration-11 column list (none of the five new columns exist
+    // yet at this point).
+    let up_to_v10: Vec<_> = local_rag_store::ALL
+        .iter()
+        .filter(|m| m.version <= 10)
+        .copied()
+        .collect();
+    {
+        let mut conn = rusqlite::Connection::open(layout.state_db()).expect("raw conn");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        let report =
+            run(&mut conn, &up_to_v10, &layout.migration_lock(), 1000).expect("migrate to v10");
+        assert_eq!(report.store_version, 10);
+
+        conn.execute(
+            "INSERT INTO consolidation_run \
+               (run_id, session_id, from_received_seq, to_received_seq, router_version, \
+                state, lease_until, created_at, updated_at) \
+             VALUES ('run-pre-v11', 'sess-1', 1, 20, 'v1', 'failed', NULL, 1000, 1000)",
+            [],
+        )
+        .expect("insert v10-shaped consolidation_run row");
+    }
+
+    // 2) Opening with the full production set applies migration 11.
+    let db = StateDb::open(layout.state_db()).expect("open applies v11");
+    let read = db.open_read().expect("read conn");
+
+    let (kind, reason, fingerprint, attempts, next_retry): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<i64>,
+    ) = read
+        .query_row(
+            "SELECT last_failure_kind, last_failure_reason, last_failure_fingerprint, \
+                    attempt_count, next_retry_at \
+             FROM consolidation_run WHERE run_id = 'run-pre-v11'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .expect("read new columns");
+    assert_eq!(
+        kind, None,
+        "a pre-existing failed row has no classified kind yet"
+    );
+    assert_eq!(reason, None);
+    assert_eq!(fingerprint, None);
+    assert_eq!(attempts, 0, "attempt_count defaults to 0, not fabricated");
+    assert_eq!(next_retry, None);
 }
 
 /// A version-4-shaped `worktree` INSERT: the column list migration 5 has not
