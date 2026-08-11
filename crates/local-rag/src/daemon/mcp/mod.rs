@@ -29,6 +29,7 @@ use serde_json::value::RawValue;
 use tokio::sync::watch;
 
 use super::handshake::RequestHandler;
+use super::indexing::SupervisorClient;
 use super::memory::MemoryContext;
 use super::mode::DaemonMode;
 
@@ -79,9 +80,17 @@ pub struct McpHandler {
     /// the same shared instance `HandshakeContext::telemetry` is recorded
     /// into; `dispatch`'s `admin/tail_calls`/`admin/tool_stats` read it.
     telemetry: super::telemetry::TelemetryState,
+    /// The daemon-managed indexing supervisor's shareable client (T20-06/
+    /// T20-07) — `None` exactly in `DaemonMode::MigrationOnly`, the same
+    /// condition under which `engine`/`memory` are also `None` (no usable
+    /// `state.sqlite` for the supervisor to read `managed_worktree` from
+    /// either). `dispatch`'s `admin/projects_list`/`admin/projects_reload`/
+    /// `admin/reconcile_now` read it.
+    indexing_supervisor: Option<SupervisorClient>,
 }
 
 impl McpHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Option<Arc<SearchEngine>>,
         memory: Option<Arc<MemoryContext>>,
@@ -89,6 +98,7 @@ impl McpHandler {
         now: fn() -> i64,
         tool_calls: super::tool_calls::ToolCallCounters,
         telemetry: super::telemetry::TelemetryState,
+        indexing_supervisor: Option<SupervisorClient>,
     ) -> Self {
         McpHandler {
             engine,
@@ -97,6 +107,7 @@ impl McpHandler {
             now,
             tool_calls,
             telemetry,
+            indexing_supervisor,
         }
     }
 }
@@ -112,6 +123,7 @@ impl RequestHandler for McpHandler {
             now_ms: (self.now)(),
             tool_calls: &self.tool_calls,
             telemetry: &self.telemetry,
+            indexing_supervisor: self.indexing_supervisor.as_ref(),
         };
         let response_text = dispatch::dispatch(mcp.get(), &dispatch_ctx).await?;
         Some(RawValue::from_string(response_text).expect("dispatch always produces valid JSON"))

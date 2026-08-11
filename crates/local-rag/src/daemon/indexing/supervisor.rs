@@ -29,13 +29,16 @@ use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::{Uuid, UuidSource};
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::classify::ClassifierConfig;
+use local_rag_index::reconcile::TriggerKind;
 use local_rag_store::{
     CacheDb, ManagedWorktree, RetentionParams, StateDb, WorktreeLockRegistry, managed_worktrees,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::worktree_task::{WorktreeTaskHandle, WorktreeTaskParams, spawn_worktree_task};
+use super::worktree_task::{
+    WorktreeTaskHandle, WorktreeTaskParams, WorktreeTaskStatus, spawn_worktree_task,
+};
 use crate::daemon::embedder_provider::LazyEmbedderProvider;
 use crate::daemon::jobs::JobRegistry;
 
@@ -105,29 +108,76 @@ impl SupervisorParams {
 /// inside [`spawn_supervisor`]) started/stopped — lets a caller (a test, or a
 /// future `admin/projects_reload`, T20-07) observe that a reload applied
 /// exactly the expected delta, not a guess derived from timing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ReloadOutcome {
     pub started: usize,
     pub stopped: usize,
 }
 
+/// One `managed_worktree` row (T20-01, durable) joined with its worktree
+/// task's live status (T20-05), if one is currently running — `admin/
+/// projects_list`'s (T20-07) own shape. `task` is `None` for a `disabled`
+/// row, or (transiently) for an `enabled` row whose task has not finished
+/// starting up yet; it is never fabricated to look like a healthy task that
+/// does not exist.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProjectStatus {
+    pub worktree_id: String,
+    pub enabled: bool,
+    pub registered_at: i64,
+    pub updated_at: i64,
+    pub task: Option<WorktreeTaskStatus>,
+}
+
+/// Why [`SupervisorClient::reconcile_now`] (`admin/reconcile_now`, T20-07)
+/// could not inject a trigger — today, the only reason: `worktree_id` names
+/// no row with a task currently running (never registered, registered but
+/// `enabled = 0`, or an `enabled` row whose task has not started yet). The
+/// registry and the live task set are deliberately not distinguished any
+/// further here — from a caller's perspective "reconcile a specific worktree
+/// right now" either works or it does not, and `dispatch.rs` maps this one
+/// variant to a single JSON-RPC `-32602`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileNowError {
+    NotManaged,
+}
+
+impl std::fmt::Display for ReconcileNowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReconcileNowError::NotManaged => {
+                write!(f, "worktree is not managed (or has no task running)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReconcileNowError {}
+
 enum Command {
     Reload(oneshot::Sender<ReloadOutcome>),
+    ListProjects(oneshot::Sender<Vec<ProjectStatus>>),
+    TriggerNow(String, oneshot::Sender<Result<(), ReconcileNowError>>),
     Shutdown(oneshot::Sender<()>),
 }
 
-/// A running indexing supervisor. [`SupervisorHandle::reload`] and
-/// [`SupervisorHandle::shutdown`] are the only two things a caller can do to
-/// it — the live task set itself is owned exclusively by the actor task
-/// [`spawn_supervisor`] spawns, never shared behind a lock, so there is no
-/// way for a caller to observe or mutate it except through those two calls.
-#[derive(Debug)]
-pub struct SupervisorHandle {
+/// A cheap, `Clone`-able handle over the supervisor's command channel —
+/// everything a caller can do to a running supervisor *except*
+/// [`SupervisorHandle::shutdown`], which stays exclusive to the single owner
+/// (`DaemonHandle`, T20-06). Derived via [`SupervisorHandle::client`] and
+/// shared with the MCP surface (T20-07's `admin/*` verbs): `McpHandler` is
+/// constructed and starts serving connections independently of
+/// `DaemonHandle`'s own lifetime, so it cannot hold a borrowed
+/// `&SupervisorHandle` — only this owned, freely-cloneable handle. The live
+/// task set itself is owned exclusively by the actor task
+/// [`spawn_supervisor`] spawns, never shared behind a lock — every method
+/// here is a round-trip through the command channel, never a direct read.
+#[derive(Debug, Clone)]
+pub struct SupervisorClient {
     commands: mpsc::Sender<Command>,
-    join: JoinHandle<()>,
 }
 
-impl SupervisorHandle {
+impl SupervisorClient {
     /// Re-read `managed_worktree` and bring the live task set to match it:
     /// start any newly-enabled/added row, stop any disabled/removed one.
     /// Idempotent — a `reload()` with nothing changed returns
@@ -135,13 +185,80 @@ impl SupervisorHandle {
     pub async fn reload(&self) -> ReloadOutcome {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.commands.send(Command::Reload(reply_tx)).await.is_err() {
-            // The actor already exited (should only happen post-`shutdown`,
-            // which consumes `self` — this branch exists so a stray call
-            // through a shared reference some future caller holds fails soft
-            // rather than panicking).
+            // The actor already exited (`shutdown` consumes the owning
+            // `SupervisorHandle` — this branch exists so a stray call
+            // through a clone taken beforehand fails soft rather than
+            // panicking).
             return ReloadOutcome::default();
         }
         reply_rx.await.unwrap_or_default()
+    }
+
+    /// Every enrolled worktree — durable fields (T20-01) joined with live
+    /// task status (T20-05), if a task is currently running for it —
+    /// `admin/projects_list`'s (T20-07) own data source.
+    pub async fn list_projects(&self) -> Vec<ProjectStatus> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::ListProjects(reply_tx))
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+
+    /// Inject [`local_rag_index::reconcile::TriggerKind::Manual`] into
+    /// `worktree_id`'s task directly — `admin/reconcile_now`'s (T20-07) own
+    /// mechanism. `Err(ReconcileNowError::NotManaged)` when no task is
+    /// currently running for that id (never registered, disabled, or not yet
+    /// started).
+    pub async fn reconcile_now(&self, worktree_id: &str) -> Result<(), ReconcileNowError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::TriggerNow(worktree_id.to_string(), reply_tx))
+            .await
+            .is_err()
+        {
+            return Err(ReconcileNowError::NotManaged);
+        }
+        reply_rx.await.unwrap_or(Err(ReconcileNowError::NotManaged))
+    }
+}
+
+/// A running indexing supervisor — the single owner `DaemonHandle` (T20-06)
+/// holds. [`Self::client`] derives the shareable [`SupervisorClient`] every
+/// other caller uses; [`Self::shutdown`] is exclusive to this handle.
+#[derive(Debug)]
+pub struct SupervisorHandle {
+    client: SupervisorClient,
+    join: JoinHandle<()>,
+}
+
+impl SupervisorHandle {
+    /// See [`SupervisorClient::reload`].
+    pub async fn reload(&self) -> ReloadOutcome {
+        self.client.reload().await
+    }
+
+    /// See [`SupervisorClient::list_projects`].
+    pub async fn list_projects(&self) -> Vec<ProjectStatus> {
+        self.client.list_projects().await
+    }
+
+    /// See [`SupervisorClient::reconcile_now`].
+    pub async fn reconcile_now(&self, worktree_id: &str) -> Result<(), ReconcileNowError> {
+        self.client.reconcile_now(worktree_id).await
+    }
+
+    /// A cheap `Clone`-able handle sharing every operation above except
+    /// [`Self::shutdown`] — for callers that must outlive or out-scope this
+    /// `SupervisorHandle`'s own borrow lifetime (T20-07's `McpHandler`).
+    pub fn client(&self) -> SupervisorClient {
+        self.client.clone()
     }
 
     /// Stop every running worktree task and the supervisor's own backstop
@@ -152,6 +269,7 @@ impl SupervisorHandle {
     pub async fn shutdown(self) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
+            .client
             .commands
             .send(Command::Shutdown(reply_tx))
             .await
@@ -175,7 +293,9 @@ pub fn spawn_supervisor(params: SupervisorParams) -> SupervisorHandle {
     let (commands_tx, commands_rx) = mpsc::channel(4);
     let join = tokio::spawn(run_supervisor(params, commands_rx));
     SupervisorHandle {
-        commands: commands_tx,
+        client: SupervisorClient {
+            commands: commands_tx,
+        },
         join,
     }
 }
@@ -199,6 +319,19 @@ async fn run_supervisor(params: SupervisorParams, mut commands: mpsc::Receiver<C
                         let outcome = reconcile(&params, &mut tasks).await;
                         let _ = reply.send(outcome);
                     }
+                    Some(Command::ListProjects(reply)) => {
+                        let _ = reply.send(list_projects(&params, &tasks));
+                    }
+                    Some(Command::TriggerNow(worktree_id, reply)) => {
+                        let result = match tasks.get(&worktree_id) {
+                            Some(handle) => {
+                                let _ = handle.trigger(TriggerKind::Manual).await;
+                                Ok(())
+                            }
+                            None => Err(ReconcileNowError::NotManaged),
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(Command::Shutdown(reply)) => {
                         stop_all(tasks).await;
                         let _ = reply.send(());
@@ -218,6 +351,35 @@ async fn run_supervisor(params: SupervisorParams, mut commands: mpsc::Receiver<C
             }
         }
     }
+}
+
+/// Every enrolled worktree — durable fields joined with live task status, if
+/// a task is currently running for it — [`SupervisorClient::list_projects`]'s
+/// own implementation. A read failure degrades to an empty list (logged),
+/// the same fail-soft the rest of this module already applies to
+/// `read_managed_worktrees`.
+fn list_projects(
+    params: &SupervisorParams,
+    tasks: &HashMap<String, WorktreeTaskHandle>,
+) -> Vec<ProjectStatus> {
+    let rows = match read_managed_worktrees(&params.state) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(
+                "local-rag: indexing supervisor could not read managed_worktree for projects_list: {e}"
+            );
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .map(|row| ProjectStatus {
+            task: tasks.get(&row.worktree_id).map(WorktreeTaskHandle::status),
+            worktree_id: row.worktree_id,
+            enabled: row.enabled,
+            registered_at: row.registered_at,
+            updated_at: row.updated_at,
+        })
+        .collect()
 }
 
 /// Bring `tasks` (the live set) to match `managed_worktree`'s `enabled` rows:

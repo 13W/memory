@@ -20,6 +20,7 @@ use local_rag_search::SearchEngine;
 
 use super::{content, instructions, jsonrpc, tools};
 use crate::daemon::gitroot;
+use crate::daemon::indexing::SupervisorClient;
 use crate::daemon::memory::MemoryContext;
 use crate::daemon::mode::DaemonMode;
 use crate::daemon::telemetry::TelemetryState;
@@ -40,6 +41,10 @@ pub struct DispatchContext<'a> {
     pub now_ms: i64,
     pub tool_calls: &'a ToolCallCounters,
     pub telemetry: &'a TelemetryState,
+    /// The daemon-managed indexing supervisor's client (T20-06/T20-07) —
+    /// `None` exactly in `DaemonMode::MigrationOnly`. `admin/projects_list`/
+    /// `admin/projects_reload`/`admin/reconcile_now` read it.
+    pub indexing_supervisor: Option<&'a SupervisorClient>,
 }
 
 /// Parse and answer one MCP JSON-RPC message. `None` means `text` was a
@@ -101,6 +106,24 @@ pub async fn dispatch(text: &str, ctx: &DispatchContext<'_>) -> Option<String> {
         // itself (self-exclusion), not here.
         "admin/tail_calls" => encode_success(id, admin_tail_calls_result(ctx.telemetry)),
         "admin/tool_stats" => encode_success(id, admin_tool_stats_result(ctx.telemetry)),
+        // Daemon-managed indexing control surface (spec 11 §8, T20-07) — the
+        // same TUI/CLI-only, non-catalog precedent as the two verbs just
+        // above; `admin/*`'s self-exclusion from `ctx.telemetry` is already
+        // handled by `handshake.rs` (prefix match), not here.
+        "admin/projects_list" => encode_success(
+            id,
+            admin_projects_list_result(ctx.indexing_supervisor).await,
+        ),
+        "admin/projects_reload" => encode_success(
+            id,
+            admin_projects_reload_result(ctx.indexing_supervisor).await,
+        ),
+        "admin/reconcile_now" => {
+            match admin_reconcile_now_result(ctx.indexing_supervisor, request.params).await {
+                Ok(value) => encode_success(id, value),
+                Err(msg) => encode_error(id, jsonrpc::INVALID_PARAMS, &msg),
+            }
+        }
         other => encode_error(
             id,
             jsonrpc::METHOD_NOT_FOUND,
@@ -244,6 +267,69 @@ fn admin_tool_stats_result(telemetry: &TelemetryState) -> Value {
     serde_json::json!({ "tools": tools })
 }
 
+/// `{"available": bool, "projects": [ProjectStatus, ...]}` — `admin/
+/// projects_list`'s (spec 11 §8, T20-07) own result. `available: false`
+/// (with an empty `projects`) exactly in `MigrationOnly` (no supervisor to
+/// ask) — never conflated with "genuinely zero registered worktrees"
+/// (`available: true`, empty `projects`): a caller must be able to tell
+/// "the daemon cannot answer this right now" from "it answered: there is
+/// nothing managed."
+async fn admin_projects_list_result(supervisor: Option<&SupervisorClient>) -> Value {
+    let Some(supervisor) = supervisor else {
+        return serde_json::json!({ "available": false, "projects": [] });
+    };
+    let projects = supervisor.list_projects().await;
+    serde_json::json!({ "available": true, "projects": projects })
+}
+
+/// `{"available": bool, "started": usize, "stopped": usize}` — `admin/
+/// projects_reload`'s (T20-07) own result, `ReloadOutcome` flattened with
+/// the same `available` convention as [`admin_projects_list_result`].
+async fn admin_projects_reload_result(supervisor: Option<&SupervisorClient>) -> Value {
+    let Some(supervisor) = supervisor else {
+        return serde_json::json!({ "available": false, "started": 0, "stopped": 0 });
+    };
+    let outcome = supervisor.reload().await;
+    let mut value = serde_json::to_value(outcome).expect("ReloadOutcome always serializes");
+    value["available"] = Value::Bool(true);
+    value
+}
+
+/// `admin/reconcile_now`'s (T20-07) own result: `{"available": bool}` on
+/// success, `Err` (a human-readable message) for [`dispatch`] to turn into a
+/// JSON-RPC `-32602` — a malformed `params`, or [`ReconcileNowError::
+/// NotManaged`] (unknown worktree, or registered but no task currently
+/// running for it; the two are not distinguished, spec 11 §8's own wording).
+/// `MigrationOnly` (`supervisor` is `None`) answers `{"available": false}`
+/// rather than an error — the same convention as the other two verbs, since
+/// there is no supervisor to judge "managed" against at all.
+async fn admin_reconcile_now_result(
+    supervisor: Option<&SupervisorClient>,
+    params: Option<Value>,
+) -> Result<Value, String> {
+    let worktree_id = parse_worktree_id(params)?;
+    let Some(supervisor) = supervisor else {
+        return Ok(serde_json::json!({ "available": false }));
+    };
+    supervisor
+        .reconcile_now(&worktree_id)
+        .await
+        .map(|()| serde_json::json!({ "available": true }))
+        .map_err(|e| e.to_string())
+}
+
+/// `{"worktree_id": "..."}` → the id, or a human-readable parse failure —
+/// `admin/reconcile_now`'s own argument shape.
+fn parse_worktree_id(params: Option<Value>) -> Result<String, String> {
+    let Some(Value::Object(map)) = params else {
+        return Err("params must be an object with a \"worktree_id\" string".to_string());
+    };
+    match map.get("worktree_id") {
+        Some(Value::String(s)) => Ok(s.clone()),
+        _ => Err("params.worktree_id must be a string".to_string()),
+    }
+}
+
 fn encode_success(id: Value, result: Value) -> String {
     serde_json::to_string(&jsonrpc::Response::new(id, result)).expect("Response always serializes")
 }
@@ -272,6 +358,7 @@ mod tests {
             now_ms: 0,
             tool_calls,
             telemetry,
+            indexing_supervisor: None,
         }
     }
 
@@ -361,5 +448,76 @@ mod tests {
         .expect("a request always gets a response");
         let body: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["result"]["calls"], serde_json::json!([]));
+    }
+
+    /// T20-07: with no supervisor at all (`ctx.indexing_supervisor: None` —
+    /// the same condition `MigrationOnly` produces in production), all three
+    /// admin verbs answer `available: false` rather than an error or a
+    /// fabricated healthy-looking result. `admin/reconcile_now` gets a
+    /// syntactically valid `worktree_id` here specifically to prove the
+    /// `available: false` short-circuit fires *before* any attempt to judge
+    /// whether that id is managed.
+    #[tokio::test]
+    async fn all_three_admin_verbs_answer_unavailable_without_a_supervisor() {
+        let mode = DaemonMode::Normal;
+        let rc = request_context();
+        let telemetry = TelemetryState::new();
+        let tool_calls = ToolCallCounters::new();
+        let dispatch_ctx = ctx(&mode, &rc, &telemetry, &tool_calls);
+
+        let list = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"admin/projects_list"}"#,
+            &dispatch_ctx,
+        )
+        .await
+        .expect("a request always gets a response");
+        let body: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            body["result"],
+            serde_json::json!({ "available": false, "projects": [] })
+        );
+
+        let reload = dispatch(
+            r#"{"jsonrpc":"2.0","id":2,"method":"admin/projects_reload"}"#,
+            &dispatch_ctx,
+        )
+        .await
+        .expect("a request always gets a response");
+        let body: Value = serde_json::from_str(&reload).unwrap();
+        assert_eq!(
+            body["result"],
+            serde_json::json!({ "available": false, "started": 0, "stopped": 0 })
+        );
+
+        let reconcile = dispatch(
+            r#"{"jsonrpc":"2.0","id":3,"method":"admin/reconcile_now","params":{"worktree_id":"any"}}"#,
+            &dispatch_ctx,
+        )
+        .await
+        .expect("a request always gets a response");
+        let body: Value = serde_json::from_str(&reconcile).unwrap();
+        assert_eq!(body["result"], serde_json::json!({ "available": false }));
+    }
+
+    /// `admin/reconcile_now`'s own argument validation is a JSON-RPC-level
+    /// `-32602` (spec 11 §8), checked before the `available: false`
+    /// short-circuit above — a malformed call is a protocol error regardless
+    /// of whether a supervisor exists to ask.
+    #[tokio::test]
+    async fn admin_reconcile_now_rejects_a_missing_worktree_id() {
+        let mode = DaemonMode::Normal;
+        let rc = request_context();
+        let telemetry = TelemetryState::new();
+        let tool_calls = ToolCallCounters::new();
+        let dispatch_ctx = ctx(&mode, &rc, &telemetry, &tool_calls);
+
+        let text = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"admin/reconcile_now","params":{}}"#,
+            &dispatch_ctx,
+        )
+        .await
+        .expect("a request always gets a response");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["code"], jsonrpc::INVALID_PARAMS);
     }
 }
