@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use local_rag_core::DataPolicy;
-use local_rag_core::identity::UuidSource;
+use local_rag_core::identity::{Uuid, UuidSource};
 use local_rag_core::paths::StoreLayout;
 use local_rag_embed::GeneratorPool;
+use local_rag_index::classify::ClassifierConfig;
 use local_rag_search::QueryEmbedder;
 use local_rag_store::{
-    CacheDb, CacheOpenError, OpenError, StateDb, WorktreeLockRegistry, WriteError,
+    CacheDb, CacheOpenError, OpenError, RetentionParams, StateDb, WorktreeLockRegistry, WriteError,
 };
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -24,6 +25,7 @@ use super::error::migration_only_reason;
 #[cfg(unix)]
 use super::handshake::{HandshakeContext, serve_connections};
 use super::idle::{IdleGateInputs, idle_eligible};
+use super::indexing::{SupervisorHandle, SupervisorParams, spawn_supervisor};
 use super::jobs::JobRegistry;
 use super::lock::{self, StoreLockError, StoreLockGuard, StoreLockInfo};
 use super::mcp::McpHandler;
@@ -155,6 +157,24 @@ pub struct StartOptions {
     /// parameter, not a config field, so lifecycle-level tests can drive it
     /// directly.
     pub consolidation_poll_interval: Duration,
+    /// T20-06's indexing supervisor's per-worktree retention defaults
+    /// (`config.storage`, `RetentionParams::from_storage_config`) — the same
+    /// derivation `local_rag::indexing::finish_index_ctx` already uses for
+    /// the CLI's own `IndexCtx`, applied here to every managed worktree's
+    /// `WorktreeTaskParams`.
+    pub retention: RetentionParams,
+    /// T20-06's indexing supervisor's per-worktree file classifier
+    /// (`config.index`, `ClassifierConfig::from_index_config`) — same
+    /// derivation as `retention` above.
+    pub classifier: ClassifierConfig,
+    /// How often the indexing supervisor's backstop poll re-reads
+    /// `managed_worktree` and reconciles its live task set against it, in
+    /// case an `admin/projects_reload` (T20-07) notification was missed —
+    /// "notify is a hint, the table is truth" (spec 06 §1's own discipline,
+    /// applied to the registry). A plain parameter, not a config field, so
+    /// lifecycle-level tests can drive it directly — same rationale as
+    /// `consolidation_poll_interval` above.
+    pub indexing_backstop_poll_interval: Duration,
 }
 
 /// A running daemon instance, in-process (spec 02 §4.1 steps 1–5 complete;
@@ -204,6 +224,14 @@ pub struct DaemonHandle {
     /// `handshake_stop`/`handshake_join`.
     consolidation_trigger_stop: Option<oneshot::Sender<()>>,
     consolidation_trigger_join: Option<JoinHandle<()>>,
+    /// The daemon-managed indexing supervisor (T20-06) — one background task
+    /// per `enabled` `managed_worktree` row. `None` exactly in
+    /// `DaemonMode::MigrationOnly` (same `state_db.as_ref()` gate as
+    /// `consolidation_trigger_*` above): there is no usable `state.sqlite` to
+    /// read the registry from. `shutdown` consumes it (its own `shutdown()`
+    /// stops every worktree task it owns) before `drain_and_shutdown` closes
+    /// the store.
+    indexing_supervisor: Option<SupervisorHandle>,
 }
 
 impl DaemonHandle {
@@ -257,6 +285,9 @@ impl DaemonHandle {
             consolidation_batch_size,
             consolidation_queue_threshold,
             consolidation_poll_interval,
+            retention,
+            classifier,
+            indexing_backstop_poll_interval,
         } = opts;
 
         // T20-03: derive the two query-facing embedders from the shared
@@ -482,6 +513,35 @@ impl DaemonHandle {
             None => (None, None),
         };
 
+        // T20-06: the daemon-managed indexing supervisor — one `T20-05` task
+        // per `enabled` `managed_worktree` row. Same "both present or
+        // neither" store-availability guard `engine`/`memory_ctx` above
+        // already use (no usable `state.sqlite`/`cache.sqlite` in
+        // `MigrationOnly`).
+        let indexing_supervisor = match (&state_db, &cache_db) {
+            (Some(state), Some(cache)) => {
+                tracing::info!(job = "indexing_supervisor", "background job spawned");
+                let model_space_id: Uuid = local_rag_store::DEFAULT_MODEL_SPACE_ID
+                    .parse()
+                    .expect("DEFAULT_MODEL_SPACE_ID is a valid UUID");
+                Some(spawn_supervisor(SupervisorParams {
+                    state: Arc::clone(state),
+                    cache: Arc::clone(cache),
+                    layout: layout.clone(),
+                    uuids: Arc::clone(&uuids),
+                    locks: Arc::clone(&locks),
+                    embedder_provider: Arc::clone(&embedder_provider),
+                    jobs: jobs.clone(),
+                    model_space_id,
+                    retention,
+                    data_policy,
+                    classifier,
+                    backstop_poll_interval: indexing_backstop_poll_interval,
+                }))
+            }
+            _ => None,
+        };
+
         Ok(DaemonHandle {
             socket_path: layout.socket_path(),
             layout,
@@ -500,6 +560,7 @@ impl DaemonHandle {
             resume_handles,
             consolidation_trigger_stop,
             consolidation_trigger_join,
+            indexing_supervisor,
         })
     }
 
@@ -526,6 +587,13 @@ impl DaemonHandle {
         idle_eligible(&self.idle_inputs())
     }
 
+    /// The daemon-managed indexing supervisor (T20-06), if this daemon has
+    /// one — `None` exactly in `DaemonMode::MigrationOnly`. A future
+    /// `admin/projects_reload` (T20-07) calls `reload()` through this.
+    pub fn indexing_supervisor(&self) -> Option<&SupervisorHandle> {
+        self.indexing_supervisor.as_ref()
+    }
+
     /// Drain and release the store (spec 02 §4.3): await the startup resume
     /// passes to their natural completion, signal-then-await the continuous
     /// consolidation-trigger worker (D-024 — unlike the resume passes, it
@@ -541,6 +609,13 @@ impl DaemonHandle {
         }
         if let Some(join) = self.consolidation_trigger_join.take() {
             log_if_task_panicked("the consolidation-trigger worker", join.await);
+        }
+        if let Some(supervisor) = self.indexing_supervisor.take() {
+            // Stops every worktree task it owns (each flushing its own last
+            // successful generation first, T20-05) before returning — must
+            // finish here, strictly before `drain_and_shutdown` below closes
+            // `state`/`cache`.
+            supervisor.shutdown().await;
         }
         tracing::debug!("background jobs stopped");
         if let Some(handshake_join) = self.handshake_join.take() {

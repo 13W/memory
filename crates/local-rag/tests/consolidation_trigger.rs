@@ -24,7 +24,10 @@ use local_rag_core::DataPolicy;
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
-use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, WorktreeLockRegistry};
+use local_rag_index::classify::ClassifierConfig;
+use local_rag_store::{
+    LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, RetentionParams, WorktreeLockRegistry,
+};
 use local_rag_test_support::TempHome;
 
 struct SeqUuidV7 {
@@ -77,6 +80,12 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         // (this crate has no tokio `test-util` feature; see
         // `consolidation_trigger.rs`'s own unit tests for why).
         consolidation_poll_interval: Duration::from_millis(10),
+        retention: RetentionParams {
+            keep_last_k: 2,
+            window_ms: 7 * 24 * 60 * 60 * 1000,
+        },
+        classifier: ClassifierConfig::new(1024 * 1024),
+        indexing_backstop_poll_interval: Duration::from_millis(10),
     }
 }
 
