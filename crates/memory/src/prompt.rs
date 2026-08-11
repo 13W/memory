@@ -31,8 +31,11 @@ prior inferences) plus a list of existing memory entries, and you decide what du
 memory operations to emit.
 
 Output rules (must follow exactly):
-- Output ONLY a JSON array. No prose, no markdown fences, nothing before or after it.
-- Each element is one op object: {"op": "create" | "propose_candidate" | "reinforce" |
+- Output ONE JSON object per line, one line per op. No surrounding [ ] array, no
+  commas between objects, no prose, no markdown fences, nothing before or after the
+  op lines themselves.
+- Zero ops is a valid response: output nothing at all.
+- Each line is one op object: {"op": "create" | "propose_candidate" | "reinforce" |
   "resolve" | "retract" | "supersede" | "noop", ...op-specific fields}.
 - Never invent a numeric confidence or importance. Use only "low", "medium", or "high"
   for confidence_signal/importance_signal.
@@ -55,23 +58,28 @@ Placement rules (must follow):
 Examples:
 
 Input observation: {"id":"o1","event_type":"UserPromptSubmit","evidence_kind":"user_statement","trust":"normal","text":"we decided to use pnpm instead of npm for this repo"}
-Output: [{"op":"create","kind":"decision","text":"Use pnpm instead of npm for this repo.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}]
+Output: {"op":"create","kind":"decision","text":"Use pnpm instead of npm for this repo.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}
 
 Input observation: {"id":"o2","event_type":"UserPromptSubmit","evidence_kind":"user_statement","trust":"normal","text":"мы решили всегда запускать тесты перед коммитом"}
-Output: [{"op":"create","kind":"convention","text":"Всегда запускать тесты перед коммитом.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o2"]}]
+Output: {"op":"create","kind":"convention","text":"Всегда запускать тесты перед коммитом.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o2"]}
 
 Input observation: {"id":"o3","event_type":"UserPromptSubmit","evidence_kind":"user_statement","trust":"normal","text":"what if we cached the embeddings?"}
-Output: [{"op":"create","kind":"hypothesis","text":"Caching embeddings might help.","scope_kind":"repository","confidence_signal":"low","importance_signal":"low","cites":["o3"]}]
+Output: {"op":"create","kind":"hypothesis","text":"Caching embeddings might help.","scope_kind":"repository","confidence_signal":"low","importance_signal":"low","cites":["o3"]}
 
 Input observation: {"id":"o4","event_type":"UserPromptSubmit","evidence_kind":"user_statement","trust":"normal","text":"не используй больше SQLite ATTACH для этой операции"}
 Existing entry: {"memory_id":"m1","kind":"convention","state":"active","canonical_key":null,"text":"Use SQLite ATTACH for cross-database writes."}
-Output: [{"op":"retract","target_memory_id":"m1","cites":["o4"]}]
+Output: {"op":"retract","target_memory_id":"m1","cites":["o4"]}
 
 Input observation: {"id":"o5","event_type":"PostToolUse","evidence_kind":"model_claim","trust":"low","text":"this function is probably the main entry point"}
-Output: [{"op":"propose_candidate","kind":"fact","text":"This function is probably the main entry point.","scope_kind":"repository","confidence_signal":"low","importance_signal":"low","cites":["o5"]}]
+Output: {"op":"propose_candidate","kind":"fact","text":"This function is probably the main entry point.","scope_kind":"repository","confidence_signal":"low","importance_signal":"low","cites":["o5"]}
 
 Input observation: {"id":"o6","event_type":"Stop","evidence_kind":"tool_result","trust":"normal","text":"pytest: 42 passed, 0 failed"}
-Output: [{"op":"noop","reason":"routine test result, nothing durable to record"}]
+Output: {"op":"noop","reason":"routine test result, nothing durable to record"}
+
+Input observation: {"id":"o7","event_type":"UserPromptSubmit","evidence_kind":"user_statement","trust":"normal","text":"we decided to use pytest for testing -- what if we added mutation testing later?"}
+Output (two ops from one observation -- one line each, no separator between them):
+{"op":"create","kind":"decision","text":"Use pytest for testing.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o7"]}
+{"op":"create","kind":"hypothesis","text":"Mutation testing might be added later.","scope_kind":"repository","confidence_signal":"low","importance_signal":"low","cites":["o7"]}
 "#
     .to_string()
 }
@@ -143,8 +151,9 @@ pub fn user_prompt(window: &ConsolidationWindow, existing: &[MemoryEntrySummary]
 /// module doc for the tier-1/tier-2 split this is part of).
 pub fn correction_prompt(parse_error: &str) -> String {
     format!(
-        "Your previous response was not valid JSON ({parse_error}). Respond again with ONLY \
-         the JSON array of ops -- no prose, no markdown fences."
+        "Your previous response was not valid ({parse_error}). Respond again with ONLY one \
+         JSON object per line, one line per op -- no [ ] array, no commas between objects, \
+         no prose, no markdown fences."
     )
 }
 

@@ -1,7 +1,11 @@
 //! The router's wire JSON schema (T14-07, spec 08 §4 `[FIXED]`/`[SPEC]`):
 //! [`RawRouterOp`] is exactly what the local generator is asked to emit — one
-//! JSON array of these, nothing else. [`crate::parse`] deserializes into this
-//! type; [`crate::guard`] turns each value into a
+//! JSON object per line (JSONL, D-051 — not a single top-level `[...]` array;
+//! see [`crate::parse`]'s own module doc for why one bad/truncated element
+//! must not be able to invalidate every other, syntactically valid, element
+//! in the same response), nothing else on a line. [`crate::parse`]
+//! deserializes each line into this type; [`crate::guard`] turns each value
+//! into a
 //! [`local_rag_store::GeneratedOp`] (materializing it, downgrading it to a
 //! candidate, or discarding it as a no-op) — this module owns *shape* only,
 //! never placement policy.
@@ -90,9 +94,8 @@ impl Signal {
 /// One router-emitted op (spec 08 §4's `{create, reinforce, supersede,
 /// resolve, retract, noop, propose_candidate}` envelope). Wire format:
 /// `{"op": "create", ...fields}` (`serde` internally tagged, `snake_case`) —
-/// the response as a whole is a bare JSON array of these
-/// (`[`[`crate::parse`]`]` parses it), matching spec 08 §4 step 3's "ordered
-/// ops list" literally.
+/// one such object per line ([`crate::parse`] parses each line
+/// independently), matching spec 08 §4 step 3's "ordered ops list" literally.
 ///
 /// `kind`/`scope_kind` stay plain `String` here, exactly like
 /// [`local_rag_store::ProposedOperation`] — parsed against
@@ -109,6 +112,14 @@ impl Signal {
 /// handle_create` (which already turns an unrecognized `scope_kind` —
 /// `ScopeKind::from_db` returns `None` for anything outside its three known
 /// values, `""` included — into `Noop`, no crash, no per-op regression).
+/// D-051: `confidence_signal`/`importance_signal` on `Create`/
+/// `ProposeCandidate`/`Supersede` carry the same `#[serde(default)]`
+/// treatment, but as `Option<Signal>` rather than a fabricated fallback
+/// value — the same shape [`RawRouterOp::Reinforce`]'s own
+/// `confidence_signal` already has (though there it means "leave the
+/// existing value alone," a different semantic; here a missing value is a
+/// per-op degrade to `noop` in [`crate::guard`], never an invented
+/// `Signal::Low`/`Medium`/`High` the model never actually said).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RawRouterOp {
@@ -119,8 +130,10 @@ pub enum RawRouterOp {
         canonical_key: Option<String>,
         #[serde(default)]
         scope_kind: String,
-        confidence_signal: Signal,
-        importance_signal: Signal,
+        #[serde(default)]
+        confidence_signal: Option<Signal>,
+        #[serde(default)]
+        importance_signal: Option<Signal>,
         #[serde(default)]
         cites: Vec<String>,
     },
@@ -133,8 +146,10 @@ pub enum RawRouterOp {
         canonical_key: Option<String>,
         #[serde(default)]
         scope_kind: String,
-        confidence_signal: Signal,
-        importance_signal: Signal,
+        #[serde(default)]
+        confidence_signal: Option<Signal>,
+        #[serde(default)]
+        importance_signal: Option<Signal>,
         #[serde(default)]
         cites: Vec<String>,
     },
@@ -161,8 +176,10 @@ pub enum RawRouterOp {
         new_text: String,
         #[serde(default)]
         new_canonical_key: Option<String>,
-        confidence_signal: Signal,
-        importance_signal: Signal,
+        #[serde(default)]
+        confidence_signal: Option<Signal>,
+        #[serde(default)]
+        importance_signal: Option<Signal>,
         #[serde(default)]
         cites: Vec<String>,
     },
@@ -174,38 +191,38 @@ pub enum RawRouterOp {
     },
 }
 
-/// An advisory JSON Schema for [`RawRouterOp`]'s array form, passed via
+/// An advisory JSON Schema for **one line** of [`RawRouterOp`]'s JSONL wire
+/// form (D-051 — the response as a whole is not itself valid JSON, so this
+/// describes a single object, not a `{"type": "array", "items": ...}`
+/// wrapper around one), passed via
 /// [`local_rag_embed::GenRequest::with_json_schema`]. `[SPEC]`, not
 /// `[FIXED]`: a runtime that supports grammar-constrained decoding compiles
 /// this into its own grammar; `local_rag_generate::LlamaGenerator` (v0) does
 /// not — see that crate's module doc — so today this is documentation only,
 /// forward-compatible with a future runtime that honors it.
 pub const ROUTER_OPS_JSON_SCHEMA: &str = r#"{
-  "type": "array",
-  "items": {
-    "type": "object",
-    "required": ["op"],
-    "properties": {
-      "op": {
-        "enum": ["create", "propose_candidate", "reinforce", "resolve", "retract", "supersede", "noop"]
-      },
-      "kind": {
-        "enum": ["fact", "decision", "convention", "procedure", "task", "question", "hypothesis"]
-      },
-      "text": { "type": "string" },
-      "canonical_key": { "type": ["string", "null"] },
-      "scope_kind": { "enum": ["global", "repository", "worktree"] },
-      "confidence_signal": { "enum": ["low", "medium", "high"] },
-      "importance_signal": { "enum": ["low", "medium", "high"] },
-      "cites": { "type": "array", "items": { "type": "string" } },
-      "target_memory_id": { "type": "string" },
-      "new_kind": {
-        "enum": ["fact", "decision", "convention", "procedure", "task", "question", "hypothesis"]
-      },
-      "new_text": { "type": "string" },
-      "new_canonical_key": { "type": ["string", "null"] },
-      "reason": { "type": ["string", "null"] }
-    }
+  "type": "object",
+  "required": ["op"],
+  "properties": {
+    "op": {
+      "enum": ["create", "propose_candidate", "reinforce", "resolve", "retract", "supersede", "noop"]
+    },
+    "kind": {
+      "enum": ["fact", "decision", "convention", "procedure", "task", "question", "hypothesis"]
+    },
+    "text": { "type": "string" },
+    "canonical_key": { "type": ["string", "null"] },
+    "scope_kind": { "enum": ["global", "repository", "worktree"] },
+    "confidence_signal": { "enum": ["low", "medium", "high"] },
+    "importance_signal": { "enum": ["low", "medium", "high"] },
+    "cites": { "type": "array", "items": { "type": "string" } },
+    "target_memory_id": { "type": "string" },
+    "new_kind": {
+      "enum": ["fact", "decision", "convention", "procedure", "task", "question", "hypothesis"]
+    },
+    "new_text": { "type": "string" },
+    "new_canonical_key": { "type": ["string", "null"] },
+    "reason": { "type": ["string", "null"] }
   }
 }"#;
 
@@ -257,8 +274,8 @@ mod tests {
                 assert_eq!(text, "uses pnpm");
                 assert_eq!(canonical_key, None);
                 assert_eq!(scope_kind, "repository");
-                assert_eq!(confidence_signal, Signal::High);
-                assert_eq!(importance_signal, Signal::Medium);
+                assert_eq!(confidence_signal, Some(Signal::High));
+                assert_eq!(importance_signal, Some(Signal::Medium));
                 assert_eq!(cites, vec!["obs-1".to_string()]);
             }
             other => panic!("expected Create, got {other:?}"),
@@ -305,22 +322,67 @@ mod tests {
         assert!(serde_json::from_str::<RawRouterOp>(json).is_err());
     }
 
+    /// D-051: a `create` op missing `confidence_signal` entirely must not
+    /// fail the whole batch's deserialization (tier 1) — the field defaults
+    /// to `None`, leaving `guard::handle_create`'s degrade (tier 2) to turn
+    /// just this one op into `Noop`, exactly like `create_defaults_scope_kind_
+    /// to_empty_when_omitted` above does for the sibling `scope_kind` gap.
     #[test]
-    fn an_array_of_mixed_ops_parses_in_order() {
-        let json = r#"[
-            {"op":"noop"},
-            {"op":"retract","target_memory_id":"m-1"}
-        ]"#;
-        let ops: Vec<RawRouterOp> = serde_json::from_str(json).expect("valid array");
-        assert_eq!(ops.len(), 2);
-        assert!(matches!(ops[0], RawRouterOp::Noop { .. }));
-        assert!(matches!(ops[1], RawRouterOp::Retract { .. }));
+    fn create_defaults_confidence_signal_to_none_when_omitted() {
+        let json = r#"{"op":"create","kind":"fact","text":"uses pnpm","scope_kind":"global","importance_signal":"medium"}"#;
+        let op: RawRouterOp = serde_json::from_str(json).expect("valid create despite the gap");
+        match op {
+            RawRouterOp::Create {
+                confidence_signal, ..
+            } => assert_eq!(confidence_signal, None),
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    /// Same gap, `importance_signal` instead.
+    #[test]
+    fn create_defaults_importance_signal_to_none_when_omitted() {
+        let json = r#"{"op":"create","kind":"fact","text":"uses pnpm","scope_kind":"global","confidence_signal":"high"}"#;
+        let op: RawRouterOp = serde_json::from_str(json).expect("valid create despite the gap");
+        match op {
+            RawRouterOp::Create {
+                importance_signal, ..
+            } => assert_eq!(importance_signal, None),
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    /// Same gap, `propose_candidate` variant.
+    #[test]
+    fn propose_candidate_defaults_confidence_signal_to_none_when_omitted() {
+        let json = r#"{"op":"propose_candidate","kind":"fact","text":"uses pnpm","scope_kind":"global","importance_signal":"medium"}"#;
+        let op: RawRouterOp =
+            serde_json::from_str(json).expect("valid propose_candidate despite the gap");
+        match op {
+            RawRouterOp::ProposeCandidate {
+                confidence_signal, ..
+            } => assert_eq!(confidence_signal, None),
+            other => panic!("expected ProposeCandidate, got {other:?}"),
+        }
+    }
+
+    /// Same gap, `supersede` variant.
+    #[test]
+    fn supersede_defaults_confidence_signal_to_none_when_omitted() {
+        let json = r#"{"op":"supersede","target_memory_id":"m-1","new_kind":"fact","new_text":"confirmed","importance_signal":"medium"}"#;
+        let op: RawRouterOp = serde_json::from_str(json).expect("valid supersede despite the gap");
+        match op {
+            RawRouterOp::Supersede {
+                confidence_signal, ..
+            } => assert_eq!(confidence_signal, None),
+            other => panic!("expected Supersede, got {other:?}"),
+        }
     }
 
     #[test]
     fn the_advisory_json_schema_is_itself_valid_json() {
         let value: serde_json::Value =
             serde_json::from_str(ROUTER_OPS_JSON_SCHEMA).expect("schema is valid JSON");
-        assert_eq!(value["type"], "array");
+        assert_eq!(value["type"], "object");
     }
 }

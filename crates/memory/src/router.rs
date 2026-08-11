@@ -44,6 +44,19 @@ fn trace_raw_response(text: &str) {
     }
 }
 
+/// Same gate as [`trace_raw_response`] — D-051: a partial [`parse::
+/// ParseOutcome`] (a valid prefix, a trailing line dropped) is not a
+/// failure, so it never reaches this crate's daemon-side caller's own
+/// `tracing`-based failure logging (`daemon::resume::consolidation`/
+/// `daemon::consolidation_trigger`, both of which only log `RunOutcome::
+/// Failed`) — this is the one place that visibility exists, for whoever is
+/// actively tuning the prompt/generation budget.
+fn trace_dropped_tail(reason: &str) {
+    if std::env::var_os("LOCAL_RAG_ROUTER_DEBUG").is_some() {
+        eprintln!("[router debug] dropped trailing content: {reason}");
+    }
+}
+
 /// Route one consolidation window to durable-memory ops (spec 08 §4 step 3).
 /// `uuids` mints every fresh `memory_id`/`candidate_id`
 /// [`crate::guard::materialize`] needs — injected so tests (and, in
@@ -102,8 +115,14 @@ pub async fn route(
         .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
     trace_raw_response(&response.text);
 
-    let raw_ops = match parse::parse_ops(&response.text) {
-        Ok(ops) => ops,
+    // D-051: `Err` here is a tier-1 hard failure (see `parse`'s module doc) —
+    // the *only* case still worth the one corrective re-prompt, since a
+    // tier-2 partial recovery (`Ok(outcome)` with a `dropped_tail`) already
+    // has a valid prefix worth keeping, and a live incident's own corrective
+    // retry reproduced an identical truncation byte-for-byte (re-asking does
+    // not fix a deterministic, greedy-decoded generation budget overrun).
+    let outcome = match parse::parse_ops(&response.text) {
+        Ok(outcome) => outcome,
         Err(first_error) => {
             let mut retry_messages = messages;
             retry_messages.push(GenMessage {
@@ -126,6 +145,10 @@ pub async fn route(
             })?
         }
     };
+    if let Some(dropped) = &outcome.dropped_tail {
+        trace_dropped_tail(dropped);
+    }
+    let raw_ops = outcome.ops;
 
     let by_id: HashMap<&str, &WindowObservation> = window
         .observations
@@ -268,7 +291,7 @@ mod tests {
         let (_home, db) = open_state();
         seed_observation(&db, "o1").await;
         let pool = pool_with(vec![
-            r#"[{"op":"create","kind":"decision","text":"use pnpm","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}]"#,
+            r#"{"op":"create","kind":"decision","text":"use pnpm","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}"#,
         ]);
         let uuids = SeqUuidV7::new();
         let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
@@ -282,7 +305,7 @@ mod tests {
     async fn a_malformed_first_response_recovers_via_one_corrective_reprompt() {
         let (_home, db) = open_state();
         seed_observation(&db, "o1").await;
-        let pool = pool_with(vec!["not json at all", r#"[{"op":"noop"}]"#]);
+        let pool = pool_with(vec!["not json at all", r#"{"op":"noop"}"#]);
         let uuids = SeqUuidV7::new();
         let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
             .await
@@ -330,12 +353,30 @@ mod tests {
     async fn an_empty_ops_array_routes_to_an_empty_batch() {
         let (_home, db) = open_state();
         seed_observation(&db, "o1").await;
-        let pool = pool_with(vec!["[]"]);
+        let pool = pool_with(vec![""]);
         let uuids = SeqUuidV7::new();
         let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
             .await
             .expect("empty is valid");
         assert!(ops.is_empty());
+    }
+
+    /// D-051's own reason for existing: a valid prefix followed by trailing
+    /// garbage/truncation is accepted as-is, and — the actual live-incident
+    /// motivated behavior — does **not** spend the one corrective re-prompt
+    /// trying to recover it. Proven here by scripting only **one** response:
+    /// if `route` called the generator a second time, `ScriptedGenerator`
+    /// would return "scripted generator exhausted" and this test would fail.
+    #[tokio::test]
+    async fn a_dropped_trailing_line_is_accepted_without_a_wasted_reprompt() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let pool = pool_with(vec!["{\"op\":\"noop\"}\nnot valid json at all"]);
+        let uuids = SeqUuidV7::new();
+        let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
+            .await
+            .expect("the valid prefix is accepted, not treated as a failure");
+        assert_eq!(ops, vec![GeneratedOp::Noop]);
     }
 
     /// A generator that records how many times it was actually invoked — a
@@ -349,7 +390,7 @@ mod tests {
         fn generate(&self, _req: local_rag_embed::GenRequest) -> Result<GenResponse, GenError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(GenResponse {
-                text: "[]".to_string(),
+                text: String::new(),
                 finish_reason: FinishReason::Stop,
                 tokens_generated: None,
             })

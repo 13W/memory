@@ -257,6 +257,32 @@ columns (`last_failure_kind`/`last_failure_reason`/`last_failure_fingerprint`/`a
 `next_retry_at`, schema v11): a pre-existing `failed` row with none of them set is never classified
 `Mechanical`, so it stays retry-eligible — the safe default, not a special case.
 
+As-built note (D-051, `[SPEC]`): D-050 stopped a *deterministically*-failing window from
+retry-storming forever; it did not fix why those windows failed in the first place — live
+verification right after D-050 shipped confirmed all 4 incident windows failed **again**, byte-for-
+byte identically, on their one post-fix retry. Two root causes, both fixed here. First: like
+`scope_kind` (D-048, above), `RawRouterOp::Create`/`ProposeCandidate`/`Supersede`'s
+`confidence_signal`/`importance_signal` now carry `#[serde(default)]` as `Option<Signal>` (the same
+shape `RawRouterOp::Reinforce`'s own `confidence_signal` already has, though there `None` means
+"leave the existing value alone" — a different semantic; here it means "the model didn't say," which
+`local_rag_memory::guard` degrades to `Noop` for that one op, tier 2, never a fabricated
+`Signal::Low`/`Medium`/`High` the model never emitted). Second, and larger: T14-07's "one bounded
+corrective re-prompt before the whole window fails" (above) assumed the router's wire format was a
+single top-level JSON array — under that framing, one bad or truncated trailing element invalidated
+deserialization of the *entire* response, including every syntactically valid element before it.
+The wire format is now JSONL (one `RawRouterOp` object per line, `local_rag_memory::parse::
+parse_ops`), parsed line-by-line and stopping at the first line that fails: a response with a valid
+prefix followed by trailing garbage or a truncated final line (both live incident shapes) now
+recovers that prefix as a real, partial success (`ParseOutcome::dropped_tail` names why recovery
+stopped) instead of losing the whole window. `local_rag_memory::router::route` does **not** spend
+its one corrective re-prompt trying to recover a dropped tail — a live incident's own corrective
+retry reproduced an identical truncation, byte-for-byte, since nothing about a second, otherwise-
+identical greedy-decoded generation call changes a deterministic outcome; the re-prompt remains
+reserved for the case a partial recovery structurally cannot help — the *first* line itself failing
+to parse at all. Deliberate tradeoff, not an oversight: prefix-stop recovers "good prefix, bad
+suffix" (the two shapes actually observed) but no longer searches for valid content after *leading*
+prose the way the pre-D-051 whole-array recovery did — an unobserved failure shape, not defended.
+
 ## 5. Explicit tool-initiated memory (`remember`, review tools)
 
 `remember` (11 §2) is an explicit durable operation: creates an `active` entry, `actor='user'`
