@@ -9,6 +9,7 @@ use std::time::Duration;
 use local_rag_core::DataPolicy;
 use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
+use local_rag_embed::GeneratorPool;
 use local_rag_search::QueryEmbedder;
 use local_rag_store::{
     CacheDb, CacheOpenError, OpenError, StateDb, WorktreeLockRegistry, WriteError,
@@ -411,6 +412,22 @@ impl DaemonHandle {
 
         // Step 5: resume passes — startup catch-up only (see `daemon::resume`'s
         // own scope note), spawned non-blocking relative to readiness.
+        //
+        // D-054: built exactly once, here, and shared (via `Arc`) between
+        // `spawn_consolidation_resume` and `spawn_consolidation_trigger`
+        // below — each used to call `build_best_effort_pool` independently,
+        // and since both are `tokio::spawn`ed concurrently, whichever one's
+        // `LlamaBackend::init()` lost that race failed with
+        // `BackendAlreadyInitialized` (llama.cpp's backend handle is a
+        // process-wide singleton, not reentrant) and silently fell back to
+        // an empty pool for the rest of the daemon's uptime — no amount of
+        // waiting or retrying recovered it, only a restart, and even then
+        // only a coin flip on which task won. `.map` keeps this gated behind
+        // `state_db.is_some()`, matching both spawns' own existing guard —
+        // no model load in `MigrationOnly` mode, where neither spawn runs.
+        let pool = state_db
+            .as_ref()
+            .map(|_| Arc::new(build_best_effort_pool(&layout)));
         let jobs = JobRegistry::new();
         let mut resume_handles = Vec::new();
         if let Some(ref db) = state_db {
@@ -426,7 +443,7 @@ impl DaemonHandle {
             tracing::info!(job = "consolidation_resume", "background job spawned");
             resume_handles.push(tokio::spawn(spawn_consolidation_resume(
                 Arc::clone(db),
-                layout.clone(),
+                Arc::clone(pool.as_ref().expect("state_db present implies pool built")),
                 jobs.clone(),
                 consolidation_lease_ms,
                 consolidation_renew_interval_ms,
@@ -448,6 +465,7 @@ impl DaemonHandle {
                 let join = tokio::spawn(spawn_consolidation_trigger(
                     Arc::clone(db),
                     layout.clone(),
+                    Arc::clone(pool.as_ref().expect("state_db present implies pool built")),
                     Arc::clone(&uuids),
                     jobs.clone(),
                     consolidation_lease_ms,
@@ -608,7 +626,7 @@ async fn spawn_spool_resume(
 #[allow(clippy::too_many_arguments)]
 async fn spawn_consolidation_resume(
     db: Arc<StateDb>,
-    layout: StoreLayout,
+    pool: Arc<GeneratorPool>,
     jobs: JobRegistry,
     lease_ms: i64,
     renew_interval_ms: i64,
@@ -616,7 +634,6 @@ async fn spawn_consolidation_resume(
     data_policy: DataPolicy,
     uuids: Arc<dyn UuidSource + Send + Sync>,
 ) {
-    let pool = build_best_effort_pool(&layout);
     let generate =
         |window| local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window);
     log_resume_sweep(
@@ -649,6 +666,7 @@ async fn spawn_consolidation_resume(
 async fn spawn_consolidation_trigger(
     db: Arc<StateDb>,
     layout: StoreLayout,
+    pool: Arc<GeneratorPool>,
     uuids: Arc<dyn UuidSource + Send + Sync>,
     jobs: JobRegistry,
     lease_ms: i64,
@@ -660,7 +678,6 @@ async fn spawn_consolidation_trigger(
     data_policy: DataPolicy,
     stop: oneshot::Receiver<()>,
 ) {
-    let pool = Arc::new(build_best_effort_pool(&layout));
     let generate = {
         let db = Arc::clone(&db);
         let uuids = Arc::clone(&uuids);

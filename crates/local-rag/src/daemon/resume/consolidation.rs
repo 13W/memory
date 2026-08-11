@@ -47,7 +47,14 @@ pub fn build_best_effort_pool(layout: &StoreLayout) -> GeneratorPool {
             entry.model_id,
             Arc::new(generator),
         )]),
-        Err(_) => GeneratorPool::new(Vec::new()),
+        Err(e) => {
+            tracing::error!(
+                "local-rag: generator pool build failed for {}: {e} — consolidation will report \
+                 NoProvider until the next daemon restart",
+                entry.model_id
+            );
+            GeneratorPool::new(Vec::new())
+        }
     }
 }
 
