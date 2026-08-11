@@ -235,12 +235,24 @@ pub fn processing_cursor(conn: &Connection, session_id: &str) -> rusqlite::Resul
 
 /// How many envelopes are past `session_id`'s processing cursor, not yet
 /// swept into any consolidation window (spec 07 §6's "queue size threshold"
-/// trigger, D-024). `0` for an unknown session or a cursor already caught up
-/// to `max_received_seq` — never negative.
+/// trigger, D-024). `0` for an unknown session or a cursor already caught up.
+///
+/// D-052: a genuine row count, not `MAX(received_seq) - cursor`.
+/// `observation_envelope.received_seq` is a single `AUTOINCREMENT` shared by
+/// every session (spec 03's own envelope table), not a per-session counter —
+/// the distance between a session's cursor and its own latest `received_seq`
+/// includes every other session's interleaved inserts in between, and
+/// overcounts by exactly that amount whenever more than one session writes
+/// concurrently. Counting rows directly is served by the same
+/// `envelope_session(session_id, received_seq)` index this query already
+/// relies on for the range scan.
 pub fn pending_backlog(conn: &Connection, session_id: &str) -> rusqlite::Result<i64> {
     let cursor = processing_cursor(conn, session_id)?.unwrap_or(0);
-    let max_seq = crate::observation::max_received_seq(conn, session_id)?.unwrap_or(cursor);
-    Ok((max_seq - cursor).max(0))
+    conn.query_row(
+        "SELECT COUNT(*) FROM observation_envelope WHERE session_id = ?1 AND received_seq > ?2",
+        params![session_id, cursor],
+        |r| r.get(0),
+    )
 }
 
 /// Every `session_id` whose [`pending_backlog`] is non-zero, ascending — the
@@ -1231,6 +1243,47 @@ mod tests {
             pending_backlog(&read, "sess-1").expect("backlog"),
             0,
             "cursor caught up to max_received_seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_backlog_counts_only_this_sessions_rows_when_another_session_interleaves() {
+        // D-052 regression: `received_seq` is a single AUTOINCREMENT shared by
+        // every session, not a per-session counter. Interleave two sessions'
+        // inserts so `sess-a`'s own rows land at received_seq 1, 3, 5 (3 rows)
+        // while its last row is received_seq 5 — the pre-fix formula
+        // (`max_received_seq - cursor` = 5 - 0 = 5) would overcount by
+        // exactly the 2 rows `sess-b` inserted in between.
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(|tx| {
+                for (i, session_id) in ["sess-a", "sess-b", "sess-a", "sess-b", "sess-a"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    tx.execute(
+                        "INSERT INTO observation_envelope \
+                           (observation_id, source_event_id, payload_hash, event_type, \
+                            evidence_kind, trust, session_id) \
+                         VALUES (?1, ?2, 'deadbeef', 'Stop', 'user_statement', 'normal', ?3)",
+                        params![format!("obs-{i}"), format!("evt-{i}"), session_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed interleaved envelopes");
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            pending_backlog(&read, "sess-a").expect("backlog"),
+            3,
+            "sess-a has 3 of its own rows, not received_seq 5 (its own max) minus cursor 0"
+        );
+        assert_eq!(
+            pending_backlog(&read, "sess-b").expect("backlog"),
+            2,
+            "sess-b has 2 of its own rows"
         );
     }
 

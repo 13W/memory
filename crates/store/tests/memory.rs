@@ -1842,7 +1842,12 @@ async fn total_pending_backlog_sums_pending_backlog_across_every_session() {
         .transaction(|tx| {
             // One global `received_seq` sequence, insertion order: sess-b
             // gets 1..=2, sess-a gets 3..=5 -- mirrors `sessions_with_
-            // pending_backlog`'s own test fixture shape.
+            // pending_backlog`'s own test fixture shape. D-052: the total
+            // must be each session's own row count (2 + 3 = 5), not each
+            // session's distance to its own last `received_seq` (2 + 5 = 7,
+            // which double-counts sess-b's 2 rows inside sess-a's 0..=5
+            // span -- `received_seq` is one sequence shared by both
+            // sessions, not a per-session counter).
             for (oid, evt, sess) in [
                 ("obs-b1", "evt-b1", "sess-b"),
                 ("obs-b2", "evt-b2", "sess-b"),
@@ -1866,8 +1871,8 @@ async fn total_pending_backlog_sums_pending_backlog_across_every_session() {
     let read = db.open_read().expect("read conn");
     assert_eq!(
         total_pending_backlog(&read).expect("total backlog"),
-        7,
-        "no cursor for either session: 2 (sess-b, seq 1..=2) + 5 (sess-a, up to seq 5)"
+        5,
+        "no cursor for either session: 2 own rows (sess-b) + 3 own rows (sess-a)"
     );
     drop(read);
 
@@ -1879,8 +1884,8 @@ async fn total_pending_backlog_sums_pending_backlog_across_every_session() {
     let read = db.open_read().expect("read conn");
     assert_eq!(
         total_pending_backlog(&read).expect("total backlog"),
-        5,
-        "sess-b caught up (backlog 0, drops out of the sum); sess-a's 5 remains"
+        3,
+        "sess-b caught up (backlog 0, drops out of the sum); sess-a's 3 own rows remain"
     );
 }
 
