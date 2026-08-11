@@ -1043,6 +1043,19 @@ screen calls touch a running daemon. `App`-struct extraction remains deferred (a
 bearing local, `memory_nav`, alongside `repositories_nav` — still a flat, readable `match`, not
 yet the pressure point either T18-02's or T18-03's own as-built notes flagged).
 
+As-built note (D-056, `[SPEC]`). The Entries union above now sorts **descending** —
+`(created_at, memory_id)` both reversed, so the newest row leads — not the ascending order this
+section originally documented. Live dogfooding surfaced the defect: the Entries screen's own
+`PAGE_SIZE` (10) always starts at `offset` 0, so an ascending sort put the *oldest* rows, which by
+definition never change, on the default first page — an actively-consolidating store looked frozen
+for days. `fetch_entry_page`'s `skip`/`take` slicing is unchanged, only the comparator direction
+in the union sort; `compute_merge_select` shares the same helper, so `MergeSelect` picks from the
+same newest-first page `EntryList` shows. Both Entries surfaces also gained a rendered
+`created_at` (list row) and `created_at`/`updated_at` (detail panel) — as raw epoch-millisecond
+integers, the same `created_at=<n>` convention already used by this screen's own Candidates view
+and by `local-rag memory list`; no new date-formatting dependency was introduced. `docs/
+implementation-plan/DEVIATIONS.md`'s `D-056` names the full rationale and evidence.
+
 As-built note (T18-05, `[SPEC]`). Memory mutations (approve/reject/edit/retract/merge) are real,
 layered on top of T18-04's read paths without touching their own shape. `handle_memory_key` stays
 100% pure — no I/O of any kind — by changing its return type to `MemoryKeyOutcome::{Nav(MemoryNav),

@@ -558,10 +558,14 @@ fn fetch_entry_page(
         .map_err(|e| format!("could not list memory entries: {e}"))?;
         combined.extend(rows);
     }
+    // D-056: newest-first — the union has no SQL LIMIT/OFFSET of its own (comment above), so
+    // page 1 (offset 0) is whichever end of this sort sits first. Oldest-first made the default
+    // view show only rows that, by definition, never change, which live dogfooding showed reads
+    // as "the screen is frozen" even while consolidation is actively producing new entries.
     combined.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.memory_id.cmp(&b.memory_id))
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.memory_id.cmp(&a.memory_id))
     });
 
     let total = combined.len();
@@ -1521,10 +1525,11 @@ pub fn render_memory(frame: &mut ratatui::Frame, data: &MemoryScreenData) {
                     .map(|r| {
                         let preview: String = r.text.chars().take(60).collect();
                         ListItem::new(format!(
-                            "{}  {}/{}  scope={}:{}  {}",
+                            "{}  {}/{}  created_at={}  scope={}:{}  {}",
                             r.memory_id,
                             r.kind.as_str(),
                             r.state.as_str(),
+                            r.created_at,
                             r.scope_kind.as_str(),
                             r.scope_owner_id,
                             preview,
@@ -1600,7 +1605,7 @@ pub fn render_memory(frame: &mut ratatui::Frame, data: &MemoryScreenData) {
             evidence_ids,
         } => {
             let [detail_area, evidence_area] =
-                Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(frame.area());
+                Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).areas(frame.area());
 
             let lines = vec![
                 Line::from(format!("memory_id: {}", entry.memory_id)),
@@ -1617,6 +1622,10 @@ pub fn render_memory(frame: &mut ratatui::Frame, data: &MemoryScreenData) {
                 Line::from(format!(
                     "confidence={:.2} importance={:.2} v{}",
                     entry.confidence, entry.importance, entry.entry_version
+                )),
+                Line::from(format!(
+                    "created_at={} updated_at={}",
+                    entry.created_at, entry.updated_at
                 )),
                 Line::from(entry.text.clone()),
             ];
@@ -1872,6 +1881,7 @@ mod tests {
         assert!(content.contains("decision/active"), "{content}");
         assert!(content.contains("repo:repo-a"), "{content}");
         assert!(content.contains("more available"), "{content}");
+        assert!(content.contains("created_at=1000"), "{content}");
     }
 
     #[test]
@@ -1897,6 +1907,10 @@ mod tests {
         assert!(content.contains("mem-1"), "{content}");
         assert!(content.contains("obs-1"), "{content}");
         assert!(content.contains("obs-2"), "{content}");
+        assert!(
+            content.contains("created_at=1000") && content.contains("updated_at=1000"),
+            "{content}"
+        );
     }
 
     #[test]

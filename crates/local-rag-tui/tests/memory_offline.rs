@@ -236,10 +236,10 @@ async fn unresolved_cwd_sees_only_global_scope_entries() {
     }
 }
 
-// ---- 2: resolved repo+worktree unions all three scopes, sorted ----
+// ---- 2: resolved repo+worktree unions all three scopes, sorted newest-first (D-056) ----
 
 #[tokio::test]
-async fn resolved_worktree_unions_all_three_scopes_sorted_by_created_at() {
+async fn resolved_worktree_unions_all_three_scopes_sorted_by_created_at_desc() {
     let (home, layout) = open_layout();
     let repo_path = home.join("repo-b");
     std::fs::create_dir_all(&repo_path).expect("create repo dir");
@@ -287,7 +287,7 @@ async fn resolved_worktree_unions_all_three_scopes_sorted_by_created_at() {
             assert_eq!(scope_label, "repo:repo-b");
             assert_eq!(total, 3);
             let ids: Vec<&str> = rows.iter().map(|r| r.memory_id.as_str()).collect();
-            assert_eq!(ids, ["mem-1", "mem-2", "mem-3"], "{ids:?}");
+            assert_eq!(ids, ["mem-3", "mem-2", "mem-1"], "{ids:?}");
         }
         other => panic!("expected EntryList, got {other:?}"),
     }
@@ -472,7 +472,9 @@ async fn entry_pagination_reports_has_more_across_two_pages() {
             assert_eq!(total, 12);
             assert_eq!(rows.len(), 10, "{rows:?}");
             assert!(has_more);
-            assert_eq!(rows[0].memory_id, "mem-00");
+            // D-056: newest-first — mem-11 has the highest created_at (1_000 + 11) of the 12
+            // seeded rows, so it leads page 1.
+            assert_eq!(rows[0].memory_id, "mem-11");
         }
         other => panic!("expected EntryList, got {other:?}"),
     }
@@ -489,7 +491,10 @@ async fn entry_pagination_reports_has_more_across_two_pages() {
         MemoryScreenData::EntryList { rows, has_more, .. } => {
             assert_eq!(rows.len(), 2, "{rows:?}");
             assert!(!has_more);
-            assert_eq!(rows[0].memory_id, "mem-10");
+            // The two oldest rows spill onto page 2, still newest-first: mem-01 (1_001) before
+            // mem-00 (1_000).
+            assert_eq!(rows[0].memory_id, "mem-01");
+            assert_eq!(rows[1].memory_id, "mem-00");
         }
         other => panic!("expected EntryList, got {other:?}"),
     }
