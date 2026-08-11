@@ -13,9 +13,10 @@ One native service binary, no mandatory external daemons; model assets delivered
 - Binaries per platform package `[SPEC]`: `local-rag` (daemon+CLI multiplexed), `local-rag-proxy`
   (stdio MCP proxy), `local-rag-hook` (spool writer). Single binary with argv0/subcommand
   multiplexing is acceptable; hooks path must be exec-fast (<50 ms cold `[SPEC]`). The Claude Code
-  plugin's own MCP server entry point resolves through a three-tier fallback (a locally installed
-  npm package, a known-path cache, `npx` last resort — not a bare, uncached `npx` invocation) and
-  its cached-tier launcher-only overhead must stay under a p95 < 100 ms cold budget `[SPEC]`.
+  plugin's own MCP server entry point resolves through a three-tier fallback (`@13w/memory`
+  installed on this machine — project-local override or machine-global, D-055 — a known-path
+  cache, `npx` last resort — not a bare, uncached `npx` invocation) and its cached-tier
+  launcher-only overhead must stay under a p95 < 100 ms cold budget `[SPEC]`.
 
 As-built note (T17-03, `[SPEC]`). The npm scope stays `@13w`, but the launcher and platform
 package **names** are `@13w/memory` / `@13w/memory-{darwin-arm64,darwin-x64,linux-x64,
@@ -60,6 +61,38 @@ distinct from the npm launcher T17-01/T17-03 already cover above:
   chaining, so Node startup itself is unavoidable on every tier (unlike the hook's fast path, which
   execs the cached native binary directly, no Node at all); the MCP server pays this once per
   session, not once per event the way the hook's own tighter budget matters for.
+
+As-built note (D-055, `[SPEC]` correction). "A locally installed `@13w/memory`" above was
+ambiguous, and T19-03 silently resolved it toward the narrower of its two readings: tier 1's
+`require.resolve` preflight anchored at exactly one path, `${CLAUDE_PROJECT_DIR}/node_modules`,
+and its own doc comment explicitly rejected checking any machine-global npm directory ("not `npm
+root -g`... `@13w/memory` isn't shaped as a global-install tool anyway") — an unflagged product
+assumption, unlike the sibling T19-02 ambiguity in the same group-19 card, which got an explicit
+owner flag and became D-042. Confirmed by the owner in a live dogfooding session (D-055): "locally
+installed" for an npm package, everywhere in this project's usage, means installed on the machine
+(`--global`), not scoped to whichever project happens to be open — the marketplace-installed
+plugin never installs the server itself (`[FIXED]`: "plugin packaging must not modify users'
+repositories"), so a real user's only route to a network-free cold start, usable from every
+project, is `npm install --global @13w/memory` once. `tier1()` now tries two anchors in order:
+`${CLAUDE_PROJECT_DIR}/node_modules` first (kept — an explicit local override/pin for monorepo
+vendoring or version pinning, "local beats global" the same way most npm CLI tools already let a
+project devDependency shadow a global install), then this machine's global npm modules directory,
+computed synchronously from `process.execPath` (`npmGlobalNodeModules()`:
+`<node-install>/lib/node_modules` on POSIX, `<node-install>/node_modules` on win32 — npm's own
+default-prefix convention absent a custom `.npmrc` prefix) rather than shelling out to `npm root
+-g`/`npm config get prefix` (100-300 ms subprocess spawn, too slow for this tier) — a custom global
+prefix remains a known, accepted miss, same trade-off the code already made, just now aimed at the
+right target instead of skipping it. `pnpm link --global`/`npm link` (global-only, no project-level
+second link step) do **not** land here or anywhere in this resolution chain — confirmed by reading
+both `tier1()`'s explicit `paths` anchoring and `npm/memory/src/resolve.js`'s
+`createRequire(fromFile).resolve(...)` directory walk, neither of which ever reaches a package
+manager's global link store; only a real `npm install --global`-style install (or the file
+literally present under the computed default prefix) resolves. Test-only override
+`LOCAL_RAG_TEST_GLOBAL_NODE_MODULES` lets `plugin/test/mcp-launcher-tiers.test.js` (and
+`mcp-cold-start.test.js`'s two launcher-spawning tests, updated to force a miss so they keep
+testing tier 2/the real-binary handoff specifically) exercise this deterministically — this
+machine's own *real* global npm directory lives under the user's home directory, which CLAUDE.md
+forbids tests depending on.
 
 As-built note (T19-04, `[SPEC]`, group 19 plan). A fifth adoption channel, alongside
 `SERVER_INSTRUCTIONS` (D-041), the tool catalog (T19-01), and the recall trailer (T19-02):
