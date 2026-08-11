@@ -48,8 +48,13 @@ test("launcher-only overhead on the cached (tier 2) fast path stays under the 10
   fs.writeFileSync(cacheFile, FAKE_BINARY_SRC);
   fs.chmodSync(cacheFile, 0o755);
 
+  const noGlobal = fs.mkdtempSync(path.join(os.tmpdir(), "lr-plugin-mcp-coldstart-noglobal-"));
   const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };
   delete env.CLAUDE_PROJECT_DIR; // force tier 2 (cache), isolating launcher-only overhead
+  // D-055: tier1() also checks a machine-global npm install now — force a
+  // miss there too, or a real global @13w/memory on the host machine (as
+  // opposed to this test's synthetic tier-2 cache) would take over instead.
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
 
   return (async () => {
     const timingsMs = [];
@@ -75,6 +80,7 @@ test("launcher-only overhead on the cached (tier 2) fast path stays under the 10
     assert.ok(p95 < P95_BUDGET_MS, `p95 ${p95.toFixed(1)}ms exceeds the ${P95_BUDGET_MS}ms budget`);
 
     fs.rmSync(pluginData, { recursive: true, force: true });
+    fs.rmSync(noGlobal, { recursive: true, force: true });
   })();
 });
 
@@ -98,10 +104,15 @@ test(
     fs.mkdirSync(binDir, { recursive: true });
     const cacheFile = path.join(binDir, "local-rag-proxy");
     fs.symlinkSync(nativeProxyBin, cacheFile);
+    const noGlobal = fs.mkdtempSync(path.join(os.tmpdir(), "lr-plugin-mcp-realcoldstart-noglobal-"));
 
     const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };
     delete env.CLAUDE_PROJECT_DIR;
     delete env.LOCAL_RAG_HOME;
+    // D-055: force tier1()'s global check to miss too, so this test
+    // exercises tier 2 (this test's own point) against a real binary this
+    // machine's actual global npm state does not shadow it with.
+    env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
 
     const start = process.hrtime.bigint();
     const launcher = spawn(process.execPath, [LAUNCHER_FILE], {
@@ -115,5 +126,6 @@ test(
     );
 
     fs.rmSync(pluginData, { recursive: true, force: true });
+    fs.rmSync(noGlobal, { recursive: true, force: true });
   },
 );

@@ -1,8 +1,8 @@
 "use strict";
 
-// T19-03: behavioral tests for plugin/bin/local-rag-mcp-launcher.js's
-// three-tier dispatch (locally-installed @13w/memory -> known-path cache
-// -> npx last resort). Two styles, deliberately:
+// T19-03/D-055: behavioral tests for plugin/bin/local-rag-mcp-launcher.js's
+// three-tier dispatch (@13w/memory installed on this machine -> known-path
+// cache -> npx last resort). Two styles, deliberately:
 //
 //   - "Group A" below calls tier1()/tier2() directly via require() — safe
 //     ONLY for their fall-through (`return false`) branches, which never
@@ -15,6 +15,14 @@
 //     `npm/memory/test/subprocess.test.js`'s own philosophy: genuine
 //     child processes, no mocking) and observes stdout/exit behavior —
 //     the only safe way to exercise a tier's success path end to end.
+//
+// D-055: tier1() now tries two anchors (project-local, then a machine-
+// global npm install). Every test below that does not itself want the
+// global anchor to resolve pins `LOCAL_RAG_TEST_GLOBAL_NODE_MODULES` to a
+// guaranteed-empty directory — this machine's *real* global npm modules
+// dir lives under the user's home directory, and CLAUDE.md forbids tests
+// depending on it, so a test must never rely on that real location being
+// empty by chance.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -45,6 +53,24 @@ function withoutEnvKeys(env, keys) {
   }
   return copy;
 }
+
+/**
+ * A `LOCAL_RAG_TEST_GLOBAL_NODE_MODULES` value guaranteed to resolve
+ * nothing — a fresh, empty temp dir, not a nonexistent path (avoids any
+ * platform-specific ENOENT-vs-ENOTDIR difference in how `require.resolve`
+ * reports a totally absent ancestor). Caller owns cleanup via the returned
+ * path, same convention every other `mkTmpRoot()` call site in this file
+ * already follows.
+ *
+ * @returns {string}
+ */
+function noGlobalInstallDir() {
+  return mkTmpRoot("lr-launcher-noglobal-");
+}
+
+/** A `local-rag-proxy` stand-in that fails loudly if ever invoked — used to prove a tier was never reached, not just that this tier's own output looks right. */
+const POISON_BINARY_SRC =
+  '#!/usr/bin/env node\nprocess.stderr.write("WRONG_TIER_INVOKED\\n");\nprocess.exit(1);\n';
 
 // Group B below is POSIX-only (see the skip reason on each test) — this
 // helper is never called on win32, so it stays a plain shebang script,
@@ -111,17 +137,43 @@ test("cachedProxyPath() matches the real binary-cache.js convention", () => {
   }
 });
 
-test("tier1() returns false, does not throw, when CLAUDE_PROJECT_DIR is unset", () => {
+test("npmGlobalNodeModules() computes npm's own default-prefix convention, per platform", () => {
+  delete require.cache[LAUNCHER_FILE];
+  const { npmGlobalNodeModules } = require(LAUNCHER_FILE);
+  assert.equal(
+    npmGlobalNodeModules("/usr/local/bin/node", "darwin"),
+    "/usr/local/lib/node_modules",
+  );
+  assert.equal(
+    npmGlobalNodeModules("/home/zero/.nvm/versions/node/v24.0.0/bin/node", "linux"),
+    "/home/zero/.nvm/versions/node/v24.0.0/lib/node_modules",
+  );
+  assert.equal(
+    npmGlobalNodeModules("C:\\Program Files\\nodejs\\node.exe", "win32"),
+    "C:\\Program Files\\nodejs\\node_modules",
+  );
+});
+
+test("tier1() returns false, does not throw, when CLAUDE_PROJECT_DIR is unset and no global install exists", () => {
   delete require.cache[LAUNCHER_FILE];
   const { tier1 } = require(LAUNCHER_FILE);
-  const saved = process.env.CLAUDE_PROJECT_DIR;
+  const noGlobal = noGlobalInstallDir();
+  const savedProjectDir = process.env.CLAUDE_PROJECT_DIR;
+  const savedGlobal = process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES;
   delete process.env.CLAUDE_PROJECT_DIR;
+  process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
   try {
     assert.equal(tier1(), false);
   } finally {
-    if (saved !== undefined) {
-      process.env.CLAUDE_PROJECT_DIR = saved;
+    if (savedProjectDir !== undefined) {
+      process.env.CLAUDE_PROJECT_DIR = savedProjectDir;
     }
+    if (savedGlobal === undefined) {
+      delete process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES;
+    } else {
+      process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = savedGlobal;
+    }
+    fs.rmSync(noGlobal, { recursive: true, force: true });
   }
 });
 
@@ -135,19 +187,28 @@ test("tier1() falls through cleanly (regression: does not process.exit) when the
   // — this test proves the preflight check catches it first.
   const root = mkTmpRoot("lr-launcher-partial-");
   buildFlatLayout(root, []); // launcher package only, zero platform packages
+  const noGlobal = noGlobalInstallDir();
   delete require.cache[LAUNCHER_FILE];
   const { tier1 } = require(LAUNCHER_FILE);
-  const saved = process.env.CLAUDE_PROJECT_DIR;
+  const savedProjectDir = process.env.CLAUDE_PROJECT_DIR;
+  const savedGlobal = process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES;
   process.env.CLAUDE_PROJECT_DIR = root;
+  process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
   try {
     assert.equal(tier1(), false, "must fall through, not exit the test process");
   } finally {
-    if (saved === undefined) {
+    if (savedProjectDir === undefined) {
       delete process.env.CLAUDE_PROJECT_DIR;
     } else {
-      process.env.CLAUDE_PROJECT_DIR = saved;
+      process.env.CLAUDE_PROJECT_DIR = savedProjectDir;
+    }
+    if (savedGlobal === undefined) {
+      delete process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES;
+    } else {
+      process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = savedGlobal;
     }
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(noGlobal, { recursive: true, force: true });
   }
 });
 
@@ -216,7 +277,7 @@ const POSIX_ONLY = {
   skip: process.platform === "win32" && "signal-forwarding tests are POSIX-only (see lifecycle.js's Windows note)",
 };
 
-test("tier 1 hit: a locally installed @13w/memory starts the server, npx never invoked", POSIX_ONLY, async () => {
+test("tier 1 hit: a project-local @13w/memory starts the server, npx never invoked", POSIX_ONLY, async () => {
   const root = mkTmpRoot("lr-launcher-t1-");
   buildFlatLayout(root, [
     {
@@ -226,9 +287,11 @@ test("tier 1 hit: a locally installed @13w/memory starts the server, npx never i
       binaryContents: { "local-rag-proxy": FAKE_BINARY_SRC },
     },
   ]);
+  const noGlobal = noGlobalInstallDir();
 
   const env = withoutEnvKeys(process.env, ["CLAUDE_PLUGIN_DATA"]);
   env.CLAUDE_PROJECT_DIR = root;
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
   const launcher = spawnLauncher(env);
   const getStderr = collectText(launcher.stderr);
 
@@ -236,11 +299,77 @@ test("tier 1 hit: a locally installed @13w/memory starts the server, npx never i
   assert.ok(!lines.some((l) => l.startsWith("NPX_ARGS")), `npx must never be invoked: ${getStderr()}`);
 
   fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(noGlobal, { recursive: true, force: true });
+});
+
+// D-055: the original single-anchor tier1() made a real user's global
+// install unreachable — see DEVIATIONS.md D-055. This is the case that
+// deviation exists to fix: no project-local install at all, only a
+// machine-global one (what `npm install --global @13w/memory` produces).
+test("tier 1 hit via a global npm install (no CLAUDE_PROJECT_DIR): starts the server, npx never invoked", POSIX_ONLY, async () => {
+  const globalRoot = mkTmpRoot("lr-launcher-t1global-");
+  buildFlatLayout(globalRoot, [
+    {
+      name: HOST_PACKAGE_NAME,
+      platform: process.platform,
+      cpu: process.arch,
+      binaryContents: { "local-rag-proxy": FAKE_BINARY_SRC },
+    },
+  ]);
+
+  const env = withoutEnvKeys(process.env, ["CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR"]);
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = path.join(globalRoot, "node_modules");
+  const launcher = spawnLauncher(env);
+  const getStderr = collectText(launcher.stderr);
+
+  const lines = await expectReadyThenStop(launcher);
+  assert.ok(!lines.some((l) => l.startsWith("NPX_ARGS")), `npx must never be invoked: ${getStderr()}`);
+
+  fs.rmSync(globalRoot, { recursive: true, force: true });
+});
+
+test("project-local install wins over a global install when both are present", POSIX_ONLY, async () => {
+  const projectRoot = mkTmpRoot("lr-launcher-t1precedence-project-");
+  buildFlatLayout(projectRoot, [
+    {
+      name: HOST_PACKAGE_NAME,
+      platform: process.platform,
+      cpu: process.arch,
+      binaryContents: { "local-rag-proxy": FAKE_BINARY_SRC },
+    },
+  ]);
+  const globalRoot = mkTmpRoot("lr-launcher-t1precedence-global-");
+  buildFlatLayout(globalRoot, [
+    {
+      name: HOST_PACKAGE_NAME,
+      platform: process.platform,
+      cpu: process.arch,
+      // A poison binary: if this ever runs instead of the project-local
+      // one, the test fails loudly (WRONG_TIER_INVOKED on stderr) rather
+      // than passing by accident because both binaries happen to print a
+      // READY line.
+      binaryContents: { "local-rag-proxy": POISON_BINARY_SRC },
+    },
+  ]);
+
+  const env = withoutEnvKeys(process.env, ["CLAUDE_PLUGIN_DATA"]);
+  env.CLAUDE_PROJECT_DIR = projectRoot;
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = path.join(globalRoot, "node_modules");
+  const launcher = spawnLauncher(env);
+  const getStderr = collectText(launcher.stderr);
+
+  const lines = await expectReadyThenStop(launcher);
+  assert.ok(!lines.some((l) => l.startsWith("NPX_ARGS")), `npx must never be invoked: ${getStderr()}`);
+  assert.ok(!getStderr().includes("WRONG_TIER_INVOKED"), `the global (poison) binary must never run: ${getStderr()}`);
+
+  fs.rmSync(projectRoot, { recursive: true, force: true });
+  fs.rmSync(globalRoot, { recursive: true, force: true });
 });
 
 test("tier 1 partial failure falls through to tier 2 end to end (real subprocess)", POSIX_ONLY, async () => {
   const projectRoot = mkTmpRoot("lr-launcher-t1fail-");
   buildFlatLayout(projectRoot, []); // base package only, no platform package
+  const noGlobal = noGlobalInstallDir();
 
   const pluginData = mkTmpRoot("lr-launcher-t1fail-cache-");
   const binDir = path.join(pluginData, "bin");
@@ -252,6 +381,7 @@ test("tier 1 partial failure falls through to tier 2 end to end (real subprocess
   const env = { ...process.env };
   env.CLAUDE_PROJECT_DIR = projectRoot;
   env.CLAUDE_PLUGIN_DATA = pluginData;
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
   const launcher = spawnLauncher(env);
   const getStderr = collectText(launcher.stderr);
 
@@ -267,18 +397,21 @@ test("tier 1 partial failure falls through to tier 2 end to end (real subprocess
 
   fs.rmSync(projectRoot, { recursive: true, force: true });
   fs.rmSync(pluginData, { recursive: true, force: true });
+  fs.rmSync(noGlobal, { recursive: true, force: true });
 });
 
-test("tier 1 skipped (no CLAUDE_PROJECT_DIR), tier 2 hit: the cache starts the server", POSIX_ONLY, async () => {
+test("tier 1 skipped (no CLAUDE_PROJECT_DIR, no global install), tier 2 hit: the cache starts the server", POSIX_ONLY, async () => {
   const pluginData = mkTmpRoot("lr-launcher-t2-");
   const binDir = path.join(pluginData, "bin");
   fs.mkdirSync(binDir, { recursive: true });
   const cacheFile = path.join(binDir, "local-rag-proxy" + (process.platform === "win32" ? ".exe" : ""));
   fs.writeFileSync(cacheFile, FAKE_BINARY_SRC);
   fs.chmodSync(cacheFile, 0o755);
+  const noGlobal = noGlobalInstallDir();
 
   const env = withoutEnvKeys(process.env, ["CLAUDE_PROJECT_DIR"]);
   env.CLAUDE_PLUGIN_DATA = pluginData;
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
   const launcher = spawnLauncher(env);
   const getStderr = collectText(launcher.stderr);
 
@@ -286,6 +419,7 @@ test("tier 1 skipped (no CLAUDE_PROJECT_DIR), tier 2 hit: the cache starts the s
   assert.ok(!lines.some((l) => l.startsWith("NPX_ARGS")), `npx must never be invoked: ${getStderr()}`);
 
   fs.rmSync(pluginData, { recursive: true, force: true });
+  fs.rmSync(noGlobal, { recursive: true, force: true });
 });
 
 test("tier 2 stale falls through to tier 3, which is invoked with exactly the expected npx arguments", POSIX_ONLY, async () => {
@@ -296,9 +430,11 @@ test("tier 2 stale falls through to tier 3, which is invoked with exactly the ex
   fs.symlinkSync(path.join(pluginData, "gone" + suffix), path.join(binDir, "local-rag-proxy" + suffix));
 
   const npxDir = mkTmpRoot("lr-launcher-fakenpx-");
+  const noGlobal = noGlobalInstallDir();
   const env = withoutEnvKeys(process.env, ["CLAUDE_PROJECT_DIR"]);
   env.CLAUDE_PLUGIN_DATA = pluginData;
   env.PATH = pathWithFakeNpx(npxDir);
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
   const launcher = spawnLauncher(env);
 
   const lines = await expectReadyThenStop(launcher);
@@ -311,6 +447,7 @@ test("tier 2 stale falls through to tier 3, which is invoked with exactly the ex
 
   fs.rmSync(pluginData, { recursive: true, force: true });
   fs.rmSync(npxDir, { recursive: true, force: true });
+  fs.rmSync(noGlobal, { recursive: true, force: true });
 });
 
 test("card requirement: registry unreachable (no npx on PATH), local cached binary exists -> server still starts", POSIX_ONLY, async () => {
@@ -320,10 +457,12 @@ test("card requirement: registry unreachable (no npx on PATH), local cached bina
   const cacheFile = path.join(binDir, "local-rag-proxy" + (process.platform === "win32" ? ".exe" : ""));
   fs.writeFileSync(cacheFile, FAKE_BINARY_SRC);
   fs.chmodSync(cacheFile, 0o755);
+  const noGlobal = noGlobalInstallDir();
 
   const env = withoutEnvKeys(process.env, ["CLAUDE_PROJECT_DIR"]);
   env.CLAUDE_PLUGIN_DATA = pluginData;
   env.PATH = pathWithoutNpx(); // deliberately no npx reachable anywhere
+  env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES = noGlobal;
   const launcher = spawnLauncher(env);
   const getStderr = collectText(launcher.stderr);
 
@@ -331,4 +470,5 @@ test("card requirement: registry unreachable (no npx on PATH), local cached bina
   assert.ok(!lines.some((l) => l.startsWith("NPX_ARGS")), `npx must never even be attempted: ${getStderr()}`);
 
   fs.rmSync(pluginData, { recursive: true, force: true });
+  fs.rmSync(noGlobal, { recursive: true, force: true });
 });
