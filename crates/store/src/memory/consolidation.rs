@@ -492,9 +492,11 @@ fn read_window(tx: &Transaction<'_>, run_id: &str) -> rusqlite::Result<RunWindow
 ///    [`crate::StateWriter`]'s single-writer queue, so the second caller's
 ///    own transaction already observes the first's committed row here — no
 ///    separate read-then-write pre-check, and no TOCTOU gap.
-/// 2. Else compute `from = cursor + 1`, `to = min(from + batch - 1,
-///    max_received_seq)`; refuse with [`SnapshotOutcome::NothingPending`] if
-///    there is no envelope past the cursor at all.
+/// 2. Else compute `from = cursor + 1`, `to` = the `received_seq` of the
+///    `batch`-th of *this session's own* envelopes at or past `from` (capped
+///    at `max_received_seq` when fewer than `batch` remain); refuse with
+///    [`SnapshotOutcome::NothingPending`] if there is no envelope past the
+///    cursor at all.
 /// 3. Else create the row, transition `pending → running`, and acquire the
 ///    lease — [`SnapshotOutcome::Opened`].
 pub fn open_next_run(
@@ -522,7 +524,26 @@ pub fn open_next_run(
     if max_seq < from {
         return Ok(SnapshotOutcome::NothingPending);
     }
-    let to = (from + batch.max(1) - 1).min(max_seq);
+    // D-053: `to` is anchored on this session's own `batch`-th row, not
+    // `from + batch - 1` — `received_seq` is one sequence shared by every
+    // session (D-052's own finding), so a fixed-width slice of it can be
+    // almost entirely another session's rows when sessions interleave
+    // heavily, opening a window with zero of this session's own envelopes
+    // (confirmed live: a real session's cursor sat ~7800 received_seq behind
+    // its own next row, needing ~390 empty 20-wide windows — each still a
+    // real local LLM call, `router::route()` never short-circuits an empty
+    // window — to walk through). Falls back to `max_seq` when fewer than
+    // `batch` of this session's own rows remain past `from`.
+    let to = tx
+        .query_row(
+            "SELECT received_seq FROM observation_envelope \
+             WHERE session_id = ?1 AND received_seq >= ?2 \
+             ORDER BY received_seq LIMIT 1 OFFSET ?3",
+            params![session_id, from, batch.max(1) - 1],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(max_seq);
 
     create_consolidation_run(
         tx,
@@ -1000,7 +1021,7 @@ mod tests {
                 from_received_seq: 1,
                 to_received_seq: 3,
             }),
-            "to = min(from+batch-1, max_seq) = min(3, 5) = 3, never past to_seq",
+            "to = received_seq of sess-1's own 3rd row from `from` = 3, never past max_seq",
         );
 
         let read = db.open_read().expect("read conn");
@@ -1008,6 +1029,71 @@ mod tests {
             consolidation_run_state(&read, "run-1").expect("state"),
             Some(RunState::Running),
             "opened run is already running with a lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_next_run_skips_another_sessions_interleaved_rows_to_reach_a_full_batch() {
+        // D-053 regression: `received_seq` is one sequence shared by every
+        // session (same finding as D-052). Interleave sess-a's rows across a
+        // wide span dominated by sess-b so the pre-fix `to = from + batch - 1`
+        // would open an empty window (batch=2, from=1..=2 is entirely
+        // sess-b's own rows) instead of reaching sess-a's own 2 rows.
+        let (_home, db) = open_state();
+        db.writer()
+            .transaction(|tx| {
+                for (i, session_id) in ["sess-b", "sess-b", "sess-b", "sess-a", "sess-b", "sess-a"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    tx.execute(
+                        "INSERT INTO observation_envelope \
+                           (observation_id, source_event_id, payload_hash, event_type, \
+                            evidence_kind, trust, session_id) \
+                         VALUES (?1, ?2, 'deadbeef', 'Stop', 'user_statement', 'normal', ?3)",
+                        params![format!("obs-{i}"), format!("evt-{i}"), session_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed interleaved envelopes");
+
+        // sess-a's own rows land at received_seq 4 and 6.
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(tx, "run-a", "sess-a", 2, "v1", LEASE_DURATION_MS, 1_000)
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-a".to_string(),
+                session_id: "sess-a".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 6,
+            }),
+            "window reaches sess-a's own 2nd row (received_seq 6), not from+batch-1=2 \
+             (which would be entirely sess-b's rows)",
+        );
+
+        let SnapshotOutcome::Opened(window) = outcome else {
+            unreachable!("asserted Opened above");
+        };
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            crate::observation::envelopes_in_range(
+                &read,
+                "sess-a",
+                window.from_received_seq,
+                window.to_received_seq
+            )
+            .expect("envelopes in range")
+            .len(),
+            2,
+            "the opened window actually contains both of sess-a's own rows, not zero"
         );
     }
 
