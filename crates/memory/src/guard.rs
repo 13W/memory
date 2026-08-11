@@ -194,8 +194,8 @@ fn handle_create(
     text: String,
     canonical_key: Option<String>,
     scope_kind: String,
-    confidence_signal: Signal,
-    importance_signal: Signal,
+    confidence_signal: Option<Signal>,
+    importance_signal: Option<Signal>,
     cites: Vec<String>,
 ) -> rusqlite::Result<local_rag_store::GeneratedOp> {
     use local_rag_store::GeneratedOp;
@@ -204,6 +204,16 @@ fn handle_create(
         return Ok(GeneratedOp::Noop);
     };
     let Some(scope_kind) = ScopeKind::from_db(&scope_kind) else {
+        return Ok(GeneratedOp::Noop);
+    };
+    // D-051: a missing signal is per-op information loss, not a value to
+    // invent (spec 08 §2's "never invent a numeric confidence") — degrade
+    // this one op to `Noop`, the same tier-2 treatment `kind`/`scope_kind`
+    // already get above, rather than fabricating `Signal::Low`.
+    let Some(confidence_signal) = confidence_signal else {
+        return Ok(GeneratedOp::Noop);
+    };
+    let Some(importance_signal) = importance_signal else {
         return Ok(GeneratedOp::Noop);
     };
     let cited = resolve_citations(conn, by_id, &cites)?;
@@ -253,8 +263,8 @@ fn handle_supersede(
     new_kind: String,
     new_text: String,
     new_canonical_key: Option<String>,
-    confidence_signal: Signal,
-    importance_signal: Signal,
+    confidence_signal: Option<Signal>,
+    importance_signal: Option<Signal>,
     cites: Vec<String>,
 ) -> rusqlite::Result<local_rag_store::GeneratedOp> {
     use local_rag_store::GeneratedOp;
@@ -273,6 +283,13 @@ fn handle_supersede(
         // e.g. a task/question: that kind's machine never allows supersede.
         return Ok(GeneratedOp::Noop);
     }
+    // D-051: see the identical check in `handle_create` above.
+    let Some(confidence_signal) = confidence_signal else {
+        return Ok(GeneratedOp::Noop);
+    };
+    let Some(importance_signal) = importance_signal else {
+        return Ok(GeneratedOp::Noop);
+    };
 
     let cited = resolve_citations(conn, by_id, &cites)?;
     let evidence_observation_ids = cited_ids(&cited);
@@ -602,8 +619,8 @@ mod tests {
             text: "we decided to use pnpm".to_string(),
             canonical_key: canonical_key.map(str::to_string),
             scope_kind: scope_kind.to_string(),
-            confidence_signal: Signal::High,
-            importance_signal: Signal::Medium,
+            confidence_signal: Some(Signal::High),
+            importance_signal: Some(Signal::Medium),
             cites,
         }
     }
@@ -807,6 +824,80 @@ mod tests {
         assert_eq!(outcome, GeneratedOp::Noop);
     }
 
+    /// D-051 regression: `confidence_signal`/`importance_signal` now carry
+    /// `#[serde(default)]` as `Option<Signal>` (`crate::schema`), so a
+    /// `create` op missing either one deserializes with `None` instead of
+    /// failing the whole batch — this proves the end-to-end degrade path
+    /// treats a missing signal exactly like an out-of-domain `scope_kind`
+    /// above: `Noop` for this one op, never a fabricated value.
+    #[tokio::test]
+    async fn create_with_a_missing_confidence_signal_noops() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = RawRouterOp::Create {
+            kind: "fact".to_string(),
+            text: "we decided to use pnpm".to_string(),
+            canonical_key: None,
+            scope_kind: "global".to_string(),
+            confidence_signal: None,
+            importance_signal: Some(Signal::Medium),
+            cites: vec![],
+        };
+        let outcome = materialize(&read, &HashMap::new(), &[], &uuids, raw).expect("materialize");
+        assert_eq!(outcome, GeneratedOp::Noop);
+    }
+
+    /// Same gap, `importance_signal` instead.
+    #[tokio::test]
+    async fn create_with_a_missing_importance_signal_noops() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = RawRouterOp::Create {
+            kind: "fact".to_string(),
+            text: "we decided to use pnpm".to_string(),
+            canonical_key: None,
+            scope_kind: "global".to_string(),
+            confidence_signal: Some(Signal::Medium),
+            importance_signal: None,
+            cites: vec![],
+        };
+        let outcome = materialize(&read, &HashMap::new(), &[], &uuids, raw).expect("materialize");
+        assert_eq!(outcome, GeneratedOp::Noop);
+    }
+
+    /// Same gap, `supersede` variant — a different `handle_*` function with
+    /// its own independent degrade check.
+    #[tokio::test]
+    async fn supersede_with_a_missing_confidence_signal_noops() {
+        let (_home, db) = open_state();
+        let id = uuid(15);
+        create_memory(
+            &db,
+            &id,
+            StoreMemoryKind::Hypothesis,
+            ScopeKind::Global,
+            local_rag_store::GLOBAL_SCOPE_OWNER_ID,
+            None,
+        )
+        .await;
+
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = RawRouterOp::Supersede {
+            target_memory_id: id,
+            new_kind: "fact".to_string(),
+            new_text: "confirmed".to_string(),
+            new_canonical_key: None,
+            confidence_signal: None,
+            importance_signal: Some(Signal::High),
+            cites: vec![],
+        };
+        let outcome = materialize(&read, &HashMap::new(), &[], &uuids, raw).expect("materialize");
+        assert_eq!(outcome, GeneratedOp::Noop);
+    }
+
     #[tokio::test]
     async fn create_repository_scoped_with_no_repo_id_anywhere_noops() {
         let (_home, db) = open_state();
@@ -866,8 +957,8 @@ mod tests {
             text: "maybe uses pnpm".to_string(),
             canonical_key: None,
             scope_kind: "global".to_string(),
-            confidence_signal: Signal::Low,
-            importance_signal: Signal::Low,
+            confidence_signal: Some(Signal::Low),
+            importance_signal: Some(Signal::Low),
             cites: vec![obs_id],
         };
         let outcome = materialize(&read, &by_id, &window, &uuids, raw).expect("materialize");
@@ -1019,8 +1110,8 @@ mod tests {
             new_kind: "fact".to_string(),
             new_text: "promoted".to_string(),
             new_canonical_key: None,
-            confidence_signal: Signal::High,
-            importance_signal: Signal::High,
+            confidence_signal: Some(Signal::High),
+            importance_signal: Some(Signal::High),
             cites: vec![],
         };
         let outcome = materialize(&read, &HashMap::new(), &[], &uuids, raw).expect("materialize");
@@ -1062,8 +1153,8 @@ mod tests {
             new_kind: "fact".to_string(),
             new_text: "confirmed: uses postgres".to_string(),
             new_canonical_key: Some("storage-backend".to_string()),
-            confidence_signal: Signal::High,
-            importance_signal: Signal::High,
+            confidence_signal: Some(Signal::High),
+            importance_signal: Some(Signal::High),
             cites: vec![obs_id],
         };
         let outcome = materialize(&read, &by_id, &window, &uuids, raw).expect("materialize");
