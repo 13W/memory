@@ -14,8 +14,11 @@ use local_rag_memory::recall as recall_pipeline;
 use local_rag_protocol::ErrorEnvelope;
 use local_rag_store::{
     CandidateState, MemoryEntryRow, MemoryKind, MemoryState, ProposedOperation, RequestRoot,
-    Resolution, ScopeKind, list_candidates, list_memory_entries_for_scope, memory_entry_counts,
-    memory_evidence_for, pending_candidate_counts, projection_state, resolve, store_instance_uuid,
+    Resolution, ScopeKind, consolidation_run_counts, list_candidates,
+    list_memory_entries_for_scope, memory_entry_counts, memory_evidence_for,
+    observation_envelope_count, observations_applied_since, oldest_open_run_created_at,
+    pending_candidate_counts, projection_state, resolve, store_instance_uuid,
+    total_pending_backlog,
 };
 
 use crate::daemon::memory::MemoryContext;
@@ -477,6 +480,43 @@ struct MemoryStatsWire {
     pending_candidates_by_state: Vec<CandidateCountWire>,
 }
 
+/// D-049: `consolidation_run` count-by-state bucket, the run twin of
+/// [`MemoryCountWire`]/[`CandidateCountWire`].
+#[derive(Debug, Serialize)]
+struct RunCountWire {
+    state: String,
+    count: i64,
+}
+
+impl From<local_rag_store::RunCountRow> for RunCountWire {
+    fn from(r: local_rag_store::RunCountRow) -> Self {
+        RunCountWire {
+            state: r.state.as_str().to_string(),
+            count: r.count,
+        }
+    }
+}
+
+/// D-049: the observations pillar (`01-overview.md` §5-9), previously
+/// unreported by `stats()` entirely.
+#[derive(Debug, Serialize)]
+struct ObservationStatsWire {
+    total: i64,
+}
+
+/// D-049: consolidation backlog + a best-effort progress/ETA estimate.
+/// `progress_pct`/`eta_seconds` are honestly `null` when unmeasurable (empty
+/// store, zero throughput, zero backlog) rather than a fabricated number.
+#[derive(Debug, Serialize)]
+struct ConsolidationStatsWire {
+    runs_by_state: Vec<RunCountWire>,
+    pending_backlog_total: i64,
+    progress_pct: Option<f64>,
+    throughput_observations_per_min: f64,
+    eta_seconds: Option<i64>,
+    oldest_pending_run_created_at: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 struct WriteQueueWire {
     capacity: usize,
@@ -526,11 +566,33 @@ struct ToolCallCountsWire {
 #[derive(Debug, Serialize)]
 struct StatsResult {
     memory: MemoryStatsWire,
+    observations: ObservationStatsWire,
+    consolidation: ConsolidationStatsWire,
     scope: String,
     worktree: Option<WorktreeStatsWire>,
     store_instance_uuid: Option<String>,
     write_queues: WriteQueuesWire,
     tool_calls: ToolCallCountsWire,
+}
+
+/// Window (D-049, `[SPEC]`-chosen, not measured — mirrors `cli::stats`'s own
+/// identical constant; the two `stats` implementations are independently
+/// duplicated, not shared, per this module's own precedent) over which
+/// recently-`applied` consolidation runs are summed to estimate
+/// throughput/ETA.
+const CONSOLIDATION_THROUGHPUT_WINDOW_MS: i64 = 5 * 60 * 1000;
+
+/// The current wall-clock time as Unix milliseconds — mirrors
+/// `consolidation_trigger::system_now_ms`/`lifecycle::system_now_ms`/
+/// `worktree_task::system_now_ms` exactly, this project's established
+/// convention of each call site carrying its own trivial copy rather than a
+/// shared helper.
+fn system_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub async fn stats(
@@ -557,6 +619,48 @@ pub async fn stats(
     let pending_candidates_by_state = match pending_candidate_counts(&state_read) {
         Ok(v) => v,
         Err(e) => return Ok(infra_err(e)),
+    };
+
+    // D-049: the observations pillar (`01-overview.md` §5-9) and the
+    // consolidation backlog/progress -- store-wide, same as the memory
+    // counts above, previously unreported by `stats()` entirely.
+    let observations_total = match observation_envelope_count(&state_read) {
+        Ok(v) => v,
+        Err(e) => return Ok(infra_err(e)),
+    };
+    let runs_by_state = match consolidation_run_counts(&state_read) {
+        Ok(v) => v,
+        Err(e) => return Ok(infra_err(e)),
+    };
+    let pending_backlog_total = match total_pending_backlog(&state_read) {
+        Ok(v) => v,
+        Err(e) => return Ok(infra_err(e)),
+    };
+    let now_ms = system_now_ms();
+    let applied_recently = match observations_applied_since(
+        &state_read,
+        now_ms - CONSOLIDATION_THROUGHPUT_WINDOW_MS,
+    ) {
+        Ok(v) => v,
+        Err(e) => return Ok(infra_err(e)),
+    };
+    let oldest_pending_run_created_at = match oldest_open_run_created_at(&state_read) {
+        Ok(v) => v,
+        Err(e) => return Ok(infra_err(e)),
+    };
+    let throughput_observations_per_min =
+        applied_recently as f64 / (CONSOLIDATION_THROUGHPUT_WINDOW_MS as f64 / 60_000.0);
+    let progress_pct = if observations_total > 0 {
+        Some(
+            (observations_total - pending_backlog_total) as f64 / observations_total as f64 * 100.0,
+        )
+    } else {
+        None
+    };
+    let eta_seconds = if throughput_observations_per_min > 0.0 && pending_backlog_total > 0 {
+        Some((pending_backlog_total as f64 / throughput_observations_per_min * 60.0) as i64)
+    } else {
+        None
     };
 
     let resolution = match resolve(&state_read, &root) {
@@ -605,6 +709,17 @@ pub async fn stats(
                 .into_iter()
                 .map(CandidateCountWire::from)
                 .collect(),
+        },
+        observations: ObservationStatsWire {
+            total: observations_total,
+        },
+        consolidation: ConsolidationStatsWire {
+            runs_by_state: runs_by_state.into_iter().map(RunCountWire::from).collect(),
+            pending_backlog_total,
+            progress_pct,
+            throughput_observations_per_min,
+            eta_seconds,
+            oldest_pending_run_created_at,
         },
         scope: scope_label,
         worktree,
