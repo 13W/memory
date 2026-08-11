@@ -7,12 +7,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use local_rag::daemon::{DaemonHandle, LazyEmbedderProvider, SessionGuard, StartOptions};
+use local_rag::daemon::{
+    DaemonHandle, LazyEmbedderProvider, ProviderProbe, SessionGuard, StartOptions,
+};
 use local_rag_core::DataPolicy;
+use local_rag_core::identity::domain::path_fingerprint;
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
-use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, WorktreeLockRegistry};
+use local_rag_embed::{Embedder, HashingEmbedder};
+use local_rag_index::classify::ClassifierConfig;
+use local_rag_store::{
+    DEFAULT_MODEL_SPACE_ID, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, RepresentationKind,
+    RetentionParams, StateDb, WorktreeKind, WorktreeLockRegistry, WorktreeRootFacts,
+    register_managed_worktree, register_representation, set_model_space_representation,
+};
 use local_rag_test_support::TempHome;
 
 struct SeqUuidV7 {
@@ -62,6 +71,12 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         consolidation_batch_size: 20,
         consolidation_queue_threshold: 50,
         consolidation_poll_interval: Duration::from_millis(50),
+        retention: RetentionParams {
+            keep_last_k: 2,
+            window_ms: 7 * 24 * 60 * 60 * 1000,
+        },
+        classifier: ClassifierConfig::new(1024 * 1024),
+        indexing_backstop_poll_interval: Duration::from_millis(50),
     }
 }
 
@@ -158,6 +173,95 @@ async fn a_live_session_prevents_idle_exit_even_with_no_pending_spool() {
         handle.is_idle_eligible(),
         "dropping the last session restores idle eligibility"
     );
+
+    handle.shutdown().await;
+}
+
+fn facts_for(root: &std::path::Path) -> WorktreeRootFacts {
+    let path = root.display().to_string();
+    WorktreeRootFacts {
+        observed_canonical_path: path.clone(),
+        display_path: path.clone(),
+        path_fingerprint: path_fingerprint(&path),
+        kind: WorktreeKind::NonGit,
+        common_dir_fingerprint: None,
+        remote_fingerprint: None,
+    }
+}
+
+/// T20-06 regression: spec 02 §4.3 `[FIXED]` ("idle shutdown only when
+/// **all** hold") must not gain a new, unwritten "and no managed project is
+/// registered" clause — a daemon with a registered-but-quiet managed
+/// worktree (indexed once at startup, then untouched) still becomes idle-
+/// eligible, exactly as it would with none registered at all. T20-10 (owner
+/// decision, not implemented here) is where an opt-in keep-alive would live
+/// if the product ever wants one.
+#[tokio::test]
+async fn a_registered_but_quiet_managed_worktree_still_allows_idle_shutdown() {
+    let (home, layout) = open_layout();
+    let uuids = SeqUuidV7::new();
+    let now_ms = 1_000;
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    {
+        let code_key = HashingEmbedder::new(RepresentationKind::CodeRaw).key();
+        let memory_key = HashingEmbedder::new(RepresentationKind::Memory).key();
+        state
+            .writer()
+            .transaction(move |tx| {
+                let code_id = register_representation(tx, "test-code-raw", &code_key, now_ms)?;
+                set_model_space_representation(
+                    tx,
+                    DEFAULT_MODEL_SPACE_ID,
+                    RepresentationKind::CodeRaw,
+                    &code_id,
+                    true,
+                    now_ms,
+                )?;
+                let memory_id = register_representation(tx, "test-memory", &memory_key, now_ms)?;
+                set_model_space_representation(
+                    tx,
+                    DEFAULT_MODEL_SPACE_ID,
+                    RepresentationKind::Memory,
+                    &memory_id,
+                    true,
+                    now_ms,
+                )
+            })
+            .await
+            .expect("register representations");
+    }
+
+    let root = home.join("quiet-repo");
+    std::fs::create_dir_all(&root).expect("create worktree root");
+    std::fs::write(root.join("main.rs"), "fn parse_config() {}\n").expect("seed file");
+    let repo_id = uuids.next_uuid();
+    let worktree_id = uuids.next_uuid();
+    let facts = facts_for(&root);
+    local_rag::indexing::register_new_worktree(&state, repo_id, worktree_id, &facts, now_ms)
+        .await
+        .expect("register worktree");
+    let worktree_id_str = worktree_id.to_string();
+    state
+        .writer()
+        .transaction(move |tx| register_managed_worktree(tx, &worktree_id_str, now_ms))
+        .await
+        .expect("enroll managed worktree");
+    drop(state);
+
+    let mut opts = start_options(layout.clone());
+    opts.embedder_provider = Arc::new(LazyEmbedderProvider::with_probes(
+        || ProviderProbe::Ready(Arc::new(HashingEmbedder::new(RepresentationKind::CodeRaw))),
+        || ProviderProbe::Ready(Arc::new(HashingEmbedder::new(RepresentationKind::Memory))),
+    ));
+    let handle = DaemonHandle::start(opts).await.expect("start");
+
+    // Once the seeded worktree's own single startup cycle has finished (no
+    // further file changes ever arrive), the daemon must still become idle-
+    // eligible — the managed-worktree supervisor's `JobGuard` is held only
+    // for the active span (D-024 discipline, inherited from T20-05), never
+    // while its task merely waits for the next trigger.
+    wait_until_idle_eligible(&handle).await;
 
     handle.shutdown().await;
 }

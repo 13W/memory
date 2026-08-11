@@ -260,6 +260,16 @@ without ever requiring the queried *file* to still exist, falling back to pure s
 normalization only if the parent itself is also gone (11 §2's as-built note has the full
 reasoning).
 
+As-built note (T20-06, `[SPEC]`): ADR-0009's daemon-managed indexing supervisor
+(`local_rag::daemon::indexing::supervisor`) does not create an ambient current project. The
+`managed_worktree` registry (03 §2.1) it reads is a **list of background work** — which worktrees
+this daemon process keeps a `spawn_worktree_task` (06 §1) running for — never a routing input:
+every request this section governs still resolves `worktree_id`/`repo_id` fresh from its own
+explicit `RequestContext`, whether or not that worktree happens to be daemon-managed. A managed
+worktree's background task and a request naming that same worktree share no state beyond the
+registry/store both read; the supervisor never substitutes for, defaults, or narrows request
+routing.
+
 ## 4. Daemon lifecycle `[FIXED, mechanics [SPEC]]`
 
 ### 4.1 Startup

@@ -576,8 +576,11 @@ use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
 
 use local_rag::daemon::{DaemonHandle, LazyEmbedderProvider, StartOptions};
+use local_rag_index::classify::ClassifierConfig;
 use local_rag_protocol::{Hello, Message, RequestContext, RequestEnvelope};
-use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, WorktreeLockRegistry};
+use local_rag_store::{
+    LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, RetentionParams, WorktreeLockRegistry,
+};
 
 pub fn open_layout() -> (TempHome, StoreLayout) {
     let home = TempHome::new().expect("temp home");
@@ -609,6 +612,12 @@ pub fn start_options(layout: StoreLayout) -> StartOptions {
         consolidation_batch_size: 20,
         consolidation_queue_threshold: 50,
         consolidation_poll_interval: std::time::Duration::from_millis(50),
+        retention: RetentionParams {
+            keep_last_k: 2,
+            window_ms: 7 * 24 * 60 * 60 * 1000,
+        },
+        classifier: ClassifierConfig::new(1024 * 1024),
+        indexing_backstop_poll_interval: std::time::Duration::from_millis(50),
     }
 }
 
