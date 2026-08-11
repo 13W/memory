@@ -34,6 +34,12 @@ quarantine/
 npm/**/node_modules/
 npm/**/*.tgz
 
+# Root-level node_modules: machine-local dev symlinks so the plugin launcher's
+# tier 1 (plugin/bin/local-rag-mcp-launcher.js) resolves @13w/memory and its
+# platform package straight to this checkout instead of npm's tier-3 fallback
+# — never a real install, never committed.
+/node_modules/
+
 # Platform packages' `bin/` (T17-03): release binaries and the bundled ONNX
 # Runtime shared library, populated locally by `cargo build --release`/`cargo
 # zigbuild`/`cargo xtask dist-ort` for verification — build output, not
