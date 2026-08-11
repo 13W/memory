@@ -11,9 +11,10 @@ use std::process::{Output, Stdio};
 use local_rag::daemon::gitroot;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, ProposedOperation, ScopeKind, StateDb,
-    create_memory_entry, create_repository, create_worktree, insert_projection_state,
-    observe_repository_path, observe_worktree_path, propose_candidate,
+    GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewConsolidationRun, NewMemoryEntry, ProposedOperation,
+    ScopeKind, StateDb, create_consolidation_run, create_memory_entry, create_repository,
+    create_worktree, insert_projection_state, observe_repository_path, observe_worktree_path,
+    propose_candidate,
 };
 use local_rag_test_support::TempHome;
 
@@ -94,6 +95,58 @@ async fn seed_entry(state: &StateDb, memory_id: &str, kind: MemoryKind, text: &s
         .expect("seed entry domain");
 }
 
+/// Insert a minimal, standalone `observation_envelope` row (D-049) — no
+/// repo/worktree/payload, just enough for `observation_envelope_count`/
+/// `total_pending_backlog` to see it. Mirrors `crates/store/tests/memory.rs`'s
+/// own `seed_observation`, duplicated here per this crate's established
+/// per-file-fixture convention.
+async fn seed_observation_envelope(state: &StateDb, observation_id: &str, session_id: &str) {
+    let (oid, sid) = (observation_id.to_string(), session_id.to_string());
+    state
+        .writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO observation_envelope \
+                   (observation_id, source_event_id, payload_hash, event_type, evidence_kind, \
+                    trust, session_id) \
+                 VALUES (?1, ?1, 'deadbeef', 'Stop', 'user_statement', 'normal', ?2)",
+                [&oid, &sid],
+            )
+        })
+        .await
+        .expect("seed observation envelope");
+}
+
+/// Create a `consolidation_run` row in its initial `pending` state (D-049) —
+/// no existing seed helper for this table in this crate's tests.
+async fn seed_consolidation_run(
+    state: &StateDb,
+    run_id: &str,
+    session_id: &str,
+    from_received_seq: i64,
+    to_received_seq: i64,
+    now_ms: i64,
+) {
+    let (run_id, session_id) = (run_id.to_string(), session_id.to_string());
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: &run_id,
+                    session_id: &session_id,
+                    from_received_seq,
+                    to_received_seq,
+                    router_version: "v1",
+                },
+                now_ms,
+            )
+        })
+        .await
+        .expect("seed consolidation run");
+}
+
 async fn seed_candidate(state: &StateDb, candidate_id: &str, now_ms: i64) {
     let cid = candidate_id.to_string();
     state
@@ -133,6 +186,23 @@ fn stats_on_an_empty_store_reports_zero_counts_and_no_worktree() {
     assert!(text.contains("memory entries: none"), "{text}");
     assert!(text.contains("pending candidates: none"), "{text}");
     assert!(text.contains("worktree: (unresolved)"), "{text}");
+    // D-049: observations pillar + consolidation backlog/progress, honestly
+    // "unknown"/"none" on an empty store rather than a fabricated number.
+    assert!(text.contains("observations: 0 total"), "{text}");
+    assert!(text.contains("consolidation runs: none"), "{text}");
+    assert!(text.contains("consolidation pending backlog: 0"), "{text}");
+    assert!(
+        text.contains("consolidation progress: unknown (no observations yet)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("consolidation eta: unknown (no measurable throughput)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("consolidation oldest pending run: none (fully caught up)"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -143,6 +213,12 @@ async fn stats_reports_seeded_counts_and_the_resolved_worktree_block() {
         seed_entry(&state, "mem-a", MemoryKind::Fact, "a fact", 1_000).await;
         seed_entry(&state, "mem-b", MemoryKind::Task, "a task", 2_000).await;
         seed_candidate(&state, "cand-a", 1_000).await;
+        // D-049: two envelopes (received_seq 1, 2 -- fresh store, one global
+        // sequence) and one still-`pending` consolidation run, no cursor
+        // advanced yet -- backlog equals the session's own max received_seq.
+        seed_observation_envelope(&state, "obs-1", "sess-1").await;
+        seed_observation_envelope(&state, "obs-2", "sess-1").await;
+        seed_consolidation_run(&state, "run-1", "sess-1", 1, 1, 1_000).await;
     }
     seed_active_repo_and_worktree(&layout, "repo-1", "wt-1", home.path()).await;
 
@@ -155,6 +231,18 @@ async fn stats_reports_seeded_counts_and_the_resolved_worktree_block() {
     assert!(
         text.contains("worktree: repo repo-1 / worktree wt-1"),
         "{text}"
+    );
+    assert!(text.contains("observations: 2 total"), "{text}");
+    assert!(text.contains("consolidation runs  pending: 1"), "{text}");
+    assert!(text.contains("consolidation pending backlog: 2"), "{text}");
+    assert!(text.contains("consolidation progress: 0.0%"), "{text}");
+    assert!(
+        text.contains("consolidation eta: unknown (no measurable throughput)"),
+        "{text}",
+    );
+    assert!(
+        !text.contains("consolidation oldest pending run: none"),
+        "a pending run exists, its created_at must be reported: {text}"
     );
 
     let output = run_cli(&home, home.path(), &["stats", "--json"]);
@@ -169,4 +257,16 @@ async fn stats_reports_seeded_counts_and_the_resolved_worktree_block() {
             .len(),
         2
     );
+    assert_eq!(json["observations"]["total"], 2);
+    assert_eq!(
+        json["consolidation"]["runs_by_state"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(json["consolidation"]["pending_backlog_total"], 2);
+    assert_eq!(json["consolidation"]["progress_pct"], 0.0);
+    assert!(json["consolidation"]["eta_seconds"].is_null());
+    assert!(!json["consolidation"]["oldest_pending_run_created_at"].is_null());
 }

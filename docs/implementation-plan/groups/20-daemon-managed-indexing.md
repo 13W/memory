@@ -227,7 +227,16 @@ an owner»), §5 `[SPEC]` (L2 + `[OPEN]` про eviction), §6 (`BUSY_RETRY`); s
   `projects_list` = durable-поля из таблицы + in-memory статус из `T20-05`;
   `reconcile_now` инжектирует `TriggerKind::Manual`; ошибки — JSON-RPC-канал (`-32602` для
   неизвестного/неуправляемого worktree), не `isError`-контент; `admin/*` не попадает в
-  собственную телеметрию (уже обеспечено `handshake.rs`).
+  собственную телеметрию (уже обеспечено `handshake.rs`). **Форвард-пометка D-049**:
+  `WorktreeTaskStatus` (`last_generation_id`/`last_success_ms`/`consecutive_failures`/
+  `last_error`, `daemon/indexing/worktree_task.rs:102-113`) дополнить полем начала текущего
+  активного цикла (например `in_progress_since: Option<i64>`), не только `last_success_ms` —
+  без него будущий потребитель прогресс-индикатора (`local-rag stats`, который D-049 уже
+  снабдил consolidation-прогрессом/ETA тем же способом) не сможет посчитать elapsed/ETA для
+  индексации. Проверено при подготовке D-049 (2026-08): сегодня в проде нет ни одного фонового
+  индексирующего таска (`spawn_worktree_task` вызывается только из тестов) и у ручного
+  `index/reindex/watch` нет межпроцессного канала для промежуточного состояния — само поле
+  вводится только здесь, когда статус впервые становится внешне видимым.
 - **Не в scope:** MCP-инструменты (`tools::catalog()` не трогать — T19-01's `MAX_CATALOG_BYTES`);
   push/подписки (`local_rag_protocol` остаётся request/response, 02 §4.2); правки методов
   T18-08 (пока `G18` не закрыт).

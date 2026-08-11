@@ -19,14 +19,15 @@ use local_rag_store::memory::{
     Actor, CandidateState, CandidateTransitionError, CreateMemoryEntryError, GLOBAL_SCOPE_OWNER_ID,
     IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition, MemoryCountRow,
     MemoryKind, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
-    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunState, RunTransitionError,
-    ScopeKind, active_entries_for_scope, candidate_state, canonical_key_owner,
-    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
-    insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
+    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunCountRow, RunState,
+    RunTransitionError, ScopeKind, active_entries_for_scope, candidate_state, canonical_key_owner,
+    consolidation_run_counts, consolidation_run_state, create_candidate, create_consolidation_run,
+    create_memory_entry, insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
     list_memory_entries_for_scope, memory_entry_by_id, memory_entry_counts, memory_entry_state,
-    memory_entry_summary, memory_evidence_for, processing_cursor, read_audit_events_for_entity,
-    recall_candidates_for_scope, transition_candidate, transition_memory_entry, transition_run,
-    upsert_processing_cursor,
+    memory_entry_summary, memory_evidence_for, observations_applied_since,
+    oldest_open_run_created_at, processing_cursor, read_audit_events_for_entity,
+    recall_candidates_for_scope, total_pending_backlog, transition_candidate,
+    transition_memory_entry, transition_run, upsert_processing_cursor,
 };
 use local_rag_store::{StateDb, WriteError};
 use local_rag_test_support::TempHome;
@@ -1774,4 +1775,281 @@ async fn memory_entry_counts_is_empty_for_an_empty_store() {
     let (_home, db) = open_state();
     let read = db.open_read().expect("read conn");
     assert_eq!(memory_entry_counts(&read).expect("counts"), Vec::new());
+}
+
+#[tokio::test]
+async fn consolidation_run_counts_groups_by_state_store_wide() {
+    let (_home, db) = open_state();
+    db.writer()
+        .transaction(|tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-pending",
+                    session_id: "sess-1",
+                    from_received_seq: 1,
+                    to_received_seq: 5,
+                    router_version: "v1",
+                },
+                1000,
+            )?;
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-applied",
+                    session_id: "sess-1",
+                    from_received_seq: 6,
+                    to_received_seq: 10,
+                    router_version: "v1",
+                },
+                1000,
+            )?;
+            transition_run(tx, "run-applied", RunState::Running, 1100)?.expect("legal");
+            transition_run(tx, "run-applied", RunState::Applied, 1200)?.expect("legal");
+            Ok(())
+        })
+        .await
+        .expect("seed runs");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        consolidation_run_counts(&read).expect("counts"),
+        vec![
+            RunCountRow {
+                state: RunState::Applied,
+                count: 1,
+            },
+            RunCountRow {
+                state: RunState::Pending,
+                count: 1,
+            },
+        ],
+        "ordered by state text ('applied' < 'pending'); empty buckets omitted"
+    );
+}
+
+#[tokio::test]
+async fn consolidation_run_counts_is_empty_for_an_empty_store() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+    assert_eq!(consolidation_run_counts(&read).expect("counts"), Vec::new());
+}
+
+#[tokio::test]
+async fn total_pending_backlog_sums_pending_backlog_across_every_session() {
+    let (_home, db) = open_state();
+    db.writer()
+        .transaction(|tx| {
+            // One global `received_seq` sequence, insertion order: sess-b
+            // gets 1..=2, sess-a gets 3..=5 -- mirrors `sessions_with_
+            // pending_backlog`'s own test fixture shape.
+            for (oid, evt, sess) in [
+                ("obs-b1", "evt-b1", "sess-b"),
+                ("obs-b2", "evt-b2", "sess-b"),
+                ("obs-a1", "evt-a1", "sess-a"),
+                ("obs-a2", "evt-a2", "sess-a"),
+                ("obs-a3", "evt-a3", "sess-a"),
+            ] {
+                tx.execute(
+                    "INSERT INTO observation_envelope \
+                       (observation_id, source_event_id, payload_hash, event_type, \
+                        evidence_kind, trust, session_id) \
+                     VALUES (?1, ?2, 'deadbeef', 'Stop', 'user_statement', 'normal', ?3)",
+                    [oid, evt, sess],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed envelopes across two sessions");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        total_pending_backlog(&read).expect("total backlog"),
+        7,
+        "no cursor for either session: 2 (sess-b, seq 1..=2) + 5 (sess-a, up to seq 5)"
+    );
+    drop(read);
+
+    db.writer()
+        .transaction(|tx| upsert_processing_cursor(tx, "sess-b", 2))
+        .await
+        .expect("catch sess-b up");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        total_pending_backlog(&read).expect("total backlog"),
+        5,
+        "sess-b caught up (backlog 0, drops out of the sum); sess-a's 5 remains"
+    );
+}
+
+#[tokio::test]
+async fn total_pending_backlog_is_zero_for_an_empty_store() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+    assert_eq!(total_pending_backlog(&read).expect("total backlog"), 0);
+}
+
+#[tokio::test]
+async fn observations_applied_since_sums_window_sizes_of_recently_applied_runs() {
+    let (_home, db) = open_state();
+    db.writer()
+        .transaction(|tx| {
+            // Applied before the cutoff -- must not count.
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-old",
+                    session_id: "sess-1",
+                    from_received_seq: 1,
+                    to_received_seq: 10,
+                    router_version: "v1",
+                },
+                500,
+            )?;
+            transition_run(tx, "run-old", RunState::Running, 600)?.expect("legal");
+            transition_run(tx, "run-old", RunState::Applied, 700)?.expect("legal");
+            // Applied after the cutoff -- must count (window size 5: 11..=15).
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-recent",
+                    session_id: "sess-1",
+                    from_received_seq: 11,
+                    to_received_seq: 15,
+                    router_version: "v1",
+                },
+                1500,
+            )?;
+            transition_run(tx, "run-recent", RunState::Running, 1600)?.expect("legal");
+            transition_run(tx, "run-recent", RunState::Applied, 1700)?.expect("legal");
+            // Still running after the cutoff -- must not count (not applied).
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-in-flight",
+                    session_id: "sess-1",
+                    from_received_seq: 16,
+                    to_received_seq: 20,
+                    router_version: "v1",
+                },
+                1800,
+            )?;
+            transition_run(tx, "run-in-flight", RunState::Running, 1900)?.expect("legal");
+            Ok(())
+        })
+        .await
+        .expect("seed runs");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        observations_applied_since(&read, 1000).expect("applied since"),
+        5,
+        "only run-recent's window (11..=15, 5 observations) is applied after the cutoff"
+    );
+}
+
+#[tokio::test]
+async fn observations_applied_since_is_zero_for_an_empty_store() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        observations_applied_since(&read, 0).expect("applied since"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn oldest_open_run_created_at_ignores_applied_runs() {
+    let (_home, db) = open_state();
+    db.writer()
+        .transaction(|tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-applied",
+                    session_id: "sess-1",
+                    from_received_seq: 1,
+                    to_received_seq: 5,
+                    router_version: "v1",
+                },
+                1000,
+            )?;
+            transition_run(tx, "run-applied", RunState::Running, 1100)?.expect("legal");
+            transition_run(tx, "run-applied", RunState::Applied, 1200)?.expect("legal");
+            // The oldest still-open run -- created before the newer one below.
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-open-old",
+                    session_id: "sess-1",
+                    from_received_seq: 6,
+                    to_received_seq: 10,
+                    router_version: "v1",
+                },
+                2000,
+            )?;
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-open-new",
+                    session_id: "sess-1",
+                    from_received_seq: 11,
+                    to_received_seq: 15,
+                    router_version: "v1",
+                },
+                3000,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed runs");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        oldest_open_run_created_at(&read).expect("oldest open run"),
+        Some(2000),
+        "the applied run's created_at (1000) must not win despite being earlier"
+    );
+}
+
+#[tokio::test]
+async fn oldest_open_run_created_at_is_none_when_every_run_is_applied() {
+    let (_home, db) = open_state();
+    db.writer()
+        .transaction(|tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-applied",
+                    session_id: "sess-1",
+                    from_received_seq: 1,
+                    to_received_seq: 5,
+                    router_version: "v1",
+                },
+                1000,
+            )?;
+            transition_run(tx, "run-applied", RunState::Running, 1100)?.expect("legal");
+            transition_run(tx, "run-applied", RunState::Applied, 1200)?.expect("legal");
+            Ok(())
+        })
+        .await
+        .expect("seed run");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        oldest_open_run_created_at(&read).expect("oldest open run"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn oldest_open_run_created_at_is_none_for_an_empty_store() {
+    let (_home, db) = open_state();
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        oldest_open_run_created_at(&read).expect("oldest open run"),
+        None
+    );
 }

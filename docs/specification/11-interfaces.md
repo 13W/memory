@@ -250,6 +250,27 @@ memory on a long-lived daemon serving many short Claude Code sessions, not a tok
 (`[SPEC]`, this task's own scope boundary) — `state.sqlite`'s schema is unchanged; a daemon
 restart resets it to zero, the same way `write_queues`' own in-memory numbers already do.
 
+As-built note (D-049, `[SPEC]`). `stats()` previously reported only one of the three pillars this
+row's own "counts per pillar" wording promises (`01-overview.md` §5-9: memory, code search,
+**observations**) — a live dogfooding session found 11000+ accumulated `observation_envelope` rows
+and thousands of `consolidation_run`s invisible to both `local-rag stats` and its MCP twin. Two new
+store-wide fields close the gap, computed identically (duplicated, not shared — same as the
+CLI/MCP `stats` implementations themselves) in `cli::stats::run`/`daemon::mcp::memory::stats`:
+`observations.total` (new `local_rag_store::observation_envelope_count`) and `consolidation`
+(`runs_by_state` — new `consolidation_run_counts`, the `consolidation_run` twin of
+`memory_entry_counts`; `pending_backlog_total` — new `total_pending_backlog`, composing the
+already-existing `sessions_with_pending_backlog`/`pending_backlog`; `progress_pct`/
+`throughput_observations_per_min`/`eta_seconds` — presentation-layer estimates from a new
+`observations_applied_since(conn, since_ms)` throughput primitive over a `[SPEC]`-chosen 5-minute
+window; `oldest_pending_run_created_at` — new `oldest_open_run_created_at`). `progress_pct`/
+`eta_seconds` are `null` whenever unmeasurable (empty store, zero throughput, zero backlog) —
+never a fabricated number. Code-indexing progress was explicitly investigated and found
+unmeasurable today: no background indexing task runs in production before `T20-06`/`T20-07` land
+(`spawn_worktree_task`, T20-05, is called only from tests), and manual `index`/`reindex`/`watch`
+are synchronous, single-process black boxes with no inter-process channel a separate `stats`
+invocation could read — `T20-07`'s own card is annotated with the field (`in_progress_since`) a
+future indexing-progress consumer will need, rather than fabricating indexing data here.
+
 As-built note (T15-05, `[SPEC]`): the eight memory-write/candidate-review tools this section's
 table names — `remember`, `approve_memory_candidate`, `reject_memory_candidate`,
 `edit_memory_candidate`, `edit_memory`, `retract_memory`, `merge_memories`, `give_feedback` — are

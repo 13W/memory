@@ -13,9 +13,9 @@ use local_rag_core::identity::domain::subject_memory_entry;
 use local_rag_memory::recall::{QueryEmbedError, QueryEmbedder};
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, DistanceMetric, EmbeddingKey, GLOBAL_SCOPE_OWNER_ID,
-    MemoryKind, MemoryState, RepresentationKey, RepresentationKind, ScopeKind, StateDb,
-    SubjectKind, ensure_store_instance_uuid, insert_embedding, register_representation,
-    set_model_space_representation,
+    MemoryKind, MemoryState, NewConsolidationRun, RepresentationKey, RepresentationKind, ScopeKind,
+    StateDb, SubjectKind, create_consolidation_run, ensure_store_instance_uuid, insert_embedding,
+    register_representation, set_model_space_representation,
 };
 use serde_json::Value;
 use support::{
@@ -910,6 +910,73 @@ async fn stats_reports_counts_by_kind_state_and_pending_candidates_by_state() {
         parsed["tool_calls"]["since_daemon_start"],
         serde_json::json!([{"name": "stats", "count": 1}]),
         "{text}"
+    );
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+/// D-049: `stats` reports the observations pillar and consolidation
+/// backlog/progress, not only the memory pillar.
+#[tokio::test]
+async fn stats_reports_observations_and_consolidation_backlog() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_observation(&state, "obs-1").await;
+        seed_observation(&state, "obs-2").await;
+        state
+            .writer()
+            .transaction(|tx| {
+                create_consolidation_run(
+                    tx,
+                    &NewConsolidationRun {
+                        run_id: "run-1",
+                        session_id: "sess-1",
+                        from_received_seq: 1,
+                        to_received_seq: 1,
+                        router_version: "v1",
+                    },
+                    1_000,
+                )
+            })
+            .await
+            .expect("seed consolidation run");
+    }
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+
+    assert_eq!(parsed["observations"]["total"], 2, "{text}");
+    let runs_by_state = parsed["consolidation"]["runs_by_state"].as_array().unwrap();
+    assert_eq!(runs_by_state.len(), 1, "{text}");
+    assert_eq!(runs_by_state[0]["state"], "pending", "{text}");
+    assert_eq!(runs_by_state[0]["count"], 1, "{text}");
+    assert_eq!(
+        parsed["consolidation"]["pending_backlog_total"], 2,
+        "{text}"
+    );
+    assert_eq!(parsed["consolidation"]["progress_pct"], 0.0, "{text}");
+    assert!(
+        parsed["consolidation"]["eta_seconds"].is_null(),
+        "no measurable throughput yet: {text}"
+    );
+    assert!(
+        !parsed["consolidation"]["oldest_pending_run_created_at"].is_null(),
+        "a pending run exists, its created_at must be reported: {text}"
     );
 
     drop(home);

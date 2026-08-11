@@ -437,6 +437,15 @@ pub(crate) fn max_received_seq(
     )
 }
 
+/// The store-wide count of `observation_envelope` rows (D-049, spec 11 §2
+/// `stats()`'s "counts per pillar" — the observations pillar, `01-overview.md`
+/// §5-9, previously unreported by `stats()` entirely).
+pub fn observation_envelope_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM observation_envelope", [], |r| {
+        r.get(0)
+    })
+}
+
 /// One envelope inside a consolidation window, plus its still-live payload if
 /// any (T14-06, spec 08 §4 step 2: "Load envelopes (+ surviving payloads) of
 /// the window"). `payload: None` is the normal case for a payload the TTL
@@ -1009,6 +1018,26 @@ mod tests {
         let read = db.open_read().expect("read conn");
         assert_eq!(max_received_seq(&read, "sess-1").unwrap(), Some(2));
         assert_eq!(max_received_seq(&read, "sess-2").unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn observation_envelope_count_is_zero_then_tracks_inserts_across_sessions() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        assert_eq!(observation_envelope_count(&read).unwrap(), 0);
+        drop(read);
+
+        db.writer()
+            .transaction(|tx| {
+                insert_envelope(tx, &row("obs-1", "sess-1", "evt-1", None, Some(1)))?;
+                insert_envelope(tx, &row("obs-2", "sess-1", "evt-2", None, Some(2)))?;
+                insert_envelope(tx, &row("obs-3", "sess-2", "evt-3", None, Some(3)))
+            })
+            .await
+            .unwrap();
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(observation_envelope_count(&read).unwrap(), 3);
     }
 
     #[tokio::test]

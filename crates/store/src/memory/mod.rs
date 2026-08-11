@@ -137,7 +137,11 @@ pub use runner::{
     ApplyReport, ConsolidationWindow, GeneratedOp, RunOutcome, RunOutcomeError, RunnerApplyError,
     RunnerError, WindowObservation, commit_apply_run, run_once,
 };
-pub use stats::{CandidateCountRow, MemoryCountRow, memory_entry_counts, pending_candidate_counts};
+pub use stats::{
+    CandidateCountRow, MemoryCountRow, RunCountRow, consolidation_run_counts, memory_entry_counts,
+    observations_applied_since, oldest_open_run_created_at, pending_candidate_counts,
+    total_pending_backlog,
+};
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the
 /// `memory_entry`/`memory_evidence`/`pending_memory_candidate`/
