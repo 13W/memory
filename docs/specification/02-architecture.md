@@ -321,6 +321,23 @@ disambiguated by `details`) rather than leaving nothing reachable at all — see
 degrades silently" `[FIXED]`. Every *other* step-1–4 failure (lock contention, a non-migration state
 error, a cache-open failure, a bind failure) remains a genuine startup abort.
 
+As-built note (T20-06, `[SPEC]`, G20). Step 4's "start workers" now includes one more: the
+daemon-managed indexing supervisor (`local_rag::daemon::indexing::spawn_supervisor`, ADR-0009)
+is constructed immediately after the readiness marker is written (`lock_guard.mark_ready(...)`),
+before `McpHandler` starts serving connections — still squarely inside step 4, not a new step —
+because `McpHandler` needs a ready `Option<SupervisorClient>` at construction time (T20-07's own
+as-built note in 11 §8 explains why: `McpHandler` is built, and begins serving, independently of
+`DaemonHandle`'s own remaining construction). The supervisor is `None` in exactly the same
+condition `engine`/`memory` are `None` in (`DaemonMode::MigrationOnly` — no usable `state.sqlite`
+to read `managed_worktree` from), so a migration-only daemon binds and answers step-4's readiness
+marker without ever starting a background indexing worker, consistent with the "nothing degrades
+silently" discipline `§6` fixes: the daemon still comes up, `admin/*` verbs answer `available:
+false` rather than hanging or crashing. Cold start itself: the supervisor's own `reconcile()`
+reads every enrolled row from `managed_worktree` (03 §2.1) and starts one `spawn_worktree_task`
+per **enabled** row, batched `MAX_CONCURRENT_STARTUP_RECONCILES` at a time — an internal `[SPEC]`
+constant chosen (not derived) the same way `LIVENESS_PROBE_TIMEOUT_MS` is, documented at its own
+definition site, not repeated here.
+
 ### 4.2 Proxy → daemon handshake
 
 ```
@@ -452,6 +469,21 @@ a single non-idle input refuses regardless of the other two, per this section's 
 This task's own scope covered only the two *startup* resume jobs (07 §6, 08 §4); no
 reconcile-watcher or periodic-GC scheduling exists yet either (no card names an owner narrower
 than "group 15" for either).
+
+As-built note (T20-05/T20-06, `[SPEC]`, G20). The reconcile-watcher scheduling gap the note above
+names is now owned: `local_rag::daemon::indexing::worktree_task`'s per-worktree task is the
+`running_jobs` input's newest producer, `JobKind::Reconcile` (already declared, T20-05). The same
+D-024 discipline the consolidation-trigger note below fixes applies here too — `JobGuard` is
+acquired immediately before `write_locked(project_generation)` and dropped at the end of that one
+call, never held across the outer `select!`'s own wait — so a daemon with one or more **enrolled
+but quiet** managed worktrees (registered, watched, nothing has changed since) is exactly as
+idle-eligible as one with none registered at all: watching a filesystem for changes is not
+"running," only an active embed/activate/materialize cycle is. `tests/idle_shutdown.rs::
+a_registered_but_quiet_managed_worktree_still_allows_idle_shutdown` is the regression test proving
+this — a managed enrollment alone must never grow an unwritten fifth condition onto this section's
+own "**all**" `[FIXED]` clause. (Whether a managed project should instead *keep* the daemon alive
+is `T20-10`, an owner-decision card explicitly blocked pending a product decision — until then this
+paragraph describes the only behavior that exists.)
 
 As-built note (D-024, `[SPEC]`): continuous consolidation triggering (checkpoint on `Stop`,
 queue-size threshold, best-effort `SessionEnd`) — the quarter this section's own text names but
