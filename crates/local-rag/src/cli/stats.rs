@@ -8,10 +8,10 @@ use std::process::ExitCode;
 
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
-    RequestRoot, Resolution, consolidation_run_counts, memory_entry_counts,
-    observation_envelope_count, observations_applied_since, oldest_open_run_created_at,
-    pending_candidate_counts, projection_state, resolve, store_instance_uuid,
-    total_pending_backlog,
+    RequestRoot, Resolution, UnconsolidatableSession, consolidation_run_counts,
+    memory_entry_counts, observation_envelope_count, observations_applied_since,
+    oldest_open_run_created_at, pending_candidate_counts, projection_state, resolve,
+    store_instance_uuid, total_pending_backlog, unconsolidatable_sessions,
 };
 
 use local_rag::daemon::gitroot;
@@ -48,6 +48,13 @@ struct ConsolidationStats {
     throughput_observations_per_min: f64,
     eta_seconds: Option<i64>,
     oldest_pending_run_created_at: Option<i64>,
+    /// D-058: sessions permanently stuck in the floor case — an observation
+    /// (or an already-halved window) that alone still overflows the model's
+    /// context, so [`open_next_run`](local_rag_store::open_next_run)'s
+    /// shrink-and-retry has no narrower window left to try. Empty in the
+    /// overwhelmingly common case; every non-empty session here needs a
+    /// human decision, not another retry.
+    unconsolidatable: Vec<UnconsolidatableSession>,
 }
 
 fn compute_consolidation_stats(
@@ -74,6 +81,7 @@ fn compute_consolidation_stats(
         None
     };
     let oldest_pending_run_created_at = oldest_open_run_created_at(conn)?;
+    let unconsolidatable = unconsolidatable_sessions(conn, local_rag_core::BUILD_ID)?;
     Ok(ConsolidationStats {
         runs_by_state,
         pending_backlog_total,
@@ -81,6 +89,7 @@ fn compute_consolidation_stats(
         throughput_observations_per_min,
         eta_seconds,
         oldest_pending_run_created_at,
+        unconsolidatable,
     })
 }
 
@@ -197,6 +206,12 @@ pub fn run(args: StatsArgs) -> ExitCode {
                 "throughput_observations_per_min": consolidation.throughput_observations_per_min,
                 "eta_seconds": consolidation.eta_seconds,
                 "oldest_pending_run_created_at": consolidation.oldest_pending_run_created_at,
+                "unconsolidatable_sessions": consolidation.unconsolidatable.iter().map(|s| serde_json::json!({
+                    "session_id": s.session_id,
+                    "dead_letter_run_id": s.dead_letter_run_id,
+                    "from_received_seq": s.from_received_seq,
+                    "to_received_seq": s.to_received_seq,
+                })).collect::<Vec<_>>(),
             },
             "scope": scope_label,
             "worktree": worktree_json,
@@ -267,6 +282,22 @@ pub fn run(args: StatsArgs) -> ExitCode {
     match consolidation.oldest_pending_run_created_at {
         Some(ms) => println!("consolidation oldest pending run created_at: {ms}"),
         None => println!("consolidation oldest pending run: none (fully caught up)"),
+    }
+    // D-058: silent when empty — the overwhelmingly common case — so this
+    // never adds noise to a healthy store; every line printed here names a
+    // session that needs a human, not another retry.
+    if !consolidation.unconsolidatable.is_empty() {
+        println!(
+            "consolidation unconsolidatable: {} session(s) — needs manual review, \
+             will not resolve on its own",
+            consolidation.unconsolidatable.len()
+        );
+        for s in &consolidation.unconsolidatable {
+            println!(
+                "  session {} received_seq {}..={} — dead-letter run {}",
+                s.session_id, s.from_received_seq, s.to_received_seq, s.dead_letter_run_id
+            );
+        }
     }
     match &worktree {
         Some((repo_id, worktree_id, projection)) => {

@@ -11,10 +11,10 @@ use std::process::{Output, Stdio};
 use local_rag::daemon::gitroot;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewConsolidationRun, NewMemoryEntry, ProposedOperation,
-    ScopeKind, StateDb, create_consolidation_run, create_memory_entry, create_repository,
-    create_worktree, insert_projection_state, observe_repository_path, observe_worktree_path,
-    propose_candidate,
+    FailureKind, GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewConsolidationRun, NewMemoryEntry,
+    ProposedOperation, RunState, ScopeKind, StateDb, create_consolidation_run, create_memory_entry,
+    create_repository, create_worktree, insert_projection_state, observe_repository_path,
+    observe_worktree_path, propose_candidate, record_run_failure, transition_run,
 };
 use local_rag_test_support::TempHome;
 
@@ -147,6 +147,50 @@ async fn seed_consolidation_run(
         .expect("seed consolidation run");
 }
 
+/// Create a `consolidation_run` row already in D-058's floor case (`pending
+/// -> running -> failed`, classified `Mechanical`/context-overflow, on
+/// `local_rag_core::BUILD_ID` — the same build the CLI subprocess runs
+/// under) — exactly the shape `unconsolidatable_sessions` looks for.
+async fn seed_unconsolidatable_run(
+    state: &StateDb,
+    run_id: &str,
+    session_id: &str,
+    from_received_seq: i64,
+    to_received_seq: i64,
+    now_ms: i64,
+) {
+    let (run_id, session_id) = (run_id.to_string(), session_id.to_string());
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: &run_id,
+                    session_id: &session_id,
+                    from_received_seq,
+                    to_received_seq,
+                    router_version: "v1",
+                },
+                now_ms,
+            )?;
+            transition_run(tx, &run_id, RunState::Running, now_ms)?.expect("pending -> running");
+            record_run_failure(
+                tx,
+                &run_id,
+                FailureKind::Mechanical,
+                "request needs 99999 tokens, model context is 32768",
+                true,
+                Some(local_rag_core::BUILD_ID),
+                now_ms,
+            )?
+            .expect("running -> failed");
+            Ok(())
+        })
+        .await
+        .expect("seed unconsolidatable run");
+}
+
 async fn seed_candidate(state: &StateDb, candidate_id: &str, now_ms: i64) {
     let cid = candidate_id.to_string();
     state
@@ -203,6 +247,8 @@ fn stats_on_an_empty_store_reports_zero_counts_and_no_worktree() {
         text.contains("consolidation oldest pending run: none (fully caught up)"),
         "{text}"
     );
+    // D-058: silent on a healthy store — no line at all, not "0 sessions".
+    assert!(!text.contains("consolidation unconsolidatable"), "{text}");
 }
 
 #[tokio::test]
@@ -269,4 +315,49 @@ async fn stats_reports_seeded_counts_and_the_resolved_worktree_block() {
     assert_eq!(json["consolidation"]["progress_pct"], 0.0);
     assert!(json["consolidation"]["eta_seconds"].is_null());
     assert!(!json["consolidation"]["oldest_pending_run_created_at"].is_null());
+    assert_eq!(
+        json["consolidation"]["unconsolidatable_sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "no unconsolidatable session was seeded"
+    );
+}
+
+/// D-058: `local-rag stats` is the exact tool this deviation's own incident
+/// was found *without* — a session permanently stuck at the floor case
+/// (a single observation still overflowing the model's context) must be
+/// named explicitly, not folded silently into the ordinary backlog/progress
+/// numbers.
+#[tokio::test]
+async fn stats_reports_an_unconsolidatable_session_needing_manual_review() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_observation_envelope(&state, "obs-1", "sess-stuck").await;
+        seed_unconsolidatable_run(&state, "run-stuck", "sess-stuck", 1, 1, 1_000).await;
+    }
+
+    let output = run_cli(&home, home.path(), &["stats"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(
+        text.contains("consolidation unconsolidatable: 1 session(s)"),
+        "{text}"
+    );
+    assert!(text.contains("session sess-stuck"), "{text}");
+    assert!(text.contains("dead-letter run run-stuck"), "{text}");
+
+    let output = run_cli(&home, home.path(), &["stats", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let sessions = json["consolidation"]["unconsolidatable_sessions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], "sess-stuck");
+    assert_eq!(sessions[0]["dead_letter_run_id"], "run-stuck");
+    assert_eq!(sessions[0]["from_received_seq"], 1);
+    assert_eq!(sessions[0]["to_received_seq"], 1);
 }

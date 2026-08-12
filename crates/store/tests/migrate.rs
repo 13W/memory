@@ -380,16 +380,17 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(name, "default", "default model space display_name");
         assert_eq!(state, "active", "default model space MUST be active");
 
-        // Recorded as exactly eleven rows: (1,"registry"), (2,"worktree"),
+        // Recorded as exactly twelve rows: (1,"registry"), (2,"worktree"),
         // (3,"code"), (4,"projection"), (5,"worktree_state_clock"),
         // (6,"representation"), (7,"observation"),
         // (8,"observation_redaction_version"), (9,"memory"),
-        // (10,"managed_worktree"), (11,"consolidation_run_failure_tracking").
+        // (10,"managed_worktree"), (11,"consolidation_run_failure_tracking"),
+        // (12,"consolidation_run_context_overflow_tracking").
         let rows = migration_rows(&read);
         assert_eq!(
             rows.len(),
-            11,
-            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11] at D-050"
+            12,
+            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12] at D-058"
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
@@ -413,6 +414,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[9].1, "managed_worktree");
         assert_eq!(rows[10].0, 11);
         assert_eq!(rows[10].1, "consolidation_run_failure_tracking");
+        assert_eq!(rows[11].0, 12);
+        assert_eq!(rows[11].1, "consolidation_run_context_overflow_tracking");
     }
     drop(db);
 
@@ -422,7 +425,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 11, "reopen adds no new migration rows");
+    assert_eq!(applied, 12, "reopen adds no new migration rows");
 }
 
 /// D-007: migration 5 adds `worktree.state_changed_at` and backfills every

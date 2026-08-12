@@ -91,7 +91,16 @@ async fn open_run(
     let (rid, sid) = (run_id.to_string(), session_id.to_string());
     db.writer()
         .transaction(move |tx| {
-            open_next_run(tx, &rid, &sid, batch, "v1", LEASE_DURATION_MS, now_ms)
+            open_next_run(
+                tx,
+                &rid,
+                &sid,
+                batch,
+                "v1",
+                LEASE_DURATION_MS,
+                now_ms,
+                "build-test",
+            )
         })
         .await
         .expect("open tx")

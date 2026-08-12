@@ -438,6 +438,17 @@ pub enum SnapshotOutcome {
         state: RunState,
         lease_until: Option<i64>,
     },
+    /// D-058: the blocking row is a context-overflow dead-letter that has
+    /// already been shrunk to a single observation, and even that alone
+    /// still overflows the model's context — there is no narrower window
+    /// left to try. `dead_letter_run_id` names the permanent, durable
+    /// record; per the product decision behind this variant, this session
+    /// stays blocked here for a human to review rather than being silently
+    /// skipped or auto-retracted.
+    Unconsolidatable {
+        window: RunWindow,
+        dead_letter_run_id: String,
+    },
 }
 
 /// The most recently created non-`applied` run for `session_id`, if any.
@@ -483,23 +494,17 @@ fn read_window(tx: &Transaction<'_>, run_id: &str) -> rusqlite::Result<RunWindow
     )
 }
 
-/// Open the next consolidation window for `session_id`, or report why not
-/// (spec 08 §4 step 1, `[FIXED]`) — one transaction:
+/// Create, open, and lease a fresh window of up to `batch` of `session_id`'s
+/// own envelopes past its cursor — the actual window-opening mechanics
+/// [`open_next_run`] composes for both its normal path and its D-058
+/// shrink-and-retry path. Never checks for a blocking existing row; callers
+/// establish that themselves.
 ///
-/// 1. Refuse to open a second run while any non-`applied` row already exists
-///    for this session ([`SnapshotOutcome::Existing`]). Two concurrent
-///    callers for the same `session_id` are fully serialized by
-///    [`crate::StateWriter`]'s single-writer queue, so the second caller's
-///    own transaction already observes the first's committed row here — no
-///    separate read-then-write pre-check, and no TOCTOU gap.
-/// 2. Else compute `from = cursor + 1`, `to` = the `received_seq` of the
-///    `batch`-th of *this session's own* envelopes at or past `from` (capped
-///    at `max_received_seq` when fewer than `batch` remain); refuse with
-///    [`SnapshotOutcome::NothingPending`] if there is no envelope past the
-///    cursor at all.
-/// 3. Else create the row, transition `pending → running`, and acquire the
-///    lease — [`SnapshotOutcome::Opened`].
-pub fn open_next_run(
+/// `from = cursor + 1`, `to` = the `received_seq` of the `batch`-th of *this
+/// session's own* envelopes at or past `from` (capped at `max_received_seq`
+/// when fewer than `batch` remain); [`SnapshotOutcome::NothingPending`] if
+/// there is no envelope past the cursor at all.
+fn open_window(
     tx: &Transaction<'_>,
     run_id: &str,
     session_id: &str,
@@ -508,14 +513,6 @@ pub fn open_next_run(
     lease_ms: i64,
     now_ms: i64,
 ) -> rusqlite::Result<SnapshotOutcome> {
-    if let Some((existing_id, state, lease_until)) = latest_non_applied_run(tx, session_id)? {
-        return Ok(SnapshotOutcome::Existing {
-            window: read_window(tx, &existing_id)?,
-            state,
-            lease_until,
-        });
-    }
-
     let cursor = processing_cursor(tx, session_id)?.unwrap_or(0);
     let from = cursor + 1;
     let Some(max_seq) = crate::observation::max_received_seq(tx, session_id)? else {
@@ -566,6 +563,151 @@ pub fn open_next_run(
         from_received_seq: from,
         to_received_seq: to,
     }))
+}
+
+/// Whether — and how — a `Failed` row blocking [`open_next_run`] should be
+/// superseded by a narrower window instead of left as-is (D-058).
+enum DeadLetterShrink {
+    /// Not a context-overflow dead-letter on the current build: leave the
+    /// blocking row exactly as [`SnapshotOutcome::Existing`] already did
+    /// before D-058 — this must never widen to a failure class D-050 already
+    /// owns (a corrective-reprompt parse failure, a materialization
+    /// rejection, a still-live lease, a `Transient` backoff).
+    NotEligible,
+    /// Open a new window at the same starting point with this many of the
+    /// session's own observations — half of the dead-lettered window's own
+    /// count, floored at 1.
+    Shrink(i64),
+    /// The dead-lettered window was already a single observation and it
+    /// alone still overflows the model's context — no narrower window is
+    /// possible.
+    Floor,
+}
+
+/// D-058: decide whether `blocking_run_id` (the row [`open_next_run`] found
+/// via [`latest_non_applied_run`]) is a dead-letter this session can make
+/// progress past by retrying narrower, rather than a row that must simply
+/// block (a live lease, a `Transient` backoff, or a `Mechanical` failure
+/// D-050 already dead-letters permanently for reasons unrelated to context
+/// size). Eligible only when *all* of: `Failed`, `last_failure_kind =
+/// 'mechanical'`, `last_failure_context_overflow = 1`, and
+/// `last_failure_fingerprint = current_build_id` — exactly the row shape
+/// [`stale_runs`] itself will never retry again, so this carve-out only ever
+/// fires once a window is provably permanently stuck, never on a row that
+/// might still resolve on its own.
+/// `(last_failure_kind, last_failure_context_overflow, last_failure_fingerprint,
+/// session_id, from_received_seq, to_received_seq)` — [`dead_letter_shrink_decision`]'s
+/// own row shape, named so clippy's `type_complexity` lint has somewhere to
+/// point instead of an inline tuple.
+type DeadLetterRow = (Option<String>, bool, Option<String>, String, i64, i64);
+
+fn dead_letter_shrink_decision(
+    tx: &Transaction<'_>,
+    blocking_run_id: &str,
+    blocking_state: RunState,
+    current_build_id: &str,
+) -> rusqlite::Result<DeadLetterShrink> {
+    if blocking_state != RunState::Failed {
+        return Ok(DeadLetterShrink::NotEligible);
+    }
+    let row: Option<DeadLetterRow> = tx
+        .query_row(
+            "SELECT last_failure_kind, last_failure_context_overflow, last_failure_fingerprint, \
+                    session_id, from_received_seq, to_received_seq \
+             FROM consolidation_run WHERE run_id = ?1",
+            params![blocking_run_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kind, context_overflow, fingerprint, session_id, from, to)) = row else {
+        return Ok(DeadLetterShrink::NotEligible);
+    };
+    let eligible = kind.as_deref() == Some(FailureKind::Mechanical.as_str())
+        && context_overflow
+        && fingerprint.as_deref() == Some(current_build_id);
+    if !eligible {
+        return Ok(DeadLetterShrink::NotEligible);
+    }
+
+    let previous_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM observation_envelope \
+         WHERE session_id = ?1 AND received_seq BETWEEN ?2 AND ?3",
+        params![session_id, from, to],
+        |r| r.get(0),
+    )?;
+    if previous_count <= 1 {
+        Ok(DeadLetterShrink::Floor)
+    } else {
+        Ok(DeadLetterShrink::Shrink((previous_count / 2).max(1)))
+    }
+}
+
+/// Open the next consolidation window for `session_id`, or report why not
+/// (spec 08 §4 step 1, `[FIXED]`; D-058 amendment below) — one transaction:
+///
+/// 1. Refuse to open a second run while any non-`applied` row already exists
+///    for this session ([`SnapshotOutcome::Existing`]) — **unless** that row
+///    is a context-overflow dead-letter on the current build
+///    ([`dead_letter_shrink_decision`]), in which case a narrower window
+///    opens instead ([`SnapshotOutcome::Opened`]), or, once shrinking has no
+///    room left, [`SnapshotOutcome::Unconsolidatable`]. Two concurrent
+///    callers for the same `session_id` are fully serialized by
+///    [`crate::StateWriter`]'s single-writer queue, so the second caller's
+///    own transaction already observes the first's committed row here — no
+///    separate read-then-write pre-check, and no TOCTOU gap.
+/// 2. Else [`open_window`] with the configured `batch`.
+#[allow(clippy::too_many_arguments)]
+pub fn open_next_run(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    session_id: &str,
+    batch: i64,
+    router_version: &str,
+    lease_ms: i64,
+    now_ms: i64,
+    current_build_id: &str,
+) -> rusqlite::Result<SnapshotOutcome> {
+    if let Some((existing_id, state, lease_until)) = latest_non_applied_run(tx, session_id)? {
+        return match dead_letter_shrink_decision(tx, &existing_id, state, current_build_id)? {
+            DeadLetterShrink::Shrink(narrower_batch) => open_window(
+                tx,
+                run_id,
+                session_id,
+                narrower_batch,
+                router_version,
+                lease_ms,
+                now_ms,
+            ),
+            DeadLetterShrink::Floor => Ok(SnapshotOutcome::Unconsolidatable {
+                window: read_window(tx, &existing_id)?,
+                dead_letter_run_id: existing_id,
+            }),
+            DeadLetterShrink::NotEligible => Ok(SnapshotOutcome::Existing {
+                window: read_window(tx, &existing_id)?,
+                state,
+                lease_until,
+            }),
+        };
+    }
+
+    open_window(
+        tx,
+        run_id,
+        session_id,
+        batch,
+        router_version,
+        lease_ms,
+        now_ms,
+    )
 }
 
 /// Re-acquire an existing non-`applied` run under a fresh lease (spec 04 §4):
@@ -634,6 +776,13 @@ impl FailureKind {
 pub struct ClassifiedFailure {
     pub kind: FailureKind,
     pub reason: String,
+    /// D-058: `Mechanical` caused specifically by a deterministic model-
+    /// context overflow (D-057) — never set for `Transient`. Narrower than
+    /// `kind == Mechanical` alone: [`open_next_run`]'s shrink-and-retry
+    /// carve-out only ever fires on this exact shape, not on the corrective-
+    /// reprompt-parse-failure/materialization-rejection `Mechanical` causes
+    /// D-050 already dead-letters permanently.
+    pub context_overflow: bool,
 }
 
 impl ClassifiedFailure {
@@ -641,6 +790,17 @@ impl ClassifiedFailure {
         Self {
             kind: FailureKind::Mechanical,
             reason: reason.into(),
+            context_overflow: false,
+        }
+    }
+
+    /// A `Mechanical` failure specifically caused by a deterministic model-
+    /// context overflow (D-057/D-058) — see [`Self::context_overflow`].
+    pub fn mechanical_context_overflow(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Mechanical,
+            reason: reason.into(),
+            context_overflow: true,
         }
     }
 
@@ -648,6 +808,7 @@ impl ClassifiedFailure {
         Self {
             kind: FailureKind::Transient,
             reason: reason.into(),
+            context_overflow: false,
         }
     }
 }
@@ -705,6 +866,7 @@ pub fn record_run_failure(
     run_id: &str,
     kind: FailureKind,
     reason: &str,
+    context_overflow: bool,
     current_fingerprint: Option<&str>,
     now_ms: i64,
 ) -> rusqlite::Result<Result<(), RunTransitionError>> {
@@ -727,7 +889,7 @@ pub fn record_run_failure(
     tx.execute(
         "UPDATE consolidation_run SET \
            last_failure_kind = ?2, last_failure_reason = ?3, last_failure_fingerprint = ?4, \
-           attempt_count = ?5, next_retry_at = ?6 \
+           attempt_count = ?5, next_retry_at = ?6, last_failure_context_overflow = ?7 \
          WHERE run_id = ?1",
         params![
             run_id,
@@ -735,7 +897,8 @@ pub fn record_run_failure(
             reason,
             fingerprint,
             attempt_count,
-            next_retry_at
+            next_retry_at,
+            context_overflow,
         ],
     )?;
     Ok(Ok(()))
@@ -832,6 +995,60 @@ pub fn stale_runs(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// One session stuck in D-058's floor case (`SnapshotOutcome::
+/// Unconsolidatable`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnconsolidatableSession {
+    pub session_id: String,
+    pub dead_letter_run_id: String,
+    pub from_received_seq: i64,
+    pub to_received_seq: i64,
+}
+
+/// Every session currently in D-058's floor case, store-wide (D-058: `local-
+/// rag stats` visibility for the exact incident this task fixes — the prior
+/// retry-storm was only found by reading `state.sqlite` directly, because
+/// nothing surfaced it). Not every context-overflow dead-letter: most are
+/// resolved automatically by [`open_next_run`]'s shrink-and-retry carve-out
+/// on the next tick. Only a session whose latest non-`applied` run is a
+/// context-overflow dead-letter on `current_build_id` **and** whose own
+/// window is already down to a single observation — the same condition
+/// [`open_next_run`] itself uses to return
+/// [`SnapshotOutcome::Unconsolidatable`] — makes no further progress without
+/// a human decision.
+pub fn unconsolidatable_sessions(
+    conn: &Connection,
+    current_build_id: &str,
+) -> rusqlite::Result<Vec<UnconsolidatableSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.session_id, c.run_id, c.from_received_seq, c.to_received_seq \
+         FROM consolidation_run c \
+         WHERE c.state = 'failed' \
+           AND c.last_failure_kind = 'mechanical' \
+           AND c.last_failure_context_overflow = 1 \
+           AND c.last_failure_fingerprint = ?1 \
+           AND c.created_at = ( \
+             SELECT MAX(c2.created_at) FROM consolidation_run c2 \
+             WHERE c2.session_id = c.session_id AND c2.state != 'applied' \
+           ) \
+           AND ( \
+             SELECT COUNT(*) FROM observation_envelope e \
+             WHERE e.session_id = c.session_id \
+               AND e.received_seq BETWEEN c.from_received_seq AND c.to_received_seq \
+           ) <= 1 \
+         ORDER BY c.session_id",
+    )?;
+    stmt.query_map(params![current_build_id], |r| {
+        Ok(UnconsolidatableSession {
+            session_id: r.get(0)?,
+            dead_letter_run_id: r.get(1)?,
+            from_received_seq: r.get(2)?,
+            to_received_seq: r.get(3)?,
+        })
+    })?
+    .collect()
 }
 
 #[cfg(test)]
@@ -972,7 +1189,16 @@ mod tests {
         let outcome = db
             .writer()
             .transaction(|tx| {
-                open_next_run(tx, "run-1", "sess-1", 10, "v1", LEASE_DURATION_MS, 1_000)
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    10,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
             })
             .await
             .expect("open tx");
@@ -990,7 +1216,16 @@ mod tests {
         let outcome = db
             .writer()
             .transaction(|tx| {
-                open_next_run(tx, "run-2", "sess-2", 10, "v1", LEASE_DURATION_MS, 1_000)
+                open_next_run(
+                    tx,
+                    "run-2",
+                    "sess-2",
+                    10,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
             })
             .await
             .expect("open tx");
@@ -1009,7 +1244,16 @@ mod tests {
         let outcome = db
             .writer()
             .transaction(|tx| {
-                open_next_run(tx, "run-1", "sess-1", 3, "v1", LEASE_DURATION_MS, 1_000)
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    3,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
             })
             .await
             .expect("open tx");
@@ -1063,7 +1307,16 @@ mod tests {
         let outcome = db
             .writer()
             .transaction(|tx| {
-                open_next_run(tx, "run-a", "sess-a", 2, "v1", LEASE_DURATION_MS, 1_000)
+                open_next_run(
+                    tx,
+                    "run-a",
+                    "sess-a",
+                    2,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
             })
             .await
             .expect("open tx");
@@ -1104,7 +1357,16 @@ mod tests {
 
         db.writer()
             .transaction(|tx| {
-                open_next_run(tx, "run-1", "sess-1", 2, "v1", LEASE_DURATION_MS, 1_000)
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    2,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
             })
             .await
             .expect("open tx");
@@ -1112,7 +1374,16 @@ mod tests {
         let outcome = db
             .writer()
             .transaction(|tx| {
-                open_next_run(tx, "run-2", "sess-1", 2, "v1", LEASE_DURATION_MS, 2_000)
+                open_next_run(
+                    tx,
+                    "run-2",
+                    "sess-1",
+                    2,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    2_000,
+                    "build-test",
+                )
             })
             .await
             .expect("open tx");
@@ -1137,13 +1408,356 @@ mod tests {
         );
     }
 
+    /// D-058: the actual bug this task fixes. A window that structurally
+    /// cannot fit the model's context is halved and retried at the same
+    /// starting point until it either succeeds or hits a single observation
+    /// — proving forward progress without data loss, that every
+    /// dead-lettered row along the way survives untouched (the audit trail
+    /// this design promises), and that `pending_backlog` stays correct no
+    /// matter how many dead-lettered rows pile up (D-052's own row-count
+    /// definition, not `consolidation_run`-row-count).
+    #[tokio::test]
+    async fn open_next_run_shrinks_a_context_overflow_dead_letter_until_it_fits_or_floors() {
+        let (_home, db) = open_state();
+        seed_envelopes(&db, "sess-1", 8).await;
+
+        async fn dead_letter(db: &crate::StateDb, run_id: &str, now_ms: i64) {
+            let run_id = run_id.to_string();
+            db.writer()
+                .transaction(move |tx| {
+                    record_run_failure(
+                        tx,
+                        &run_id,
+                        FailureKind::Mechanical,
+                        "request needs 99999 tokens, model context is 32768",
+                        true,
+                        Some("build-1"),
+                        now_ms,
+                    )
+                })
+                .await
+                .expect("record tx")
+                .expect("legal running -> failed");
+        }
+
+        // 8 -> opens the full window.
+        let opened = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-8",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            opened,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-8".to_string(),
+                session_id: "sess-1".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 8,
+            })
+        );
+        dead_letter(&db, "run-8", 2_000).await;
+
+        // 8 -> 4, same starting point, batch argument (8) ignored in favor
+        // of the dead-lettered window's own halved count.
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-4",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    3_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-4".to_string(),
+                session_id: "sess-1".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 4,
+            }),
+            "halves the dead-lettered window's own 8-observation count to 4"
+        );
+        dead_letter(&db, "run-4", 4_000).await;
+
+        // 4 -> 2.
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-2",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    5_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-2".to_string(),
+                session_id: "sess-1".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 2,
+            })
+        );
+        dead_letter(&db, "run-2", 6_000).await;
+
+        // 2 -> 1 (floored at 1, not 0).
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-1b",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    7_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-1b".to_string(),
+                session_id: "sess-1".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 1,
+            })
+        );
+        dead_letter(&db, "run-1b", 8_000).await;
+
+        // A single observation, alone, still overflows: no narrower window
+        // is possible — Unconsolidatable, not another shrink.
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-final",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    9_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Unconsolidatable {
+                window: RunWindow {
+                    run_id: "run-1b".to_string(),
+                    session_id: "sess-1".to_string(),
+                    from_received_seq: 1,
+                    to_received_seq: 1,
+                },
+                dead_letter_run_id: "run-1b".to_string(),
+            }
+        );
+
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            consolidation_run_state(&read, "run-final").expect("state"),
+            None,
+            "the floor case creates no new row"
+        );
+        for run_id in ["run-8", "run-4", "run-2", "run-1b"] {
+            assert_eq!(
+                consolidation_run_state(&read, run_id).expect("state"),
+                Some(RunState::Failed),
+                "{run_id} stays failed, never deleted or overwritten — the audit trail"
+            );
+        }
+        assert_eq!(
+            pending_backlog(&read, "sess-1").expect("backlog"),
+            8,
+            "cursor never advanced (nothing ever applied) — all 8 observations still pending"
+        );
+
+        let stuck = unconsolidatable_sessions(&read, "build-1").expect("query");
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].session_id, "sess-1");
+        assert_eq!(stuck[0].dead_letter_run_id, "run-1b");
+    }
+
+    /// Regression guard: a `Mechanical` dead-letter for a reason other than
+    /// context overflow (D-050's original two causes — a corrective-reprompt
+    /// parse failure, a materialization rejection) must never be shrunk —
+    /// the D-058 carve-out is narrower than `kind == Mechanical` alone.
+    #[tokio::test]
+    async fn open_next_run_does_not_shrink_a_non_context_overflow_mechanical_dead_letter() {
+        let (_home, db) = open_state();
+        seed_envelopes(&db, "sess-1", 8).await;
+        db.writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        db.writer()
+            .transaction(|tx| {
+                record_run_failure(
+                    tx,
+                    "run-1",
+                    FailureKind::Mechanical,
+                    "missing field confidence_signal",
+                    false,
+                    Some("build-1"),
+                    2_000,
+                )
+            })
+            .await
+            .expect("record tx")
+            .expect("legal");
+
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-2",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    3_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        match outcome {
+            SnapshotOutcome::Existing { window, .. } => {
+                assert_eq!(window.run_id, "run-1", "left exactly as before D-058")
+            }
+            other => panic!("expected Existing, got {other:?}"),
+        }
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            consolidation_run_state(&read, "run-2").expect("state"),
+            None,
+            "no narrower window was opened"
+        );
+    }
+
+    /// Regression guard: a context-overflow dead-letter from a *different*
+    /// build must not shrink — D-050's existing "one free retry per rebuild"
+    /// guarantee (`stale_runs_excludes_a_mechanical_failure_on_the_current_build_only`)
+    /// must not silently become a shrink cycle instead.
+    #[tokio::test]
+    async fn open_next_run_does_not_shrink_a_context_overflow_dead_letter_from_a_different_build() {
+        let (_home, db) = open_state();
+        seed_envelopes(&db, "sess-1", 8).await;
+        db.writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-1",
+                )
+            })
+            .await
+            .expect("open tx");
+        db.writer()
+            .transaction(|tx| {
+                record_run_failure(
+                    tx,
+                    "run-1",
+                    FailureKind::Mechanical,
+                    "request needs 99999 tokens, model context is 32768",
+                    true,
+                    Some("build-1"),
+                    2_000,
+                )
+            })
+            .await
+            .expect("record tx")
+            .expect("legal");
+
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-2",
+                    "sess-1",
+                    8,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    3_000,
+                    "build-2",
+                )
+            })
+            .await
+            .expect("open tx");
+        match outcome {
+            SnapshotOutcome::Existing { window, .. } => {
+                assert_eq!(window.run_id, "run-1")
+            }
+            other => panic!("expected Existing on a different build, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn retry_run_legal_on_running_and_failed_illegal_on_applied() {
         let (_home, db) = open_state();
         seed_envelopes(&db, "sess-1", 3).await;
         db.writer()
             .transaction(|tx| {
-                open_next_run(tx, "run-1", "sess-1", 3, "v1", LEASE_DURATION_MS, 1_000)
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    3,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
             })
             .await
             .expect("open tx");
@@ -1504,6 +2118,7 @@ mod tests {
                     "run-1",
                     FailureKind::Mechanical,
                     "missing field confidence_signal",
+                    false,
                     Some("build-abc"),
                     5_000,
                 )
@@ -1554,6 +2169,7 @@ mod tests {
                     "run-1",
                     FailureKind::Transient,
                     "no generation provider configured",
+                    false,
                     Some("build-abc"),
                     5_000,
                 )
@@ -1602,6 +2218,7 @@ mod tests {
                         "run-1",
                         FailureKind::Transient,
                         "transient",
+                        false,
                         None,
                         now_ms,
                     )
@@ -1635,7 +2252,15 @@ mod tests {
         let outcome = db
             .writer()
             .transaction(|tx| {
-                record_run_failure(tx, "run-1", FailureKind::Mechanical, "late", None, 5_000)
+                record_run_failure(
+                    tx,
+                    "run-1",
+                    FailureKind::Mechanical,
+                    "late",
+                    false,
+                    None,
+                    5_000,
+                )
             })
             .await
             .expect("record tx");
@@ -1676,6 +2301,7 @@ mod tests {
                     "run-mech",
                     FailureKind::Mechanical,
                     "missing field confidence_signal",
+                    false,
                     Some("build-1"),
                     2_000,
                 )
@@ -1711,6 +2337,7 @@ mod tests {
                     "run-trans",
                     FailureKind::Transient,
                     "no generation provider configured",
+                    false,
                     Some("build-1"),
                     2_000,
                 )

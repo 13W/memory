@@ -374,8 +374,9 @@ async fn migration_produces_exact_registry_schema() {
     // (3,"code"), (4,"projection"), (5,"worktree_state_clock"),
     // (6,"representation"), (7,"observation"),
     // (8,"observation_redaction_version"), (9,"memory"),
-    // (10,"managed_worktree"), and
-    // (11,"consolidation_run_failure_tracking"), appended by later groups.
+    // (10,"managed_worktree"), (11,"consolidation_run_failure_tracking"), and
+    // (12,"consolidation_run_context_overflow_tracking"), appended by later
+    // groups.
     let mut stmt = read
         .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
         .expect("prepare migration rows");
@@ -398,11 +399,13 @@ async fn migration_produces_exact_registry_schema() {
             (9, "memory".to_string()),
             (10, "managed_worktree".to_string()),
             (11, "consolidation_run_failure_tracking".to_string()),
+            (12, "consolidation_run_context_overflow_tracking".to_string()),
         ],
         "the production set is [v1 registry, v2 worktree, v3 code, v4 projection, \
          v5 worktree_state_clock, v6 representation, v7 observation, \
          v8 observation_redaction_version, v9 memory, v10 managed_worktree, \
-         v11 consolidation_run_failure_tracking] at D-050",
+         v11 consolidation_run_failure_tracking, \
+         v12 consolidation_run_context_overflow_tracking] at D-058",
     );
 }
 

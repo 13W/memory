@@ -174,7 +174,12 @@ impl Migration {
 /// unbackfilled columns to `consolidation_run` — `last_failure_kind`/
 /// `last_failure_reason`/`last_failure_fingerprint`/`attempt_count`/
 /// `next_retry_at`, the retry-storm circuit breaker's own bookkeeping
-/// (`memory::SCHEMA_V11`). Each checksum is frozen once shipped (see
+/// (`memory::SCHEMA_V11`); version 12 (D-058) adds one more,
+/// `last_failure_context_overflow` (`NOT NULL DEFAULT 0`, backfills safely
+/// unlike v11's columns) — distinguishes a deterministic context-overflow
+/// dead-letter from every other `Mechanical` cause, so `open_next_run`'s
+/// shrink-and-retry carve-out fires only on that exact shape
+/// (`memory::SCHEMA_V12`). Each checksum is frozen once shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
 pub const ALL: &[Migration] = &[
@@ -196,6 +201,11 @@ pub const ALL: &[Migration] = &[
         11,
         "consolidation_run_failure_tracking",
         crate::memory::SCHEMA_V11,
+    ),
+    Migration::sql(
+        12,
+        "consolidation_run_context_overflow_tracking",
+        crate::memory::SCHEMA_V12,
     ),
 ];
 

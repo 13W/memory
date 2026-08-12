@@ -41,7 +41,7 @@ pub const MAX_GENERATION_TOKENS: u32 = 1024;
 /// keeps the existing `Transient` treatment.
 fn classify_generate_failure(e: GenError) -> ClassifiedFailure {
     if e.is_deterministic_context_overflow() {
-        ClassifiedFailure::mechanical(format!(
+        ClassifiedFailure::mechanical_context_overflow(format!(
             "deterministic context overflow for this window, retrying will not help: {e}"
         ))
     } else {

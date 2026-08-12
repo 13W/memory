@@ -532,11 +532,20 @@ async fn mark_failed(
     let run_id = run_id.to_string();
     let kind = failure.kind;
     let reason = failure.reason.clone();
+    let context_overflow = failure.context_overflow;
     let build_id = build_id.to_string();
     state_db
         .writer()
         .transaction(move |tx| {
-            let _ = record_run_failure(tx, &run_id, kind, &reason, Some(&build_id), now_ms)?;
+            let _ = record_run_failure(
+                tx,
+                &run_id,
+                kind,
+                &reason,
+                context_overflow,
+                Some(&build_id),
+                now_ms,
+            )?;
             Ok(())
         })
         .await
