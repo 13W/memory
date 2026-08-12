@@ -850,6 +850,40 @@ not `2`) or blurred that line for no benefit. `memory merge --loser <id>:<versio
 is the first genuinely repeated flag this CLI has ever had a typed primitive for: a plain
 `Vec<String>` field.
 
+As-built note (T20-09, `[SPEC]`). `index`/`reindex`/`watch` each print, at most once per
+invocation and only to **stderr**, this fixed-wording advisory when the resolved worktree is both
+daemon-managed and a live daemon actually answers:
+
+> local-rag: this worktree is managed by a running daemon — `local-rag project reindex` avoids
+> duplicate indexing; continuing anyway
+
+The wording is the `pub(crate) const DAEMON_MANAGED_ADVISORY` in `crates/local-rag/src/cli/
+mod.rs` — one place, quoted here verbatim rather than reconstructed, so drift between code and
+spec is a single-point fix. The check itself (`advise_if_daemon_managed`, same file) is two
+independent conditions, both required: `local_rag_store::is_managed(worktree_id)` (T20-01,
+durable — **regardless of `enabled`**, a paused managed project still counts, matching that
+function's own doc) **and** the identical `read_store_lock_file` → `pid_exists` → `fetch_welcome`
+three-way liveness probe `cli::status::compute_status` (this section, above) already establishes,
+comparing `Welcome.store_instance_uuid` against `store.lock`'s own `instance_uuid`. Either
+condition alone is not enough — a managed-but-stale-lock worktree, or an unmanaged worktree with
+some other daemon running, prints nothing.
+
+Called exactly once per invocation, after the worktree identity resolves (`Resolution::Resolved`)
+and before the (possibly slow) embedder/pipeline work starts — for `watch` specifically, this is
+strictly before `run_watch_loop` is ever entered, so a long-running watch session never re-prints
+it on every subsequent filesystem trigger. `Resolution::GlobalOnly`/`Ambiguous` never reach the
+check — there is nothing yet to deduplicate against for a path this store does not already know.
+
+Fail-open by construction, per the card's own explicit "не в scope: отказ выполнять команду": the
+function returns `()`, never a `Result`, and has no way to influence its caller's exit code or
+stdout — the printed line is the only observable side effect, `index`/`reindex`/`watch`'s existing
+behavior (including every exit code T15-07's own as-built note already fixes) is otherwise
+unchanged. No `--quiet` flag or suppression environment variable was added: the card left this
+choice open ("по усмотрению карточки") but not on-by-default, and the minimal implementation above
+already satisfies the card's full required result without one — a suppression surface across three
+command files (one of which, `watch`, does not carry a `clap::Args` struct today) was judged not
+worth adding speculatively.
+
 ## 7. TUI dashboard `[SPEC surface, post-v0 — ADR-0008]`
 
 A fourth user-facing surface, alongside §§1–6: a terminal client reading/writing the same
