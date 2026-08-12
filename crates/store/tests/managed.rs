@@ -318,5 +318,5 @@ async fn the_version_10_checksum_matches_the_frozen_migration_and_survives_reope
     let count: i64 = read2
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(count, 11, "reopen adds no new migration rows");
+    assert_eq!(count, 12, "reopen adds no new migration rows");
 }

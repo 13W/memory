@@ -109,10 +109,10 @@ pub use consolidation::{
     ClassifiedFailure, FailureKind, IllegalRunTransition, LEASE_DURATION_MS,
     LEASE_RENEW_INTERVAL_MS, NewConsolidationRun, RenewError, RunState, RunTransitionError,
     RunWindow, SnapshotOutcome, StaleRun, TRANSIENT_BACKOFF_BASE_MS, TRANSIENT_BACKOFF_CAP_MS,
-    acquire_lease, consolidation_run_state, create_consolidation_run, lease_expired, open_next_run,
-    pending_backlog, processing_cursor, record_run_failure, renew_lease, retry_run,
-    sessions_with_pending_backlog, stale_runs, transient_backoff_delay_ms, transition_run,
-    upsert_processing_cursor,
+    UnconsolidatableSession, acquire_lease, consolidation_run_state, create_consolidation_run,
+    lease_expired, open_next_run, pending_backlog, processing_cursor, record_run_failure,
+    renew_lease, retry_run, sessions_with_pending_backlog, stale_runs, transient_backoff_delay_ms,
+    transition_run, unconsolidatable_sessions, upsert_processing_cursor,
 };
 pub(crate) use entry::all_memory_entry_ids;
 pub use entry::{
@@ -261,6 +261,28 @@ ALTER TABLE consolidation_run ADD COLUMN last_failure_reason TEXT;
 ALTER TABLE consolidation_run ADD COLUMN last_failure_fingerprint TEXT;
 ALTER TABLE consolidation_run ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE consolidation_run ADD COLUMN next_retry_at INTEGER;
+";
+
+/// Version-12 migration DDL (D-058): one `NOT NULL DEFAULT 0` column on
+/// `consolidation_run`, distinguishing a `Mechanical` dead-letter caused by a
+/// deterministic context overflow (D-057) from every other `Mechanical`
+/// cause (a corrective-reprompt parse failure, a materialization rejection).
+/// `open_next_run`'s shrink-and-retry carve-out only ever fires on this exact
+/// shape — narrower than `last_failure_kind='mechanical'` alone — so it never
+/// widens to dead-letters D-050 already covers. Unlike `SCHEMA_V11`'s five
+/// columns this one backfills safely to a real default (`0`, "not a context
+/// overflow") rather than staying nullable: every pre-migration row predates
+/// D-057's classifier entirely, so `0` is not a guess, it is the only value
+/// that was ever possible before this migration existed. Referenced by
+/// [`crate::migrate::ALL`] as migration version 12.
+///
+/// **Frozen once shipped.** Like the earlier `SCHEMA_V*` constants, the
+/// checksum is the SHA-256 of this text; any edit trips
+/// [`ChecksumDrift`](crate::migrate::MigrationError::ChecksumDrift) on an
+/// existing store. Future schema changes are new numbered migrations.
+pub(crate) const SCHEMA_V12: &str = "\
+ALTER TABLE consolidation_run ADD COLUMN last_failure_context_overflow INTEGER NOT NULL DEFAULT 0
+  CHECK (last_failure_context_overflow IN (0, 1));
 ";
 
 /// The global singleton `memory_entry.scope_owner_id` for `scope_kind='global'`

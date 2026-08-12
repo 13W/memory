@@ -115,6 +115,17 @@ pub enum SessionTickOutcome {
     /// Opening a new window failed at the infrastructure level (not a
     /// domain rejection — those already surface as `Ran(RunOutcome::Failed)`).
     OpenFailed(WriteError),
+    /// D-058: this session's dead-letter has already been shrunk to a single
+    /// observation and even that alone still overflows the model's context —
+    /// no narrower window is possible. Distinct from the silent
+    /// `SkippedExisting` on purpose: this session makes no further progress
+    /// without a human decision, and must not be mistaken for routine
+    /// backoff.
+    Unconsolidatable {
+        from_received_seq: i64,
+        to_received_seq: i64,
+        dead_letter_run_id: String,
+    },
 }
 
 /// One tick: stale-run recovery, then per-session import + checkpoint-gated
@@ -203,11 +214,20 @@ where
         let _job = jobs.begin(JobKind::ConsolidationTrigger);
         let run_id = uuids.next_uuid().to_string();
         let (batch, lease_ms) = (params.batch_size, params.lease_ms);
-        let (rid, sid) = (run_id.clone(), session_id.clone());
+        let (rid, sid, bid) = (run_id.clone(), session_id.clone(), build_id.to_string());
         let snapshot = db
             .writer()
             .transaction(move |tx| {
-                open_next_run(tx, &rid, &sid, batch, ROUTER_VERSION, lease_ms, now_ms)
+                open_next_run(
+                    tx,
+                    &rid,
+                    &sid,
+                    batch,
+                    ROUTER_VERSION,
+                    lease_ms,
+                    now_ms,
+                    &bid,
+                )
             })
             .await;
 
@@ -234,6 +254,14 @@ where
             }
             Ok(SnapshotOutcome::Existing { .. }) => SessionTickOutcome::SkippedExisting,
             Ok(SnapshotOutcome::NothingPending) => SessionTickOutcome::NothingPending,
+            Ok(SnapshotOutcome::Unconsolidatable {
+                window,
+                dead_letter_run_id,
+            }) => SessionTickOutcome::Unconsolidatable {
+                from_received_seq: window.from_received_seq,
+                to_received_seq: window.to_received_seq,
+                dead_letter_run_id,
+            },
             Err(write_err) => SessionTickOutcome::OpenFailed(write_err),
         };
         results.push((session_id, outcome));
@@ -300,6 +328,17 @@ fn log_session_tick_outcomes(results: &[(String, SessionTickOutcome)]) {
             SessionTickOutcome::ImportFailed(e) => {
                 tracing::warn!(
                     "local-rag: consolidation tail-import failed for session {session_id}: {e}"
+                );
+            }
+            SessionTickOutcome::Unconsolidatable {
+                from_received_seq,
+                to_received_seq,
+                dead_letter_run_id,
+            } => {
+                tracing::error!(
+                    "local-rag: consolidation unconsolidatable for session {session_id}, \
+                     received_seq {from_received_seq}..={to_received_seq} (D-058 floor case, \
+                     needs manual review — dead-letter run {dead_letter_run_id})"
                 );
             }
             SessionTickOutcome::NoCheckpoint
@@ -592,6 +631,90 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].1, SessionTickOutcome::SkippedExisting));
+    }
+
+    /// D-058 end-to-end: a window that overflows the model's context fails
+    /// and is dead-lettered on its own tick; the very next tick — same
+    /// session, same build — opens a narrower window at the same starting
+    /// point automatically and it succeeds, without any operator
+    /// intervention. This is the actual behavior the live incident (a
+    /// session retried 1700+ times over 7+ hours, permanently blocked) was
+    /// missing before D-057/D-058.
+    #[tokio::test]
+    async fn a_context_overflow_dead_letter_shrinks_and_succeeds_on_the_next_tick() {
+        let (_home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+        for i in 0..4u32 {
+            write_spool_segment(
+                &layout,
+                "sess-a",
+                1 + i,
+                &spool_fixture(
+                    "sess-a",
+                    &format!("evt-{i}"),
+                    if i == 3 { "Stop" } else { "UserPromptSubmit" },
+                    1_000 + i as i64,
+                ),
+            );
+        }
+        let mut params = default_params();
+        params.batch_size = 4;
+        // Low enough that the second tick (no new spool bytes, so no fresh
+        // checkpoint) still re-evaluates this session on its own backlog.
+        params.queue_threshold = 1;
+
+        // Scripted "generator": overflows for any window wider than 2
+        // observations, succeeds otherwise — deterministic on window size,
+        // exactly like a real token-budget overflow is deterministic on
+        // prompt size.
+        let generate = |window: ConsolidationWindow| async move {
+            if window.observations.len() > 2 {
+                Err(ClassifiedFailure::mechanical_context_overflow(
+                    "request needs 99999 tokens, model context is 32768",
+                ))
+            } else {
+                Ok(noop_ops())
+            }
+        };
+
+        let results = consolidation_trigger_tick(
+            &db, &layout, &uuids, &jobs, &params, 1_000, "build-1", &generate,
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        match &results[0].1 {
+            SessionTickOutcome::Ran(RunOutcome::Failed(reason)) => {
+                assert!(reason.contains("context"), "{reason}");
+            }
+            other => panic!("expected the full 4-observation window to fail, got {other:?}"),
+        }
+        {
+            let read = db.open_read().expect("read conn");
+            assert_eq!(
+                pending_backlog(&read, "sess-a").expect("backlog"),
+                4,
+                "nothing applied yet — the failed run never advanced the cursor"
+            );
+        }
+
+        let results = consolidation_trigger_tick(
+            &db, &layout, &uuids, &jobs, &params, 2_000, "build-1", &generate,
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        match &results[0].1 {
+            SessionTickOutcome::Ran(RunOutcome::Applied(_)) => {}
+            other => {
+                panic!("expected the shrunk 2-observation window to apply cleanly, got {other:?}")
+            }
+        }
+        let read = db.open_read().expect("read conn");
+        assert_eq!(
+            pending_backlog(&read, "sess-a").expect("backlog"),
+            2,
+            "the shrunk window (2 of the original 4 observations) applied"
+        );
     }
 
     #[tokio::test]
