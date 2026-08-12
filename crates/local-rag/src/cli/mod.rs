@@ -49,9 +49,14 @@ pub mod worktree;
 
 use std::future::Future;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use local_rag::daemon::{LIVENESS_PROBE_TIMEOUT_MS, StoreLockFileState, read_store_lock_file};
 use local_rag_core::config::{Config, ConfigError};
+use local_rag_core::identity::Uuid;
 use local_rag_core::paths::{PathError, StoreLayout, SystemEnv, config_dir};
+use local_rag_core::process::pid_exists;
+use local_rag_store::StateDb;
 
 // `#[command(version)]` defaults to this crate's own `CARGO_PKG_VERSION` —
 // numerically identical to `local_rag_core::VERSION` (both resolve
@@ -187,4 +192,49 @@ pub(crate) fn system_now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// T20-09: the fixed-wording stderr advisory `index`/`reindex`/`watch` print
+/// when the target worktree is both daemon-managed (T20-01) and a live daemon
+/// answers the liveness probe — spec 11 §6's own as-built note quotes this
+/// constant verbatim, so the wording lives in exactly one place.
+pub(crate) const DAEMON_MANAGED_ADVISORY: &str = "local-rag: this worktree is managed by a running daemon — `local-rag project reindex` \
+     avoids duplicate indexing; continuing anyway";
+
+/// Print [`DAEMON_MANAGED_ADVISORY`] to stderr, once, iff `worktree_id` is
+/// enrolled in `managed_worktree` (`local_rag_store::is_managed`, T20-01 —
+/// regardless of `enabled`, matching that function's own doc: a paused
+/// project is still daemon-managed territory) **and** a live daemon answers
+/// the same `read_store_lock_file` → `pid_exists` → `fetch_welcome` liveness
+/// sequence `cli::status::compute_status` already uses. Never fails, never
+/// changes the caller's exit code or stdout — this is fail-open by the
+/// card's own explicit "не в scope: отказ выполнять команду": the printed
+/// line is the only observable effect, the command itself always continues.
+pub(crate) fn advise_if_daemon_managed(layout: &StoreLayout, state: &StateDb, worktree_id: Uuid) {
+    let managed = state
+        .open_read()
+        .ok()
+        .and_then(|conn| local_rag_store::is_managed(&conn, &worktree_id.to_string()).ok())
+        .unwrap_or(false);
+    if !managed {
+        return;
+    }
+
+    #[cfg(unix)]
+    let daemon_alive = match read_store_lock_file(layout) {
+        StoreLockFileState::Parsed(info) if info.ready && pid_exists(info.pid) => {
+            local_rag::daemon::fetch_welcome(
+                &layout.socket_path(),
+                Duration::from_millis(LIVENESS_PROBE_TIMEOUT_MS),
+            )
+            .is_some_and(|w| w.store_instance_uuid == info.instance_uuid)
+        }
+        _ => false,
+    };
+    #[cfg(not(unix))]
+    let daemon_alive = false;
+
+    if daemon_alive {
+        eprintln!("{DAEMON_MANAGED_ADVISORY}");
+    }
 }

@@ -141,6 +141,8 @@ pub fn run_index(args: IndexArgs) -> ExitCode {
             }
         };
 
+        super::advise_if_daemon_managed(&layout, &state, worktree_id);
+
         let ctx = match finish_index_ctx(state, &layout, &config).await {
             Ok(ctx) => ctx,
             Err(e) => return fail(BIN, &e),
@@ -194,6 +196,8 @@ pub fn run_reindex() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    super::advise_if_daemon_managed(&layout, &state, worktree_id);
 
     block_on(async {
         let ctx = match finish_index_ctx(state, &layout, &config).await {

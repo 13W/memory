@@ -80,6 +80,8 @@ pub fn run_watch() -> ExitCode {
         }
     };
 
+    super::advise_if_daemon_managed(&layout, &state, worktree_id);
+
     block_on(async {
         // Installed before `finish_index_ctx` (which loads the ONNX model —
         // a real window of wall-clock time), not just before the select
