@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 
 use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::UuidSource;
-use local_rag_embed::{GenMessage, GenRequest, GenRole, GeneratorPool};
+use local_rag_embed::{GenError, GenMessage, GenRequest, GenRole, GeneratorPool};
 use local_rag_store::{
     ClassifiedFailure, ConsolidationWindow, GeneratedOp, StateDb, WindowObservation,
     effective_data_policy,
@@ -32,6 +32,22 @@ use crate::{guard, parse, prompt, recall, schema};
 /// looping/malformed generation cannot run unbounded. Revisit once Phase 5's
 /// real end-to-end run measures actual response sizes.
 pub const MAX_GENERATION_TOKENS: u32 = 1024;
+
+/// D-057: `pool.generate`'s own failure classifier. A deterministic context
+/// overflow (the request will never fit the model's context no matter how
+/// many times this *same* window is retried) is `Mechanical`, so D-050's
+/// dead-letter engages after one attempt instead of retrying every daemon
+/// tick forever under `Transient` backoff; every other generator failure
+/// keeps the existing `Transient` treatment.
+fn classify_generate_failure(e: GenError) -> ClassifiedFailure {
+    if e.is_deterministic_context_overflow() {
+        ClassifiedFailure::mechanical(format!(
+            "deterministic context overflow for this window, retrying will not help: {e}"
+        ))
+    } else {
+        ClassifiedFailure::transient(e.to_string())
+    }
+}
 
 /// Prints the generator's raw response text to stderr when
 /// `LOCAL_RAG_ROUTER_DEBUG` is set — off by default, zero cost when unset.
@@ -79,12 +95,16 @@ fn trace_dropped_tail(reason: &str) {
 /// forever. Everything up through the *first* generator call, plus the
 /// corrective re-prompt's own generator call, is `Transient`: a db-read
 /// hiccup or a model/infra failure is not expected to reproduce identically
-/// on an unchanged retry. Only the two failure points that are actually
-/// *about the model's output content* — the corrective-re-prompt's parse
-/// still failing, and a per-op materialization rejection — are `Mechanical`:
-/// greedy decoding makes the model's response to the *same* window
-/// deterministic, so these two reproduce byte-for-byte on every retry until
-/// the code (schema, prompt, or generation budget) actually changes.
+/// on an unchanged retry — **except** a deterministic context overflow
+/// (D-057, see [`classify_generate_failure`]), which is a third case that
+/// *is* about the request, not transient infra, and is folded into
+/// `Mechanical` at both `pool.generate` call sites below. The two other
+/// failure points that are actually *about the model's output content* —
+/// the corrective-re-prompt's parse still failing, and a per-op
+/// materialization rejection — are also `Mechanical`: greedy decoding makes
+/// the model's response to the *same* window deterministic, so these two
+/// reproduce byte-for-byte on every retry until the code (schema, prompt, or
+/// generation budget) actually changes.
 pub async fn route(
     state_db: &StateDb,
     pool: &GeneratorPool,
@@ -112,7 +132,7 @@ pub async fn route(
         .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
     let response = pool
         .generate(policy, request)
-        .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
+        .map_err(classify_generate_failure)?;
     trace_raw_response(&response.text);
 
     // D-051: `Err` here is a tier-1 hard failure (see `parse`'s module doc) —
@@ -137,7 +157,7 @@ pub async fn route(
                 .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
             let retry_response = pool
                 .generate(policy, retry_request)
-                .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
+                .map_err(classify_generate_failure)?;
             parse::parse_ops(&retry_response.text).map_err(|e| {
                 ClassifiedFailure::mechanical(format!(
                     "router output still malformed after one corrective re-prompt: {e}"
@@ -347,6 +367,90 @@ mod tests {
         let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
         let failure = result.expect_err("no provider configured for an empty pool");
         assert_eq!(failure.kind, FailureKind::Transient);
+    }
+
+    /// A generator that always fails with the live-incident shape (D-057):
+    /// `state.sqlite` observed exactly `requested_tokens: 36269,
+    /// max_context_tokens: 32768` for a fixed 43-observation window, retried
+    /// over 1700 times under the old unconditional-`Transient` classifier.
+    struct ContextOverflowGenerator;
+
+    impl Generator for ContextOverflowGenerator {
+        fn generate(&self, _req: local_rag_embed::GenRequest) -> Result<GenResponse, GenError> {
+            Err(GenError::ContextOverflow {
+                requested_tokens: 36_269,
+                max_context_tokens: 32_768,
+            })
+        }
+    }
+
+    fn pool_with_context_overflow() -> GeneratorPool {
+        use local_rag_embed::GeneratorEntry;
+        GeneratorPool::new(vec![GeneratorEntry::local(
+            "scripted",
+            Arc::new(ContextOverflowGenerator),
+        )])
+    }
+
+    /// D-057: the window's own content never changes between retries, so a
+    /// context overflow on the *first* generator call is exactly as
+    /// deterministic as the parse failures D-050 already dead-letters — it
+    /// must classify `Mechanical`, not the blanket `Transient` every other
+    /// generator failure gets.
+    #[tokio::test]
+    async fn a_context_overflow_on_the_first_call_classifies_mechanical() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let pool = pool_with_context_overflow();
+        let uuids = SeqUuidV7::new();
+        let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
+        let failure = result.expect_err("context overflow never succeeds");
+        assert_eq!(
+            failure.kind,
+            FailureKind::Mechanical,
+            "same window, same token count, every retry — must dead-letter, not retry-storm"
+        );
+    }
+
+    /// A generator that returns a malformed response once, then fails every
+    /// subsequent call with a context overflow — exercises the corrective
+    /// re-prompt's own `pool.generate` call site, not just the first one.
+    struct MalformedThenContextOverflowGenerator {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl Generator for MalformedThenContextOverflowGenerator {
+        fn generate(&self, _req: local_rag_embed::GenRequest) -> Result<GenResponse, GenError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(GenResponse {
+                    text: "not json at all".to_string(),
+                    finish_reason: FinishReason::Stop,
+                    tokens_generated: None,
+                })
+            } else {
+                Err(GenError::ContextOverflow {
+                    requested_tokens: 36_269,
+                    max_context_tokens: 32_768,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_on_the_corrective_reprompt_also_classifies_mechanical() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        use local_rag_embed::GeneratorEntry;
+        let pool = GeneratorPool::new(vec![GeneratorEntry::local(
+            "scripted",
+            Arc::new(MalformedThenContextOverflowGenerator {
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }),
+        )]);
+        let uuids = SeqUuidV7::new();
+        let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
+        let failure = result.expect_err("context overflow never succeeds");
+        assert_eq!(failure.kind, FailureKind::Mechanical);
     }
 
     #[tokio::test]

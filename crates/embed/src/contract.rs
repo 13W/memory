@@ -123,6 +123,12 @@ pub struct ProviderFailure {
     pub attempts: u32,
     /// The last error message it produced.
     pub message: String,
+    /// D-057: whether the last error was [`GenError::ContextOverflow`] —
+    /// always `false` for `Embedder`'s own failures, which have no context-
+    /// window analog. Lets [`GenError::is_deterministic_context_overflow`]
+    /// see through [`GenError::AllProvidersFailed`]'s flattened `message`
+    /// strings without string-sniffing `Display` text.
+    pub context_overflow: bool,
 }
 
 impl fmt::Display for ProviderFailure {
@@ -484,6 +490,28 @@ impl GenError {
     pub fn is_retryable(&self) -> bool {
         matches!(self, GenError::Retryable { .. })
     }
+
+    /// D-057: whether this failure is guaranteed to reproduce byte-for-byte
+    /// on an unchanged retry — the request's token count does not change
+    /// between attempts, so a context overflow can never be resolved by
+    /// waiting and trying again (unlike every other [`GenError`] variant,
+    /// which may reflect transient infra/network conditions).
+    ///
+    /// `true` for the bare [`GenError::ContextOverflow`] variant, and for
+    /// [`GenError::AllProvidersFailed`] only when *every* contained
+    /// [`ProviderFailure`] is itself tagged `context_overflow` — a provider
+    /// that failed for a different, possibly-transient reason must not be
+    /// swallowed into "deterministic" just because another provider in the
+    /// same pool happened to overflow.
+    pub fn is_deterministic_context_overflow(&self) -> bool {
+        match self {
+            GenError::ContextOverflow { .. } => true,
+            GenError::AllProvidersFailed { failures } => {
+                !failures.is_empty() && failures.iter().all(|f| f.context_overflow)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for GenError {
@@ -597,11 +625,13 @@ mod tests {
                         provider: "local".to_string(),
                         attempts: 1,
                         message: "assets missing".to_string(),
+                        context_overflow: false,
                     },
                     ProviderFailure {
                         provider: "backup".to_string(),
                         attempts: 3,
                         message: "500".to_string(),
+                        context_overflow: false,
                     },
                 ],
             }
@@ -674,10 +704,78 @@ mod tests {
                     provider: "llama-local".to_string(),
                     attempts: 2,
                     message: "context overflow".to_string(),
+                    context_overflow: true,
                 }],
             }
             .to_string(),
             "all generation providers failed: llama-local (after 2 attempts): context overflow"
+        );
+    }
+
+    #[test]
+    fn bare_context_overflow_is_deterministic() {
+        assert!(
+            GenError::ContextOverflow {
+                requested_tokens: 36_269,
+                max_context_tokens: 32_768,
+            }
+            .is_deterministic_context_overflow()
+        );
+    }
+
+    #[test]
+    fn all_providers_failed_is_deterministic_only_when_every_failure_overflowed() {
+        let overflow = |provider: &str| ProviderFailure {
+            provider: provider.to_string(),
+            attempts: 1,
+            message: "request needs 36269 tokens, model context is 32768".to_string(),
+            context_overflow: true,
+        };
+        let other = |provider: &str| ProviderFailure {
+            provider: provider.to_string(),
+            attempts: 1,
+            message: "500".to_string(),
+            context_overflow: false,
+        };
+
+        assert!(
+            GenError::AllProvidersFailed {
+                failures: vec![overflow("a"), overflow("b")],
+            }
+            .is_deterministic_context_overflow(),
+            "every provider overflowed"
+        );
+        assert!(
+            !GenError::AllProvidersFailed {
+                failures: vec![overflow("a"), other("b")],
+            }
+            .is_deterministic_context_overflow(),
+            "a non-overflow failure might still succeed on retry — must not be swallowed"
+        );
+        assert!(
+            !GenError::AllProvidersFailed { failures: vec![] }.is_deterministic_context_overflow(),
+            "never vacuously true on an empty list"
+        );
+    }
+
+    #[test]
+    fn every_other_gen_error_variant_is_not_deterministic_context_overflow() {
+        assert!(!GenError::NoProvider.is_deterministic_context_overflow());
+        assert!(!GenError::retryable("busy").is_deterministic_context_overflow());
+        assert!(!GenError::permanent("400").is_deterministic_context_overflow());
+        assert!(
+            !GenError::ModelAssetsMissing {
+                model_id: "gemma".to_string(),
+                expected_path: "/models/gemma".to_string(),
+            }
+            .is_deterministic_context_overflow()
+        );
+        assert!(
+            !GenError::PolicyBlockedRemote {
+                policy: DataPolicy::LocalOnly,
+                blocked: vec!["hosted".to_string()],
+            }
+            .is_deterministic_context_overflow()
         );
     }
 }
