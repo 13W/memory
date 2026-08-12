@@ -1503,3 +1503,58 @@ As-built note (T20-07, `[SPEC]`): the three `admin/*` verbs' concrete request/re
   tail_calls`/`admin/tool_stats` (§7, T18-08) already established; `admin/*`'s self-exclusion from
   `ctx.telemetry` is a prefix match in `handshake.rs`, already covering these three verbs without
   any change there.
+
+As-built note (T20-08, `[SPEC]`): `local-rag project` — the CLI half, working with or without a
+live daemon.
+
+- **`add <path>`/`remove <path>`/`enable <path>`/`disable <path>`** never touch a socket for their
+  durable effect: each resolves `path` the same way `index`/`reindex` do (`gitroot::probe` →
+  `resolve_facts`, `Ambiguous` refused via the same `print_ambiguous` listing) and writes straight
+  to `managed_worktree` via one `StateWriter::transaction`. `add` on a `Resolution::GlobalOnly`
+  path (never indexed before) creates the repository/worktree rows **and** enrolls them managed in
+  that **same** transaction (`local_rag::indexing::register_new_managed_worktree`, T20-08 —
+  `register_new_worktree`'s own four-write body factored into a shared private `new_worktree_tx`
+  so both entry points run inside exactly one `StateWriter::transaction`, never two, closing the
+  window a crash between two separate transactions would otherwise leave: a worktree registered but
+  never marked managed). `add` on an already-known (`Resolved`) path is a plain
+  `register_managed_worktree` upsert. After any successful write, a live daemon is notified
+  best-effort (`admin/projects_reload`, result fully ignored in both directions — spec 11 §8's own
+  "notify is a hint, the table is truth"); no attempt to spawn or wait for a daemon is ever made.
+  `enable`/`disable`'s `set_managed_enabled` returning `false` (path known but never enrolled) is a
+  typed refusal, `fail()`, non-zero exit, "…is not a managed project" — `set_managed_enabled`'s own
+  doc names this exact wording. `remove`'s `unregister_managed_worktree` returning `false` is,
+  by contrast, **idempotent success** (`ExitCode::SUCCESS`, "…is not managed (nothing to do)") —
+  matching that function's own "a second call is `Ok(false)`, never an error" contract. A path that
+  was never indexed at all (`Resolution::GlobalOnly`) is a distinct refusal for `remove`/`enable`/
+  `disable`: "not a known worktree" — `add` is the only verb that may register a brand-new path.
+- **`list [--json]`** is durable-only, no daemon dependency whatsoever (the same reason `repo
+  list`/`worktree list` never touch the socket) — every enrolled row from `managed_worktree`,
+  joined with `local_rag_store::current_worktree_path` for a human-readable path. `--json`:
+  `{"projects": [{"worktree_id", "enabled", "registered_at", "updated_at", "path"}, ...]}`.
+- **`status [--json]`** is `list`'s durable rows plus a live join, via `call_admin(…,
+  "admin/projects_list", None)` (T20-07). Three possible `"daemon"` values, always present:
+  `"not_running"` (`CallAdminError::Unreachable` — the common, unremarkable case, not treated as a
+  CLI failure), `"migration_only"` (a live daemon answered but `available: false` — spec 11 §8's
+  own `MigrationOnly` convention), `"running"` (`available: true`; each row's `"task"` is the
+  matching live `ProjectEntry.task` verbatim, or `null` for a disabled row or one whose task has not
+  finished starting yet — same transient meaning `admin/projects_list` itself already documents). A
+  genuine anomaly (`Timeout`/`JsonRpcError` from a verb that takes no params and cannot itself be
+  malformed) is reported as a distinct CLI failure, never silently folded into `"not_running"`.
+  `--json`: `{"daemon": "not_running"|"migration_only"|"running", "projects": [{…list fields…,
+  "task": TaskStatus | null}]}`.
+- **`reindex [<path>]`** resolves `path` (or the current directory) and requires
+  `Resolution::Resolved` — an unindexed path fails with the same "run `local-rag index <path>`
+  first" text `reindex` (the standalone command) already uses; `Ambiguous` gets the same refusal.
+  On a resolved worktree, `call_admin(…, "admin/reconcile_now", {"worktree_id"})` (T20-07):
+  `Unreachable` → "the daemon is not running; run `local-rag reindex` instead" (the card's own
+  required hint, pointing at the always-available standalone command); a `-32602` JSON-RPC error
+  (T20-07's own unknown-or-unmanaged-worktree meaning) → "worktree … is not currently managed by
+  the daemon; run `local-rag project add <path>` first"; any other outcome is a generic failure.
+  Success only confirms the trigger was accepted (`available: true`), the same fire-and-forget
+  meaning `admin/reconcile_now` itself already documents — it does not wait for the resulting
+  reconcile to finish.
+- Not implemented by this task (explicitly out of scope, spec 11 §8's own forward note): the
+  stderr dual-indexing advisory in `index`/`reindex`/`watch` (T20-09) and any daemon keep-alive
+  semantics for managed-but-quiet projects (T20-10, blocked on an owner decision). `remove` never
+  touches the index/shards themselves (`rebuild`/`gc`/`worktree`'s own territory), and `add` never
+  recurses into a directory of projects.

@@ -53,7 +53,7 @@ use local_rag_store::{
     Resolution, RetentionParams, StateDb, WorktreeLockRegistry, WorktreeRootFacts, WriteError,
     create_repository, create_worktree, effective_data_policy, ensure_store_instance_uuid,
     insert_projection_state, materialize_fts, observe_repository_path, observe_worktree_path,
-    resolve, worktree_summary,
+    register_managed_worktree, resolve, worktree_summary,
 };
 
 /// Everything the pipeline needs, built once per invocation and threaded
@@ -418,6 +418,35 @@ pub async fn finish_index_ctx(
     })
 }
 
+/// The write body `register_new_worktree`/`register_new_managed_worktree`
+/// share — create the repository and worktree rows, observe both current
+/// paths, seed `worktree_projection_state`. Factored out so both public
+/// entry points run it inside exactly one `StateWriter::transaction`, never
+/// two: `register_new_managed_worktree` (T20-08) additionally enrolls the
+/// new worktree as managed in that same transaction, which a second,
+/// separate transaction could not guarantee (a crash between the two would
+/// leave a worktree registered but never marked managed).
+fn new_worktree_tx(
+    tx: &rusqlite::Transaction<'_>,
+    repo_id: &str,
+    worktree_id: &str,
+    facts: &WorktreeRootFacts,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    create_repository(tx, repo_id, None, now_ms)?;
+    create_worktree(tx, worktree_id, repo_id, facts.kind, now_ms)?;
+    observe_worktree_path(
+        tx,
+        worktree_id,
+        &facts.observed_canonical_path,
+        &facts.display_path,
+        &facts.path_fingerprint,
+        now_ms,
+    )?;
+    observe_repository_path(tx, repo_id, &facts.observed_canonical_path, now_ms)?;
+    insert_projection_state(tx, worktree_id, now_ms)
+}
+
 /// Register a brand-new `{repo_id, worktree_id}` under `facts` — the same
 /// four-write transaction `xtask::bench::run::register_worktree` already
 /// established (create the repository and worktree rows, observe both
@@ -431,20 +460,31 @@ pub async fn register_new_worktree(
     now_ms: i64,
 ) -> Result<(), WriteError> {
     let (r, w) = (repo_id.to_string(), worktree_id.to_string());
-    let (canonical, display, fp, kind) = (
-        facts.observed_canonical_path.clone(),
-        facts.display_path.clone(),
-        facts.path_fingerprint.clone(),
-        facts.kind,
-    );
+    let facts = facts.clone();
+    state
+        .writer()
+        .transaction(move |tx| new_worktree_tx(tx, &r, &w, &facts, now_ms))
+        .await
+}
+
+/// [`register_new_worktree`], plus enrolling the new worktree as daemon-managed
+/// (`local_rag_store::register_managed_worktree`) in the **same** transaction
+/// (T20-08, `local-rag project add` on a not-yet-known path — spec 11 §8's
+/// "add … creates repo/worktree and marks it managed in one transaction").
+pub async fn register_new_managed_worktree(
+    state: &StateDb,
+    repo_id: Uuid,
+    worktree_id: Uuid,
+    facts: &WorktreeRootFacts,
+    now_ms: i64,
+) -> Result<(), WriteError> {
+    let (r, w) = (repo_id.to_string(), worktree_id.to_string());
+    let facts = facts.clone();
     state
         .writer()
         .transaction(move |tx| {
-            create_repository(tx, &r, None, now_ms)?;
-            create_worktree(tx, &w, &r, kind, now_ms)?;
-            observe_worktree_path(tx, &w, &canonical, &display, &fp, now_ms)?;
-            observe_repository_path(tx, &r, &canonical, now_ms)?;
-            insert_projection_state(tx, &w, now_ms)
+            new_worktree_tx(tx, &r, &w, &facts, now_ms)?;
+            register_managed_worktree(tx, &w, now_ms)
         })
         .await
 }
@@ -462,8 +502,8 @@ mod tests {
     use local_rag_search::{QueryEmbedder, SearchRequest};
     use local_rag_store::{
         GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, RepresentationKind, ScopeKind,
-        WorktreeKind, create_memory_entry, register_representation, set_model_space_representation,
-        set_repo_data_policy,
+        WorktreeKind, create_memory_entry, managed_worktrees, register_representation,
+        set_model_space_representation, set_repo_data_policy,
     };
     use local_rag_test_support::TempHome;
 
@@ -673,6 +713,39 @@ mod tests {
             "{:?}",
             response.results
         );
+    }
+
+    /// T20-08: `register_new_managed_worktree` is `register_new_worktree`
+    /// plus enrollment, atomically — both the worktree/repo rows and the
+    /// `managed_worktree` row must exist after one call, in one transaction.
+    #[tokio::test]
+    async fn register_new_managed_worktree_creates_and_enrolls_in_one_call() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).expect("repo dir");
+
+        let ctx = open_ctx(&layout);
+        let now_ms = 1_000;
+        let repo_id = ctx.uuids.next_uuid();
+        let worktree_id = ctx.uuids.next_uuid();
+        let facts = facts_for(&root);
+
+        register_new_managed_worktree(&ctx.state, repo_id, worktree_id, &facts, now_ms)
+            .await
+            .expect("register managed worktree");
+
+        let conn = ctx.state.open_read().expect("open read connection");
+        let summary = worktree_summary(&conn, &worktree_id.to_string())
+            .expect("read worktree")
+            .expect("worktree row exists");
+        assert_eq!(summary.repo_id, repo_id.to_string());
+
+        let managed = managed_worktrees(&conn).expect("read managed_worktree");
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].worktree_id, worktree_id.to_string());
+        assert!(managed[0].enabled, "a freshly enrolled row starts enabled");
     }
 
     /// T20-04: `write_locked` — the typed write-cycle wrapper T20-05's

@@ -37,6 +37,7 @@ pub mod index;
 pub mod init;
 pub mod inspect;
 pub mod memory;
+pub mod project;
 pub mod purge;
 pub mod rebuild;
 pub mod repo;
@@ -99,6 +100,11 @@ pub enum Command {
     Worktree {
         #[command(subcommand)]
         command: worktree::WorktreeCommand,
+    },
+    /// Daemon-managed background indexing (spec 11 §8, T20-08).
+    Project {
+        #[command(subcommand)]
+        command: project::ProjectCommand,
     },
     /// Force-rebuild the FTS view and/or dense projection from already-indexed content.
     Rebuild(rebuild::RebuildArgs),
