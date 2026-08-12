@@ -308,6 +308,7 @@ impl ProviderPool {
                                 provider: entry.name.clone(),
                                 attempts,
                                 message: last,
+                                context_overflow: false,
                             }));
                         }
                     };
@@ -325,6 +326,7 @@ impl ProviderPool {
             provider: entry.name.clone(),
             attempts,
             message: last,
+            context_overflow: false,
         }))
     }
 }

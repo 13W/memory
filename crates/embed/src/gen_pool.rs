@@ -188,12 +188,17 @@ impl GeneratorPool {
     ) -> Result<GenResponse, ProviderFailure> {
         let mut attempts = 0;
         let mut last = String::new();
+        // D-057: tracked alongside `last` so a deterministic context overflow
+        // survives past this loop's string-collapse — `router::route()`
+        // needs it to classify the eventual `AllProvidersFailed` correctly.
+        let mut last_context_overflow = false;
         while attempts < self.retry.max_attempts {
             attempts += 1;
             match entry.provider.generate(req.clone()) {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
                     last = err.to_string();
+                    last_context_overflow = matches!(err, GenError::ContextOverflow { .. });
                     let retry_after = match &err {
                         GenError::Retryable { retry_after_ms, .. } => *retry_after_ms,
                         // Not retryable: fall back to the next provider now.
@@ -202,6 +207,7 @@ impl GeneratorPool {
                                 provider: entry.name.clone(),
                                 attempts,
                                 message: last,
+                                context_overflow: last_context_overflow,
                             });
                         }
                     };
@@ -219,6 +225,7 @@ impl GeneratorPool {
             provider: entry.name.clone(),
             attempts,
             message: last,
+            context_overflow: last_context_overflow,
         })
     }
 }
@@ -399,6 +406,40 @@ mod tests {
                 assert_eq!(failures.len(), 2);
                 assert_eq!(failures[0].provider, "a");
                 assert_eq!(failures[1].provider, "b");
+            }
+            other => panic!("expected AllProvidersFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_overflow_is_tagged_on_the_provider_failure() {
+        let a = Arc::new(ScriptedGenerator::new(vec![Err(
+            GenError::ContextOverflow {
+                requested_tokens: 36_269,
+                max_context_tokens: 32_768,
+            },
+        )]));
+        let b = Arc::new(ScriptedGenerator::new(vec![Err(GenError::permanent(
+            "400",
+        ))]));
+        let pool = GeneratorPool::new(vec![
+            GeneratorEntry::local("a", a),
+            GeneratorEntry::local("b", b),
+        ]);
+
+        let err = pool
+            .generate(DataPolicy::LocalOnly, req())
+            .expect_err("both fail");
+        match err {
+            GenError::AllProvidersFailed { failures } => {
+                assert!(
+                    failures[0].context_overflow,
+                    "a's ContextOverflow must be tagged"
+                );
+                assert!(
+                    !failures[1].context_overflow,
+                    "b's permanent failure is not a context overflow"
+                );
             }
             other => panic!("expected AllProvidersFailed, got {other:?}"),
         }
