@@ -274,6 +274,16 @@ pub struct MemoryConfig {
     /// at or below the batch size would make this path fire on nearly every
     /// tick instead of reserving it for genuine off-checkpoint buildup.
     pub consolidation_queue_threshold: i64,
+    /// X-005: how long a session's backlog may sit with no new observation
+    /// before the trigger treats it as an implicit `Stop` and consolidates
+    /// it as-is, even without a real `Stop`/`SessionEnd` event ever
+    /// arriving. Closes the gap for sessions that crash before their first
+    /// lifecycle event (spool captures only `SessionStart`) — the queue-size
+    /// threshold alone never reaches such a session, since no further
+    /// observation will ever arrive to grow its backlog toward it. Like
+    /// `consolidation_batch_size`/`consolidation_queue_threshold`, a
+    /// `[SPEC]`-chosen value, not derived from any normative text.
+    pub consolidation_idle_checkpoint_hours: u64,
 }
 
 impl Default for MemoryConfig {
@@ -282,6 +292,7 @@ impl Default for MemoryConfig {
             recall_token_budget: 1500,
             consolidation_batch_size: 20,
             consolidation_queue_threshold: 50,
+            consolidation_idle_checkpoint_hours: 24,
         }
     }
 }
@@ -570,6 +581,7 @@ deny_tools = []
 recall_token_budget = 1500
 consolidation_batch_size = 20
 consolidation_queue_threshold = 50
+consolidation_idle_checkpoint_hours = 24
 ";
 
     const ALL_POLICIES: [DataPolicy; 4] = [
@@ -773,6 +785,26 @@ consolidation_queue_threshold = 50
         assert_eq!(cfg.memory.consolidation_queue_threshold, 30);
         // A partial `[memory]` section still defaults the untouched key.
         assert_eq!(cfg.memory.recall_token_budget, 1500);
+    }
+
+    // ---- `[memory]` idle-timeout implicit checkpoint (X-005) ----------------
+
+    #[test]
+    fn memory_config_defaults_to_a_24_hour_idle_checkpoint() {
+        assert_eq!(
+            MemoryConfig::default().consolidation_idle_checkpoint_hours,
+            24
+        );
+    }
+
+    #[test]
+    fn memory_section_round_trips_a_custom_idle_checkpoint_hours() {
+        let cfg =
+            Config::parse_toml("[memory]\nconsolidation_idle_checkpoint_hours = 6\n").unwrap();
+        assert_eq!(cfg.memory.consolidation_idle_checkpoint_hours, 6);
+        // A partial `[memory]` section still defaults the untouched keys.
+        assert_eq!(cfg.memory.consolidation_batch_size, 20);
+        assert_eq!(cfg.memory.consolidation_queue_threshold, 50);
     }
 
     // ---- write direction: `to_toml_string`/`save` (T18-07) ------------------

@@ -111,9 +111,9 @@ pub use consolidation::{
     RunWindow, SnapshotOutcome, StaleRun, TRANSIENT_BACKOFF_BASE_MS, TRANSIENT_BACKOFF_CAP_MS,
     UnconsolidatableSession, acquire_lease, consolidation_run_state, create_consolidation_run,
     has_unconsolidated_checkpoint, lease_expired, open_next_run, pending_backlog,
-    processing_cursor, record_run_failure, renew_lease, retry_run, sessions_with_pending_backlog,
-    stale_runs, transient_backoff_delay_ms, transition_run, unconsolidatable_sessions,
-    upsert_processing_cursor,
+    processing_cursor, record_run_failure, renew_lease, retry_run, session_idle_since,
+    sessions_with_pending_backlog, stale_runs, transient_backoff_delay_ms, transition_run,
+    unconsolidatable_sessions, upsert_processing_cursor,
 };
 pub(crate) use entry::all_memory_entry_ids;
 pub use entry::{

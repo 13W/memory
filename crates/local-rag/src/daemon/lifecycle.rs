@@ -151,6 +151,10 @@ pub struct StartOptions {
     /// The continuous consolidation-trigger worker's backlog threshold
     /// (`config.memory.consolidation_queue_threshold`, D-024, spec 07 §6).
     pub consolidation_queue_threshold: i64,
+    /// The continuous consolidation-trigger worker's idle-timeout implicit
+    /// checkpoint (`config.memory.consolidation_idle_checkpoint_hours`,
+    /// X-005, spec 07 §6).
+    pub consolidation_idle_checkpoint_hours: u64,
     /// How often the continuous consolidation-trigger worker ticks (D-024).
     /// No `[SPEC]` number exists for it (the same bucket
     /// `wait_for_shutdown_trigger`'s own `poll_interval` occupies) — a plain
@@ -284,6 +288,7 @@ impl DaemonHandle {
             recall_token_budget,
             consolidation_batch_size,
             consolidation_queue_threshold,
+            consolidation_idle_checkpoint_hours,
             consolidation_poll_interval,
             retention,
             classifier,
@@ -542,6 +547,7 @@ impl DaemonHandle {
                     consolidation_renew_interval_ms,
                     consolidation_batch_size,
                     consolidation_queue_threshold,
+                    consolidation_idle_checkpoint_hours,
                     payload_ttl_hours,
                     consolidation_poll_interval,
                     data_policy,
@@ -758,6 +764,7 @@ async fn spawn_consolidation_trigger(
     renew_interval_ms: i64,
     batch_size: i64,
     queue_threshold: i64,
+    idle_checkpoint_hours: u64,
     payload_ttl_hours: u64,
     poll_interval: Duration,
     data_policy: DataPolicy,
@@ -781,6 +788,7 @@ async fn spawn_consolidation_trigger(
         batch_size,
         queue_threshold,
         payload_ttl_hours,
+        idle_checkpoint_hours,
     };
     super::consolidation_trigger::run_consolidation_trigger(
         db,

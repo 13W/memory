@@ -150,6 +150,7 @@ async fn serve() -> ExitCode {
         recall_token_budget: config.memory.recall_token_budget,
         consolidation_batch_size: config.memory.consolidation_batch_size,
         consolidation_queue_threshold: config.memory.consolidation_queue_threshold,
+        consolidation_idle_checkpoint_hours: config.memory.consolidation_idle_checkpoint_hours,
         consolidation_poll_interval: CONSOLIDATION_POLL_INTERVAL,
         retention: local_rag_store::RetentionParams::from_storage_config(&config.storage),
         classifier: local_rag_index::classify::ClassifierConfig::from_index_config(&config.index),

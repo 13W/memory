@@ -611,6 +611,7 @@ pub fn start_options(layout: StoreLayout) -> StartOptions {
         recall_token_budget: 1500,
         consolidation_batch_size: 20,
         consolidation_queue_threshold: 50,
+        consolidation_idle_checkpoint_hours: 24,
         consolidation_poll_interval: std::time::Duration::from_millis(50),
         retention: RetentionParams {
             keep_last_k: 2,

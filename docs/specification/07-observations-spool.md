@@ -344,11 +344,29 @@ cursor); deliberately 2.5× the companion `consolidation_batch_size = 20`
 (`docs/specification/08-memory.md` §4's own as-built note) — a threshold at or below the batch
 size would open a fresh run on nearly every tick that has *any* backlog at all, defeating the
 point of reserving this path for genuine off-checkpoint buildup rather than eager per-tick
-triggering against a 120s-leased, non-instant local-LLM call. A known, accepted gap: at daemon
+triggering against a 120s-leased, non-instant local-LLM call.
+
+As-built note (D-061, `[SPEC]`): the above once documented a "known, accepted gap" — at daemon
 boot this worker's first tick races T15-01's own startup spool-import pass for the same session's
-tail, so a `Stop` arriving exactly at startup can be missed by the checkpoint path specifically
-(caught later by the queue-threshold path instead) — see
-`crates/local-rag/src/daemon/consolidation_trigger.rs`'s own module doc for the full reasoning.
+tail, so a `Stop`/`SessionEnd` arriving exactly at startup could be silently and *permanently*
+missed by the checkpoint path if the startup pass won the race (only the queue-threshold fallback
+remained, which a session that has already ended can never cross). Live dogfooding proved this
+was not boot-time-only or benign: 14 sessions whose spool tail had already been imported by the
+losing side of that race sat unconsolidated for 42-181 hours. `local_rag_store::
+has_unconsolidated_checkpoint` closes it by asking the database directly — whether the session has
+an un-consolidated `Stop`/`SessionEnd` row past its cursor — race-free regardless of which call
+actually imported the bytes; see `crates/local-rag/src/daemon/consolidation_trigger.rs`'s own
+module doc for the full reasoning.
+
+As-built note (X-005, `[SPEC]`): a session that crashes before ever sending a real `Stop`/
+`SessionEnd` — the spool captures only its `SessionStart` — satisfies none of this section's three
+checkpoint triggers and, since no further observation ever arrives, never crosses the queue-size
+threshold either; D-061's own live investigation found three such orphan sessions stuck with a
+single unconsolidated observation each for 52-181 hours. A fourth, explicit-owner-decision trigger
+closes this: `config.memory.consolidation_idle_checkpoint_hours = 24` — a session with nonzero
+backlog whose newest observation (`MAX(observation_envelope.source_timestamp)`) is at least this
+old is treated as an implicit `Stop` and consolidated as-is
+(`local_rag_store::session_idle_since`, `consolidation_trigger_tick`'s fourth gate condition).
 
 As-built note (T13-05, `[SPEC]`): the session directory GC sweep is
 `local_rag_store::housekeeping::run_spool_session_sweep`, the fourth sweep in

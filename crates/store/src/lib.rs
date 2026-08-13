@@ -455,7 +455,7 @@ pub use memory::{
     observations_applied_since, oldest_open_run_created_at, open_next_run, pending_backlog,
     pending_candidate_ages, pending_candidate_counts, processing_cursor, propose_candidate,
     read_audit_events_for_entity, recall_candidate_by_id, recall_candidates_for_scope,
-    record_run_failure, reject_candidate, renew_lease, retry_run, run_once,
+    record_run_failure, reject_candidate, renew_lease, retry_run, run_once, session_idle_since,
     sessions_with_pending_backlog, stale_runs, total_pending_backlog, transient_backoff_delay_ms,
     transition_candidate, transition_memory_entry, transition_run, unconsolidatable_sessions,
     upsert_processing_cursor,
