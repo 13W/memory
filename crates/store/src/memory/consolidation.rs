@@ -255,6 +255,34 @@ pub fn pending_backlog(conn: &Connection, session_id: &str) -> rusqlite::Result<
     )
 }
 
+/// D-061: whether `session_id` already has an un-consolidated `Stop`/`SessionEnd`
+/// envelope past its cursor, evaluated straight against persisted state rather
+/// than a single import call's own transient report.
+///
+/// `consolidation_trigger_tick`'s checkpoint signal used to come solely from
+/// *that tick's own* `import_session_tail` call's `saw_stop`/`saw_session_end`
+/// — but the daemon-startup catch-up pass (`resume::resume_spool_import`) and
+/// this worker's first tick independently race to import the same session's
+/// spool tail, and only whichever call actually consumes the fresh bytes ever
+/// observes the checkpoint. The loser sees nothing new and silently drops the
+/// signal forever, leaving the size-threshold fallback (`pending_backlog`) as
+/// the only remaining path — which a session that has already ended will
+/// never cross. Asking the database directly is race-free: it doesn't matter
+/// which call imported the row, only that it is there, unconsolidated.
+pub fn has_unconsolidated_checkpoint(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
+    let cursor = processing_cursor(conn, session_id)?.unwrap_or(0);
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observation_envelope \
+         WHERE session_id = ?1 AND received_seq > ?2 \
+           AND event_type IN ('Stop', 'SessionEnd'))",
+        params![session_id, cursor],
+        |r| r.get(0),
+    )
+}
+
 /// Every `session_id` whose [`pending_backlog`] is non-zero, ascending — the
 /// same "past the cursor" criterion, evaluated for all sessions at once
 /// (D-040).
@@ -2040,6 +2068,93 @@ mod tests {
                 .expect("enumerate")
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-061: has_unconsolidated_checkpoint
+    // -----------------------------------------------------------------------
+
+    async fn seed_envelope_with_event_type(
+        db: &crate::StateDb,
+        session_id: &str,
+        observation_id: &str,
+        event_type: &str,
+    ) {
+        let (session_id, observation_id, event_type) = (
+            session_id.to_string(),
+            observation_id.to_string(),
+            event_type.to_string(),
+        );
+        db.writer()
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO observation_envelope \
+                       (observation_id, source_event_id, payload_hash, event_type, \
+                        evidence_kind, trust, session_id) \
+                     VALUES (?1, ?2, 'deadbeef', ?3, 'user_statement', 'normal', ?4)",
+                    params![
+                        observation_id,
+                        format!("evt-{observation_id}"),
+                        event_type,
+                        session_id
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed envelope");
+    }
+
+    #[tokio::test]
+    async fn has_unconsolidated_checkpoint_is_false_without_a_checkpoint_event_type() {
+        let (_home, db) = open_state();
+        seed_envelope_with_event_type(&db, "sess-a", "obs-1", "UserPromptSubmit").await;
+        seed_envelope_with_event_type(&db, "sess-a", "obs-2", "PostToolUse").await;
+
+        let read = db.open_read().expect("read conn");
+        assert!(
+            !has_unconsolidated_checkpoint(&read, "sess-a").expect("checkpoint check"),
+            "no Stop/SessionEnd row past the cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_unconsolidated_checkpoint_is_true_for_an_already_imported_session_end() {
+        // D-061 regression: this is the exact shape of the daemon-startup race
+        // — some other caller (`resume::resume_spool_import`) already imported
+        // the SessionEnd byte into `observation_envelope` before this tick's
+        // own `import_session_tail` call ever ran, so no in-memory
+        // `SpoolImportReport` will ever report `saw_session_end` for it again.
+        // The persisted check must still see it.
+        let (_home, db) = open_state();
+        seed_envelope_with_event_type(&db, "sess-a", "obs-1", "UserPromptSubmit").await;
+        seed_envelope_with_event_type(&db, "sess-a", "obs-2", "SessionEnd").await;
+
+        let read = db.open_read().expect("read conn");
+        assert!(has_unconsolidated_checkpoint(&read, "sess-a").expect("checkpoint check"));
+    }
+
+    #[tokio::test]
+    async fn has_unconsolidated_checkpoint_is_false_once_the_cursor_passes_it() {
+        let (_home, db) = open_state();
+        seed_envelope_with_event_type(&db, "sess-a", "obs-1", "SessionEnd").await;
+        db.writer()
+            .transaction(|tx| upsert_processing_cursor(tx, "sess-a", 1))
+            .await
+            .expect("consolidate past the checkpoint row");
+
+        let read = db.open_read().expect("read conn");
+        assert!(
+            !has_unconsolidated_checkpoint(&read, "sess-a").expect("checkpoint check"),
+            "already consolidated — not a pending checkpoint anymore"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_unconsolidated_checkpoint_is_false_for_an_unknown_session() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        assert!(!has_unconsolidated_checkpoint(&read, "nobody").expect("checkpoint check"));
     }
 
     // -----------------------------------------------------------------------
