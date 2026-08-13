@@ -32,7 +32,9 @@
 //!    saw a `Stop`/`SessionEnd` row, or the session already has one
 //!    un-consolidated in persisted state
 //!    ([`has_unconsolidated_checkpoint`], D-061), or the session's backlog
-//!    ([`pending_backlog`]) has crossed the configured threshold.
+//!    ([`pending_backlog`]) has crossed the configured threshold, or the
+//!    session has gone idle past the configured timeout with nonzero
+//!    backlog ([`session_idle_since`], X-005).
 //!
 //! No step here ever sleeps — [`consolidation_trigger_tick`] is directly
 //! unit-testable with fixed `now_ms` literals, mirroring
@@ -55,6 +57,21 @@
 //! `Stop`/`SessionEnd` row past its cursor" is race-free regardless of which
 //! call actually imported the row, so no daemon-startup serialization is
 //! needed.
+//!
+//! ## X-005: idle-timeout implicit checkpoint
+//!
+//! Even with D-061's fix, a session that crashes before ever sending a real
+//! `Stop`/`SessionEnd` — the spool captures only its `SessionStart` — has no
+//! checkpoint event to race in the first place, `saw_stop`/`saw_session_end`
+//! and [`has_unconsolidated_checkpoint`] are both permanently `false` for
+//! it, and no further observation will ever arrive to grow its backlog
+//! toward `queue_threshold`. Confirmed live: three such sessions sat with a
+//! single unconsolidated observation each for 52–162 hours, permanently —
+//! the reason `local-rag stats`'s pending backlog never reaches exactly
+//! zero even once every live session has genuinely stopped.
+//! [`session_idle_since`] closes this by treating a session whose newest
+//! observation is at least `idle_checkpoint_hours` old as an implicit
+//! `Stop` — consolidated as-is, not silently dropped.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -65,7 +82,8 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
     ClassifiedFailure, ConsolidationWindow, GeneratedOp, ImportError, RequestRoot, RunOutcome,
     SnapshotOutcome, StateDb, WriteError, has_unconsolidated_checkpoint, import_session_tail,
-    known_spool_sessions, open_next_run, pending_backlog, run_once, sessions_with_pending_backlog,
+    known_spool_sessions, open_next_run, pending_backlog, run_once, session_idle_since,
+    sessions_with_pending_backlog,
 };
 use tokio::sync::oneshot;
 
@@ -80,8 +98,8 @@ use super::resume::{log_resume_sweep, resume_stale_consolidation_runs};
 const ROUTER_VERSION: &str = "v1";
 
 /// Tunable parameters for the continuous consolidation-trigger worker
-/// (D-024). `batch_size`/`queue_threshold` are `[SPEC]`-chosen values (no
-/// default is specified anywhere normative — see
+/// (D-024). `batch_size`/`queue_threshold`/`idle_checkpoint_hours` are
+/// `[SPEC]`-chosen values (no default is specified anywhere normative — see
 /// `crates/core/src/config::MemoryConfig`'s own doc) surfaced through
 /// `config.toml`'s `[memory]` section; `lease_ms`/`renew_interval_ms` are the
 /// already-`[SPEC]`-fixed `LEASE_DURATION_MS`/`LEASE_RENEW_INTERVAL_MS`
@@ -94,6 +112,12 @@ pub struct ConsolidationTriggerParams {
     pub batch_size: i64,
     pub queue_threshold: i64,
     pub payload_ttl_hours: u64,
+    /// X-005: a session whose newest observation is at least this old, with
+    /// nonzero backlog, is treated as an implicit `Stop` — closes the gap
+    /// for sessions that crash before ever sending a real `Stop`/
+    /// `SessionEnd` (spool captures only `SessionStart`), which the
+    /// queue-size threshold alone never reaches.
+    pub idle_checkpoint_hours: u64,
 }
 
 /// What one session's checkpoint-gated pass did this tick.
@@ -207,15 +231,27 @@ where
         // already in `observation_envelope` but nothing here ever saw them
         // arrive. Ask the database directly, race-free regardless of which
         // call actually imported the row.
-        let (backlog_over_threshold, persisted_checkpoint) = match db.open_read() {
+        //
+        // X-005: `idle_timed_out` covers the session that never gets a real
+        // `Stop`/`SessionEnd` at all (crashed right after `SessionStart`) —
+        // its backlog would otherwise sit below `queue_threshold` forever,
+        // since no further observation ever arrives to grow it.
+        let (backlog_over_threshold, persisted_checkpoint, idle_timed_out) = match db.open_read() {
             Ok(read) => (
                 pending_backlog(&read, &session_id).unwrap_or(0) >= params.queue_threshold,
                 has_unconsolidated_checkpoint(&read, &session_id).unwrap_or(false),
+                session_idle_since(
+                    &read,
+                    &session_id,
+                    now_ms,
+                    (params.idle_checkpoint_hours as i64).saturating_mul(3_600_000),
+                )
+                .unwrap_or(false),
             ),
-            Err(_) => (false, false),
+            Err(_) => (false, false, false),
         };
 
-        if !(saw_checkpoint || backlog_over_threshold || persisted_checkpoint) {
+        if !(saw_checkpoint || backlog_over_threshold || persisted_checkpoint || idle_timed_out) {
             results.push((session_id, SessionTickOutcome::NoCheckpoint));
             continue;
         }
@@ -450,6 +486,7 @@ mod tests {
             batch_size: 20,
             queue_threshold: 50,
             payload_ttl_hours: 72,
+            idle_checkpoint_hours: 24,
         }
     }
 
@@ -584,6 +621,80 @@ mod tests {
             other => {
                 panic!("expected Ran(Applied(_)) via the persisted checkpoint check, got {other:?}")
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_session_that_never_got_a_stop_still_triggers() {
+        // X-005 regression: a session that crashed right after `SessionStart`
+        // (no `Stop`/`SessionEnd` ever, backlog forever under threshold) must
+        // still eventually consolidate once it has been idle long enough.
+        let (_home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+        write_spool_segment(
+            &layout,
+            "sess-a",
+            1,
+            &spool_fixture("sess-a", "ss:a:1", "SessionStart", 1_000),
+        );
+
+        let mut params = default_params();
+        params.queue_threshold = 50;
+        params.idle_checkpoint_hours = 24;
+
+        let results = consolidation_trigger_tick(
+            &db,
+            &layout,
+            &uuids,
+            &jobs,
+            &params,
+            1_000 + 24 * 3_600_000,
+            "build-test",
+            &|_window| async { Ok(noop_ops()) },
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "sess-a");
+        match &results[0].1 {
+            SessionTickOutcome::Ran(RunOutcome::Applied(_)) => {}
+            other => panic!("expected Ran(Applied(_)) via the idle-timeout check, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_session_under_the_timeout_does_not_trigger_yet() {
+        let (_home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+        write_spool_segment(
+            &layout,
+            "sess-a",
+            1,
+            &spool_fixture("sess-a", "ss:a:1", "SessionStart", 1_000),
+        );
+
+        let mut params = default_params();
+        params.queue_threshold = 50;
+        params.idle_checkpoint_hours = 24;
+
+        let results = consolidation_trigger_tick(
+            &db,
+            &layout,
+            &uuids,
+            &jobs,
+            &params,
+            1_000 + 3_600_000,
+            "build-test",
+            &|_window| async { Ok(noop_ops()) },
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0].1 {
+            SessionTickOutcome::NoCheckpoint => {}
+            other => panic!("expected NoCheckpoint (idle timeout not reached), got {other:?}"),
         }
     }
 

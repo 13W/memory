@@ -76,6 +76,7 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         recall_token_budget: 1500,
         consolidation_batch_size: 20,
         consolidation_queue_threshold: 50,
+        consolidation_idle_checkpoint_hours: 24,
         // A short cadence — real tests, real (tiny) ticks, no virtual clock
         // (this crate has no tokio `test-util` feature; see
         // `consolidation_trigger.rs`'s own unit tests for why).

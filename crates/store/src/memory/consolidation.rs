@@ -283,6 +283,32 @@ pub fn has_unconsolidated_checkpoint(
     )
 }
 
+/// X-005: whether `session_id` has gone idle for at least `idle_threshold_ms`
+/// — its newest `observation_envelope.source_timestamp` is that old or
+/// older. Used as a third, implicit-`Stop` checkpoint trigger alongside
+/// [`has_unconsolidated_checkpoint`]/the queue-size threshold: a session
+/// that crashes before ever sending a real `Stop`/`SessionEnd` (spool
+/// captures only `SessionStart`) would otherwise never checkpoint at all —
+/// no further observation ever arrives to grow its backlog toward the size
+/// threshold either.
+///
+/// `source_timestamp` is nullable (client-supplied, spec 03's envelope
+/// table); a session with no timestamped rows at all returns `false` — a
+/// safe default, not a forced checkpoint on data we cannot evaluate.
+pub fn session_idle_since(
+    conn: &Connection,
+    session_id: &str,
+    now_ms: i64,
+    idle_threshold_ms: i64,
+) -> rusqlite::Result<bool> {
+    let newest: Option<i64> = conn.query_row(
+        "SELECT MAX(source_timestamp) FROM observation_envelope WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    Ok(newest.is_some_and(|ts| now_ms - ts >= idle_threshold_ms))
+}
+
 /// Every `session_id` whose [`pending_backlog`] is non-zero, ascending — the
 /// same "past the cursor" criterion, evaluated for all sessions at once
 /// (D-040).
@@ -2155,6 +2181,92 @@ mod tests {
         let (_home, db) = open_state();
         let read = db.open_read().expect("read conn");
         assert!(!has_unconsolidated_checkpoint(&read, "nobody").expect("checkpoint check"));
+    }
+
+    // -----------------------------------------------------------------------
+    // X-005: session_idle_since
+    // -----------------------------------------------------------------------
+
+    async fn seed_envelope_with_timestamp(
+        db: &crate::StateDb,
+        session_id: &str,
+        observation_id: &str,
+        source_timestamp: i64,
+    ) {
+        let (session_id, observation_id) = (session_id.to_string(), observation_id.to_string());
+        db.writer()
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO observation_envelope \
+                       (observation_id, source_event_id, payload_hash, event_type, \
+                        evidence_kind, trust, session_id, source_timestamp) \
+                     VALUES (?1, ?2, 'deadbeef', 'UserPromptSubmit', 'user_statement', 'normal', \
+                             ?3, ?4)",
+                    params![
+                        observation_id,
+                        format!("evt-{observation_id}"),
+                        session_id,
+                        source_timestamp
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed envelope with timestamp");
+    }
+
+    #[tokio::test]
+    async fn session_idle_since_is_true_once_the_threshold_has_elapsed() {
+        let (_home, db) = open_state();
+        seed_envelope_with_timestamp(&db, "sess-a", "obs-1", 1_000).await;
+
+        let read = db.open_read().expect("read conn");
+        assert!(
+            session_idle_since(&read, "sess-a", 1_000 + 86_400_000, 86_400_000)
+                .expect("idle check"),
+            "exactly at the threshold counts as idle"
+        );
+        assert!(
+            session_idle_since(&read, "sess-a", 1_000 + 90_000_000, 86_400_000)
+                .expect("idle check"),
+            "past the threshold counts as idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_idle_since_is_false_before_the_threshold_elapses() {
+        let (_home, db) = open_state();
+        seed_envelope_with_timestamp(&db, "sess-a", "obs-1", 1_000).await;
+
+        let read = db.open_read().expect("read conn");
+        assert!(
+            !session_idle_since(&read, "sess-a", 1_000 + 1_000, 86_400_000).expect("idle check"),
+            "far short of the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_idle_since_tracks_the_newest_observation_not_the_oldest() {
+        let (_home, db) = open_state();
+        seed_envelope_with_timestamp(&db, "sess-a", "obs-1", 1_000).await;
+        seed_envelope_with_timestamp(&db, "sess-a", "obs-2", 50_000_000).await;
+
+        let read = db.open_read().expect("read conn");
+        assert!(
+            !session_idle_since(&read, "sess-a", 50_000_000 + 1_000, 86_400_000)
+                .expect("idle check"),
+            "the session's newest observation is what resets the idle clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_idle_since_is_false_for_an_unknown_session() {
+        let (_home, db) = open_state();
+        let read = db.open_read().expect("read conn");
+        assert!(
+            !session_idle_since(&read, "nobody", 1_000_000_000, 86_400_000).expect("idle check"),
+            "no timestamped rows to evaluate — never force a checkpoint on missing data"
+        );
     }
 
     // -----------------------------------------------------------------------
