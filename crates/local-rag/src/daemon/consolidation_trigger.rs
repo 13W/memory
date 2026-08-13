@@ -28,32 +28,33 @@
 //!    whose envelopes all arrived through a spool-bypassing daemon-internal
 //!    write such as `give_feedback`), import its fresh tail
 //!    (reusing the same `import_session_tail` call the startup spool-resume
-//!    pass makes), then open a new consolidation window if either this
-//!    import just saw a `Stop`/`SessionEnd` row, or the session's backlog
+//!    pass makes), then open a new consolidation window if this import just
+//!    saw a `Stop`/`SessionEnd` row, or the session already has one
+//!    un-consolidated in persisted state
+//!    ([`has_unconsolidated_checkpoint`], D-061), or the session's backlog
 //!    ([`pending_backlog`]) has crossed the configured threshold.
 //!
 //! No step here ever sleeps — [`consolidation_trigger_tick`] is directly
 //! unit-testable with fixed `now_ms` literals, mirroring
 //! `crates/store/tests/consolidation_runner.rs`'s own style.
 //!
-//! ## A known race against the startup spool-import pass
+//! ## D-061: the startup spool-import race no longer loses the checkpoint
 //!
 //! At daemon boot, this worker's very first tick races
 //! `daemon::resume::resume_spool_import` (spec 02 §4.1 step 5) for the same
 //! session's spool tail — both independently call `import_session_tail`.
-//! Whichever import call actually consumes the fresh bytes is the one that
-//! observes `saw_stop`/`saw_session_end`; if the startup pass wins, this
-//! worker's own first-tick import sees nothing new, so the checkpoint
-//! condition is **missed** for that specific envelope (not just a harmless
-//! redundant read) — the queue-size-threshold path is the fallback that
-//! still catches it once enough backlog accumulates. Away from daemon
-//! startup (the overwhelmingly common case — a `Stop` arriving while the
-//! daemon has been running for a while), no such race exists: nothing else
-//! is concurrently importing that session's tail. Not engineered around
-//! here: doing so would need `DaemonHandle::start` to serialize this
-//! worker's first tick behind the startup pass's own `JoinHandle`, which
-//! `resume_handles: Vec<JoinHandle<()>>` isn't structured to expose to a
-//! second caller — not justified for a boot-time-only, self-healing gap.
+//! Whichever import call actually consumes the fresh bytes is the one whose
+//! own `SpoolImportReport` observes `saw_stop`/`saw_session_end`; the other
+//! call sees nothing new. That in-memory signal alone used to be the only
+//! checkpoint source, so the loser's tick silently and **permanently** missed
+//! it — confirmed live (D-061): 14 sessions whose spool tail had already been
+//! imported (last `event_type` already `SessionEnd`) sat unconsolidated for
+//! days, each under the size-threshold fallback, which a session that has
+//! already ended can never cross. [`has_unconsolidated_checkpoint`] closes
+//! this by asking the database directly — "does this session have a
+//! `Stop`/`SessionEnd` row past its cursor" is race-free regardless of which
+//! call actually imported the row, so no daemon-startup serialization is
+//! needed.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -63,8 +64,8 @@ use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
     ClassifiedFailure, ConsolidationWindow, GeneratedOp, ImportError, RequestRoot, RunOutcome,
-    SnapshotOutcome, StateDb, WriteError, import_session_tail, known_spool_sessions, open_next_run,
-    pending_backlog, run_once, sessions_with_pending_backlog,
+    SnapshotOutcome, StateDb, WriteError, has_unconsolidated_checkpoint, import_session_tail,
+    known_spool_sessions, open_next_run, pending_backlog, run_once, sessions_with_pending_backlog,
 };
 use tokio::sync::oneshot;
 
@@ -201,12 +202,20 @@ where
         }; // `_job` dropped here — before this session's open-new-run work,
         // and always before the next tick's wait.
 
-        let backlog_over_threshold = match db.open_read() {
-            Ok(read) => pending_backlog(&read, &session_id).unwrap_or(0) >= params.queue_threshold,
-            Err(_) => false,
+        // D-061: `saw_checkpoint` only reflects *this tick's own* import call
+        // — if the daemon-startup resume pass raced it and won, the bytes are
+        // already in `observation_envelope` but nothing here ever saw them
+        // arrive. Ask the database directly, race-free regardless of which
+        // call actually imported the row.
+        let (backlog_over_threshold, persisted_checkpoint) = match db.open_read() {
+            Ok(read) => (
+                pending_backlog(&read, &session_id).unwrap_or(0) >= params.queue_threshold,
+                has_unconsolidated_checkpoint(&read, &session_id).unwrap_or(false),
+            ),
+            Err(_) => (false, false),
         };
 
-        if !(saw_checkpoint || backlog_over_threshold) {
+        if !(saw_checkpoint || backlog_over_threshold || persisted_checkpoint) {
             results.push((session_id, SessionTickOutcome::NoCheckpoint));
             continue;
         }
@@ -518,6 +527,63 @@ mod tests {
         match &results[0].1 {
             SessionTickOutcome::Ran(RunOutcome::Applied(_)) => {}
             other => panic!("expected Ran(Applied(_)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_end_already_imported_by_a_prior_pass_still_triggers() {
+        // D-061 regression: reproduces the daemon-startup race the module doc
+        // describes — some other caller (standing in for
+        // `resume::resume_spool_import`) already consumed the SessionEnd
+        // spool bytes into `observation_envelope` before this tick's own
+        // `import_session_tail` call ever runs, so the tick's own
+        // `SpoolImportReport` will report nothing new. Backlog is kept well
+        // under the threshold, so the only remaining path is the persisted
+        // `has_unconsolidated_checkpoint` check.
+        let (_home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+        write_spool_segment(
+            &layout,
+            "sess-a",
+            1,
+            &spool_fixture("sess-a", "se:a:1", "SessionEnd", 1_000),
+        );
+
+        import_session_tail(
+            &db,
+            &layout,
+            "sess-a",
+            &RequestRoot::default(),
+            &uuids,
+            1_000,
+            72,
+        )
+        .await
+        .expect("prior pass imports the SessionEnd byte first");
+
+        let mut params = default_params();
+        params.queue_threshold = 50;
+
+        let results = consolidation_trigger_tick(
+            &db,
+            &layout,
+            &uuids,
+            &jobs,
+            &params,
+            1_000,
+            "build-test",
+            &|_window| async { Ok(noop_ops()) },
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "sess-a");
+        match &results[0].1 {
+            SessionTickOutcome::Ran(RunOutcome::Applied(_)) => {}
+            other => {
+                panic!("expected Ran(Applied(_)) via the persisted checkpoint check, got {other:?}")
+            }
         }
     }
 
