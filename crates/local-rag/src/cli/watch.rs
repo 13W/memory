@@ -17,6 +17,7 @@
 //! already-tested reconcile driver, not a daemon feature.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use local_rag::daemon::gitroot;
 use local_rag::indexing::{
@@ -25,8 +26,8 @@ use local_rag::indexing::{
 use local_rag_core::identity::Uuid;
 use local_rag_core::redaction::Scanner;
 use local_rag_index::reconcile::{
-    ReconcileHandle, ScheduleConfig, TriggerKind, WorktreeReconciler, load_worktree_meta,
-    spawn_reconciler, spawn_watcher,
+    ReconcileHandle, ScheduleConfig, SystemWallClock, TriggerKind, WorktreeReconciler,
+    load_worktree_meta, spawn_reconciler, spawn_watcher,
 };
 use local_rag_store::Resolution;
 
@@ -118,6 +119,7 @@ async fn run_watch_loop(
         ctx.classifier,
         Scanner::new(),
         ctx.uuids.clone(),
+        Arc::new(SystemWallClock),
         ScheduleConfig::default(),
     );
     let ReconcileHandle {

@@ -36,7 +36,8 @@ As-built note (T05-04, `[SPEC]`): the scheduler is `local_rag_index::reconcile::
 watcher}`. It is split so a **live** filesystem watcher never makes the timing untestable:
 
 - **Engine (pure, `schedule`).** `Debouncer` is a pure state machine parameterized by an explicit
-  monotonic `now_ms: i64` (mirroring `build_generation(.., now_ms)` and `uuidv7_from(now_ms, ..)`).
+  monotonic `now_ms: i64` (the same explicit-clock-parameter shape `build_generation(.., now_ms)` and
+  `uuidv7_from(now_ms, ..)` use — the *shape* only, never the same scale, see the D-062 note below).
   It coalesces triggers into one pending request, escalates the scan mode (`Strict` wins), resets the
   quiet window on each debounced event, and self-injects the periodic backstop. The intervals are
   index-crate constants `DEBOUNCE_MS = 500` `[SPEC: 500 ms quiet window]` and
@@ -70,6 +71,19 @@ watcher}`. It is split so a **live** filesystem watcher never makes the timing u
   `Send`-spawnable (a behavior-preserving bound tightening). It **stops at `projection_ready`** — no
   activation (group 07) and no typed failure/backoff bookkeeping (T05-05, which only reuses the
   builder's existing `building → failed`).
+
+As-built note (D-062, `[SPEC]`): **the driver runs on two clocks, and they are never the same
+value.** `Debouncer` arithmetic — `next_wake`/`record`/`take_due`/`record_failure` and the
+`ReconcileFailure::backoff_until_ms` it publishes — is monotonic milliseconds since the loop's own
+`Instant` origin. Everything durable a reconcile writes (`generation.created_at` and, underneath it,
+`content_blob.created_at`/`file_revision.created_at`) is Unix milliseconds per spec 03's timestamp
+convention, supplied by `WorktreeReconciler`'s `clock: Arc<dyn WallClock>` seam
+(`reconcile::clock`, production `SystemWallClock`, tests `FixedWallClock`), read once per cycle in
+`run_and_observe` *before* the scan starts — so the stamp names when the generation began. Until
+D-062 the loop fed its monotonic reading into `reconcile_once` as well, so every row the daemon and
+`local-rag watch` wrote carried milliseconds-since-loop-start; the one-shot `index`/`reindex` path
+was unaffected because its caller already passed a wall clock. Historical rows are **not**
+backfilled: they age out through normal retention/GC (spec 06 §5).
 
 As-built note (T15-07, `[SPEC]`): `local-rag watch` is the daemon-independent process that finally
 wires `spawn_watcher`/`WorktreeReconciler` together end to end (both existed and were fully tested

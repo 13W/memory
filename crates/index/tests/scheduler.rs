@@ -26,8 +26,8 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_core::redaction::Scanner;
 use local_rag_index::classify::ClassifierConfig;
 use local_rag_index::reconcile::{
-    ReconcileHandle, ScheduleConfig, TriggerKind, WorktreeMeta, WorktreeReconciler,
-    load_worktree_meta, nested_prune_roots, reconcile_once, spawn_reconciler,
+    FixedWallClock, ReconcileHandle, ScheduleConfig, TriggerKind, WallClock, WorktreeMeta,
+    WorktreeReconciler, load_worktree_meta, nested_prune_roots, reconcile_once, spawn_reconciler,
 };
 use local_rag_index::scan::{ScanMode, StatCache};
 use local_rag_store::registry::{
@@ -121,6 +121,17 @@ fn meta(fx: &Fixture) -> WorktreeMeta {
     }
 }
 
+/// The fixed wall-clock reading every driver test injects (D-062): a plausible
+/// Unix-millisecond value (2026-08-06), far above anything the loop's monotonic
+/// clock could produce, so an assertion on it distinguishes the two scales.
+const TEST_WALL_MS: i64 = 1_786_000_000_000;
+
+/// The wall-clock seam every driver test wires in place of the system clock, so
+/// durable `_at` columns stay byte-deterministic (D-062).
+fn test_clock() -> Arc<dyn WallClock> {
+    Arc::new(FixedWallClock(TEST_WALL_MS))
+}
+
 /// A schedule config whose debounce never elapses within a test, so reconciles are
 /// driven only by the graceful-shutdown flush (deterministic regardless of CI speed).
 fn flush_only_schedule() -> ScheduleConfig {
@@ -142,6 +153,7 @@ async fn driver_runs_a_reconcile_on_shutdown_flush() {
         ClassifierConfig::new(1 << 20),
         Scanner::new(),
         uuids,
+        test_clock(),
         flush_only_schedule(),
     );
     let ReconcileHandle { sender, join, .. } = spawn_reconciler(reconciler, 8);
@@ -180,6 +192,7 @@ async fn concurrent_triggers_make_one_next_generation() {
         ClassifierConfig::new(1 << 20),
         Scanner::new(),
         uuids,
+        test_clock(),
         flush_only_schedule(),
     );
     let ReconcileHandle { sender, join, .. } = spawn_reconciler(reconciler, 64);
@@ -197,6 +210,63 @@ async fn concurrent_triggers_make_one_next_generation() {
         1,
         "a burst of triggers coalesces into exactly one next generation",
     );
+}
+
+/// D-062 regression: the driver must persist **wall-clock** Unix milliseconds
+/// (spec 03 `03-data-model.md:10`), not the debouncer's monotonic loop time.
+///
+/// Before the fix `WorktreeReconciler::run` handed the same `origin.elapsed()`
+/// millisecond to both the debouncer and `reconcile_once`, so every `_at` column
+/// the daemon/`watch` path wrote held milliseconds-since-loop-start — a freshly
+/// started loop stamped rows with values in the single digits, which is why the
+/// reporter's live store showed `generation.created_at` as `1970-01-01`. The two
+/// clocks are asserted apart here: a monotonic reading inside one test could
+/// never reach [`TEST_WALL_MS`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_stamps_rows_with_wall_clock_not_loop_time() {
+    let fx = fixture().await;
+    write(&fx.root, "a.rs", b"fn a() {}\n");
+    let uuids: Arc<dyn UuidSource + Send + Sync> = Arc::new(SeqUuidV7::new());
+
+    let reconciler = WorktreeReconciler::new(
+        fx.db.clone(),
+        meta(&fx),
+        ClassifierConfig::new(1 << 20),
+        Scanner::new(),
+        uuids,
+        test_clock(),
+        flush_only_schedule(),
+    );
+    let ReconcileHandle { sender, join, .. } = spawn_reconciler(reconciler, 8);
+    sender.send(TriggerKind::FsChange).await.expect("send");
+    drop(sender); // graceful shutdown → flush the scheduled reconcile
+    join.await.expect("join");
+
+    let read = fx.db.open_read().expect("read");
+    // The generation itself...
+    let created_at: i64 = read
+        .query_row("SELECT created_at FROM generation", [], |r| r.get(0))
+        .expect("generation created_at");
+    assert_eq!(
+        created_at, TEST_WALL_MS,
+        "generation.created_at is the injected wall clock, not the loop's elapsed millis",
+    );
+    // ...and every row the same reconcile wrote underneath it (`build.rs` threads
+    // one `now_ms` into `create_or_reuse_file_revision`/`persist_parse_output`).
+    for table in ["content_blob", "file_revision"] {
+        let (min, max): (i64, i64) = read
+            .query_row(
+                &format!("SELECT MIN(created_at), MAX(created_at) FROM {table}"),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row timestamps");
+        assert_eq!(
+            (min, max),
+            (TEST_WALL_MS, TEST_WALL_MS),
+            "{table}.created_at is wall-clock too",
+        );
+    }
 }
 
 #[tokio::test]
