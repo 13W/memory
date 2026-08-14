@@ -399,7 +399,10 @@ async fn migration_produces_exact_registry_schema() {
             (9, "memory".to_string()),
             (10, "managed_worktree".to_string()),
             (11, "consolidation_run_failure_tracking".to_string()),
-            (12, "consolidation_run_context_overflow_tracking".to_string()),
+            (
+                12,
+                "consolidation_run_context_overflow_tracking".to_string()
+            ),
         ],
         "the production set is [v1 registry, v2 worktree, v3 code, v4 projection, \
          v5 worktree_state_clock, v6 representation, v7 observation, \
