@@ -31,8 +31,8 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_core::redaction::Scanner;
 use local_rag_index::classify::ClassifierConfig;
 use local_rag_index::reconcile::{
-    BuildOutcome, ReconcileHandle, ScheduleConfig, TriggerKind, WorktreeMeta, WorktreeReconciler,
-    build_generation, spawn_reconciler,
+    BuildOutcome, FixedWallClock, ReconcileHandle, ScheduleConfig, TriggerKind, WallClock,
+    WorktreeMeta, WorktreeReconciler, build_generation, spawn_reconciler,
 };
 use local_rag_index::scan::{ScanManifest, ScanMode, StatCache, scan};
 use local_rag_store::registry::{
@@ -330,6 +330,18 @@ async fn retry_after_failure_builds_valid_generation_without_duplicates() {
     );
 }
 
+/// The fixed wall-clock reading these driver tests inject (D-062): a plausible
+/// Unix-millisecond value (2026-08-06), far above anything the loop's monotonic
+/// clock could produce within a test, so the two scales stay distinguishable in an
+/// assertion.
+const TEST_WALL_MS: i64 = 1_786_000_000_000;
+
+/// The wall-clock seam these driver tests inject in place of the system clock, so
+/// durable `_at` columns stay byte-deterministic (D-062).
+fn test_clock() -> Arc<dyn WallClock> {
+    Arc::new(FixedWallClock(TEST_WALL_MS))
+}
+
 /// A schedule whose debounce never elapses within a test, so the only reconcile is
 /// the graceful-shutdown flush (deterministic regardless of CI speed).
 fn flush_only_schedule() -> ScheduleConfig {
@@ -366,6 +378,7 @@ async fn driver_records_failure_and_backs_off() {
         ClassifierConfig::new(1 << 20),
         Scanner::new(),
         uuids,
+        test_clock(),
         flush_only_schedule(),
     );
     let ReconcileHandle {
@@ -387,6 +400,14 @@ async fn driver_records_failure_and_backs_off() {
         .expect("a failed reconcile is observable");
     assert_eq!(failure.consecutive_failures, 1, "one failure recorded");
     assert!(failure.backoff_until_ms > 0, "the backoff floor is armed");
+    // D-062's other half: splitting the clocks must not push the scheduler onto
+    // wall time. `backoff_until_ms` is documented as monotonic loop time, so it
+    // stays orders of magnitude below the injected wall clock.
+    assert!(
+        failure.backoff_until_ms < TEST_WALL_MS,
+        "the backoff deadline stays on the monotonic loop scale, got {}",
+        failure.backoff_until_ms,
+    );
     assert!(
         failure.generation_id.is_some(),
         "the build allocated a generation before failing",
@@ -428,6 +449,7 @@ async fn driver_reports_success_as_no_failure() {
         ClassifierConfig::new(1 << 20),
         Scanner::new(),
         uuids,
+        test_clock(),
         flush_only_schedule(),
     );
     let ReconcileHandle {
@@ -470,6 +492,7 @@ async fn worktree_reconciler_publishes_the_built_generation_id_on_success() {
         ClassifierConfig::new(1 << 20),
         Scanner::new(),
         uuids,
+        test_clock(),
         flush_only_schedule(),
     );
     let successes_before = reconciler.subscribe_successes();

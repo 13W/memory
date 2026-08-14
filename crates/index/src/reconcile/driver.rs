@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 use super::build::{BuildError, BuildOutcome, build_generation};
+use super::clock::WallClock;
 use super::schedule::{Debouncer, PlannedReconcile, ScheduleConfig, TriggerKind};
 use crate::classify::ClassifierConfig;
 use crate::scan::{ScanMode, ScanStats, StatCache, scan};
@@ -196,6 +197,11 @@ pub struct WorktreeReconciler {
     cfg: ClassifierConfig,
     scanner: Scanner,
     uuids: Arc<dyn UuidSource + Send + Sync>,
+    /// Wall-clock seam for the durable `_at` columns one reconcile writes
+    /// (D-062). Deliberately **not** the loop's monotonic origin: that one
+    /// belongs to [`Debouncer`] arithmetic alone, and feeding it into
+    /// [`reconcile_once`] is exactly the defect D-062 fixed.
+    clock: Arc<dyn WallClock>,
     /// Publishes the most recent failure (`None` while healthy) — the observability
     /// seam a daemon / group-07 reads via [`ReconcileHandle::failures`] (T05-05).
     failure_tx: watch::Sender<Option<ReconcileFailure>>,
@@ -210,14 +216,17 @@ pub struct WorktreeReconciler {
 impl WorktreeReconciler {
     /// Build a reconciler for `meta`. `db` is the shared state handle (one writer
     /// for the whole store); `cfg`/`scanner` are the classification inputs;
-    /// `uuids` is the id seam (`SystemUuidV7` in production); `sched` carries the
-    /// debounce/periodic intervals.
+    /// `uuids` is the id seam (`SystemUuidV7` in production); `clock` is the
+    /// wall-clock seam for durable `_at` columns ([`SystemWallClock`](super::
+    /// clock::SystemWallClock) in production, a fixed source in tests — D-062);
+    /// `sched` carries the debounce/periodic intervals.
     pub fn new(
         db: Arc<StateDb>,
         meta: WorktreeMeta,
         cfg: ClassifierConfig,
         scanner: Scanner,
         uuids: Arc<dyn UuidSource + Send + Sync>,
+        clock: Arc<dyn WallClock>,
         sched: ScheduleConfig,
     ) -> Self {
         let debouncer = Debouncer::new(sched, meta.is_git(), 0);
@@ -231,6 +240,7 @@ impl WorktreeReconciler {
             cfg,
             scanner,
             uuids,
+            clock,
             failure_tx,
             success_tx,
         }
@@ -258,6 +268,11 @@ impl WorktreeReconciler {
     /// during a build stay buffered and are recorded on the next iteration, so a
     /// burst coalesces into at most one follow-up reconcile. On graceful shutdown
     /// (channel closed) any scheduled reconcile is flushed before returning.
+    ///
+    /// Every millisecond in this loop is **monotonic** (`origin`-relative) and
+    /// belongs to the debouncer alone. The wall-clock time a reconcile persists
+    /// comes from [`self.clock`](WorktreeReconciler) instead — the two must never
+    /// be conflated (D-062).
     pub async fn run(mut self, mut rx: mpsc::Receiver<TriggerKind>) {
         let origin = Instant::now();
         loop {
@@ -265,21 +280,21 @@ impl WorktreeReconciler {
             tokio::select! {
                 biased;
                 _ = sleep_until(wake) => {
-                    let now = now_ms(origin);
-                    if let Some(plan) = self.debouncer.take_due(now) {
-                        self.run_and_observe(plan, now).await;
+                    let mono_ms = now_ms(origin);
+                    if let Some(plan) = self.debouncer.take_due(mono_ms) {
+                        self.run_and_observe(plan, mono_ms).await;
                     }
                 }
                 got = rx.recv() => match got {
                     Some(kind) => {
-                        let now = now_ms(origin);
-                        self.debouncer.record(kind, now);
+                        let mono_ms = now_ms(origin);
+                        self.debouncer.record(kind, mono_ms);
                     }
                     None => {
                         // All senders dropped: flush a scheduled reconcile, then stop.
                         if let Some(plan) = self.debouncer.take_pending() {
-                            let now = now_ms(origin);
-                            self.run_and_observe(plan, now).await;
+                            let mono_ms = now_ms(origin);
+                            self.run_and_observe(plan, mono_ms).await;
                         }
                         break;
                     }
@@ -292,6 +307,9 @@ impl WorktreeReconciler {
     /// failure observability by [`run_and_observe`](Self::run_and_observe); a failed
     /// build has already been recorded `failed` in the store (spec 04 §1) and is
     /// never routed.
+    ///
+    /// `now_ms` is **wall-clock** Unix milliseconds (spec 03): it lands in
+    /// `generation.created_at` and the row timestamps underneath it.
     async fn run_reconcile(
         &mut self,
         plan: PlannedReconcile,
@@ -320,15 +338,22 @@ impl WorktreeReconciler {
     /// The error is never propagated: a failed generation is already `failed` in the
     /// store (spec 04 §1) and is never selected for routing; this only updates the
     /// in-memory observability the daemon / group-07 reads.
-    async fn run_and_observe(&mut self, plan: PlannedReconcile, now_ms: i64) {
-        match self.run_reconcile(plan, now_ms).await {
+    ///
+    /// `mono_ms` is the caller's monotonic loop time and is used **only** for the
+    /// debouncer's backoff arithmetic (`ReconcileFailure::backoff_until_ms` is
+    /// documented on that same scale). The reconcile itself is handed a wall clock
+    /// read taken here — before the scan starts, so the timestamp names when the
+    /// generation began, not when it finished (D-062).
+    async fn run_and_observe(&mut self, plan: PlannedReconcile, mono_ms: i64) {
+        let wall_ms = self.clock.now_ms();
+        match self.run_reconcile(plan, wall_ms).await {
             Ok(report) => {
                 self.debouncer.record_success();
                 let _ = self.failure_tx.send(None);
                 let _ = self.success_tx.send(Some(report.build.generation_id));
             }
             Err(e) => {
-                self.debouncer.record_failure(now_ms);
+                self.debouncer.record_failure(mono_ms);
                 let failure = ReconcileFailure {
                     generation_id: e.failed_generation_id(),
                     last_error: e.to_string(),

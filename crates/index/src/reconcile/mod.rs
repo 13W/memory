@@ -12,13 +12,20 @@
 //! reconcile outcome into an observable [`driver::ReconcileFailure`] (counter +
 //! exponential backoff + `last_error`) and marks a failed generation `failed`
 //! without ever routing it (spec 04 §1).
+//!
+//! Two clocks meet here and must not be confused (D-062): [`schedule`]'s
+//! debounce/backoff arithmetic runs on the loop's **monotonic** milliseconds,
+//! while every durable `_at` column is **Unix** milliseconds (spec 03) supplied
+//! by the [`clock`] seam.
 
 pub mod build;
+pub mod clock;
 pub mod driver;
 pub mod schedule;
 pub mod watcher;
 
 pub use build::{BuildError, BuildErrorKind, BuildOutcome, build_generation};
+pub use clock::{FixedWallClock, SystemWallClock, WallClock};
 pub use driver::{
     MetaError, ReconcileError, ReconcileFailure, ReconcileHandle, ReconcileReport, WorktreeMeta,
     WorktreeReconciler, load_worktree_meta, nested_prune_roots, reconcile_once, spawn_reconciler,
