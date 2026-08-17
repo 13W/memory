@@ -217,6 +217,18 @@ CREATE TABLE managed_worktree (                        -- migration 10; ADR-0009
 );
 -- Keyed by the stable worktree UUID, never a path [FIXED]. No runtime columns
 -- (running/last_error): supervisor state is in-memory, surfaced by admin/projects_list.
+
+CREATE TABLE worktree_indexing_status (                -- migration 13; X-006 durable indexing outcome
+  worktree_id           TEXT PRIMARY KEY REFERENCES worktree(worktree_id),
+  last_attempt_at       INTEGER,                       -- epoch ms; when the last cycle started
+  last_success_at       INTEGER,                       -- epoch ms; when the last cycle succeeded
+  last_generation_id    TEXT,                          -- advisory, no FK: GC may retire it
+  consecutive_failures  INTEGER NOT NULL DEFAULT 0,
+  last_error            TEXT,
+  updated_at            INTEGER NOT NULL
+);
+-- Enrollment lives in managed_worktree; this table is the outcome axis only.
+-- 'in progress' is NOT persisted: only a live daemon can answer that truthfully.
 ```
 
 `retiring` exists for GC/audit only, never for routing `[FIXED]`: the per-worktree lock
@@ -334,7 +346,9 @@ indexing" indistinguishable from "the path vanished" and would require editing `
 transitions); and a JSON blob in `store_settings` (bootstrap framework storage for singletons — no
 foreign key, no per-row query, and one toggle would rewrite the whole value). The table carries
 **no runtime columns** (`running`, `last_error`): those are in-memory supervisor state surfaced by
-`admin/projects_list` (11 §8), never persisted. `enabled = 0` keeps a row enrolled but **dormant**;
+`admin/projects_list` (11 §8) — and, since X-006, additionally mirrored into a table of their own
+(`worktree_indexing_status`, see the note below), never into this one. `enabled = 0` keeps a row
+enrolled but **dormant**;
 `managed_worktrees` returns every row and the supervisor filters, the same "return everything,
 decide in one pure place" discipline `worktree_state_clocks` already uses. `enabled` follows
 §1.1's boolean convention (`INTEGER` 0/1 with `CHECK`), like `worktree_path.is_current` and
@@ -350,6 +364,43 @@ enrolling a brand-new path is *one* transaction alongside `create_repository`/`c
 The consumers — the daemon supervisor, the `local-rag project` CLI, and the advisory warning — are
 `T20-06`/`T20-08`/`T20-09`; T20-01 ships exactly the table and its typed accessors, the same
 division T02-05 drew relative to the policy guard that followed it.
+
+As-built note (X-006, `[SPEC]`): `worktree_indexing_status` is **migration 13**
+(`registry::SCHEMA_V13`, module `local_rag_store::registry::indexing_status`) — the durable
+**outcome** of background indexing, one row per worktree that has completed at least one cycle.
+
+It exists because the outcome previously lived only in the supervisor's memory
+(`WorktreeTaskStatus`, T20-05), so every idle shutdown — 15 minutes of quiet by default, 02
+§4.3 — erased the entire answer to "did background indexing ever run, and when?". That is the
+observability gap X-006 was filed for: neither `local-rag project list` nor `project status`
+could say anything at all about a worktree once its daemon had gone to sleep.
+
+**Why a second table rather than columns on `managed_worktree`.** T20-01's note above rules out
+runtime columns there, and its reasoning — subscription and runtime are orthogonal axes, and
+conflating them makes both unreadable — is unchanged by this task; the owner chose the separate
+table explicitly when this was raised. The pattern is the one §2.2's `worktree_projection_state`
+already established: durable per-worktree runtime state lives beside the registry, keyed by the
+same stable worktree id, never inside it. `SCHEMA_V10` is untouched (frozen once shipped).
+
+`last_generation_id` carries **no foreign key** on purpose: it names the generation the last
+successful cycle projected, but retention/GC (06 §5) may retire that generation later, and a
+status row must never be the reason a sweep fails — the same choice
+`worktree_projection_state.projection_op_id` already makes for an id kept for diagnosis rather
+than for referential integrity. `in_progress_since` is deliberately **not** persisted: after a
+crash such a row is a lie nothing would ever clear, and "a cycle is running right now" is a
+question only a live daemon can answer truthfully (`admin/projects_list`, 11 §8).
+
+The single writer is `write_indexing_status` — a full-row upsert of values the caller already
+computed, never a read-modify-write. Because `consecutive_failures` arrives as a number rather
+than an `x = x + 1` increment, replaying one cycle's outcome leaves the row identical instead of
+inflating the counter. On success `last_success_at`/`last_generation_id` advance and `last_error`
+clears; on failure both success fields keep their previous values through `COALESCE`, so
+"last known good" survives an arbitrarily long failure streak — precisely what a stale-index
+warning must read. Reads are `indexing_status` (one worktree) and `indexing_statuses` (all rows,
+`ORDER BY worktree_id`, the deterministic order a CLI join needs). The caller is
+`daemon::indexing::worktree_task::project_one`, in one short `StateWriter::transaction` taken
+**outside** `write_locked` so it never lengthens L2 write-lock hold; a failure to persist is
+logged and dropped, never fatal — the generation is projected either way.
 
 ### 2.2 Projection state & model registry
 
