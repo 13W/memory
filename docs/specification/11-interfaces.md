@@ -697,6 +697,14 @@ As-built note (X-004, `[SPEC]`). `local-rag serve`, run manually in a terminal, 
 them installs a subscriber, and their existing `eprintln!`-based diagnostics (e.g. `doctor`'s own
 report) are untouched.
 
+As-built note (X-007, `[SPEC]`). The same log is additionally written to
+`$LOCAL_RAG_HOME/logs/daemon.<YYYY-MM-DD>.log`, rotated daily with the newest seven files kept —
+so it is readable after the fact, and readable at all in the usual case where the daemon was
+started by `local-rag-proxy` with stderr discarded rather than by a human in a terminal. Same
+filter, same privacy rules, no separate configuration; mechanism and rationale are in 02 §3.1's
+X-007 note. A `serve` that cannot open its log file still starts — the failure is a warning, not
+an exit.
+
 As-built note (T15-08, `[SPEC]`, D-025). `memory`/`gc`/`stats` are implemented in
 `crates/local-rag/src/cli/{memory,gc,stats}.rs`, the same hand-rolled-parsing, module-per-concern
 convention T15-07 established. `inspect <observation|memory|generation> <id>`, `export`, and

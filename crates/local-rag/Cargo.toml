@@ -97,6 +97,16 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "env-filter",
 ] }
+# X-007: the file half of that sink. X-004 deliberately left `logs_dir`
+# unfilled, which turned out to be a hole — `local-rag-proxy` starts the daemon
+# with `Stdio::null()` on stderr (`connect.rs:76-82`), so in the normal MCP
+# setup X-004's whole output is discarded. `tracing-appender` is the tokio-rs
+# crate for exactly this (daily rotation + a bounded file count); rolling by
+# date in hand-written code would need date formatting, a dependency class this
+# workspace has already declined once (D-056). Used **without**
+# `non_blocking`/`WorkerGuard`: a synchronous writer cannot lose the last lines
+# at process exit, which is precisely when a crash log matters most.
+tracing-appender = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 # `kill(pid, SIGTERM)` is not exposed by `std::process::Child::kill` (unix-only
