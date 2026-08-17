@@ -377,3 +377,161 @@ fn status_and_reindex_work_through_a_live_daemon() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
+
+// ---------------------------------------------------------------------------
+// X-008: the empty registry and the current directory both say so out loud
+// ---------------------------------------------------------------------------
+
+/// Before X-008 an empty registry printed one line — `no managed projects` —
+/// which reads identically whether the feature is off or the command is broken.
+/// It must now also say how many known worktrees are sitting unenrolled, and
+/// name the command that fixes it.
+#[tokio::test]
+async fn list_on_an_empty_registry_reports_the_unenrolled_worktrees_and_the_fix() {
+    let (home, layout) = open_layout();
+    let dir = home.join("wt-a");
+    std::fs::create_dir_all(&dir).expect("create worktree dir");
+    seed_unmanaged_worktree(
+        &layout,
+        "018f0000-0000-7000-8000-0000000000a1",
+        "018f0000-0000-7000-8000-0000000000b1",
+        &dir,
+    )
+    .await;
+
+    let out = run_cli(&home, &["project", "list"]);
+    assert!(out.status.success(), "list must succeed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no managed projects"),
+        "the original line stays: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 registered worktree(s) are NOT enrolled"),
+        "the count of unenrolled worktrees must appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("local-rag project add"),
+        "the fix must travel with the diagnosis: {stdout}"
+    );
+}
+
+/// The question a human standing in a project actually has. `status` answers it
+/// for the current directory specifically, not just for the registry at large.
+#[tokio::test]
+async fn status_says_background_indexing_is_off_for_the_current_directory() {
+    let (home, layout) = open_layout();
+    let dir = home.join("wt-here");
+    std::fs::create_dir_all(&dir).expect("create worktree dir");
+    seed_unmanaged_worktree(
+        &layout,
+        "018f0000-0000-7000-8000-0000000000a2",
+        "018f0000-0000-7000-8000-0000000000b2",
+        &dir,
+    )
+    .await;
+
+    let mut cmd = home.command(env!("CARGO_BIN_EXE_local-rag"));
+    cmd.args(["project", "status"]);
+    cmd.current_dir(&dir); // stand inside the seeded worktree
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let out = cmd.output().expect("run local-rag project status");
+
+    assert!(out.status.success(), "status must succeed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("background indexing is OFF for this worktree"),
+        "the current directory's own state must be named: {stdout}"
+    );
+    assert!(
+        stdout.contains("local-rag project add ."),
+        "and the exact command to enroll it: {stdout}"
+    );
+}
+
+/// Enrolling flips that line off — the same command must not keep nagging once
+/// the project is actually managed.
+#[tokio::test]
+async fn status_stops_warning_once_the_current_directory_is_enrolled() {
+    let (home, layout) = open_layout();
+    let dir = home.join("wt-managed");
+    std::fs::create_dir_all(&dir).expect("create worktree dir");
+    seed_unmanaged_worktree(
+        &layout,
+        "018f0000-0000-7000-8000-0000000000a3",
+        "018f0000-0000-7000-8000-0000000000b3",
+        &dir,
+    )
+    .await;
+
+    let added = run_cli(
+        &home,
+        &["project", "add", dir.to_str().expect("utf-8 path")],
+    );
+    assert!(added.status.success(), "add must succeed: {added:?}");
+
+    let mut cmd = home.command(env!("CARGO_BIN_EXE_local-rag"));
+    cmd.args(["project", "status"]);
+    cmd.current_dir(&dir);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let out = cmd.output().expect("run local-rag project status");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("background indexing is OFF for this worktree"),
+        "an enrolled directory must not be warned about: {stdout}"
+    );
+    assert!(
+        !stdout.contains("are NOT enrolled"),
+        "and with every worktree enrolled there is nothing left to nag about: {stdout}"
+    );
+}
+
+/// `--json` gains the X-008 fields without renaming or dropping T20-08's.
+#[tokio::test]
+async fn list_json_carries_both_the_original_and_the_new_fields() {
+    let (home, layout) = open_layout();
+    let dir = home.join("wt-json");
+    std::fs::create_dir_all(&dir).expect("create worktree dir");
+    seed_unmanaged_worktree(
+        &layout,
+        "018f0000-0000-7000-8000-0000000000a4",
+        "018f0000-0000-7000-8000-0000000000b4",
+        &dir,
+    )
+    .await;
+    run_cli(
+        &home,
+        &["project", "add", dir.to_str().expect("utf-8 path")],
+    );
+
+    let out = run_cli(&home, &["project", "list", "--json"]);
+    assert!(out.status.success(), "list --json must succeed: {out:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("list --json emits valid JSON");
+    let row = &json["projects"][0];
+    for original in [
+        "worktree_id",
+        "enabled",
+        "registered_at",
+        "updated_at",
+        "path",
+    ] {
+        assert!(
+            !row[original].is_null(),
+            "T20-08's {original:?} must survive: {json}"
+        );
+    }
+    assert!(
+        json["unenrolled_worktrees"].is_number(),
+        "the unenrolled count is part of the machine-readable answer: {json}"
+    );
+    assert!(
+        row.get("stuck_generations").is_some() && row.get("active_generation_number").is_some(),
+        "X-008's fields must be present even when empty/null: {json}"
+    );
+}

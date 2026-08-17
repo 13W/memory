@@ -45,13 +45,15 @@ use local_rag_projection::{
 use local_rag_store::{
     CacheDb, CacheDiagnosis, DEFAULT_MODEL_SPACE_ID, FtsAvailability, FtsCheckOutcome,
     HousekeepingError, SHARD_DESTROY_GRACE_MS, ShardSweepReport, StateDb, ValidationDepth,
-    VersionDiagnosis, all_worktree_ids, check_fts, requires_index_unavailable,
+    VersionDiagnosis, WorktreeIndexingStatus, all_worktree_ids, check_fts, current_worktree_path,
+    generation_meta_for_worktree, indexing_status, managed_worktrees, requires_index_unavailable,
     run_expired_shard_sweep, run_orphan_shard_sweep, run_unreferenced_space_sweep,
     store_instance_uuid,
 };
 
 use local_rag::daemon::{StoreLockFileState, read_store_lock_file};
 
+use super::freshness::{IndexFreshness, humanize_age};
 use super::{fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
@@ -68,6 +70,33 @@ pub struct DoctorReport {
     pub orphans: OrphansFinding,
     pub heads: HeadsFinding,
     pub spool: SpoolFinding,
+    /// X-008: is background indexing enrolled for each worktree, how old is
+    /// what search serves, and is newer work built but stuck?
+    pub indexing: IndexingFinding,
+}
+
+/// X-008: the background-indexing section — one entry per worktree.
+///
+/// Answers, per worktree, the three questions no command could answer before:
+/// is it enrolled at all (`managed_worktree`, T20-01), how stale is the
+/// generation search actually serves, and has a newer generation been built
+/// without ever being switched on.
+pub enum IndexingFinding {
+    Skipped { reason: String },
+    Checked(Vec<WorktreeIndexing>),
+}
+
+pub struct WorktreeIndexing {
+    pub worktree_id: String,
+    /// Current on-disk path, when the registry still has one.
+    pub path: Option<String>,
+    /// Enrolled in daemon-managed background indexing at all.
+    pub managed: bool,
+    /// `managed` **and** not paused — the supervisor's own run/skip axis.
+    pub enabled: bool,
+    pub freshness: IndexFreshness,
+    /// The durable outcome of the last background cycle (X-006), if one ran.
+    pub status: Option<WorktreeIndexingStatus>,
 }
 
 /// D-030: every known spool session's stalled-import diagnostic (spec 11 §4
@@ -171,7 +200,26 @@ impl DoctorReport {
             &self.spool,
             SpoolFinding::Checked(list) if list.iter().all(|s| matches!(s.stalled_on, Ok(None)))
         );
-        lock_ok && permissions_ok && versions_ok && cache_ok && orphans_ok && heads_ok && spool_ok
+        // X-008, the owner's explicit decision: of everything the indexing
+        // section reports, only a **stuck** generation counts as a fault — a
+        // generation newer than the active one, built and then never switched
+        // on, i.e. work the system performed and discarded. "Not enrolled" and
+        // "never indexed" stay informational for exactly the reason the
+        // `heads_ok` comment above already gives for its own equivalent case:
+        // a bootstrap state is not a fault. `IndexFreshness::has_fault` is that
+        // one rule, in one place.
+        let indexing_ok = matches!(
+            &self.indexing,
+            IndexingFinding::Checked(list) if list.iter().all(|w| !w.freshness.has_fault())
+        );
+        lock_ok
+            && permissions_ok
+            && versions_ok
+            && cache_ok
+            && orphans_ok
+            && heads_ok
+            && spool_ok
+            && indexing_ok
     }
 }
 
@@ -246,7 +294,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
             heads: HeadsFinding::Skipped {
                 reason: reason.clone(),
             },
-            spool: SpoolFinding::Skipped { reason },
+            spool: SpoolFinding::Skipped {
+                reason: reason.clone(),
+            },
+            indexing: IndexingFinding::Skipped { reason },
         };
     }
 
@@ -265,7 +316,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 heads: HeadsFinding::Skipped {
                     reason: reason.clone(),
                 },
-                spool: SpoolFinding::Skipped { reason },
+                spool: SpoolFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                indexing: IndexingFinding::Skipped { reason },
             };
         }
     };
@@ -284,7 +338,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 heads: HeadsFinding::Skipped {
                     reason: reason.clone(),
                 },
-                spool: SpoolFinding::Skipped { reason },
+                spool: SpoolFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                indexing: IndexingFinding::Skipped { reason },
             };
         }
     };
@@ -298,6 +355,7 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
     let orphans = build_orphans(&state, layout);
     let heads = build_heads(&read, layout, &cache_binding, worktree_filter);
     let spool = build_spool(&read, layout);
+    let indexing = build_indexing(&read, worktree_filter);
 
     DoctorReport {
         lock,
@@ -307,7 +365,56 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
         orphans,
         heads,
         spool,
+        indexing,
     }
+}
+
+/// X-008: the background-indexing section, built alongside orphans/heads under
+/// the same "only once the store is fully migrated" discipline.
+///
+/// Joins three already-existing reads per worktree — `managed_worktrees`
+/// (T20-01's enrollment), `generation_meta_for_worktree` (the generation
+/// history) and `indexing_status` (X-006's durable outcome) — so it adds no new
+/// store query of its own. A per-worktree read that fails degrades that one
+/// field to "unknown" rather than skipping the whole section: a corrupt row in
+/// one worktree must not blind the report to the other worktrees.
+fn build_indexing(read: &rusqlite::Connection, worktree_filter: Option<Uuid>) -> IndexingFinding {
+    let worktree_ids: Vec<String> = match worktree_filter {
+        Some(id) => vec![id.to_string()],
+        None => match all_worktree_ids(read) {
+            Ok(ids) => ids,
+            Err(e) => {
+                return IndexingFinding::Skipped {
+                    reason: format!("could not list worktrees: {e}"),
+                };
+            }
+        },
+    };
+    let managed = match managed_worktrees(read) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return IndexingFinding::Skipped {
+                reason: format!("could not read the managed-project registry: {e}"),
+            };
+        }
+    };
+
+    let entries = worktree_ids
+        .into_iter()
+        .map(|worktree_id| {
+            let enrollment = managed.iter().find(|m| m.worktree_id == worktree_id);
+            let generations = generation_meta_for_worktree(read, &worktree_id).unwrap_or_default();
+            WorktreeIndexing {
+                path: current_worktree_path(read, &worktree_id).ok().flatten(),
+                managed: enrollment.is_some(),
+                enabled: enrollment.is_some_and(|m| m.enabled),
+                freshness: IndexFreshness::from_generations(&generations),
+                status: indexing_status(read, &worktree_id).ok().flatten(),
+                worktree_id,
+            }
+        })
+        .collect();
+    IndexingFinding::Checked(entries)
 }
 
 /// Every known spool session's stalled-import diagnostic, read-only
@@ -588,6 +695,40 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         ),
     };
 
+    let indexing = match &report.indexing {
+        IndexingFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
+        IndexingFinding::Checked(list) => serde_json::Value::Array(
+            list.iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "worktree_id": w.worktree_id,
+                        "path": w.path,
+                        "managed": w.managed,
+                        "enabled": w.enabled,
+                        "active_generation_number": w.freshness.active.as_ref().map(|(_, n, _)| *n),
+                        "active_generation_created_at":
+                            w.freshness.active.as_ref().and_then(|(_, _, ms)| *ms),
+                        "generations_total": w.freshness.total,
+                        "stuck_generations": w
+                            .freshness
+                            .stuck_newer
+                            .iter()
+                            .map(|s| serde_json::json!({
+                                "generation_id": s.generation_id,
+                                "generation_number": s.generation_number,
+                                "state": s.state.as_str(),
+                            }))
+                            .collect::<Vec<_>>(),
+                        "last_success_at": w.status.as_ref().and_then(|s| s.last_success_at),
+                        "last_attempt_at": w.status.as_ref().and_then(|s| s.last_attempt_at),
+                        "consecutive_failures": w.status.as_ref().map(|s| s.consecutive_failures),
+                        "last_error": w.status.as_ref().and_then(|s| s.last_error.clone()),
+                    })
+                })
+                .collect(),
+        ),
+    };
+
     serde_json::json!({
         "clean": report.is_clean(),
         "lock": lock,
@@ -597,6 +738,7 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         "orphans": orphans,
         "heads": heads,
         "spool": spool,
+        "indexing": indexing,
     })
 }
 
@@ -720,6 +862,72 @@ fn print_human(report: &DoctorReport) {
                         println!("spool: {} STALLED: {reason}", s.session_id)
                     }
                     Err(e) => println!("spool: {} error: {e}", s.session_id),
+                }
+            }
+        }
+    }
+
+    print_indexing(&report.indexing);
+}
+
+/// X-008's `indexing:` section — for each worktree: enrolled or not, how old the
+/// served generation is, what the last background cycle did, and (loudly) any
+/// generation built but never switched on.
+fn print_indexing(finding: &IndexingFinding) {
+    let now_ms = system_now_ms();
+    match finding {
+        IndexingFinding::Skipped { reason } => println!("indexing: skipped — {reason}"),
+        IndexingFinding::Checked(list) if list.is_empty() => {
+            println!("indexing: no worktrees registered")
+        }
+        IndexingFinding::Checked(list) => {
+            for w in list {
+                let path = w.path.as_deref().unwrap_or("(no current path)");
+                // "not enrolled" is the single most common reason a user thinks
+                // indexing is broken, so it leads the line and carries the fix.
+                let enrollment = match (w.managed, w.enabled) {
+                    (false, _) => "NOT ENROLLED (run `local-rag project add <path>`)".to_string(),
+                    (true, false) => "enrolled but PAUSED (`local-rag project enable`)".to_string(),
+                    (true, true) => "enrolled".to_string(),
+                };
+                println!("indexing: {} {path} — {enrollment}", w.worktree_id);
+
+                match &w.freshness.active {
+                    Some((_, number, created_ms)) => {
+                        let age = created_ms
+                            .map(|ms| humanize_age(now_ms, ms))
+                            .unwrap_or_else(|| "age unknown".to_string());
+                        println!("  serving generation #{number}, built {age}");
+                    }
+                    None if w.freshness.total == 0 => {
+                        println!("  never indexed — nothing is being served")
+                    }
+                    None => println!(
+                        "  no active generation, though {} exist(s) on record",
+                        w.freshness.total
+                    ),
+                }
+
+                if let Some(status) = &w.status {
+                    if let Some(ms) = status.last_success_at {
+                        println!("  last successful cycle {}", humanize_age(now_ms, ms));
+                    }
+                    if status.consecutive_failures > 0 {
+                        println!(
+                            "  {} consecutive failure(s); last error: {}",
+                            status.consecutive_failures,
+                            status.last_error.as_deref().unwrap_or("(none recorded)"),
+                        );
+                    }
+                }
+
+                for s in &w.freshness.stuck_newer {
+                    println!(
+                        "  STUCK: generation #{} is {} but never became active — \
+                         built work that is not being served",
+                        s.generation_number,
+                        s.state.as_str(),
+                    );
                 }
             }
         }

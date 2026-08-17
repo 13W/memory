@@ -836,3 +836,133 @@ mod with_real_model {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// X-008: the indexing section, and the one state in it that is a fault
+// ---------------------------------------------------------------------------
+
+/// A healthy worktree that nobody enrolled: the section must say so — that is
+/// the single most common reason someone believes indexing is broken — while
+/// the verdict stays `clean`, because "not enrolled" is a choice, not a fault.
+#[tokio::test]
+async fn indexing_section_reports_an_unenrolled_worktree_without_failing_the_verdict() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (wt, _) = seed_indexed_worktree(&state, &layout, 40).await;
+    drop(state);
+
+    let out = run_cli(&home, &["doctor"]);
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "an unenrolled worktree is not a fault: {text}{}",
+        stderr(&out)
+    );
+    assert!(
+        text.contains("doctor: clean"),
+        "verdict stays clean: {text}"
+    );
+    assert!(
+        text.contains(&format!("indexing: {wt}")),
+        "the worktree must appear in the indexing section: {text}"
+    );
+    assert!(
+        text.contains("NOT ENROLLED"),
+        "and be named as unenrolled: {text}"
+    );
+    assert!(
+        text.contains("serving generation #1, built"),
+        "with the age of what it actually serves: {text}"
+    );
+}
+
+/// The fault X-008 introduces: a generation newer than the active one, built and
+/// then never switched on. That is work the system did and dropped — the exact
+/// shape the reporter's live store was in (#3308/#3309 behind an active #3307) —
+/// and it must both print loudly and fail the verdict.
+#[tokio::test]
+async fn a_generation_built_but_never_activated_is_reported_and_fails_the_verdict() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (wt, _) = seed_indexed_worktree(&state, &layout, 44).await;
+
+    // A second, newer generation that reaches `projection_ready` and stops
+    // there — no `switch()`, so the worktree keeps serving the first one.
+    let stuck = uuid(200);
+    let (w, g) = (wt.to_string(), stuck.to_string());
+    state
+        .writer()
+        .transaction(move |tx| allocate_generation(tx, &w, &g, 2000).map(|_| ()))
+        .await
+        .expect("allocate the newer generation");
+    let g2 = stuck.to_string();
+    state
+        .writer()
+        .transaction(move |tx| transition_generation(tx, &g2, GenerationState::ProjectionReady))
+        .await
+        .expect("transition tx")
+        .expect("building -> projection_ready is legal");
+    drop(state);
+
+    let out = run_cli(&home, &["doctor"]);
+    let text = stdout(&out);
+    assert!(
+        !out.status.success(),
+        "built-but-unserved work must fail the verdict: {text}"
+    );
+    assert!(
+        text.contains("doctor: issues found"),
+        "and say so in the headline: {text}"
+    );
+    assert!(
+        text.contains("STUCK: generation #2 is projection_ready but never became active"),
+        "the stuck generation must be named with its number and state: {text}"
+    );
+}
+
+/// `--json` carries the same finding, including the machine-readable
+/// `stuck_generations` list and the `clean: false` verdict.
+#[tokio::test]
+async fn indexing_json_carries_enrollment_freshness_and_stuck_generations() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (wt, _) = seed_indexed_worktree(&state, &layout, 48).await;
+    let stuck = uuid(210);
+    let (w, g) = (wt.to_string(), stuck.to_string());
+    state
+        .writer()
+        .transaction(move |tx| allocate_generation(tx, &w, &g, 2000).map(|_| ()))
+        .await
+        .expect("allocate the newer generation");
+    let g2 = stuck.to_string();
+    state
+        .writer()
+        .transaction(move |tx| transition_generation(tx, &g2, GenerationState::ProjectionReady))
+        .await
+        .expect("transition tx")
+        .expect("building -> projection_ready is legal");
+    drop(state);
+
+    let out = run_cli(&home, &["doctor", "--json"]);
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor --json emits valid JSON");
+    assert_eq!(json["clean"], serde_json::Value::Bool(false));
+
+    let entry = json["indexing"]
+        .as_array()
+        .expect("indexing is an array of worktrees")
+        .iter()
+        .find(|e| e["worktree_id"] == wt.to_string())
+        .expect("the seeded worktree appears")
+        .clone();
+    assert_eq!(entry["managed"], serde_json::Value::Bool(false));
+    assert_eq!(entry["active_generation_number"], serde_json::json!(1));
+    assert_eq!(
+        entry["stuck_generations"][0]["generation_number"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        entry["stuck_generations"][0]["state"],
+        serde_json::json!("projection_ready")
+    );
+}
