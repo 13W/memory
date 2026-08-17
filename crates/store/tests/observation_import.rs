@@ -17,7 +17,7 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
-    DecodedObservation, DedupClass, ImportError, RequestRoot, StateDb, WorktreeKind,
+    DecodedObservation, DedupClass, ImportError, RequestRoot, RootResolver, StateDb, WorktreeKind,
     WorktreeRootFacts, create_repository, create_worktree, diagnose_spool_tail, import_batch,
     import_session_tail, observe_worktree_path,
 };
@@ -526,6 +526,175 @@ async fn resolved_root_populates_repo_and_worktree_ids() {
         .unwrap();
     assert_eq!(got_repo.as_deref(), Some(repo_id.as_str()));
     assert_eq!(got_worktree.as_deref(), Some(worktree_id.as_str()));
+}
+
+/// Records every raw `worktree_root` it is asked about, and answers with one
+/// fixed, pre-built [`RequestRoot`] — the git probing a real daemon-side
+/// resolver does has no place in `crates/store`'s own tests.
+struct SpyResolver {
+    seen: std::sync::Mutex<Vec<Option<String>>>,
+    answer: RequestRoot,
+}
+
+impl SpyResolver {
+    fn new(answer: RequestRoot) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+            answer,
+        }
+    }
+
+    fn seen(&self) -> Vec<Option<String>> {
+        self.seen.lock().expect("spy mutex").clone()
+    }
+}
+
+impl RootResolver for SpyResolver {
+    fn resolve_root(&self, raw_worktree_root: Option<&str>) -> RequestRoot {
+        self.seen
+            .lock()
+            .expect("spy mutex")
+            .push(raw_worktree_root.map(str::to_string));
+        self.answer.clone()
+    }
+}
+
+async fn seed_worktree(
+    db: &StateDb,
+    repo_id: &str,
+    worktree_id: &str,
+    canonical: &str,
+) -> RequestRoot {
+    let (r, w, c) = (
+        repo_id.to_string(),
+        worktree_id.to_string(),
+        canonical.to_string(),
+    );
+    db.writer()
+        .transaction(move |tx| {
+            create_repository(tx, &r, None, 1_000)?;
+            create_worktree(tx, &w, &r, WorktreeKind::Main, 1_000)?;
+            observe_worktree_path(tx, &w, &c, &c, "fp-1", 1_000)
+        })
+        .await
+        .expect("seed registry");
+
+    RequestRoot {
+        worktree_root: Some(WorktreeRootFacts {
+            observed_canonical_path: canonical.to_string(),
+            display_path: canonical.to_string(),
+            path_fingerprint: "fp-1".to_string(),
+            kind: WorktreeKind::Main,
+            common_dir_fingerprint: None,
+            remote_fingerprint: None,
+        }),
+        repo_hint: None,
+    }
+}
+
+/// D-063: the tail importer asks its [`RootResolver`] for the batch's *own*
+/// raw `worktree_root` — once per batch (spec 07 §5/§6), taking the first
+/// frame that actually carries one, so an envelope-only leading frame without
+/// a `cwd` does not make the whole batch unattributable — and every envelope
+/// of that batch is written with the resolved `repo_id`/`worktree_id`.
+#[tokio::test]
+async fn the_batch_is_attributed_from_the_frames_own_worktree_root() {
+    let (_home, layout, db) = open_state();
+    let uuids = SeqUuidV7::new();
+    let session = "sess-root";
+    let repo_id = "11111111-1111-7111-8111-111111111111";
+    let worktree_id = "22222222-2222-7222-8222-222222222222";
+    let resolver = SpyResolver::new(seed_worktree(&db, repo_id, worktree_id, "/repo/root").await);
+
+    let leading = fixture(
+        "SessionStart",
+        "ss:sess-root:1",
+        None,
+        session,
+        1_000,
+        vec![],
+        None,
+    );
+    let mut with_root = fixture("Stop", "st:sess-root:1", None, session, 1_100, vec![], None);
+    with_root.worktree_root = Some("/repo/root/packages/api".to_string());
+    let mut later = fixture(
+        "SessionEnd",
+        "se:sess-root:1",
+        None,
+        session,
+        1_200,
+        vec![],
+        None,
+    );
+    later.worktree_root = Some("/repo/root/packages/api".to_string());
+    write_segment(&layout, session, 1, &[leading, with_root, later]);
+
+    let outcome = import_session_tail(&db, &layout, session, &resolver, &uuids, 5_000, 72)
+        .await
+        .expect("import succeeds");
+    assert_eq!(outcome.report.imported, 3);
+
+    // Once per batch, with the frame's own uncanonicalized `cwd` — not the
+    // leading frame's absent one, and not once per frame.
+    assert_eq!(
+        resolver.seen(),
+        vec![Some("/repo/root/packages/api".to_string())]
+    );
+
+    let read = db.open_read().expect("read conn");
+    let attributed: i64 = read
+        .query_row(
+            "SELECT count(*) FROM observation_envelope
+              WHERE session_id = ?1 AND repo_id = ?2 AND worktree_id = ?3",
+            [session, repo_id, worktree_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(attributed, 3);
+}
+
+/// The other half of spec 07 §5's rule: a batch whose frames carry no `cwd` at
+/// all still consults the resolver (with `None`) and imports with NULL ids —
+/// "an unknown root imports with NULL worktree" is the resolver's answer, not
+/// a skipped call.
+#[tokio::test]
+async fn a_batch_without_any_worktree_root_imports_with_null_ids() {
+    let (_home, layout, db) = open_state();
+    let uuids = SeqUuidV7::new();
+    let session = "sess-no-root";
+    let resolver = SpyResolver::new(RequestRoot::default());
+
+    write_segment(
+        &layout,
+        session,
+        1,
+        &[fixture(
+            "Stop",
+            "st:sess-no-root:1",
+            None,
+            session,
+            1_000,
+            vec![],
+            None,
+        )],
+    );
+
+    let outcome = import_session_tail(&db, &layout, session, &resolver, &uuids, 5_000, 72)
+        .await
+        .expect("import succeeds");
+    assert_eq!(outcome.report.imported, 1);
+    assert_eq!(resolver.seen(), vec![None]);
+
+    let read = db.open_read().expect("read conn");
+    let (repo_id, worktree_id): (Option<String>, Option<String>) = read
+        .query_row(
+            "SELECT repo_id, worktree_id FROM observation_envelope WHERE session_id = ?1",
+            [session],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(repo_id.is_none());
+    assert!(worktree_id.is_none());
 }
 
 #[tokio::test]

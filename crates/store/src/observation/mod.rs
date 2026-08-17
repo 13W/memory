@@ -28,7 +28,7 @@ mod import;
 mod payload_ttl;
 
 pub use import::{
-    ImportBatchReport, ImportError, ImportOutcome, diagnose_spool_tail, import_batch,
+    ImportBatchReport, ImportError, ImportOutcome, RootResolver, diagnose_spool_tail, import_batch,
     import_session_tail, known_spool_sessions,
 };
 pub use payload_ttl::{PayloadSweepError, PayloadSweepReport, run_payload_ttl_sweep};

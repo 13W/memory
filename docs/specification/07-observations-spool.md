@@ -291,13 +291,25 @@ in practice every frame decoded together in one pass shares one session, and a s
 does not change mid-batch) via `registry::resolve`, insert envelopes/paths/payloads, and advance
 `spool_import_cursor`, all committing atomically. `registry::resolve` needs a canonicalized,
 git-probed `RequestRoot` (`crates/store/src/registry/resolve.rs`'s own doc: building one from a
-raw path is "the daemon's job (T15)" — `crates/store` carries no git dependency). Since group 15
-has not started, `import_batch`/`import_session_tail` accept an already-built `&RequestRoot` as a
-parameter rather than computing one from the frame's raw `worktree_root` string themselves;
-passing `RequestRoot { worktree_root: None, .. }` (today's only available caller state) resolves
-to `GlobalOnly`, which **is** this section's "an unknown root imports with NULL worktree" —
-literally, not a stand-in for it. A future group-15 driver supplies real git-probed facts through
-the same parameter without this module changing. `Resolution::Ambiguous` is treated the same as
+raw path is "the daemon's job (T15)" — `crates/store` carries no git dependency), so the probing
+is injected rather than computed here: `import_batch` takes an already-built `&RequestRoot`, and
+its driver `import_session_tail` takes a `&dyn RootResolver` — a one-method trait
+(`raw worktree_root -> RequestRoot`) whose daemon-side implementation
+(`local_rag::daemon::gitroot::ProbingRootResolver`) git-probes the string through the same `probe`
+a live MCP request uses, memoized per raw path for the sweep. `RequestRoot` implements the trait
+as a fixed answer, so a caller that already holds probed facts passes one directly.
+
+Amendment (D-063, `[SPEC]`): this note originally recorded that "since group 15 has not started"
+both drivers pass `RequestRoot { worktree_root: None, .. }`, calling that literal compliance with
+this section's "an unknown root imports with NULL worktree". It is compliance only for a root that
+is genuinely unknown. Group 15 shipped and the premise expired unnoticed, so **every** observation
+imported with NULL ids — measured on a live store: 21985 of 21986 rows — while the frames on disk
+carried real `cwd` values all along, and the memory router (which places a `repository`-scoped
+entry from a cited observation's own `repo_id`) could therefore place nothing. The resolver seam
+above is the fix; the resolver is consulted **before** the write transaction opens, since it
+shells out to `git` and a subprocess must never run while the single write connection is held.
+Historical rows are not backfilled: a consumed segment is deleted, so the raw `cwd` that would
+attribute them no longer exists. `Resolution::Ambiguous` is treated the same as
 `GlobalOnly` (NULL ids): an ambiguous root has not picked one specific worktree, so recording no
 worktree is the conservative reading (never guessing).
 

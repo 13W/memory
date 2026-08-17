@@ -12,22 +12,23 @@
 use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    ImportError, ImportOutcome, RequestRoot, StateDb, import_session_tail, known_spool_sessions,
+    ImportError, ImportOutcome, StateDb, import_session_tail, known_spool_sessions,
 };
 
+use super::super::gitroot::ProbingRootResolver;
 use super::super::jobs::{JobKind, JobRegistry};
 
 /// Resume every known spool session's import, one [`JobRegistry`]-tracked
 /// job per session (spool 02 §4.1 step 5).
 ///
-/// `RequestRoot::default()` (`Resolution::GlobalOnly`) is used for every
-/// session: a historical spool session at startup carries no live proxy
-/// connection to git-probe a `worktree_root` from at all (spec 07 §2/§3's
-/// frame shape has no such field) — `local_rag_store::observation::import`'s
-/// own module doc names this the structurally correct choice ("an unknown
-/// root imports with NULL worktree", spec 07 §5), not a stand-in for real
-/// resolution. A *live* HELLO-carried root (once T15-02 exists) is a
-/// different, per-connection code path, not this startup sweep.
+/// Root resolution does not need a live connection: every frame carries the
+/// hook's own `cwd` (spec 07 §3's `worktree_root`), so this sweep git-probes
+/// it through one shared [`ProbingRootResolver`] and each session's envelopes
+/// get their real `repo_id`/`worktree_id` (spec 07 §5, D-063). Before D-063
+/// this passed a fixed `RequestRoot::default()` on the incorrect premise that
+/// the frame shape has no such field. A root that no longer exists on disk, or
+/// one belonging to a worktree this store never registered, still resolves to
+/// `GlobalOnly` — spec 07 §5's "an unknown root imports with NULL worktree".
 ///
 /// A session directory that cannot even be enumerated (`known_spool_sessions`
 /// failing, e.g. the `spool/` directory itself is unreadable) yields an empty
@@ -46,7 +47,7 @@ pub async fn resume_spool_import(
         Ok(sessions) => sessions,
         Err(_) => return Vec::new(),
     };
-    let request_root = RequestRoot::default();
+    let root_resolver = ProbingRootResolver::default();
     let mut results = Vec::with_capacity(sessions.len());
     for session_id in sessions {
         let _job = jobs.begin(JobKind::SpoolImport);
@@ -55,7 +56,7 @@ pub async fn resume_spool_import(
             db,
             layout,
             &session_id,
-            &request_root,
+            &root_resolver,
             uuids,
             now_ms,
             payload_ttl_hours,
@@ -169,6 +170,123 @@ mod tests {
             jobs.is_empty(),
             "every job guard must be released once its session finishes"
         );
+    }
+
+    /// D-063, end to end: a session whose frames carry a `cwd` inside a
+    /// registered worktree imports **attributed** — the resolved
+    /// `repo_id`/`worktree_id` land on every envelope, which is what lets the
+    /// memory router place a `repository`-scoped entry at all. Before D-063
+    /// this same fixture imported with NULL ids.
+    #[tokio::test]
+    async fn a_registered_worktrees_own_cwd_attributes_its_envelopes() {
+        if !git_available() {
+            eprintln!("skip: git not on PATH");
+            return;
+        }
+        let (home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_init(&repo);
+        // Register it exactly as a real `local-rag index` would: the probe's
+        // own canonical path and fingerprint, not a hand-written string.
+        let facts = crate::daemon::gitroot::probe(&repo).expect("probe the temp repo");
+        let repo_id = "11111111-1111-7111-8111-111111111111".to_string();
+        let worktree_id = "22222222-2222-7222-8222-222222222222".to_string();
+        {
+            let (r, w, f) = (repo_id.clone(), worktree_id.clone(), facts.clone());
+            db.writer()
+                .transaction(move |tx| {
+                    local_rag_store::create_repository(tx, &r, None, 1_000)?;
+                    local_rag_store::create_worktree(
+                        tx,
+                        &w,
+                        &r,
+                        local_rag_store::WorktreeKind::Main,
+                        1_000,
+                    )?;
+                    local_rag_store::observe_worktree_path(
+                        tx,
+                        &w,
+                        &f.observed_canonical_path,
+                        &f.display_path,
+                        &f.path_fingerprint,
+                        1_000,
+                    )
+                })
+                .await
+                .expect("register the worktree");
+        }
+
+        let mut frame = spool_fixture("sess-root", "st:root:1", 1_000);
+        frame.worktree_root = Some(repo.to_str().expect("utf-8 path").to_string());
+        write_spool_segment(&layout, "sess-root", 1, &frame);
+
+        let results = resume_spool_import(&db, &layout, &uuids, &jobs, 1_000, 72).await;
+        assert_eq!(results.len(), 1);
+        results[0].1.as_ref().expect("import must succeed");
+
+        let read = db.open_read().expect("read conn");
+        let (got_repo, got_worktree): (Option<String>, Option<String>) = read
+            .query_row(
+                "SELECT repo_id, worktree_id FROM observation_envelope WHERE session_id = 'sess-root'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the envelope was imported");
+        assert_eq!(got_repo, Some(repo_id));
+        assert_eq!(got_worktree, Some(worktree_id));
+    }
+
+    /// The negative half: the same frame pointing at a directory this store
+    /// never registered still imports, with NULL ids (spec 07 §5's "an unknown
+    /// root imports with NULL worktree").
+    #[tokio::test]
+    async fn an_unregistered_cwd_still_imports_with_null_ids() {
+        let (home, layout, db) = open_state();
+        let uuids = SeqUuidV7::new();
+        let jobs = JobRegistry::new();
+
+        let elsewhere = home.join("never-registered");
+        std::fs::create_dir_all(&elsewhere).expect("create dir");
+        let mut frame = spool_fixture("sess-unknown", "st:unknown:1", 1_000);
+        frame.worktree_root = Some(elsewhere.to_str().expect("utf-8 path").to_string());
+        write_spool_segment(&layout, "sess-unknown", 1, &frame);
+
+        let results = resume_spool_import(&db, &layout, &uuids, &jobs, 1_000, 72).await;
+        results[0].1.as_ref().expect("import must succeed");
+
+        let read = db.open_read().expect("read conn");
+        let (got_repo, got_worktree): (Option<String>, Option<String>) = read
+            .query_row(
+                "SELECT repo_id, worktree_id FROM observation_envelope
+                  WHERE session_id = 'sess-unknown'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the envelope was imported");
+        assert!(got_repo.is_none());
+        assert!(got_worktree.is_none());
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git_init(dir: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init failed");
     }
 
     #[tokio::test]
