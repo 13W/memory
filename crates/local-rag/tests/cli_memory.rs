@@ -15,8 +15,8 @@ use std::process::{Output, Stdio};
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
     EvidenceKind, GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, NewMemoryEvidence,
-    ProposedOperation, ScopeKind, StateDb, create_memory_entry, insert_memory_evidence,
-    propose_candidate,
+    ProposedOperation, ScopeKind, StateDb, create_memory_entry, create_repository, create_worktree,
+    insert_memory_evidence, observe_worktree_path, propose_candidate,
 };
 use local_rag_test_support::TempHome;
 
@@ -381,4 +381,200 @@ async fn memory_list_candidates_then_approve_and_reject() {
     // silent success.
     let output = run_cli(&home, &["memory", "reject", "cand-approve"]);
     assert_ne!(output.status.code(), Some(0), "{output:?}");
+}
+
+// ---------------------------------------------------------------------
+// memory rescope (X-009)
+// ---------------------------------------------------------------------
+
+/// Register `dir` as a worktree of a fresh repository, from the *probed*
+/// facts rather than hand-written strings — a plain (non-git) directory
+/// probes fine (`WorktreeKind::NonGit`), so this needs no `git` on PATH.
+async fn seed_registered_worktree(state: &StateDb, dir: &std::path::Path) -> String {
+    let facts = local_rag::daemon::gitroot::probe(dir).expect("an existing directory probes");
+    let repo_id = "11111111-1111-7111-8111-111111111111".to_string();
+    let worktree_id = "22222222-2222-7222-8222-222222222222".to_string();
+    let (r, w, f) = (repo_id.clone(), worktree_id, facts);
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_repository(tx, &r, None, 1_000)?;
+            create_worktree(tx, &w, &r, f.kind, 1_000)?;
+            observe_worktree_path(
+                tx,
+                &w,
+                &f.observed_canonical_path,
+                &f.display_path,
+                &f.path_fingerprint,
+                1_000,
+            )
+        })
+        .await
+        .expect("register the worktree");
+    repo_id
+}
+
+fn entry_row(state: &StateDb, memory_id: &str) -> (String, String, String, Option<String>) {
+    let read = state.open_read().expect("read conn");
+    read.query_row(
+        "SELECT state, scope_kind, scope_owner_id, supersedes_id FROM memory_entry \
+         WHERE memory_id = ?1",
+        [memory_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .expect("the entry exists")
+}
+
+#[tokio::test]
+async fn memory_rescope_moves_a_global_entry_into_the_repository_scope() {
+    let (home, layout) = open_layout();
+    let repo_dir = home.join("some-project");
+    std::fs::create_dir_all(&repo_dir).expect("create dir");
+    let repo_id = {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(&state, "mem-move", "a project fact", 1_000).await;
+        seed_registered_worktree(&state, &repo_dir).await
+    };
+
+    let output = run_cli(
+        &home,
+        &[
+            "memory",
+            "rescope",
+            "mem-move",
+            "--expected-version",
+            "1",
+            "--scope",
+            "repository",
+            "--root",
+            repo_dir.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("superseded by"), "{text}");
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    // The original stays in the ledger, superseded, still in its old scope.
+    let (old_state, old_scope, _, _) = entry_row(&state, "mem-move");
+    assert_eq!(old_state, "superseded");
+    assert_eq!(old_scope, ScopeKind::Global.as_str());
+
+    // ...and the successor is active, repository-scoped, owned by the
+    // registered repository, and linked back to the original.
+    let read = state.open_read().expect("read conn");
+    let (successor, scope_kind, owner, supersedes): (String, String, String, Option<String>) = read
+        .query_row(
+            "SELECT memory_id, scope_kind, scope_owner_id, supersedes_id FROM memory_entry \
+             WHERE memory_id != 'mem-move'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("exactly one successor was created");
+    assert_ne!(successor, "mem-move");
+    assert_eq!(scope_kind, ScopeKind::Repository.as_str());
+    assert_eq!(owner, repo_id);
+    assert_eq!(supersedes.as_deref(), Some("mem-move"));
+}
+
+/// The whole point of D-064 restated for the CLI: an unresolvable root is a
+/// typed refusal, never a quiet `global` write.
+#[tokio::test]
+async fn memory_rescope_refuses_an_unregistered_root_rather_than_falling_back() {
+    let (home, layout) = open_layout();
+    let elsewhere = home.join("never-registered");
+    std::fs::create_dir_all(&elsewhere).expect("create dir");
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(&state, "mem-stay", "text", 1_000).await;
+    }
+
+    let output = run_cli(
+        &home,
+        &[
+            "memory",
+            "rescope",
+            "mem-stay",
+            "--expected-version",
+            "1",
+            "--scope",
+            "repository",
+            "--root",
+            elsewhere.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stderr(&output).contains("does not resolve to a registered worktree"),
+        "{}",
+        stderr(&output)
+    );
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (entry_state, scope, _, _) = entry_row(&state, "mem-stay");
+    assert_eq!(entry_state, "active", "the refused move changed nothing");
+    assert_eq!(scope, ScopeKind::Global.as_str());
+}
+
+#[tokio::test]
+async fn memory_rescope_into_the_same_scope_is_a_no_op() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(&state, "mem-same", "text", 1_000).await;
+    }
+
+    let output = run_cli(
+        &home,
+        &[
+            "memory",
+            "rescope",
+            "mem-same",
+            "--expected-version",
+            "1",
+            "--scope",
+            "global",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stdout(&output).contains("nothing to do"), "{output:?}");
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    let count: i64 = read
+        .query_row("SELECT count(*) FROM memory_entry", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(count, 1, "a no-op must not mint a successor");
+    let (entry_state, _, _, _) = entry_row(&state, "mem-same");
+    assert_eq!(entry_state, "active");
+}
+
+#[tokio::test]
+async fn memory_rescope_honours_expected_version() {
+    let (home, layout) = open_layout();
+    let repo_dir = home.join("some-project");
+    std::fs::create_dir_all(&repo_dir).expect("create dir");
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(&state, "mem-conflict", "text", 1_000).await;
+        seed_registered_worktree(&state, &repo_dir).await;
+    }
+
+    let output = run_cli(
+        &home,
+        &[
+            "memory",
+            "rescope",
+            "mem-conflict",
+            "--expected-version",
+            "99",
+            "--scope",
+            "repository",
+            "--root",
+            repo_dir.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let err = stderr(&output);
+    assert!(err.contains("expected version 99"), "{err}");
 }

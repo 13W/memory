@@ -1,5 +1,5 @@
-//! `local-rag memory list|approve|reject|edit|retract|merge|evidence` (spec
-//! 11 §6, D-025). Thin CLI adapters over the exact same domain calls
+//! `local-rag memory list|approve|reject|edit|retract|merge|rescope|evidence`
+//! (spec 11 §6, D-025; `rescope` is X-009). Thin CLI adapters over the exact same domain calls
 //! `crates/local-rag/src/daemon/mcp/{memory,memory_write}.rs` already make
 //! (T15-04/T15-05) — parse args, open a transaction/read connection against
 //! `state.sqlite`, call a domain function, print the outcome. `memory
@@ -17,12 +17,14 @@
 
 use std::process::ExitCode;
 
+use local_rag_core::identity::{SystemUuidV7, UuidSource};
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
-    Actor, CandidateState, EditMemoryOp, MemoryEntryRow, MemoryKind, MemoryOpError, MemoryState,
-    MergeLoser, MergeMemoryOp, RequestRoot, RetractMemoryOp, ReviewError, ScopeKind, apply_edit,
-    apply_merge, apply_retract, approve_candidate, list_candidates, list_memory_entries_for_scope,
-    memory_evidence_for, reject_candidate, resolve,
+    Actor, CandidateState, EditMemoryOp, GLOBAL_SCOPE_OWNER_ID, MemoryEntryRow, MemoryKind,
+    MemoryOpError, MemoryState, MergeLoser, MergeMemoryOp, RequestRoot, RetractMemoryOp,
+    ReviewError, ScopeKind, SupersedeMemoryOp, apply_edit, apply_merge, apply_retract,
+    apply_supersede, approve_candidate, list_candidates, list_memory_entries_for_scope,
+    memory_entry_by_id, memory_evidence_for, reject_candidate, resolve,
 };
 
 use local_rag::daemon::gitroot;
@@ -92,6 +94,19 @@ pub enum MemoryCommand {
         #[arg(long = "loser")]
         losers: Vec<String>,
     },
+    /// Move an entry into another scope by superseding it with an identical
+    /// entry there (X-009).
+    Rescope {
+        memory_id: String,
+        #[arg(long)]
+        expected_version: i64,
+        #[arg(long, value_parser = parse_scope_kind)]
+        scope: ScopeKind,
+        /// Directory whose registered worktree names the target repository or
+        /// worktree (defaults to the current directory). Unused for `global`.
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     Evidence {
         memory_id: String,
     },
@@ -113,6 +128,12 @@ pub fn run(command: MemoryCommand) -> ExitCode {
             expected_version,
         } => run_retract(memory_id, expected_version),
         MemoryCommand::Merge { survivor, losers } => run_merge(survivor, losers),
+        MemoryCommand::Rescope {
+            memory_id,
+            expected_version,
+            scope,
+            root,
+        } => run_rescope(memory_id, expected_version, scope, root),
         MemoryCommand::Evidence { memory_id } => run_evidence(memory_id),
     }
 }
@@ -437,6 +458,158 @@ fn run_edit(
         }
         Ok(Err(e)) => fail(BIN, &memory_op_error_message(&e)),
         Err(e) => fail(BIN, &format!("could not edit {id}: {e}")),
+    }
+}
+
+/// `memory rescope` (X-009): move an entry into another scope by superseding
+/// it with an identical entry there.
+///
+/// Scope is not editable — `edit`'s patch is `text`/`importance` only (spec 08
+/// §3), and for good reason: an entry's scope is half of its
+/// `(scope_kind, scope_owner_id, canonical_key)` identity. `supersede` is the
+/// op that *does* take a new scope, so this command is a thin adapter over it
+/// rather than a new store primitive, and the move stays inside the ledger:
+/// one transaction, ordinary audit rows, the old entry preserved as
+/// `superseded` with the successor's `supersedes_id` pointing back at it.
+///
+/// Evidence rows are deliberately not copied onto the successor — they stay on
+/// the superseded original, which the `supersedes_id` chain keeps reachable
+/// (`memory evidence <old_id>` still answers). Duplicating them would double-
+/// count the same observations as independent support.
+fn run_rescope(
+    id: String,
+    expected_version: i64,
+    scope: ScopeKind,
+    root: Option<std::path::PathBuf>,
+) -> ExitCode {
+    let (layout, _config) = match resolve_layout_and_config() {
+        Ok(v) => v,
+        Err(e) => return fail(BIN, &e),
+    };
+    let state = match open_state(&layout) {
+        Ok(s) => s,
+        Err(e) => return fail(BIN, &e),
+    };
+    let conn = match state.open_read() {
+        Ok(c) => c,
+        Err(e) => return fail(BIN, &format!("could not open state.sqlite: {e}")),
+    };
+
+    let Some(entry) = (match memory_entry_by_id(&conn, &id) {
+        Ok(e) => e,
+        Err(e) => return fail(BIN, &format!("could not read {id}: {e}")),
+    }) else {
+        return fail(BIN, &format!("unknown memory entry {id}"));
+    };
+
+    let owner_id = match scope {
+        ScopeKind::Global => GLOBAL_SCOPE_OWNER_ID.to_string(),
+        ScopeKind::Repository | ScopeKind::Worktree => {
+            let target = match root {
+                Some(p) => p,
+                None => match std::env::current_dir() {
+                    Ok(cwd) => cwd,
+                    Err(e) => {
+                        return fail(
+                            BIN,
+                            &format!("could not determine the current directory: {e}"),
+                        );
+                    }
+                },
+            };
+            let resolution = match resolve(
+                &conn,
+                &RequestRoot {
+                    worktree_root: gitroot::probe(&target),
+                    repo_hint: None,
+                },
+            ) {
+                Ok(r) => r,
+                Err(e) => return fail(BIN, &format!("could not resolve worktree identity: {e}")),
+            };
+            match (&resolution, scope) {
+                (local_rag_store::Resolution::Resolved { repo_id, .. }, ScopeKind::Repository) => {
+                    repo_id.clone()
+                }
+                (
+                    local_rag_store::Resolution::Resolved { worktree_id, .. },
+                    ScopeKind::Worktree,
+                ) => worktree_id.clone(),
+                // Never a silent fallback to `global` — that is exactly the
+                // silent degradation D-064 removed from `remember`.
+                _ => {
+                    return fail(
+                        BIN,
+                        &format!(
+                            "{} does not resolve to a registered worktree, so there is no \
+                             {} scope to move {id} into — index it first (`local-rag index \
+                             <path>`)",
+                            target.display(),
+                            scope.as_str()
+                        ),
+                    );
+                }
+            }
+        }
+    };
+
+    if entry.scope_kind == scope && entry.scope_owner_id == owner_id {
+        println!(
+            "{BIN}: {id} is already {} scope (owner {owner_id}); nothing to do",
+            scope.as_str()
+        );
+        return ExitCode::SUCCESS;
+    }
+    drop(conn);
+
+    let new_memory_id = SystemUuidV7.next_uuid().to_string();
+    let now_ms = system_now_ms();
+    let outcome = block_on({
+        let id = id.clone();
+        let new_memory_id = new_memory_id.clone();
+        async move {
+            state
+                .writer()
+                .transaction(move |tx| {
+                    apply_supersede(
+                        tx,
+                        &SupersedeMemoryOp {
+                            old_memory_id: &id,
+                            old_expected_version: expected_version,
+                            new_memory_id: &new_memory_id,
+                            new_kind: entry.kind,
+                            new_text: &entry.text,
+                            new_canonical_key: entry.canonical_key.as_deref(),
+                            new_scope_kind: scope,
+                            new_scope_owner_id: &owner_id,
+                            new_confidence: entry.confidence,
+                            new_importance: entry.importance,
+                            new_valid_from_tree: entry.valid_from_tree.as_deref(),
+                            new_last_verified_tree: entry.last_verified_tree.as_deref(),
+                            evidence: &[],
+                            actor: Actor::User,
+                            idempotency_key: None,
+                        },
+                        now_ms,
+                    )
+                })
+                .await
+        }
+    });
+
+    match outcome {
+        Ok(Ok(op_outcome)) => {
+            println!(
+                "{BIN}: {id} superseded by {new_memory_id} in {} scope -> entry_version {}, \
+                 audit_id {}",
+                scope.as_str(),
+                op_outcome_entry_version(&op_outcome),
+                op_outcome_audit_id(&op_outcome)
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Err(e)) => fail(BIN, &memory_op_error_message(&e)),
+        Err(e) => fail(BIN, &format!("could not rescope {id}: {e}")),
     }
 }
 
