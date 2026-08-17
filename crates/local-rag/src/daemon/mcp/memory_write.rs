@@ -113,6 +113,57 @@ fn require_i64(args: &Map<String, Value>, key: &str) -> Result<i64, String> {
     }
 }
 
+/// Why a `remember` call that asked for no particular scope ended up in
+/// `global` instead of `repository` (D-064). The two states have different
+/// remedies, so they are not collapsed into one marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeFallback {
+    /// The request's root resolved to nothing this store knows.
+    WorktreeNotIndexed,
+    /// The root matched more than one detached worktree, and spec 04 §7
+    /// forbids guessing between them.
+    WorktreeAmbiguous,
+}
+
+impl ScopeFallback {
+    /// Lowercase marker, matching spec 02 §6's own `degraded: "dense_only"`
+    /// style rather than the `SCREAMING_CASE` of the error codes.
+    fn as_str(self) -> &'static str {
+        match self {
+            ScopeFallback::WorktreeNotIndexed => "worktree_not_indexed",
+            ScopeFallback::WorktreeAmbiguous => "worktree_ambiguous",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            ScopeFallback::WorktreeNotIndexed => {
+                "this worktree is not indexed, so the entry was stored machine-wide and every \
+                 project's recall will see it; index it (`local-rag index <path>`) to get \
+                 project-scoped memory, or pass scope explicitly to silence this"
+            }
+            ScopeFallback::WorktreeAmbiguous => {
+                "this root matches more than one detached worktree, so the entry was stored \
+                 machine-wide and every project's recall will see it; re-bind the worktree \
+                 (`local-rag repo attach`) to get project-scoped memory"
+            }
+        }
+    }
+}
+
+/// The scope a `remember` call actually wrote into, plus why — if the caller
+/// asked for no scope and did not get the `repository` one it would have had
+/// with an indexed worktree.
+#[derive(Debug)]
+struct WriteScope {
+    kind: ScopeKind,
+    owner_id: String,
+    /// `None` on every non-degraded path: an explicit `scope` request is the
+    /// caller's own choice, never a degradation, and a resolved worktree
+    /// yields the normal `repository` default.
+    fallback: Option<ScopeFallback>,
+}
+
 /// The single `(scope_kind, scope_owner_id)` a `remember` call writes into
 /// (T15-05, `[SPEC]`). Defaults to `repository` when the request's worktree
 /// resolves, else `global` — a durable memory is normally "about this
@@ -120,10 +171,16 @@ fn require_i64(args: &Map<String, Value>, key: &str) -> Result<i64, String> {
 /// `repository`/`worktree` request while unresolved is `WORKTREE_NOT_INDEXED`
 /// (the caller asked for a scope this request cannot supply), never silently
 /// downgraded to `global`.
+///
+/// D-064: the *implicit* `global` fallback is not an error — spec 02 §6's own
+/// table says memory tools work in repo/global scope for an unknown worktree —
+/// but it is a degradation, and the same section's `[FIXED]` line ("Degradation
+/// is always explicit in responses; nothing degrades silently") makes reporting
+/// it mandatory, hence [`WriteScope::fallback`].
 fn resolve_write_scope(
     resolution: &Resolution,
     requested: Option<ScopeKind>,
-) -> Result<(ScopeKind, String), ErrorEnvelope> {
+) -> Result<WriteScope, ErrorEnvelope> {
     let resolved = match resolution {
         Resolution::Resolved {
             repo_id,
@@ -138,14 +195,33 @@ fn resolve_write_scope(
         ScopeKind::Global
     });
 
+    let fallback = match (requested, resolution) {
+        // Only an *implicit* global is a degradation.
+        (None, Resolution::GlobalOnly) => Some(ScopeFallback::WorktreeNotIndexed),
+        (None, Resolution::Ambiguous { .. }) => Some(ScopeFallback::WorktreeAmbiguous),
+        _ => None,
+    };
+
     match scope_kind {
-        ScopeKind::Global => Ok((ScopeKind::Global, GLOBAL_SCOPE_OWNER_ID.to_string())),
+        ScopeKind::Global => Ok(WriteScope {
+            kind: ScopeKind::Global,
+            owner_id: GLOBAL_SCOPE_OWNER_ID.to_string(),
+            fallback,
+        }),
         ScopeKind::Repository => match resolved {
-            Some((repo_id, _)) => Ok((ScopeKind::Repository, repo_id.to_string())),
+            Some((repo_id, _)) => Ok(WriteScope {
+                kind: ScopeKind::Repository,
+                owner_id: repo_id.to_string(),
+                fallback: None,
+            }),
             None => Err(ErrorEnvelope::worktree_not_indexed()),
         },
         ScopeKind::Worktree => match resolved {
-            Some((_, worktree_id)) => Ok((ScopeKind::Worktree, worktree_id.to_string())),
+            Some((_, worktree_id)) => Ok(WriteScope {
+                kind: ScopeKind::Worktree,
+                owner_id: worktree_id.to_string(),
+                fallback: None,
+            }),
             None => Err(ErrorEnvelope::worktree_not_indexed()),
         },
     }
@@ -176,6 +252,39 @@ impl From<MemoryOpOutcome> for MemoryOpResultWire {
             entry_version: result.entry_version,
             audit_id: result.audit_id,
             outcome,
+        }
+    }
+}
+
+/// `remember`'s own wire shape: [`MemoryOpResultWire`]'s fields plus where the
+/// entry actually landed (D-064). `scope` is always present — a caller that
+/// never passed one should not have to infer it — and `degraded`/`hint` appear
+/// only when an implicit `repository` became `global`, which spec 02 §6
+/// `[FIXED]` requires be explicit in the response.
+#[derive(Debug, Serialize)]
+struct RememberResultWire {
+    memory_id: String,
+    entry_version: i64,
+    audit_id: i64,
+    outcome: &'static str,
+    scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'static str>,
+}
+
+impl RememberResultWire {
+    fn new(outcome: MemoryOpOutcome, scope: &WriteScope) -> Self {
+        let op = MemoryOpResultWire::from(outcome);
+        RememberResultWire {
+            memory_id: op.memory_id,
+            entry_version: op.entry_version,
+            audit_id: op.audit_id,
+            outcome: op.outcome,
+            scope: scope.kind.as_str(),
+            degraded: scope.fallback.map(ScopeFallback::as_str),
+            hint: scope.fallback.map(ScopeFallback::hint),
         }
     }
 }
@@ -257,10 +366,11 @@ pub async fn remember(
         Err(e) => return Ok(infra_err(e)),
     };
     drop(state_read);
-    let (scope_kind, scope_owner_id) = match resolve_write_scope(&resolution, scope_requested) {
+    let write_scope = match resolve_write_scope(&resolution, scope_requested) {
         Ok(v) => v,
         Err(envelope) => return Ok(content::err(&envelope)),
     };
+    let (scope_kind, scope_owner_id) = (write_scope.kind, write_scope.owner_id.clone());
 
     let memory_id = ctx.uuids.next_uuid().to_string();
     // Always Actor::User, never Actor::Router, regardless of
@@ -305,7 +415,7 @@ pub async fn remember(
         .await;
 
     match outcome {
-        Ok(Ok(outcome)) => Ok(content::ok(&MemoryOpResultWire::from(outcome))),
+        Ok(Ok(outcome)) => Ok(content::ok(&RememberResultWire::new(outcome, &write_scope))),
         Ok(Err(e)) => Ok(content::err(&memory_op_error_envelope(&e))),
         Err(e) => Ok(infra_err(e)),
     }
@@ -678,5 +788,88 @@ pub async fn give_feedback(
             deduplicated: inner.is_none(),
         })),
         Err(e) => Ok(infra_err(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use local_rag_store::{Candidate, WorktreeKind};
+
+    fn resolved() -> Resolution {
+        Resolution::Resolved {
+            repo_id: "repo-1".to_string(),
+            worktree_id: "wt-1".to_string(),
+        }
+    }
+
+    fn ambiguous() -> Resolution {
+        Resolution::Ambiguous {
+            candidates: vec![
+                Candidate {
+                    repo_id: "repo-1".to_string(),
+                    worktree_id: "wt-1".to_string(),
+                    kind: WorktreeKind::Linked,
+                },
+                Candidate {
+                    repo_id: "repo-1".to_string(),
+                    worktree_id: "wt-2".to_string(),
+                    kind: WorktreeKind::Linked,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_resolved_root_defaults_to_repository_without_degrading() {
+        let scope = resolve_write_scope(&resolved(), None).expect("resolved roots never error");
+        assert_eq!(scope.kind, ScopeKind::Repository);
+        assert_eq!(scope.owner_id, "repo-1");
+        assert_eq!(scope.fallback, None);
+    }
+
+    /// D-064: the implicit `global` is still written (spec 02 §6's table says
+    /// memory tools work in repo/global scope) but is now reported.
+    #[test]
+    fn an_unresolved_root_falls_back_to_global_and_says_so() {
+        let scope = resolve_write_scope(&Resolution::GlobalOnly, None)
+            .expect("the fallback is not an error");
+        assert_eq!(scope.kind, ScopeKind::Global);
+        assert_eq!(scope.owner_id, GLOBAL_SCOPE_OWNER_ID);
+        assert_eq!(scope.fallback, Some(ScopeFallback::WorktreeNotIndexed));
+    }
+
+    /// An ambiguous root has its own remedy (`repo attach`, spec 04 §7), so it
+    /// is a distinct marker rather than the same "not indexed" string.
+    #[test]
+    fn an_ambiguous_root_falls_back_with_its_own_marker() {
+        let scope = resolve_write_scope(&ambiguous(), None).expect("the fallback is not an error");
+        assert_eq!(scope.kind, ScopeKind::Global);
+        assert_eq!(scope.fallback, Some(ScopeFallback::WorktreeAmbiguous));
+        assert_ne!(
+            ScopeFallback::WorktreeAmbiguous.hint(),
+            ScopeFallback::WorktreeNotIndexed.hint()
+        );
+    }
+
+    /// An explicitly requested `global` is the caller's own choice — nothing
+    /// degraded, so nothing to report.
+    #[test]
+    fn an_explicit_global_request_is_never_a_degradation() {
+        for resolution in [resolved(), Resolution::GlobalOnly, ambiguous()] {
+            let scope = resolve_write_scope(&resolution, Some(ScopeKind::Global))
+                .expect("global is always satisfiable");
+            assert_eq!(scope.kind, ScopeKind::Global);
+            assert_eq!(scope.fallback, None, "{resolution:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_repository_or_worktree_request_while_unresolved_still_errors() {
+        for requested in [ScopeKind::Repository, ScopeKind::Worktree] {
+            let err = resolve_write_scope(&Resolution::GlobalOnly, Some(requested))
+                .expect_err("the caller asked for a scope this request cannot supply");
+            assert_eq!(err.code.as_str(), "WORKTREE_NOT_INDEXED", "{requested:?}");
+        }
     }
 }

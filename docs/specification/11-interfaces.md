@@ -307,6 +307,19 @@ is pure wiring plus five decisions the spec's own terseness left open:
   checkout. An explicit `scope: "repository"`/`"worktree"` while unresolved is
   `WORKTREE_NOT_INDEXED` (the caller asked for a scope this request cannot supply), never
   silently downgraded.
+
+  Amendment (D-064, `[SPEC]`): the *implicit* `global` fallback stays — 02 §6's own table says
+  memory tools work in repo/global scope for an unknown worktree — but it is a degradation, and
+  02 §6's `[FIXED]` line ("Degradation is always **explicit** in responses; nothing degrades
+  silently") applies to it. `remember`'s result therefore always carries `scope` (the scope
+  actually written), and on the implicit fallback also `degraded` —
+  `worktree_not_indexed` for `Resolution::GlobalOnly`, `worktree_ambiguous` for
+  `Resolution::Ambiguous`, kept distinct because their remedies differ (`local-rag index <path>`
+  versus `local-rag repo attach`, 04 §7) — plus a one-line `hint`. An **explicitly** requested
+  `global` is the caller's own choice and is never marked degraded. Found by a live dogfood
+  session: seven entries written from an unindexed worktree had silently become machine-wide, and
+  `recall`'s `global ∪ repository ∪ worktree` union (08 §6, `[FIXED]`) surfaced them in every
+  other project, with nothing in any response having said so.
 - **`give_feedback` never calls the op engine** — it is the MCP-callable equivalent of a hook's
   spool append, purely an `observation_envelope` insert (`local_rag_store::observation::
   insert_envelope`, widened from `pub(crate)` to `pub` — it had no spool-specific coupling to

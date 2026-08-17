@@ -300,7 +300,10 @@ pub fn catalog() -> Value {
                 "description": "Call the moment something durable surfaces — a decision, a \
                     convention, a fact worth keeping — not later in the session. Creates a new \
                     durable memory entry directly (not via candidate review). Defaults to \
-                    repository scope when the request's worktree resolves, else global.",
+                    repository scope when the request's worktree resolves, else global. The \
+                    response always reports the scope actually written, and carries a `degraded` \
+                    marker when an unindexed worktree forced the global fallback — a global entry \
+                    is machine-wide and every project's recall sees it.",
                 "annotations": annotations("Create memory entry", false, false, false),
                 "inputSchema": {
                     "type": "object",

@@ -13,8 +13,9 @@ use local_rag_store::{
     propose_candidate,
 };
 use support::{
-    Client, git_available, open_layout, seed_memory_entry, seed_memory_entry_with_canonical_key,
-    seed_pending_candidate, start, transition_seeded_memory_entry,
+    Client, git_available, open_layout, seed_indexed_worktree, seed_memory_entry,
+    seed_memory_entry_with_canonical_key, seed_pending_candidate, start,
+    transition_seeded_memory_entry,
 };
 
 fn actor_of(state: &StateDb, entity_id: &str) -> String {
@@ -266,6 +267,101 @@ async fn remember_scope_defaults_repository_when_resolved_global_otherwise() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
     assert_eq!(parsed["outcome"], "applied", "{text}");
+    // D-064: the fallback is written, but never silently — spec 02 §6
+    // `[FIXED]` ("nothing degrades silently") and the same table's
+    // WORKTREE_NOT_INDEXED flag for exactly this condition.
+    assert_eq!(parsed["scope"], "global", "{text}");
+    assert_eq!(parsed["degraded"], "worktree_not_indexed", "{text}");
+    assert!(
+        parsed["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("machine-wide"),
+        "the hint must say what a global entry actually means: {text}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// D-064's non-degraded half: a request rooted in a *registered* worktree
+/// takes the normal `repository` default and reports no degradation at all.
+#[tokio::test]
+async fn remember_in_a_registered_worktree_is_repository_scoped_and_not_degraded() {
+    if !git_available() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (home, layout) = open_layout();
+    let seeded = seed_indexed_worktree(&home, &layout).await;
+    let repo_path = seeded.repo_path.to_string_lossy().into_owned();
+    let expected_repo_id = seeded.repo_id.clone();
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember","arguments":{"text":"a project fact","kind":"fact"}}}"#,
+            Some(&repo_path),
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["scope"], "repository", "{text}");
+    assert!(
+        parsed.get("degraded").is_none(),
+        "a resolved worktree degrades nothing: {text}"
+    );
+    assert!(parsed.get("hint").is_none(), "{text}");
+
+    // ...and the entry really is owned by that repository, not the global
+    // singleton.
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    let (scope_kind, owner): (String, String) = read
+        .query_row(
+            "SELECT scope_kind, scope_owner_id FROM memory_entry WHERE text = 'a project fact'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("the entry was created");
+    assert_eq!(scope_kind, ScopeKind::Repository.as_str());
+    assert_eq!(owner, expected_repo_id);
+
+    handle.shutdown().await;
+}
+
+/// An explicitly requested `global` is the caller's own decision, so it must
+/// not be reported as a degradation — otherwise the marker would cry wolf on
+/// every deliberate machine-wide note.
+#[tokio::test]
+async fn remember_with_an_explicit_global_scope_is_not_reported_as_degraded() {
+    let (home, layout) = open_layout();
+    let real_dir = home.join("never-registered");
+    std::fs::create_dir_all(&real_dir).expect("create dir");
+    let real_path = real_dir.to_string_lossy().into_owned();
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember","arguments":{"text":"a machine-wide note","kind":"fact","scope":"global"}}}"#,
+            Some(&real_path),
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["scope"], "global", "{text}");
+    assert!(parsed.get("degraded").is_none(), "{text}");
 
     handle.shutdown().await;
 }
