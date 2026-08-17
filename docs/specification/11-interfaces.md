@@ -794,6 +794,39 @@ resolved detail the one-line sketch left open:
   privacy/legal operation, so atomicity here is a correctness requirement, not an optimization
   being skipped.
 
+As-built note (X-008, `[SPEC]`): the observability payoff of D-062/X-006/X-007 — three commands
+now answer "is background indexing working for this project?", which none of them could before.
+
+Shared computation lives in `crates/local-rag/src/cli/freshness.rs` so the three cannot disagree:
+`IndexFreshness::from_generations` over `generation_meta_for_worktree` yields the active
+generation (number + creation time) and any **stuck** generation — one numbered above the active
+one still in `projection_ready`/`building`, i.e. work that was built and then never switched on.
+`generation_created_ms` reads `generation.created_at` when it is plausibly epoch-ms and otherwise
+falls back to the UUIDv7 timestamp embedded in `generation_id`, which repairs the pre-D-062 rows
+**on read** instead of by migration (03 §2.1's own D-062 note: historical rows are not
+backfilled). That fallback is transitional by construction — once GC has swept every generation
+built before D-062, `created_at` is always used.
+
+- **`project list`** — an empty registry still prints `no managed projects`, and now also how many
+  registered worktrees are unenrolled plus the exact `local-rag project add <path>` that fixes it.
+  Each listed project gains index age, `last_success_at`/`consecutive_failures` from X-006's
+  durable status, and a `[STUCK: …]` marker. `--json` gains `unenrolled_worktrees` and per-row
+  `active_generation_number`/`active_generation_created_at`/`last_success_at`/`last_attempt_at`/
+  `consecutive_failures`/`last_error`/`stuck_generations`; every T20-08 key keeps its name.
+- **`project status`** — additionally classifies the **current directory**, resolved through the
+  same `gitroot::probe` → `resolve_facts` pair the write verbs use: enrolled, known but not
+  enrolled (`background indexing is OFF for this worktree`, with `local-rag project add .`), or
+  not a registered worktree at all. Under `--json` that is the `current_directory` object.
+- **`doctor`** — a new `indexing:` section, per worktree: enrollment (enrolled / paused / not
+  enrolled), the age of the served generation, X-006's last-cycle outcome, and every stuck
+  generation. **Verdict rule, an explicit owner decision:** only a *stuck* generation makes
+  `is_clean()` false (and so the exit code 1). "Not enrolled" and "never indexed" stay
+  informational, for the same reason the pre-existing `both_legs_unavailable` case is not a gate —
+  a bootstrap state is not a fault. So enrolling nothing never fails `doctor`, while built work
+  that is not being served always does.
+- **`stats`** — next to `active_generation` it prints when that generation was built and how old
+  it is, plus the same stuck-generation lines.
+
 As-built note (T16-03, `[SPEC]`, D-025). `doctor [--worktree <id>] [--json]` is implemented in
 `crates/local-rag/src/cli/doctor.rs`. Its defining constraint, not visible in this section's
 one-line sketch, is that `doctor` must be categorically read-only, but every normal constructor

@@ -9,13 +9,15 @@ use std::process::ExitCode;
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
     RequestRoot, Resolution, UnconsolidatableSession, consolidation_run_counts,
-    memory_entry_counts, observation_envelope_count, observations_applied_since,
-    oldest_open_run_created_at, pending_candidate_counts, projection_state, resolve,
-    store_instance_uuid, total_pending_backlog, unconsolidatable_sessions,
+    generation_meta_for_worktree, memory_entry_counts, observation_envelope_count,
+    observations_applied_since, oldest_open_run_created_at, pending_candidate_counts,
+    projection_state, resolve, store_instance_uuid, total_pending_backlog,
+    unconsolidatable_sessions,
 };
 
 use local_rag::daemon::gitroot;
 
+use super::freshness::{IndexFreshness, humanize_age};
 use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 use local_rag::indexing::{open_cache, open_state};
 
@@ -163,7 +165,18 @@ pub fn run(args: StatsArgs) -> ExitCode {
             repo_id,
             worktree_id,
         } => match projection_state(&conn, worktree_id) {
-            Ok(p) => Some((repo_id.clone(), worktree_id.clone(), p)),
+            Ok(p) => {
+                // X-008: `active_generation_id` alone never answered "is this
+                // index current?" — the age of that generation does.
+                let generations =
+                    generation_meta_for_worktree(&conn, worktree_id).unwrap_or_default();
+                Some((
+                    repo_id.clone(),
+                    worktree_id.clone(),
+                    p,
+                    IndexFreshness::from_generations(&generations),
+                ))
+            }
             Err(e) => return fail(BIN, &format!("could not read projection state: {e}")),
         },
         Resolution::GlobalOnly | Resolution::Ambiguous { .. } => None,
@@ -175,7 +188,9 @@ pub fn run(args: StatsArgs) -> ExitCode {
     };
 
     if json {
-        let worktree_json = worktree.as_ref().map(|(repo_id, worktree_id, projection)| {
+        let worktree_json = worktree
+            .as_ref()
+            .map(|(repo_id, worktree_id, projection, freshness)| {
             serde_json::json!({
                 "repo_id": repo_id,
                 "worktree_id": worktree_id,
@@ -183,6 +198,16 @@ pub fn run(args: StatsArgs) -> ExitCode {
                 "active_model_space_id": projection.as_ref().and_then(|p| p.active_model_space_id.clone()),
                 "projection_status": projection.as_ref().map(|p| p.status.as_str().to_string()),
                 "projection_last_error": projection.as_ref().and_then(|p| p.last_error.clone()),
+                "active_generation_number": freshness.active.as_ref().map(|(_, n, _)| *n),
+                "active_generation_created_at": freshness.active.as_ref().and_then(|(_, _, ms)| *ms),
+                "stuck_generations": freshness
+                    .stuck_newer
+                    .iter()
+                    .map(|s| serde_json::json!({
+                        "generation_number": s.generation_number,
+                        "state": s.state.as_str(),
+                    }))
+                    .collect::<Vec<_>>(),
             })
         });
         let report = serde_json::json!({
@@ -300,7 +325,7 @@ pub fn run(args: StatsArgs) -> ExitCode {
         }
     }
     match &worktree {
-        Some((repo_id, worktree_id, projection)) => {
+        Some((repo_id, worktree_id, projection, freshness)) => {
             println!("worktree: repo {repo_id} / worktree {worktree_id}");
             match projection {
                 Some(p) => println!(
@@ -311,6 +336,26 @@ pub fn run(args: StatsArgs) -> ExitCode {
                     p.last_error.as_deref().unwrap_or("(none)"),
                 ),
                 None => println!("  no projection state yet"),
+            }
+            // X-008: how old the served index actually is, and whether newer
+            // work was built and dropped.
+            let now_ms = system_now_ms();
+            match &freshness.active {
+                Some((_, number, Some(created_ms))) => println!(
+                    "  index age: generation #{number} built {}",
+                    humanize_age(now_ms, *created_ms),
+                ),
+                Some((_, number, None)) => {
+                    println!("  index age: generation #{number}, build time unknown")
+                }
+                None => println!("  index age: nothing active — nothing is being served"),
+            }
+            for s in &freshness.stuck_newer {
+                println!(
+                    "  STUCK: generation #{} is {} but never became active",
+                    s.generation_number,
+                    s.state.as_str(),
+                );
             }
         }
         None => println!("worktree: (unresolved)"),

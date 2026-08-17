@@ -32,6 +32,7 @@
 
 pub mod doctor;
 pub mod export;
+pub mod freshness;
 pub mod gc;
 pub mod index;
 pub mod init;

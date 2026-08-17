@@ -11,10 +11,11 @@ use std::process::{Output, Stdio};
 use local_rag::daemon::gitroot;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    FailureKind, GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewConsolidationRun, NewMemoryEntry,
-    ProposedOperation, RunState, ScopeKind, StateDb, create_consolidation_run, create_memory_entry,
-    create_repository, create_worktree, insert_projection_state, observe_repository_path,
-    observe_worktree_path, propose_candidate, record_run_failure, transition_run,
+    FailureKind, GLOBAL_SCOPE_OWNER_ID, GenerationState, MemoryKind, NewConsolidationRun,
+    NewMemoryEntry, ProposedOperation, RunState, ScopeKind, StateDb, allocate_generation,
+    create_consolidation_run, create_memory_entry, create_repository, create_worktree,
+    insert_projection_state, observe_repository_path, observe_worktree_path, propose_candidate,
+    record_run_failure, transition_generation, transition_run,
 };
 use local_rag_test_support::TempHome;
 
@@ -360,4 +361,53 @@ async fn stats_reports_an_unconsolidatable_session_needing_manual_review() {
     assert_eq!(sessions[0]["dead_letter_run_id"], "run-stuck");
     assert_eq!(sessions[0]["from_received_seq"], 1);
     assert_eq!(sessions[0]["to_received_seq"], 1);
+}
+
+/// X-008: `active_generation=<uuid>` never answered "is this index current?".
+/// The age of that generation does, and a generation built but never switched on
+/// is called out — the same two facts `doctor` and `project status` now report.
+#[tokio::test]
+async fn stats_reports_the_index_age_and_any_stuck_generation() {
+    let (home, layout) = open_layout();
+    let dir = home.join("wt");
+    std::fs::create_dir_all(&dir).expect("create worktree dir");
+    let worktree_id = "018f0000-0000-7000-8000-0000000000c1";
+    seed_active_repo_and_worktree(
+        &layout,
+        "018f0000-0000-7000-8000-0000000000c0",
+        worktree_id,
+        &dir,
+    )
+    .await;
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    // One generation left in `projection_ready`: nothing is active, so this is
+    // built work that is not being served.
+    let generation_id = "018f0000-0000-7000-8000-0000000000c2";
+    let (w, g) = (worktree_id.to_string(), generation_id.to_string());
+    state
+        .writer()
+        .transaction(move |tx| allocate_generation(tx, &w, &g, 1_786_000_000_000).map(|_| ()))
+        .await
+        .expect("allocate generation");
+    let g2 = generation_id.to_string();
+    state
+        .writer()
+        .transaction(move |tx| transition_generation(tx, &g2, GenerationState::ProjectionReady))
+        .await
+        .expect("transition tx")
+        .expect("building -> projection_ready is legal");
+    drop(state);
+
+    let out = run_cli(&home, &dir, &["stats"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "stats must succeed: {text}");
+    assert!(
+        text.contains("index age: nothing active — nothing is being served"),
+        "with no active generation the age line must say so plainly: {text}"
+    );
+    assert!(
+        text.contains("STUCK: generation #1 is projection_ready but never became active"),
+        "and the built-but-unserved generation must be named: {text}"
+    );
 }
