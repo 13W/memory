@@ -52,7 +52,12 @@
 //! module [`managed`]): `managed_worktree` (spec 03 §2.1, ADR-0009) — the
 //! persisted, explicit opt-in list of the worktrees the daemon indexes in the
 //! background, keyed by `worktree_id` and never by a path. The table is the
-//! truth; a live daemon is only notified of a change (T20-06/T20-07).
+//! truth; a live daemon is only notified of a change (T20-06/T20-07). Its
+//! **outcome** axis is a separate table (X-006, version-13 `SCHEMA_V13`, module
+//! [`indexing_status`]): `worktree_indexing_status` records what the last cycle
+//! actually did, so the answer survives the idle shutdown that erases the
+//! supervisor's in-memory copy. Subscription and outcome stay apart on purpose
+//! — T20-01's own reasoning against conflating the two axes still holds.
 //!
 //! The **generation lifecycle** (T05-01, module [`generation`]) sits on top of the
 //! `generation` table `SCHEMA_V2` shipped: [`allocate_generation`] (per-worktree
@@ -67,6 +72,7 @@
 //! (T05-01).
 
 mod generation;
+mod indexing_status;
 mod instance;
 mod managed;
 mod projection_state;
@@ -80,6 +86,12 @@ pub use generation::{
     GenerationRow, GenerationState, GenerationTransitionError, IllegalGenerationTransition,
     active_generations, allocate_generation, generation_number, generation_row, generation_state,
     transition_generation,
+};
+
+pub(crate) use indexing_status::SCHEMA_V13;
+pub use indexing_status::{
+    IndexingOutcome, WorktreeIndexingStatus, indexing_status, indexing_statuses,
+    write_indexing_status,
 };
 
 pub use instance::{ensure_store_instance_uuid, store_instance_uuid};

@@ -66,7 +66,9 @@ use local_rag_index::reconcile::{
     MetaError, ReconcileHandle, ScheduleConfig, SystemWallClock, TriggerKind, WorktreeReconciler,
     load_worktree_meta, spawn_reconciler, spawn_watcher,
 };
-use local_rag_store::{CacheDb, RetentionParams, StateDb, WorktreeLockRegistry};
+use local_rag_store::{
+    CacheDb, IndexingOutcome, RetentionParams, StateDb, WorktreeLockRegistry, write_indexing_status,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
@@ -106,6 +108,14 @@ pub struct WorktreeTaskStatus {
     /// which only means "built," not yet "served."
     pub last_generation_id: Option<String>,
     /// When [`Self::last_generation_id`] last changed, Unix milliseconds.
+    ///
+    /// This is the millisecond the cycle **started** (the same reading
+    /// [`Self::in_progress_since`] got), not the one it finished at. X-006's
+    /// durable mirror `worktree_indexing_status.last_success_at` records the
+    /// finish instead, which is the more useful of the two for "how stale is
+    /// this index"; the two therefore differ by one cycle's duration. Left as
+    /// it is deliberately — restamping this field is a T20-05 behavior change,
+    /// not X-006's business.
     pub last_success_ms: Option<i64>,
     /// Consecutive reconcile/project failures since the last success.
     pub consecutive_failures: u32,
@@ -527,6 +537,11 @@ async fn project_one(
         s.in_progress_since = Some(now_ms);
     }
     let worktree_id_str = params.worktree_id.to_string();
+    tracing::info!(
+        worktree_id = %worktree_id_str,
+        generation_id = %generation_id,
+        "indexing cycle started"
+    );
     let result = write_locked(
         &params.locks,
         &worktree_id_str,
@@ -534,19 +549,89 @@ async fn project_one(
     )
     .await;
 
-    let mut s = status.lock().expect("worktree task status mutex poisoned");
-    s.in_progress_since = None;
-    match result {
-        Ok(_outcome) => {
-            s.last_generation_id = Some(generation_id);
-            s.last_success_ms = Some(now_ms);
-            s.consecutive_failures = 0;
-            s.last_error = None;
+    // Fold the outcome into the in-memory status first. The guard is confined
+    // to this block on purpose: `std::sync::MutexGuard` is not `Send`, so it
+    // must not be alive across the durable write's `.await` below.
+    let failure = {
+        let mut s = status.lock().expect("worktree task status mutex poisoned");
+        s.in_progress_since = None;
+        match &result {
+            Ok(_) => {
+                s.last_generation_id = Some(generation_id.clone());
+                s.last_success_ms = Some(now_ms);
+                s.consecutive_failures = 0;
+                s.last_error = None;
+                None
+            }
+            Err(e) => {
+                s.consecutive_failures += 1;
+                s.last_error = Some(e.to_string());
+                Some((s.consecutive_failures, e.to_string()))
+            }
         }
-        Err(e) => {
-            s.consecutive_failures += 1;
-            s.last_error = Some(e.to_string());
-        }
+    };
+
+    let finished_ms = system_now_ms();
+    let duration_ms = finished_ms.saturating_sub(now_ms);
+    match (&result, &failure) {
+        (Ok(outcome), _) => tracing::info!(
+            worktree_id = %worktree_id_str,
+            generation_id = %generation_id,
+            embedded = outcome.backfill.embedded,
+            reused = outcome.backfill.reused,
+            embed_failed = outcome.backfill.failed,
+            occurrences = outcome.fts.occurrence_count,
+            duration_ms,
+            "indexing cycle finished"
+        ),
+        (Err(_), Some((consecutive_failures, reason))) => tracing::warn!(
+            worktree_id = %worktree_id_str,
+            generation_id = %generation_id,
+            consecutive_failures,
+            duration_ms,
+            reason = %reason,
+            "indexing cycle failed"
+        ),
+        // A failed `result` always produced a `failure` record in the block
+        // above; keeping the arm total avoids an `unreachable!` in a path whose
+        // whole job is to never panic the background task.
+        (Err(_), None) => {}
+    }
+
+    // X-006: mirror the outcome durably, so it survives the idle shutdown that
+    // erases the in-memory status every quiet 15 minutes. Deliberately outside
+    // `write_locked` — one short global-writer transaction, L2 already released.
+    // A write failure here is never fatal: the generation is projected either
+    // way, so it is logged and dropped like the observability channels above.
+    let (wt, gen_owned, err_owned) = (
+        worktree_id_str.clone(),
+        result.is_ok().then(|| generation_id.clone()),
+        failure.as_ref().map(|(_, reason)| reason.clone()),
+    );
+    let consecutive_failures = failure.as_ref().map_or(0, |(n, _)| *n);
+    if let Err(e) = params
+        .state
+        .writer()
+        .transaction(move |tx| {
+            write_indexing_status(
+                tx,
+                &wt,
+                IndexingOutcome {
+                    attempt_at: now_ms,
+                    success: gen_owned.as_deref(),
+                    consecutive_failures,
+                    last_error: err_owned.as_deref(),
+                },
+                finished_ms,
+            )
+        })
+        .await
+    {
+        tracing::warn!(
+            worktree_id = %worktree_id_str,
+            error = %e,
+            "could not persist the indexing status (the index itself is unaffected)"
+        );
     }
     // `_job` drops here — before control returns to the outer `select!`.
 }
@@ -766,6 +851,25 @@ mod tests {
         assert!(status.last_success_ms.is_some());
         assert_eq!(status.consecutive_failures, 0);
         assert!(status.last_error.is_none());
+
+        // X-006: the same outcome is mirrored durably, so it outlives the task
+        // (and the whole daemon) rather than dying with the in-memory status.
+        let read = fx.state.open_read().expect("read conn");
+        let durable = local_rag_store::indexing_status(&read, &fx.worktree_id.to_string())
+            .expect("read indexing status")
+            .expect("a completed cycle wrote its status");
+        assert_eq!(
+            durable.last_generation_id, status.last_generation_id,
+            "the durable row names the generation the task just projected",
+        );
+        assert!(durable.last_success_at.is_some(), "a success was recorded");
+        assert!(
+            durable.last_attempt_at.is_some(),
+            "so was the attempt that produced it",
+        );
+        assert_eq!(durable.consecutive_failures, 0);
+        assert_eq!(durable.last_error, None);
+        drop(read);
 
         // Prove it end to end through the real production `SearchEngine` —
         // the same `build_search_engine` the daemon itself uses.

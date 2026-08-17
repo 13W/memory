@@ -1592,3 +1592,26 @@ live daemon.
   semantics for managed-but-quiet projects (T20-10, blocked on an owner decision). `remove` never
   touches the index/shards themselves (`rebuild`/`gc`/`worktree`'s own territory), and `add` never
   recurses into a directory of projects.
+
+As-built note (X-006, `[SPEC]`): every indexing cycle now leaves two traces that outlive the
+process that produced them, closing the gap where a daemon that had gone to sleep could not say
+whether background indexing had ever run.
+
+- **Durable outcome.** `project_one` mirrors each cycle's result into `worktree_indexing_status`
+  (spec 03 §2.1) — attempt/success timestamps, the projected generation, the consecutive-failure
+  count and the last error. `WorktreeTaskStatus` and `admin/projects_list` are unchanged and stay
+  the *live* view: `task: null` still means "no task running right now", and nothing in the live
+  answer is ever back-filled from the durable row. The two differ in one documented way —
+  `WorktreeTaskStatus.last_success_ms` records when a cycle *started* (T20-05's original
+  behavior, left as is), while `worktree_indexing_status.last_success_at` records when it
+  *finished*, which is the reading a staleness check wants.
+- **Log lines.** `daemon::indexing::worktree_task` gained its first `tracing` instrumentation:
+  `indexing cycle started` and `indexing cycle finished` at `info` (worktree, generation,
+  embedded/reused/failed subject counts, materialized occurrence count, `duration_ms`), and
+  `indexing cycle failed` at `warn` with the consecutive-failure count and cause. Metadata only —
+  never file contents or indexed text (12 §1's untrusted-data boundary, the same line X-004 drew
+  for request bodies). These go to the same `serve` stderr stream X-004 established, so in the
+  common MCP setup — where `local-rag-proxy` starts the daemon with stderr suppressed — they are
+  visible only under a manual `local-rag serve` until the file log lands.
+- Reading the durable row back — in `project list`/`status`, `doctor` or `stats` — is **not** part
+  of this task; X-006 only writes it.

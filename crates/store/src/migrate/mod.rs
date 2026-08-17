@@ -179,7 +179,11 @@ impl Migration {
 /// unlike v11's columns) — distinguishes a deterministic context-overflow
 /// dead-letter from every other `Mechanical` cause, so `open_next_run`'s
 /// shrink-and-retry carve-out fires only on that exact shape
-/// (`memory::SCHEMA_V12`). Each checksum is frozen once shipped (see
+/// (`memory::SCHEMA_V12`); version 13 (X-006) is `worktree_indexing_status`,
+/// the durable outcome of background indexing — deliberately its own table
+/// rather than columns on `managed_worktree`, which stays the pure
+/// subscription axis T20-01 designed it to be
+/// (`registry::SCHEMA_V13`). Each checksum is frozen once shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
 pub const ALL: &[Migration] = &[
@@ -207,6 +211,7 @@ pub const ALL: &[Migration] = &[
         "consolidation_run_context_overflow_tracking",
         crate::memory::SCHEMA_V12,
     ),
+    Migration::sql(13, "worktree_indexing_status", crate::registry::SCHEMA_V13),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

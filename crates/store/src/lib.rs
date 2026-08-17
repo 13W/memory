@@ -508,8 +508,9 @@ pub use registry::{
     referenced_model_space_ids, set_default_model_space_id, write_projection_state,
 };
 pub use registry::{
-    ManagedWorktree, is_managed, managed_worktrees, register_managed_worktree, set_managed_enabled,
-    unregister_managed_worktree,
+    IndexingOutcome, ManagedWorktree, WorktreeIndexingStatus, indexing_status, indexing_statuses,
+    is_managed, managed_worktrees, register_managed_worktree, set_managed_enabled,
+    unregister_managed_worktree, write_indexing_status,
 };
 pub use retention::{
     ExternalPins, GenerationMeta, JobLease, PinRoots, RetentionParams, SWEEP_BATCH_ROWS,
