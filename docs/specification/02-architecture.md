@@ -157,10 +157,32 @@ session harness, byte counts, duration, status; `admin/*` at `debug` so a future
 does not flood `info`), and the same warnings a few call sites previously wrote via `eprintln!`
 (a stalled/failed spool-resume session, an installed-but-unopenable embedding model). Never a
 request or response **payload** — CLAUDE.md: recalled memory and indexed repository content are
-untrusted data. `StoreLayout::logs_dir` remains reserved and unfilled — this is a live stderr
-stream, not a persisted file log, the same boundary `T18-08`'s own in-memory ring buffer already
-drew for a different consumer (a TUI dashboard, polled via `admin/tail_calls`/`admin/tool_stats`,
-11 §7 — this stderr stream and that ring buffer are independent, neither replaces the other).
+untrusted data. `T18-08`'s in-memory ring buffer stays a separate thing for a different consumer
+(a TUI dashboard, polled via `admin/tail_calls`/`admin/tool_stats`, 11 §7) — that buffer and this
+log stream are independent, neither replaces the other.
+
+As-built note (X-007, `[SPEC]`): the same stream also goes to a **file** under
+`StoreLayout::logs_dir`, which X-004 had left reserved and unfilled. That boundary turned out to
+be a hole rather than a clean line: `local-rag-proxy` starts the daemon with stderr set to
+`Stdio::null()` (the normal MCP setup), so in practice every line X-004 emitted was discarded
+exactly when someone would want to read it back — including the indexing-cycle lines X-006 added.
+
+Two sinks, **one filter**: `logging::resolve_filter`'s single directive feeds both layers, so
+`RUST_LOG`/`log_level` cannot quiet one while the other stays chatty, and neither sink has a
+verbosity setting of its own. Files rotate **daily** and the newest seven are kept
+(`tracing-appender`'s `RollingFileAppender`, `Rotation::DAILY`, `max_log_files(7)` — the same one
+week `X-001` fixed as this store's retention horizon); names read `daemon.<YYYY-MM-DD>.log`.
+`logs_dir` is created by `logging::init` itself through the usual private-`0700` `ensure_dir`,
+because `StoreLayout::ensure` runs later, inside `DaemonHandle::start` — leaving it to that call
+would cost a brand-new store its first run's log. The appender is used synchronously, without
+`tracing_appender::non_blocking`, so no `WorkerGuard` has to outlive `serve()` and the lines
+immediately preceding an exit or a crash are never the ones lost.
+
+The file sink is **always on**: no config key gates it (an explicit owner decision), so §3.1's
+pinned `SPEC_CONFIG_TOML` and its `default_matches_spec_toml` test are unaffected. A log file that
+cannot be opened (permissions, a full disk) is **not** fatal — the daemon warns on stderr and runs
+with that sink alone (§6: nothing degrades silently). Privacy is unchanged and applies to both
+sinks: metadata only, never a request/response payload or indexed content.
 
 ### 3.2 Per-repository settings `[SPEC]`
 

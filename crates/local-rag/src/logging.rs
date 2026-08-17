@@ -9,11 +9,24 @@
 //! as they already were, and the library half of this crate
 //! (`local_rag::daemon`) never links `tracing-subscriber` at all.
 //!
-//! Sink is always **stderr**: the daemon's IPC is a Unix domain socket (spec
-//! 02 §2.1), never stdio, so stderr is free for a human running `local-rag
-//! serve` directly in a terminal. A file-based log
-//! (`StoreLayout::logs_dir`) stays reserved and unfilled, the same boundary
-//! `T18-08`'s own card already drew for its in-memory ring buffer.
+//! There are **two sinks, one filter** (X-007):
+//!
+//! - **stderr**, for a human running `local-rag serve` in a terminal — the
+//!   daemon's IPC is a Unix domain socket (spec 02 §2.1), never stdio, so
+//!   stderr is free;
+//! - **a file** under `StoreLayout::logs_dir`, rotated daily and capped at
+//!   [`MAX_LOG_FILES`].
+//!
+//! X-004 shipped only the first and left `logs_dir` reserved. That turned out
+//! to be a hole rather than a clean boundary: `local-rag-proxy` starts the
+//! daemon with `Stdio::null()` on stderr (`connect.rs:76-82`), which is the
+//! *normal* MCP setup, so every line X-004 emitted was discarded exactly when
+//! someone would want to read it back. The file sink is therefore always on —
+//! no config key gates it (an explicit owner decision): verbosity is already
+//! `log_level`/`RUST_LOG`'s job, and volume is bounded by rotation.
+//!
+//! A file that cannot be opened (permissions, a full disk) is **not** fatal:
+//! the daemon logs a warning to stderr and runs with that sink alone.
 //!
 //! Default verbosity comes from `config.daemon.log_level` (spec 02 §3.1) — a
 //! `[SPEC]` field that has existed since T02-05 and been editable from the
@@ -24,13 +37,33 @@
 //! emit carries a request or response payload, only metadata (method, tool
 //! name, session, byte counts, duration, status).
 
+use std::path::Path;
+
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// The default filter directive applied when `RUST_LOG` is unset: quiets two
 /// verbose native-library emitters (`ort`'s session/graph diagnostics,
 /// `llama_cpp_2`'s token-level tracing) that would otherwise drown out the
 /// daemon's own request-level events at `debug`.
 const QUIET_THIRD_PARTY_DIRECTIVE: &str = "ort=warn,llama_cpp_2=warn";
+
+/// Rotated log files kept under `logs_dir` before the oldest is deleted.
+///
+/// Seven, matching the one week `X-001` already fixed as the retention horizon
+/// for generations (`T = 168h`) — one number for "how far back this store
+/// remembers anything" is easier to reason about than two. Deliberately a
+/// constant rather than a config key: the owner's decision for X-007 was that
+/// the file sink has no configuration surface at all, so spec 02 §3.1's pinned
+/// `SPEC_CONFIG_TOML` (and its `default_matches_spec_toml` test) stay untouched.
+const MAX_LOG_FILES: usize = 7;
+
+/// Name parts of the rotated log files. `tracing-appender` puts the rotation
+/// date *between* them, so the files read `daemon.2026-08-17.log`.
+const LOG_FILENAME_PREFIX: &str = "daemon";
+const LOG_FILENAME_SUFFIX: &str = "log";
 
 /// The outcome of resolving a filter: the directive string to install, plus
 /// an optional warning to surface (via `warn!`, once the subscriber is up —
@@ -87,7 +120,15 @@ fn fallback_to_info(warning: String) -> ResolvedFilter {
 }
 
 /// Install the process-wide `tracing` subscriber: plain (non-ANSI) lines to
-/// stderr, filtered per [`resolve_filter`].
+/// stderr **and** to a daily-rotated file under `logs_dir`, both filtered by
+/// the single directive [`resolve_filter`] produced.
+///
+/// `logs_dir` is created here if missing, via the same private-`0700`
+/// [`ensure_dir`](local_rag_core::paths::ensure_dir) every other store
+/// directory goes through (spec 12 §1: the store is not world-readable).
+/// It cannot be left to `StoreLayout::ensure`, which runs later inside
+/// `DaemonHandle::start` (`daemon/lifecycle.rs:307`) — on a brand-new store
+/// that ordering would silently cost the first run its file log.
 ///
 /// Idempotent by construction: `try_init`'s "already installed" error is
 /// swallowed rather than panicking, since a test binary that spawns
@@ -95,16 +136,64 @@ fn fallback_to_info(warning: String) -> ResolvedFilter {
 /// call, but a unit test calling this twice in one process must not abort
 /// the test run. `with_ansi(false)` is deliberate, not merely conservative:
 /// escape sequences would corrupt the byte-exact substring assertions
-/// `tests/serve_logging.rs` makes against captured stderr, and add nothing
-/// once stderr is redirected to a pipe or a log file rather than a live tty.
-pub fn init(config_level: &str) {
+/// `tests/serve_logging.rs` makes against captured output, and add nothing
+/// once the destination is a pipe or a log file rather than a live tty.
+///
+/// The appender is used **synchronously**, without
+/// `tracing_appender::non_blocking`: that wrapper hands writing to a worker
+/// thread and drops buffered lines unless its `WorkerGuard` outlives every
+/// event, which would mean threading a guard from here through the whole of
+/// `serve()` — and losing exactly the last lines before a crash, the ones most
+/// worth having. One line per event to a local file needs no such machinery.
+pub fn init(config_level: &str, logs_dir: &Path) {
     let resolved = resolve_filter(config_level, std::env::var("RUST_LOG").ok().as_deref());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&resolved.directive))
+    let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
+        .with_ansi(false);
+
+    // A missing/unwritable log directory or file must not stop the daemon: fall
+    // back to the stderr layer alone and say so (spec 02 §6 — nothing degrades
+    // silently).
+    let file_appender = local_rag_core::paths::ensure_dir(logs_dir)
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .filename_prefix(LOG_FILENAME_PREFIX)
+                .filename_suffix(LOG_FILENAME_SUFFIX)
+                .max_log_files(MAX_LOG_FILES)
+                .build(logs_dir)
+                .map_err(|e| e.to_string())
+        });
+
+    let file_warning = match file_appender {
+        Ok(appender) => {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(appender)
+                .with_ansi(false);
+            let _ = tracing_subscriber::registry()
+                .with(EnvFilter::new(&resolved.directive))
+                .with(stderr_layer)
+                .with(file_layer)
+                .try_init();
+            None
+        }
+        Err(e) => {
+            let _ = tracing_subscriber::registry()
+                .with(EnvFilter::new(&resolved.directive))
+                .with(stderr_layer)
+                .try_init();
+            Some(format!(
+                "could not open the log file in {}: {e}; logging to stderr only",
+                logs_dir.display()
+            ))
+        }
+    };
+
     if let Some(warning) = resolved.warning {
+        tracing::warn!("{warning}");
+    }
+    if let Some(warning) = file_warning {
         tracing::warn!("{warning}");
     }
 }

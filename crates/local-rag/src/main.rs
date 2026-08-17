@@ -119,7 +119,7 @@ async fn serve() -> ExitCode {
     };
     let _ = data_dir(&env); // resolved via `layout`; kept for a clearer error above if it fails
 
-    logging::init(&config.daemon.log_level);
+    logging::init(&config.daemon.log_level, &layout.logs_dir());
     tracing::info!(
         daemon_version = %local_rag_core::VERSION,
         pid = std::process::id(),
