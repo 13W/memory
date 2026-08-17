@@ -466,8 +466,8 @@ pub use migrate::{
 };
 pub use observation::{
     EvidenceKind, ImportBatchReport, ImportError, ImportOutcome, NewObservationEnvelope,
-    PayloadStatus, PayloadSweepError, PayloadSweepReport, TrustLevel, diagnose_spool_tail,
-    import_batch, import_session_tail, insert_envelope, known_spool_sessions,
+    PayloadStatus, PayloadSweepError, PayloadSweepReport, RootResolver, TrustLevel,
+    diagnose_spool_tail, import_batch, import_session_tail, insert_envelope, known_spool_sessions,
     observation_envelope_count, run_payload_ttl_sweep,
 };
 pub use privacy::{

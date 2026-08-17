@@ -16,14 +16,16 @@
 //! dependency — this daemon needs three read-only facts, not a git
 //! implementation.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use local_rag_core::identity::domain::path_fingerprint;
 use local_rag_core::identity::path::{CaseSensitivity, canonicalize_absolute};
 use local_rag_core::identity::remote::fingerprint as remote_url_fingerprint;
 use local_rag_protocol::RequestContext;
-use local_rag_store::{RequestRoot, WorktreeKind, WorktreeRootFacts};
+use local_rag_store::{RequestRoot, RootResolver, WorktreeKind, WorktreeRootFacts};
 
 /// Build a [`RequestRoot`] from an MCP request's context. Never fails: an
 /// absent or unprobeable `worktree_root` simply yields `None`.
@@ -31,6 +33,48 @@ pub fn request_root(ctx: &RequestContext) -> RequestRoot {
     RequestRoot {
         worktree_root: ctx.worktree_root.as_deref().map(Path::new).and_then(probe),
         repo_hint: ctx.repo_hint.clone(),
+    }
+}
+
+/// The spool importer's [`RootResolver`] (D-063): git-probes a frame's raw
+/// `worktree_root` through [`probe`], the same way [`request_root`] does for a
+/// live MCP request, memoizing by the raw string.
+///
+/// One instance per sweep, not one per daemon: a sweep touches every known
+/// session, and the sessions of one repository all report the same `cwd`, so
+/// the cache collapses N sessions into one `git` invocation — while a fresh
+/// instance each sweep keeps a path that has since appeared, moved, or become
+/// a git repository from being answered from a stale probe for the daemon's
+/// whole lifetime.
+///
+/// A poisoned cache mutex is recovered from rather than propagated: the map is
+/// a pure accelerator, and a panic mid-insert can leave it stale-but-valid at
+/// worst (the probe itself is a pure function of the path).
+#[derive(Default)]
+pub struct ProbingRootResolver {
+    probed: Mutex<HashMap<String, RequestRoot>>,
+}
+
+impl RootResolver for ProbingRootResolver {
+    fn resolve_root(&self, raw_worktree_root: Option<&str>) -> RequestRoot {
+        // No `cwd` in any of the batch's frames: nothing to probe, and spec
+        // 07 §5's "an unknown root imports with NULL worktree" applies
+        // literally.
+        let Some(raw) = raw_worktree_root else {
+            return RequestRoot::default();
+        };
+        let mut cache = self.probed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(raw) {
+            return hit.clone();
+        }
+        // A spool frame carries no repo hint — the hook writes a `cwd` and
+        // nothing else about identity (spec 07 §3's frame shape).
+        let root = RequestRoot {
+            worktree_root: probe(Path::new(raw)),
+            repo_hint: None,
+        };
+        cache.insert(raw.to_string(), root.clone());
+        root
     }
 }
 
@@ -332,6 +376,69 @@ mod tests {
                 "https://example.invalid/org/repo.git"
             ))
         );
+    }
+
+    /// D-063: a batch whose frames carry no `cwd` costs no probe at all and
+    /// answers exactly what the importer treated as universal before — an
+    /// unresolvable root.
+    #[test]
+    fn the_probing_resolver_answers_an_absent_root_without_probing() {
+        let resolver = ProbingRootResolver::default();
+        let root = resolver.resolve_root(None);
+        assert_eq!(root.worktree_root, None);
+        assert_eq!(root.repo_hint, None);
+        assert!(resolver.probed.lock().expect("cache").is_empty());
+    }
+
+    /// A path that no longer exists (a repository deleted after its session
+    /// was spooled) degrades to the same unresolvable root rather than
+    /// failing the import.
+    #[test]
+    fn the_probing_resolver_answers_a_vanished_root_as_unresolvable() {
+        let resolver = ProbingRootResolver::default();
+        let root = resolver.resolve_root(Some("/definitely/does/not/exist/xyz-123"));
+        assert_eq!(root.worktree_root, None);
+    }
+
+    /// The raw string is the cache key and the probe runs once for it: a sweep
+    /// over many sessions of one repository must not spawn one `git` per
+    /// session. Two *different* raw strings that snap to the same toplevel are
+    /// still two entries — the key is the frame's own `cwd`, deliberately not
+    /// the canonicalized answer (computing that is the probe).
+    #[test]
+    fn the_probing_resolver_probes_once_per_distinct_raw_root() {
+        if !git_available() {
+            eprintln!("skip: git not on PATH");
+            return;
+        }
+        let home = TempHome::new().expect("temp home");
+        let repo = home.join("repo");
+        let sub = repo.join("packages").join("api");
+        std::fs::create_dir_all(&sub).expect("create subdirectory");
+        git(&repo, &["init", "-q"]);
+
+        let resolver = ProbingRootResolver::default();
+        let repo_raw = repo.to_str().expect("utf-8 path");
+        let sub_raw = sub.to_str().expect("utf-8 path");
+
+        let first = resolver.resolve_root(Some(repo_raw));
+        let again = resolver.resolve_root(Some(repo_raw));
+        let from_sub = resolver.resolve_root(Some(sub_raw));
+
+        let facts = first.worktree_root.as_ref().expect("a real repo probes");
+        assert_eq!(facts.kind, WorktreeKind::Main);
+        assert_eq!(again.worktree_root, first.worktree_root);
+        // Both raw paths snap to the same worktree toplevel (probe's own
+        // behavior, `probing_from_a_subdirectory_snaps_to_the_toplevel`).
+        assert_eq!(
+            from_sub
+                .worktree_root
+                .as_ref()
+                .expect("a subdirectory probes")
+                .observed_canonical_path,
+            facts.observed_canonical_path
+        );
+        assert_eq!(resolver.probed.lock().expect("cache").len(), 2);
     }
 
     #[test]

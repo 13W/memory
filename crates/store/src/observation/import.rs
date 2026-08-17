@@ -14,21 +14,36 @@
 //! transitions"). [`super::SCHEMA_V7`] creates only the four observation
 //! tables; the memory tables are a separate, later migration.
 //!
-//! ## `RequestRoot` is injected, not computed
+//! ## Root resolution is injected, not computed
 //!
 //! Turning a frame's raw `worktree_root` (an uncanonicalized `cwd` string,
 //! spec 07 §2's as-built note) into a [`RequestRoot`] requires git probing —
 //! classifying `kind`, computing the common-dir/remote fingerprints — which
 //! `registry::resolve`'s own module doc assigns to "the daemon's job (T15)":
-//! `crates/store` carries no git dependency (architecture guardrail). Group
-//! 15 (daemon/CLI) has not started. So [`import_batch`] and
-//! [`import_session_tail`] accept an already-built `&RequestRoot` parameter —
-//! today's callers (this task's own tests, and any driver built before group
-//! 15 lands) pass `RequestRoot { worktree_root: None, repo_hint: None }`,
-//! which [`resolve`] turns into [`Resolution::GlobalOnly`] — this **is** spec
-//! 07 §5's "an unknown root imports with NULL worktree", not a stand-in for
-//! it. A future group-15 driver passes real git-probed facts through the same
-//! parameter without this module changing.
+//! `crates/store` carries no git dependency (architecture guardrail). So the
+//! probing itself stays outside this crate, injected as a [`RootResolver`]
+//! (D-063): [`import_session_tail`] hands the batch's own raw `worktree_root`
+//! to the resolver and passes the resulting `&RequestRoot` down to
+//! [`import_batch`], which resolves it against the registry inside the
+//! importing transaction. A plain [`RequestRoot`] is itself a `RootResolver`
+//! (a fixed answer that ignores the frame), which is what tests and any
+//! caller already holding probed facts pass.
+//!
+//! The resolver runs **before** the write transaction opens, not inside it:
+//! the daemon's implementation shells out to `git`, and a subprocess must
+//! never run while the store's single write connection is held.
+//!
+//! A root that cannot be probed (or a batch whose frames carry no `cwd` at
+//! all) still yields `RequestRoot { worktree_root: None, .. }`, which
+//! [`resolve`] turns into [`Resolution::GlobalOnly`] — this **is** spec 07
+//! §5's "an unknown root imports with NULL worktree", not a stand-in for it.
+//!
+//! Before D-063 both daemon drivers passed a fixed `RequestRoot::default()`
+//! and never looked at the frame's `worktree_root` at all, so *every*
+//! observation imported with NULL `repo_id`/`worktree_id` — NULL is what spec
+//! 07 §5 reserves for an *unknown* root, not the universal answer, and the
+//! memory router (which places `repository`-scoped entries from an
+//! observation's own `repo_id`) could consequently place nothing.
 //!
 //! ## Segment cleanup is not atomic with the commit
 //!
@@ -65,6 +80,30 @@ const DEDUP_WINDOW_MS: i64 = 10 * 60 * 1000;
 /// Best-effort dedup window, count side (spec 07 §5 `[SPEC]`): last 512
 /// envelopes of the session.
 const DEDUP_WINDOW_ENVELOPES: u32 = 512;
+
+/// Turns a batch's raw `worktree_root` (a frame's uncanonicalized `cwd`
+/// string) into the [`RequestRoot`] [`import_batch`] resolves against the
+/// registry — the seam spec 07 §5's "Envelope resolution at import:
+/// `worktree_root` → `worktree_id`/`repo_id` via registry" needs without
+/// `crates/store` growing a git dependency (see this module's doc; D-063).
+///
+/// Implemented by `local_rag::daemon::gitroot::ProbingRootResolver` on the
+/// daemon side, and by [`RequestRoot`] itself as a fixed answer that ignores
+/// the frame entirely.
+pub trait RootResolver {
+    /// `raw_worktree_root` is the first `worktree_root` present among the
+    /// batch's frames, or `None` when no frame carries one.
+    fn resolve_root(&self, raw_worktree_root: Option<&str>) -> RequestRoot;
+}
+
+/// A fixed root: whatever this `RequestRoot` already is, regardless of what
+/// the frames say. The right implementation for a caller that has already
+/// probed the facts itself, and for tests that need a deterministic answer.
+impl RootResolver for RequestRoot {
+    fn resolve_root(&self, _raw_worktree_root: Option<&str>) -> RequestRoot {
+        self.clone()
+    }
+}
 
 /// The outcome of importing one batch of already-decoded observations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -361,11 +400,15 @@ fn decode_pending_tail(
 /// segments this pass covers is imported in one [`import_batch`] call, and
 /// `observation_id`s are minted before that call (keeping entropy out of the
 /// write path).
+///
+/// `root_resolver` is consulted **once per batch** (spec 07 §5/§6, D-063)
+/// with the first `worktree_root` any of this batch's frames carries, and
+/// before the write transaction opens — see this module's doc.
 pub async fn import_session_tail(
     db: &StateDb,
     layout: &StoreLayout,
     session_id: &str,
-    request_root: &RequestRoot,
+    root_resolver: &(dyn RootResolver + Send + Sync),
     uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
     payload_ttl_hours: u64,
@@ -389,7 +432,17 @@ pub async fn import_session_tail(
                 .map(|_| uuids.next_uuid().to_string())
                 .collect();
             let session_id_owned = session_id.to_string();
-            let request_root_owned = request_root.clone();
+            // Once per batch, outside the transaction (module doc): every
+            // frame decoded in one pass belongs to one session, and a
+            // session's `cwd` does not change mid-batch. The first frame
+            // carrying a root wins — an envelope-only frame without one
+            // (nothing forces every event to report a `cwd`) must not make
+            // the whole batch unattributable.
+            let request_root_owned = root_resolver.resolve_root(
+                observations
+                    .iter()
+                    .find_map(|obs| obs.payload.worktree_root.as_deref()),
+            );
             let final_segment_seq = segment_seq;
             let final_offset = offset;
             db.writer()

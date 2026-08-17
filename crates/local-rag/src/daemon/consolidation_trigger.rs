@@ -80,13 +80,13 @@ use std::time::Duration;
 use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    ClassifiedFailure, ConsolidationWindow, GeneratedOp, ImportError, RequestRoot, RunOutcome,
-    SnapshotOutcome, StateDb, WriteError, has_unconsolidated_checkpoint, import_session_tail,
-    known_spool_sessions, open_next_run, pending_backlog, run_once, session_idle_since,
-    sessions_with_pending_backlog,
+    ClassifiedFailure, ConsolidationWindow, GeneratedOp, ImportError, RunOutcome, SnapshotOutcome,
+    StateDb, WriteError, has_unconsolidated_checkpoint, import_session_tail, known_spool_sessions,
+    open_next_run, pending_backlog, run_once, session_idle_since, sessions_with_pending_backlog,
 };
 use tokio::sync::oneshot;
 
+use super::gitroot::ProbingRootResolver;
 use super::jobs::{JobKind, JobRegistry};
 use super::resume::{log_resume_sweep, resume_stale_consolidation_runs};
 
@@ -203,7 +203,11 @@ where
         session_set.extend(sessions_with_pending_backlog(&read).unwrap_or_default());
     }
     let sessions: Vec<String> = session_set.into_iter().collect();
-    let request_root = RequestRoot::default();
+    // D-063: one resolver per tick — every session of one repository reports
+    // the same `cwd`, so the memoization collapses them into a single `git`
+    // probe, while a per-tick instance keeps a path that has since appeared or
+    // moved from being answered from a stale probe forever.
+    let root_resolver = ProbingRootResolver::default();
     let mut results = Vec::with_capacity(sessions.len());
 
     for session_id in sessions {
@@ -213,7 +217,7 @@ where
                 db,
                 layout,
                 &session_id,
-                &request_root,
+                &root_resolver,
                 uuids,
                 now_ms,
                 params.payload_ttl_hours,
@@ -413,8 +417,8 @@ mod tests {
     use local_rag_core::identity::{Uuid, uuidv7_from};
     use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
     use local_rag_store::{
-        LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, NewConsolidationRun, RunState, acquire_lease,
-        create_consolidation_run, transition_run,
+        LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, NewConsolidationRun, RequestRoot, RunState,
+        acquire_lease, create_consolidation_run, transition_run,
     };
     use local_rag_test_support::TempHome;
     use std::sync::atomic::{AtomicU64, Ordering};
