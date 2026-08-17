@@ -624,7 +624,7 @@ local-rag index <path> | reindex | watch          # watch: standalone process, s
 local-rag project add|remove|enable|disable|list|status|reindex <path>   # daemon-managed, see §8
 local-rag repo list | repo attach <repo_id> [--path P] [--worktree <id>] | worktree list
 local-rag rebuild --worktree <id> [--fts] [--dense]
-local-rag memory list|approve|reject|edit|retract|merge|evidence …
+local-rag memory list|approve|reject|edit|retract|merge|rescope|evidence …
 local-rag inspect <observation|memory|generation> <id>
 local-rag export [--scope …] | purge [--memory <id>|--session <id>|--all]
 local-rag gc [--dry-run]
@@ -743,6 +743,22 @@ the one-line sketch above:
   `src/observation/payload_ttl.rs` — T06-03, D-007, D-011, T13-05, T14-05) is already-established,
   already-gated retention/GC behavior (specs 05 §8, 07 §6, 12 §3) with its own `dry_run` parameter;
   this task is their first production caller, not new destructive surface.
+
+Amendment (X-009, `[SPEC]`): the subcommand list above gains **`memory rescope <memory_id>
+--expected-version N --scope global|repository|worktree [--root <path>]`** — moving an entry
+between scopes, implemented as `apply_supersede` with a new `(scope_kind, scope_owner_id)` and
+everything else carried over. Scope is deliberately not an `edit` patch field (08 §3): it is half
+of an entry's `(scope_kind, scope_owner_id, canonical_key)` identity, and `supersede` is the op
+that already takes a new scope, so this is an adapter, not a new store primitive. The move stays
+inside the ledger — one transaction, ordinary audit rows, the original preserved as `superseded`
+with the successor's `supersedes_id` pointing back at it — and evidence rows stay on the original
+rather than being duplicated onto the successor, which would double-count the same observations as
+independent support. A `repository`/`worktree` target whose `--root` does not resolve is a typed
+refusal, never a quiet `global` write (the same rule D-064 established for `remember`), and a
+target scope the entry already occupies is an idempotent no-op that mints no successor. Motivated
+by cleanup after D-063/D-064: entries written from an unindexed worktree had accumulated in
+`global`, and the only alternative for moving them was editing `state.sqlite` by hand, outside the
+audit ledger.
 
 As-built note (T16-02, `[SPEC]`, D-025). `inspect <observation|memory|generation> <id>`, `export
 [--scope …]`, and `purge [--memory <id>|--session <id>|--all]` are implemented in
