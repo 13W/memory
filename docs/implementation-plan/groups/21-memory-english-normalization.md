@@ -96,6 +96,36 @@ spec 10 §3; spec 12 §2/§4 `[FIXED]` (untrusted-текст, purge); spec 14 §
 - **Приёмка:** regression-тест красный до правки и зелёный после; строка `D-067` переведена в
   `resolved`.
 
+## D-069 — Детерминированный отказ apply уходит в дедлеттер, а не крутит модель вечно
+
+- **Зависит от:** `T21-00` (только регистрацией строки в `DEVIATIONS.md`). Ортогональна остальным
+  карточкам группы: трогает consolidation-раннер, а не нормализацию.
+- **Спецификация:** spec 08 §4 (шаги 4–5 и as-built заметки T14-07/D-047/D-050/D-051); spec 04 §4
+  (`stale_runs`/`retry_run`, аренда); spec 12 §4 (вывод модели — недоверенные данные).
+- **Результат:** окно, чей ответ роутера содержит повторённый `observation_id`, применяется с
+  первой попытки; любой детерминированно воспроизводимый отказ apply уходит в дедлеттер за
+  ограниченное число попыток, а не крутит локальную модель бесконечно.
+- **В scope:** дедупликация `evidence_observation_ids` с сохранением порядка внутри `apply_run` для
+  обеих веток (`ProposeCandidate`, `runner.rs:359-384`; `Materialize` через `resolve_evidence`,
+  `runner.rs:253-288`) — store-примитивы `propose_candidate`/`insert_candidate_evidence` при этом
+  не меняются; `RunOutcomeError::Write(WriteError::Sqlite(_))` с нарушением constraint'а
+  классифицируется `Mechanical`, а не `Transient` (`runner.rs:705-721`); потолок для `Transient` —
+  N подряд одинаковых `last_failure_fingerprint` уводят ран в дедлеттер; as-built правка заметки
+  D-050 в `docs/specification/08-memory.md` §4.
+- **Не в scope:** нормализация текста и вся остальная группа 21; промпт и поведение роутера;
+  churn индексации; уровни логирования; ретеншн поколений.
+- **Тесты:** regression — роутер отдаёт `ProposeCandidate` с дважды повторённым `observation_id`
+  ⇒ `run_once` = `Applied`, в `candidate_evidence` ровно одна строка (тест обязан падать на
+  текущем коде); то же для `Materialize` против `memory_evidence`; classification — constraint-
+  нарушение из write-транзакции ⇒ `FailureKind::Mechanical`, `next_retry_at` не выставляется,
+  `stale_runs` при том же `BUILD_ID` ран не возвращает; страховка — N подряд одинаковых
+  транзиентных fingerprint'ов ⇒ ран перестаёт быть retry-eligible; идемпотентность — повторный
+  apply того же окна не создаёт вторую строку evidence.
+- **Приёмка:** regression-тесты красные до правки и зелёные после; на живом сторе владельца ран
+  `01a01648-…` применяется с первой попытки после рестарта демона, и за 10 минут в
+  `logs/daemon.<дата>.log` нет ни одной строки `consolidation resume run … failed`; строка `D-069`
+  в `DEVIATIONS.md` переведена в `resolved`.
+
 ## T21-01 — Схема v14 `memory_text_normalization` + репозиторные операции
 
 - **Зависит от:** `T21-00`.
