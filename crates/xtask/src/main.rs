@@ -16,6 +16,12 @@
 //! T14-07). Also **not** part of `ci`: it needs the installed GGUF weights
 //! and the `llama-cpp-2` toolchain (ADR-0006).
 //!
+//! `cargo xtask memory-recall-bench` runs the memory-recall retrieval-quality
+//! benchmark (spec 08 §6, X-010) — Hit@K/MRR over a bilingual fixture corpus,
+//! the counterpart `memory-bench` never provided (that one scores the
+//! consolidation router, not recall). Also **not** part of `ci`: it needs the
+//! installed ONNX weights, same catalog entry `bench` uses.
+//!
 //! `cargo xtask release-report` assembles the versioned release report for
 //! spec 14 §2's 9 acceptance gates (T17-05, see [`release_report`]'s own
 //! module doc). Also **not** part of `ci`: it needs everything `bench` and
@@ -31,6 +37,7 @@ mod bench;
 mod dist_ort;
 mod git;
 mod memory_bench;
+mod memory_recall_bench;
 mod release_report;
 mod stats;
 
@@ -45,10 +52,13 @@ fn main() -> ExitCode {
         Some("ci") => run_ci(),
         Some("bench") => run_bench(),
         Some("memory-bench") => run_memory_bench(),
+        Some("memory-recall-bench") => run_memory_recall_bench(),
         Some("release-report") => run_release_report(),
         Some("dist-ort") => dist_ort::run(),
         other => {
-            eprintln!("usage: cargo xtask <ci|bench|memory-bench|release-report|dist-ort>");
+            eprintln!(
+                "usage: cargo xtask <ci|bench|memory-bench|memory-recall-bench|release-report|dist-ort>"
+            );
             eprintln!("unknown task: {}", other.unwrap_or("<none>"));
             ExitCode::from(2)
         }
@@ -308,6 +318,91 @@ fn run_memory_bench() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// `cargo xtask memory-recall-bench [--corpus <path>] [--model <catalog-id>] [--out <path>]`
+fn run_memory_recall_bench() -> ExitCode {
+    let mut corpus_path: Option<PathBuf> = None;
+    let mut model_id: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--corpus" => corpus_path = args.next().map(PathBuf::from),
+            "--model" => model_id = args.next(),
+            "--out" => out = args.next().map(PathBuf::from),
+            other => {
+                eprintln!("unknown argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let corpus_path = corpus_path.unwrap_or_else(memory_recall_bench::corpus_fixture_path);
+    let out = out.unwrap_or_else(|| memory_recall_bench::baseline_dir().join("run.json"));
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("memory-recall-bench: tokio runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match runtime.block_on(memory_recall_bench::run::run(
+        &memory_recall_bench::run::Options {
+            corpus_path,
+            model_id,
+        },
+    )) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("memory-recall-bench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some(parent) = out.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("memory-recall-bench: creating {}: {e}", parent.display());
+        return ExitCode::FAILURE;
+    }
+    let json = serde_json::to_string_pretty(&report).expect("report serializes");
+    if let Err(e) = std::fs::write(&out, json + "\n") {
+        eprintln!("memory-recall-bench: writing {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+    let md_path = out.with_extension("report.md");
+    if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
+        eprintln!("memory-recall-bench: writing {}: {e}", md_path.display());
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "memory-recall-bench: wrote {} and {}",
+        out.display(),
+        md_path.display()
+    );
+    eprintln!(
+        "[memory-recall-bench] config={} Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (n={})",
+        report.provenance.config,
+        report.metrics.hit_at_1,
+        report.metrics.hit_at_3,
+        report.metrics.hit_at_5,
+        report.metrics.mrr,
+        report.metrics.query_count,
+    );
+    for (pair, m) in &report.metrics_by_lang_pair {
+        eprintln!(
+            "[memory-recall-bench]   {pair}: Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (n={})",
+            m.hit_at_1, m.hit_at_3, m.hit_at_5, m.mrr, m.query_count,
+        );
+    }
+
+    // No gate yet — this benchmark has no prior baseline to gate against (see
+    // this task's own module doc: the run *is* the evidence a future
+    // threshold would be derived from, O2's "collect metrics, never invent
+    // thresholds").
+    ExitCode::SUCCESS
 }
 
 /// `cargo xtask release-report --corpus <dir> [--subdir <rel>] [--memory-corpus <path>]`
