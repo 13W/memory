@@ -370,6 +370,33 @@ spec 10 §3; spec 12 §2/§4 `[FIXED]` (untrusted-текст, purge); spec 14 §
 - **Приёмка:** либо реализация с тестами, либо строка решения владельца в `PROGRESS.md` и
   `DEVIATIONS.md` с обоснованием по числам `T21-09`.
 
+## D-071 — Залипший consolidation-ран виден в `stats` и `doctor`
+
+- **Зависит от:** `T21-00` (только регистрацией строки в `DEVIATIONS.md`). С `D-069` пересекается
+  предметной областью, но не кодом: `D-069` меняет политику ретраев, эта карточка — только вывод.
+- **Спецификация:** spec 02 §6 («nothing degrades silently»); spec 11 §2 (`stats`, as-built D-049);
+  spec 11 (`doctor` как health report); spec 08 §4 (as-built D-050 — источник полей).
+- **Результат:** ран, который ретраится десятками попыток или ушёл в дедлеттер, видно без `sqlite3`
+  и без grep'а по логам — числом в `stats` и отдельным issue в `doctor`.
+- **В scope:** store-примитив рядом с `consolidation_run_counts`, отдающий проблемные раны
+  (`attempt_count` выше порога; дедлеттер = `mechanical` + fingerprint текущего `BUILD_ID`) с
+  `run_id`, `session_id`, окном и усечённым `last_failure_reason`; вывод в обеих реализациях
+  `stats` — CLI (`crates/local-rag/src/cli/stats.rs`, human + JSON) и MCP `StatsResult`
+  (`crates/local-rag/src/daemon/mcp/memory.rs`); секция consolidation в `doctor`
+  (`crates/local-rag/src/cli/doctor.rs`), влияющая на итоговый «issues found» так же, как уже
+  влияет `STUCK:` у индексации.
+- **Не в scope:** сама политика ретраев и классификация отказов (это `D-069`); churn индексации;
+  экраны TUI; уровни логирования и объём `logs/daemon.<дата>.log` (уровень `debug` — осознанная
+  настройка владельца в `config.toml`, не отклонение).
+- **Тесты:** store-примитив на фикстуре с ранами в разных состояниях (`applied`, `failed` с малым
+  и большим `attempt_count`, дедлеттер с совпадающим и с чужим fingerprint) — порог и границы;
+  `crates/local-rag/tests/cli_stats.rs` — залипший ран присутствует и в human-выводе, и в JSON;
+  doctor-тест — секция consolidation появляется и переводит отчёт в «issues found»; MCP-тест на
+  `StatsResult` (та же дублирующаяся поверхность, что и в D-049).
+- **Приёмка:** на фикстуре, воспроизводящей инцидент `D-069` (`attempt_count` в сотнях,
+  `last_failure_kind='mechanical'`, fingerprint текущего билда), `stats` и `doctor` показывают ран
+  без единого ручного SQL-запроса; строка `D-071` в `DEVIATIONS.md` переведена в `resolved`.
+
 ## G21 — Сверка English normalization
 
 - **Зависит от:** `T21-00…T21-10`.
