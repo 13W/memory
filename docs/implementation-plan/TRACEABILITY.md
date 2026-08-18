@@ -7,16 +7,16 @@
 | --- | --- | --- | --- |
 | 01 Overview, correctness budget, identity ladders | G00, G02, G03 | G17 | — |
 | 02 Architecture/lifecycle/locking | G01, G09, G15 | G17, G20 | — |
-| 03 Data model/DDL/hash rules | G01–G04, G07, G08, G11, G13, G14 | G17 schema lint | — |
+| 03 Data model/DDL/hash rules | G01–G04, G07, G08, G11, G13, G14 | G17 schema lint, G21 | — |
 | 04 State machines | G05, G07, G11, G14 | G15, G17 | — |
 | 05 Projection protocol | G07, G09, G10 | G11, G12, G17 | — |
 | 06 Reconcile/FTS/GC | G05, G06, G08 | G12, G17, G20 | — |
 | 07 Observation spool | G13 | G15, G17 | — |
-| 08 Memory | G14 | G15, G16, G17 | `fixtures/memory/baseline/run-2026-07-29-g14-verify.json` |
+| 08 Memory | G14 | G15, G16, G17, G21 | `fixtures/memory/baseline/run-2026-07-29-g14-verify.json` |
 | 09 Search | G12 | G15, G17 | `fixtures/search/baseline/run-v2-2026-07-27-g12-verify.{json,report.md}` |
-| 10 Models/embeddings | G10, G11 | G12, G17 | ADR-0004/0005/0006 |
+| 10 Models/embeddings | G10, G11 | G12, G17, G21 | ADR-0004/0005/0006 |
 | 11 Interfaces | G15 | G17 | — |
-| 12 Security/privacy | G03, G13, G14, G16 | G17 | — |
+| 12 Security/privacy | G03, G13, G14, G16 | G17, G21 | — |
 | 13 Distribution/migrations | G01, G17 | G17 | `fixtures/release/run-2026-08-05.{json,report.md}`; release tag `0.0.0` CI matrix run (D-029) |
 | 14 Acceptance/testing | каждый GNN | G17 | `fixtures/release/run-2026-08-05.{json,report.md}` (O2 numbers) |
 | 15 Roadmap/MVP/open questions | G00 и каждый GNN | G17 | см. «Open questions» ниже |
@@ -54,3 +54,12 @@ ADR-ом в каждом случае, когда выбран тяжёлый п
 scope (daemon-hosted background workers) уже была `[FIXED]` в spec 02 §1's топологии и не
 реализована ни одной карточкой (гейт `G20`, `groups/20-daemon-managed-indexing.md`), что ADR
 регистрирует как `D-043`, а не как новую scope.
+
+Третий прецедент — `docs/adr/0010-memory-english-normalization.md`: та же планка «явное продуктовое
+решение», scope снова полностью новая (ни `idea.md` rev 6, ни спецификация, ни план до этого ADR не
+говорят, на каком языке хранится и ищется durable-память), и снова многочастная — схема, эффективный
+текст, детектор, переводчик, порядок записи, фоновый воркер, privacy-поверхности, наблюдаемость и
+измерение отдельно тестируемы. Реализуется группой `21` с гейтом `G21`
+(`groups/21-memory-english-normalization.md`); попутно ADR регистрирует два дефекта, найденных при
+планировании, — `D-067` (плотная нога recall'а произвольно теряет кандидатов) и `D-068` (бенч
+memory-recall недетерминирован), — как deviations, а не как новую scope.
