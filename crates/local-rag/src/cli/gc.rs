@@ -1,5 +1,8 @@
 //! `local-rag gc [--dry-run]` (spec 11 §6, D-025) — the first production
-//! wiring of six already-built, already-tested sweeps: orphan shard dirs
+//! wiring of already-built, already-tested sweeps: the generation retention
+//! sweep (T06-02, added by D-066 — until then this command ran every sweep
+//! *except* the one spec 06 §5 is about, and `run_sweep` had no caller at all
+//! outside its own tests), orphan shard dirs
 //! (T06-03), expired detached/removing shard dirs (D-007), unreferenced
 //! model-space shard dirs (D-011), dead spool sessions (T13-05), expired
 //! `observation_payload` rows (T13-05), and stale `pending_memory_candidate`
@@ -14,12 +17,13 @@
 use std::process::ExitCode;
 
 use local_rag_store::{
-    CANDIDATE_EXPIRY_MS, SHARD_DESTROY_GRACE_MS, SPOOL_SESSION_ABSENCE_MS,
+    CANDIDATE_EXPIRY_MS, RetentionParams, SHARD_DESTROY_GRACE_MS, SPOOL_SESSION_ABSENCE_MS,
     run_candidate_expiry_sweep, run_expired_shard_sweep, run_orphan_shard_sweep,
     run_payload_ttl_sweep, run_spool_session_sweep, run_unreferenced_space_sweep,
 };
 
 use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
+use local_rag::gc::{plan_generation_sweep, run_generation_sweep};
 use local_rag::indexing::open_state;
 
 const BIN: &str = "local-rag";
@@ -34,7 +38,7 @@ pub struct GcArgs {
 pub fn run(args: GcArgs) -> ExitCode {
     let dry_run = args.dry_run;
 
-    let (layout, _config) = match resolve_layout_and_config() {
+    let (layout, config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
     };
@@ -44,6 +48,39 @@ pub fn run(args: GcArgs) -> ExitCode {
     };
     let now_ms = system_now_ms();
     let verb = if dry_run { "would remove" } else { "removed" };
+
+    // D-066: the generation sweep goes first — it is the one spec 06 §5 is
+    // actually about, and until D-066 this command ran every sweep except it.
+    // The retention policy comes from `[storage]`, exactly as the daemon's own
+    // startup sweep reads it, so the two callers cannot disagree.
+    let retention = RetentionParams::from_storage_config(&config.storage);
+    let generations = block_on(async {
+        if dry_run {
+            plan_generation_sweep(&state, &retention, now_ms)
+                .await
+                .map(|plan| (plan.candidate_generations.len() as u64, plan.would_delete))
+        } else {
+            run_generation_sweep(&state, &retention, now_ms)
+                .await
+                .map(|report| (report.generations, report))
+        }
+    });
+    let (swept_generations, rows) = match generations {
+        Ok(v) => v,
+        Err(e) => return fail(BIN, &format!("generation sweep failed: {e}")),
+    };
+    println!(
+        "generations: {verb} {swept_generations}, {} rows total",
+        rows.total()
+    );
+    println!(
+        "  occurrences {}, edges {}, generation_files {}, skipped_files {}",
+        rows.occurrences, rows.edges, rows.generation_files, rows.skipped_files
+    );
+    println!(
+        "  file_revisions {}, content_blobs {}, parsed_units {}, unresolved_references {}",
+        rows.file_revisions, rows.content_blobs, rows.parsed_units, rows.unresolved_references
+    );
 
     let orphan = match run_orphan_shard_sweep(&state, &layout, dry_run) {
         Ok(r) => r,

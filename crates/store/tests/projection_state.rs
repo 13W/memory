@@ -15,7 +15,7 @@ use local_rag_store::registry::{
     DEFAULT_MODEL_SPACE_ID, IllegalProjectionTransition, ProjectionInvariantViolation,
     ProjectionStateChange, ProjectionStateError, ProjectionStateRow, ProjectionStatus,
     allocate_generation, create_repository, create_worktree, insert_projection_state,
-    projection_state, write_projection_state,
+    projection_state, referenced_generation_ids, write_projection_state,
 };
 use local_rag_store::rusqlite::params;
 use local_rag_store::{StateDb, WorktreeKind};
@@ -371,4 +371,110 @@ async fn happy_path_one_axis_switch_walks_clean_updating_clean() {
     assert_eq!(row.active_model_space_id.as_deref(), Some(ms_b.as_str()));
     assert_eq!(row.target_generation_id, None);
     assert_eq!(row.target_model_space_id, None);
+}
+
+// ---------------------------------------------------------------------------
+// D-066: `referenced_generation_ids` — the retention sweep's external pin set.
+// A generation any of these three columns still names must never be swept: the
+// `DELETE` from `generation` would violate one of `worktree_projection_state`'s
+// foreign keys and roll the sweep batch back.
+// ---------------------------------------------------------------------------
+
+/// Set the three generation columns directly. Raw SQL rather than
+/// [`write_projection_state`] on purpose: the guarded writer enforces the
+/// one-axis-per-operation precondition and the two-axis invariants, which would
+/// make "all three columns naming a different generation at once" unreachable —
+/// but the *reader* must still be proven to look at all three.
+async fn set_generation_columns(
+    db: &StateDb,
+    worktree_id: &str,
+    active: Option<String>,
+    projected: Option<String>,
+    target: Option<String>,
+) {
+    let w = worktree_id.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE worktree_projection_state \
+                 SET active_generation_id = ?2, projected_generation_id = ?3, \
+                     target_generation_id = ?4 \
+                 WHERE worktree_id = ?1",
+                params![w, active, projected, target],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("set generation columns");
+}
+
+fn referenced(db: &StateDb) -> Vec<String> {
+    let read = db.open_read().expect("read conn");
+    referenced_generation_ids(&read)
+        .expect("read referenced generations")
+        .into_iter()
+        .collect()
+}
+
+#[tokio::test]
+async fn referenced_generations_reads_all_three_columns() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 1).await;
+    init(&db, &wt).await;
+    let a = allocate(&db, &wt, 10).await;
+    let p = allocate(&db, &wt, 11).await;
+    let t = allocate(&db, &wt, 12).await;
+
+    set_generation_columns(&db, &wt, Some(a.clone()), Some(p.clone()), Some(t.clone())).await;
+
+    let mut expected = vec![a, p, t];
+    expected.sort();
+    assert_eq!(
+        referenced(&db),
+        expected,
+        "active, projected and target all pin — reading only `active` would leave \
+         the switch-in-flight window unpinned"
+    );
+}
+
+#[tokio::test]
+async fn referenced_generations_skips_nulls_and_absent_rows() {
+    let (_home, db) = open_state();
+
+    // No projection-state row at all.
+    let bare = worktree(&db, 2).await;
+    assert!(referenced(&db).is_empty(), "no rows, no pins");
+
+    // A row with every generation column NULL (the state `init` creates).
+    init(&db, &bare).await;
+    assert!(
+        referenced(&db).is_empty(),
+        "all-NULL row contributes nothing"
+    );
+
+    // One column set: only that id.
+    let only = allocate(&db, &bare, 20).await;
+    set_generation_columns(&db, &bare, Some(only.clone()), None, None).await;
+    assert_eq!(referenced(&db), vec![only]);
+}
+
+#[tokio::test]
+async fn referenced_generations_unions_across_worktrees() {
+    let (_home, db) = open_state();
+    let one = worktree(&db, 3).await;
+    let two = worktree(&db, 4).await;
+    init(&db, &one).await;
+    init(&db, &two).await;
+    let g1 = allocate(&db, &one, 30).await;
+    let g2 = allocate(&db, &two, 31).await;
+    set_generation_columns(&db, &one, Some(g1.clone()), None, None).await;
+    set_generation_columns(&db, &two, None, Some(g2.clone()), None).await;
+
+    let mut expected = vec![g1, g2];
+    expected.sort();
+    assert_eq!(
+        referenced(&db),
+        expected,
+        "the pin set is store-wide: a generation pinned by any worktree survives"
+    );
 }

@@ -1,6 +1,8 @@
 //! `local-rag gc [--dry-run]` acceptance tests (spec 11 §6, D-025), driving
-//! the real compiled binary against real fixture rows/directories for all
-//! six wired sweeps. Unlike the store crate's own deterministic-clock unit
+//! the real compiled binary against real fixture rows/directories for every
+//! wired sweep — the original six, plus the generation retention sweep D-066
+//! added (until then this command ran every sweep except the one spec 06 §5 is
+//! actually about). Unlike the store crate's own deterministic-clock unit
 //! tests for each sweep (`crates/store/tests/housekeeping.rs`,
 //! `src/observation/payload_ttl.rs`), the CLI binary reads the *real* wall
 //! clock (`cli/mod.rs::system_now_ms`) — so every time-gated fixture here is
@@ -20,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
+use local_rag_store::registry::{GenerationState, transition_generation};
 use local_rag_store::{
     CANDIDATE_EXPIRY_MS, NewCandidate, RequestRoot, SHARD_DESTROY_GRACE_MS,
     SPOOL_SESSION_ABSENCE_MS, StateDb, WorktreeKind, WorktreeState, allocate_generation,
@@ -62,6 +65,11 @@ fn real_now_ms() -> i64 {
 /// drift between seeding and the CLI subprocess actually running can never
 /// flip a fixture from "due" to "not yet due".
 const HEADROOM_MS: i64 = 60 * 60 * 1_000;
+
+/// The default `[storage].retired_generations_ttl_h` (168 h) in milliseconds —
+/// the CLI reads the real config, so a generation must be seeded older than this
+/// to fall outside the retention window (D-066).
+const RETENTION_WINDOW_MS: i64 = 168 * 60 * 60 * 1_000;
 
 fn uuid(seed: u8) -> String {
     let mut rand = [0u8; 10];
@@ -189,6 +197,40 @@ async fn seed_all_six(db: &StateDb, layout: &StoreLayout) {
         r
     };
 
+    // 0. D-066's generation sweep: three `retiring` generations on their own
+    //    worktree, all created well past the default 168h retention window, so
+    //    the window pins none of them and `keep_last_k = 2` pins exactly the two
+    //    highest-numbered — leaving the oldest as the single sweep candidate.
+    //    Deliberately more than one: "removed 1" out of three proves the
+    //    retention policy is being applied, not that the sweep just took
+    //    whatever it found.
+    let wt_retired = uuid(12);
+    {
+        let (r, w) = (repo.clone(), wt_retired.clone());
+        db.writer()
+            .transaction(move |tx| create_worktree(tx, &w, &r, WorktreeKind::Main, 1000))
+            .await
+            .expect("create worktree");
+    }
+    let stale_at = real_now_ms() - RETENTION_WINDOW_MS - HEADROOM_MS;
+    for seed in [70u8, 71, 72] {
+        let (w, g) = (wt_retired.clone(), uuid(seed));
+        db.writer()
+            .transaction(move |tx| {
+                allocate_generation(tx, &w, &g, stale_at)?;
+                for to in [
+                    GenerationState::ProjectionReady,
+                    GenerationState::Active,
+                    GenerationState::Retiring,
+                ] {
+                    transition_generation(tx, &g, to)?.expect("legal transition");
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed retiring generation");
+    }
+
     // 1. Orphan shard dir (no worktree row at all).
     make_shard(layout, "orphan-shard");
 
@@ -301,6 +343,10 @@ async fn dry_run_reports_all_six_conditions_and_changes_nothing() {
     let output = run_cli(&home, &["gc", "--dry-run"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let text = stdout(&output);
+    assert!(
+        text.contains("generations: would remove 1"),
+        "the generation sweep (D-066) must be reported first: {text}"
+    );
     assert!(text.contains("orphan shard dirs: would remove 1"), "{text}");
     assert!(
         text.contains("expired shard dirs: would remove 1"),
@@ -339,6 +385,7 @@ async fn a_real_run_removes_all_six_and_a_second_run_is_a_no_op() {
     let output = run_cli(&home, &["gc"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let text = stdout(&output);
+    assert!(text.contains("generations: removed 1"), "{text}");
     assert!(text.contains("orphan shard dirs: removed 1"), "{text}");
     assert!(text.contains("expired shard dirs: removed 1"), "{text}");
     assert!(
@@ -362,6 +409,10 @@ async fn a_real_run_removes_all_six_and_a_second_run_is_a_no_op() {
     let second = run_cli(&home, &["gc"]);
     assert_eq!(second.status.code(), Some(0), "{second:?}");
     let text = stdout(&second);
+    assert!(
+        text.contains("generations: removed 0"),
+        "a second sweep has nothing left to collect: {text}"
+    );
     assert!(text.contains("orphan shard dirs: removed 0"), "{text}");
     assert!(text.contains("expired shard dirs: removed 0"), "{text}");
     assert!(

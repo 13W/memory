@@ -34,6 +34,7 @@
 pub mod consolidation_trigger;
 pub mod embedder_provider;
 pub mod error;
+pub mod gc;
 pub mod gitroot;
 pub mod handshake;
 pub mod idle;

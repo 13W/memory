@@ -417,6 +417,37 @@ groups (14/16), so today the mark reduces to the generation-state and `K`/`T` ro
 `[OPEN: O6]`, read from `[storage].retired_generations_keep` / `retired_generations_ttl_h`
 (provisional defaults `2` / `168 h`, not normative).
 
+As-built note (D-066, `[SPEC]`): the sweep **has callers**. Until D-066
+`run_sweep`/`plan_sweep` were reachable only from `crates/store/tests/retention.rs`, so a
+running system never collected: the reporter's store held 3396 `retiring` generations and had
+grown to 15 GB. Two callers now exist, sharing `local_rag::gc` so they cannot disagree about what
+is sweepable — a background job at daemon startup (`local_rag::daemon::gc`, tracked as
+`JobKind::Gc` so §4.3's idle-shutdown gate will not fire mid-sweep) and `local-rag gc`, whose
+`--dry-run` is `plan_sweep`. Startup is a **product decision**, not a reading of this section:
+"Metrics that drive (not schedule) maintenance" leaves the schedule open, and the policy the
+sweep enforces still comes from `[storage].retired_generations_keep`/`retired_generations_ttl_h`.
+The job is spawned, never awaited before readiness — a first sweep over a backlog is long, and
+blocking `daemon ready` on it would exhaust the proxy's connect budget (13 §2) on exactly the
+stores that most need collecting. A failed sweep is a warning, never fatal: `run_sweep` is
+idempotent and resumable, so the next start retries.
+
+This also **corrects point 5 of the T06-01 note above**. It expected groups 14/16 to populate
+`ExternalPins` with "memory evidence / audit / export references". As built they do not:
+`memory_evidence` references `observation_envelope(observation_id)` (03 §2.4), and no memory,
+audit, or export table foreign-keys `generation` or `file_revision` at all. The one table that
+does is `worktree_projection_state`, through `active_`/`projected_`/`target_generation_id` (03
+§2.2) — so that is the whole external pin set, read store-wide by
+`local_rag_store::referenced_generation_ids`. All three columns pin, for the same reason
+`referenced_model_space_ids` reads all three of its own: 05 §5's write-ahead commits the target
+tuple *before* any backend mutation, and a `projected` id keeps being referenced after the
+registry has already moved that generation to `retiring`. Sweeping a generation the table still
+names would violate its foreign key and roll the batch back. `JobLease` pins stay empty — that
+subsystem does not exist, and the candidate rule (`state ∈ {retiring, failed}`) already excludes
+whatever an in-flight indexing cycle is writing.
+
+Not addressed here, and deliberately: the file does not shrink on its own after a sweep —
+`VACUUM`/checkpoint remains this section's metric-driven policy, a separate concern.
+
 As-built note (T06-02, `[SPEC]`): the **sweep phase** — the batched, mutating deletion — is
 `local_rag_store::retention::{run_sweep, plan_sweep}` over the mark phase above. It walks the
 delete order verbatim (occurrences/edges → generation_file/skipped_file → generation → then the
