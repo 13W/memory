@@ -44,10 +44,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use local_rag_core::config::DataPolicy;
-use local_rag_core::identity::{SystemUuidV7, UuidSource};
+use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_embed::{
     BackfillParams, EmbedRequest, Embedder, InFlight, ProviderEntry, ProviderPool, run_backfill,
@@ -85,6 +86,38 @@ const RECALL_TOKEN_BUDGET: u32 = 100_000;
 
 const WARMUP_PASSES: usize = 1;
 const TIMED_PASSES: usize = 3;
+
+/// A seeded, deterministic [`UuidSource`] (D-068).
+///
+/// The harness used to mint `memory_id`s with [`local_rag_core::identity::
+/// SystemUuidV7`], whose entropy comes from the OS CSPRNG. Spec 08 §6 breaks a
+/// score tie by `created_at desc` and then by `memory_id`, so with every entry
+/// seeded at one instant the last resort decided real rankings — and decided
+/// them differently on every run. Two runs of the *same* configuration were
+/// therefore not byte-comparable, and two different configurations could
+/// diverge on a query whose inputs were identical (which is exactly what
+/// `store_en` and `both_en` did on `mrq-13`, the `en-en` pair where both the
+/// stored text and the query are the same string in either configuration).
+/// A benchmark whose output moves without its input is not evidence, so the
+/// source is seeded here and `created_at` is made distinct at the call site.
+struct SeqUuidV7 {
+    counter: AtomicU64,
+}
+
+impl SeqUuidV7 {
+    fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+        }
+    }
+}
+
+impl UuidSource for SeqUuidV7 {
+    fn next_uuid(&self) -> Uuid {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        uuidv7_from(1_000_000 + n, [0xCD; 10])
+    }
+}
 
 /// Which fixture text variant feeds the store and which feeds the query
 /// (X-011). See the module doc's "four configurations" section.
@@ -272,20 +305,28 @@ async fn run_one_config(
     let state = StateDb::open(layout.state_db()).map_err(|e| format!("state: {e}"))?;
     let cache = CacheDb::open(layout.cache_db(), "memory-recall-bench")
         .map_err(|e| format!("cache: {e}"))?;
-    let uuids = SystemUuidV7;
+    let uuids = SeqUuidV7::new();
     let now_ms = 1_000;
 
     register_memory_representation(&state, embedder.as_ref(), now_ms).await?;
 
     let mut memory_id_by_corpus_id: BTreeMap<String, String> = BTreeMap::new();
-    for corpus_entry in &corpus.entries {
+    for (i, corpus_entry) in corpus.entries.iter().enumerate() {
         let memory_id = uuids.next_uuid().to_string();
+        // D-068: one distinct `created_at` per entry, in corpus order. Spec
+        // 08 §6's final ordering is `(score desc, created_at desc, memory_id)`,
+        // so seeding every entry at the same instant pushed every tie down to
+        // `memory_id` — which, minted from the clock and the OS CSPRNG, made
+        // the run's own output depend on entropy. Distinct timestamps let the
+        // documented tie-break do the deciding, and the seeded source below
+        // makes even the last resort reproducible.
+        let created_at = now_ms + i as i64;
         seed_entry(
             &state,
             &memory_id,
             corpus_entry,
             config.store_text(corpus_entry),
-            now_ms,
+            created_at,
         )
         .await?;
         memory_id_by_corpus_id.insert(corpus_entry.id.clone(), memory_id);
@@ -508,6 +549,7 @@ fn tempdir() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_recall_bench::corpus::Relevance;
     use local_rag_store::CacheDb;
     use local_rag_test_support::TempHome;
 
@@ -581,7 +623,7 @@ mod tests {
         layout.ensure().expect("ensure store tree");
         let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
         let cache = CacheDb::open(layout.cache_db(), "test").expect("open cache.sqlite");
-        let uuids = SystemUuidV7;
+        let uuids = SeqUuidV7::new();
         let now_ms = 1_000;
 
         let entries = vec![
@@ -672,7 +714,7 @@ mod tests {
         layout.ensure().expect("ensure store tree");
         let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
         let cache = CacheDb::open(layout.cache_db(), "test").expect("open cache.sqlite");
-        let uuids = SystemUuidV7;
+        let uuids = SeqUuidV7::new();
         let now_ms = 1_000;
 
         let bilingual = entry(
@@ -720,6 +762,92 @@ mod tests {
             Some(1),
             "the English query must match the stored text — it only can if store_en actually \
              persisted the English variant, since the Russian original shares no tokens with it"
+        );
+    }
+
+    /// D-068. Two runs of one configuration, same corpus, same embedder, must
+    /// produce the same report — the property the harness lacked, and without
+    /// which no two configurations can be honestly compared.
+    #[tokio::test]
+    async fn two_runs_of_one_config_agree_on_every_query() {
+        let corpus = Corpus {
+            family: "memory-recall".to_string(),
+            version: "test".to_string(),
+            relevance: Relevance {
+                kind: "single-relevant".to_string(),
+                graded: false,
+                judgments_per_query: 1,
+            },
+            metrics: vec![
+                "hit@1".to_string(),
+                "hit@3".to_string(),
+                "hit@5".to_string(),
+                "mrr".to_string(),
+            ],
+            // Deliberately near-identical texts: with one shared `created_at`
+            // these tie on score, which is precisely when the old harness fell
+            // through to a random `memory_id` and stopped being reproducible.
+            entries: vec![
+                entry(
+                    "mr-1",
+                    "fact",
+                    "shared token payload",
+                    "shared token payload",
+                ),
+                entry(
+                    "mr-2",
+                    "fact",
+                    "shared token payload",
+                    "shared token payload",
+                ),
+                entry(
+                    "mr-3",
+                    "fact",
+                    "shared token payload",
+                    "shared token payload",
+                ),
+            ],
+            queries: vec![
+                query(
+                    "mrq-1",
+                    "mr-1",
+                    "shared token payload",
+                    "shared token payload",
+                ),
+                query(
+                    "mrq-2",
+                    "mr-2",
+                    "shared token payload",
+                    "shared token payload",
+                ),
+            ],
+        };
+        let model = find(DEFAULT_MODEL_ID).expect("catalog entry");
+        let corpus_path = std::path::Path::new("fixtures/memory-recall/corpus.json");
+
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let embedder: Arc<dyn Embedder> = Arc::new(local_rag_embed::HashingEmbedder::new(
+                local_rag_store::registry::RepresentationKind::Memory,
+            ));
+            runs.push(
+                run_one_config(&corpus, model, embedder, Config::Baseline, 0, corpus_path)
+                    .await
+                    .expect("run"),
+            );
+        }
+
+        // `latency` is wall-clock and provenance carries the run's own paths;
+        // everything that describes *what was retrieved* must match exactly,
+        // `top_result_id` included — that field is a minted `memory_id`, and it
+        // is the one the old `SystemUuidV7` made vary between runs.
+        assert_eq!(runs[0].per_query, runs[1].per_query);
+        assert_eq!(runs[0].metrics, runs[1].metrics);
+        assert_eq!(runs[0].metrics_by_lang_pair, runs[1].metrics_by_lang_pair);
+        assert!(
+            runs[0].per_query.iter().all(|q| q.top_result_id.is_some()),
+            "the fixture is built so every query retrieves something; an empty \
+             result would make the comparison vacuous"
         );
     }
 }
