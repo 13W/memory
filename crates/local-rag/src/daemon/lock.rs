@@ -16,6 +16,18 @@
 //! few microseconds after our failed `try_lock`. A crashed prior daemon
 //! cannot leave a "stale but still flock'd" lock file behind.
 //!
+//! That property is load-bearing, not just explanatory (D-065): because the
+//! failure branch implies a live holder, an *unreadable* record found there
+//! cannot be a crashed owner's leftovers — it is a live owner that has not
+//! written its record yet, or is rewriting it. So the failure branch reclaims
+//! only against a record it could parse and then prove dead; recovery from a
+//! torn write belongs to the success branch, which simply overwrites it.
+//! Getting this wrong is not a cosmetic bug: reclaiming unlinks the path the
+//! live owner's `flock` is *not* attached to (the lock lives on the open file
+//! description), so both instances end up believing they own the store — see
+//! `is_owner_alive`'s own comment, and the two daemons that did exactly this
+//! on the reporter's machine before this rule existed.
+//!
 //! The store's UDS socket file has no such auto-cleanup: `run/daemon.sock`
 //! left by a `SIGKILL`ed daemon is a plain filesystem entry that persists
 //! until removed, and a fresh `UnixListener::bind` at the same path fails
@@ -174,15 +186,20 @@ impl std::error::Error for StoreLockError {
 /// 2. On success: this instance is the sole owner. Best-effort remove any
 ///    orphaned socket file left by a crashed prior owner, write fresh lock
 ///    info, and return.
-/// 3. On `WouldBlock`: read the existing lock JSON (a parse failure is
-///    treated identically to "stale, unknown owner" — never a hard error,
-///    since a torn write from a crash is exactly the scenario this recovery
-///    exists for) and run `probe` against its `(pid, instance_uuid)`.
+/// 3. On `WouldBlock`: read the existing lock JSON and run `probe` against
+///    its `(pid, instance_uuid)`.
 ///    - [`LivenessOutcome::Alive`] → [`StoreLockError::Locked`].
 ///    - [`LivenessOutcome::Stale`] → best-effort remove both `store.lock`
 ///      and the socket file, retry step 1 **exactly once**. A second
 ///      `WouldBlock` (someone else won the race) is `Locked`, not a further
 ///      retry.
+///    - The JSON could not be read at all (D-065) → [`StoreLockError::Locked`]
+///      with an unnamed owner, **never** a reclaim. Step 1 having failed
+///      already proves a live holder, so there is nothing here that a dead
+///      owner could have left behind; see `read_lock_info_settling` for the
+///      full argument and for the bounded re-read that usually names the
+///      owner anyway. A torn write from a crash is recovered by step 2
+///      instead, where it belongs.
 pub fn acquire(
     layout: &StoreLayout,
     instance_uuid: &str,
@@ -216,17 +233,29 @@ fn acquire_inner(
         }
         Err(TryAcquireError::Io(e)) => Err(StoreLockError::Io(e)),
         Err(TryAcquireError::WouldBlock) => {
-            let owner = read_lock_info(&path);
-            let alive = owner.as_ref().is_some_and(|o| is_owner_alive(o, probe));
-            if alive {
-                // `owner` is `Some` whenever `alive` is true.
+            // D-065: an *unreadable* record is not evidence of a dead owner.
+            // Reaching this branch already proves a live process holds the
+            // `flock` right now (POSIX releases it on exit — this module's
+            // own doc comment), so the record can only be one a live owner
+            // has not written yet, or is rewriting this instant. A crashed
+            // owner's torn write cannot appear here at all: with no holder,
+            // `try_lock` succeeds and the success branch above simply
+            // overwrites it. Reclaiming on an unreadable record unlinks a
+            // live owner's lock file and leaves two daemons each convinced it
+            // alone owns the store — the exact outcome `is_owner_alive`'s doc
+            // comment warns about, observed in production on 2026-08-18.
+            let Some(owner) = read_lock_info_settling(&path) else {
                 return Err(StoreLockError::Locked {
-                    owner: owner.expect("alive implies a parsed owner"),
+                    owner: unknown_owner(),
                 });
+            };
+            if is_owner_alive(&owner, probe) {
+                return Err(StoreLockError::Locked { owner });
             }
 
-            // Stale (dead PID, mismatched instance, unreachable socket, or an
-            // unparseable lock file): reclaim and retry exactly once.
+            // Genuinely stale (dead PID, mismatched instance, or an
+            // unreachable socket — always a *parsed* record): reclaim and
+            // retry exactly once.
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(layout.socket_path());
             ensure_file_0600(&path).map_err(StoreLockError::LockPath)?;
@@ -270,9 +299,18 @@ fn is_owner_alive(owner: &StoreLockInfo, probe: &dyn LivenessProbe) -> bool {
     probe.check(owner.pid, &owner.instance_uuid) == LivenessOutcome::Alive
 }
 
-/// A placeholder for the pathological case where the retry's contender also
-/// left an unparseable lock file — still a real, live conflict (we did lose
-/// the race), just one we cannot name precisely.
+/// A placeholder for a live conflict we cannot name: the holder's record was
+/// still unreadable after [`read_lock_info_settling`] gave up (D-065), or the
+/// retry's contender left one behind. Either way we did lose the race — this
+/// stands in for the owner in the resulting [`StoreLockError::Locked`], never
+/// for an owner we believe to be dead.
+///
+/// `pid: 0` is the sentinel for "unnamed": no daemon ever runs as pid 0, and
+/// `main`'s startup message keys off it to drop the parenthetical rather than
+/// print a pid that means nothing. `ready: false` is honest for the same
+/// reason the record was unreadable in the first place — the owner is still
+/// starting up — and lands the caller on spec 02 §6's `MIGRATION_IN_PROGRESS`,
+/// whose "retry shortly" is exactly the right advice here.
 fn unknown_owner() -> StoreLockInfo {
     StoreLockInfo {
         instance_uuid: "<unknown>".to_string(),
@@ -314,23 +352,99 @@ fn try_acquire(
 }
 
 /// Overwrite the lock file's content with `info`'s JSON, through the handle
-/// that already holds the `flock` (truncate-and-rewrite, not create/rename —
-/// this file's identity, not its content, is what other processes rely on).
+/// that already holds the `flock` (rewrite in place, not create/rename — this
+/// file's identity, not its content, is what other processes rely on).
+///
+/// The rewrite deliberately never shrinks the file *before* writing (D-065).
+/// `flock` is advisory, so readers — [`read_lock_info`], and the diagnostic
+/// [`read_store_lock_file`] behind `local-rag status`/`doctor` — read the path
+/// without contending for the lock and can land mid-rewrite. A leading
+/// `set_len(0)` gave them a window in which the file was empty, indistinguishable
+/// from a torn write. Instead: one write covering at least the previous length
+/// (short records padded with trailing spaces, which `serde_json` accepts), then
+/// truncate to the record's true length. A concurrent reader therefore sees the
+/// old record, or the new one, never an empty file and never the new record's
+/// head glued to the old one's tail. The padding never survives on disk.
 fn write_info(file: &mut File, info: &StoreLockInfo) -> io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
-    file.set_len(0)?;
+    let json = serde_json::to_vec(info)?;
+    let previous_len = file.metadata()?.len();
+    let buf = padded_record(&json, previous_len);
     file.seek(SeekFrom::Start(0))?;
-    serde_json::to_writer(&mut *file, info)?;
+    file.write_all(&buf)?;
     file.flush()?;
+    file.set_len(json.len() as u64)?;
     file.sync_all()
 }
 
+/// `json`, padded with trailing spaces so the write covers `previous_len`
+/// bytes — the pure half of [`write_info`], split out so its behaviour is
+/// testable without racing a real reader against a real writer.
+///
+/// Trailing whitespace is valid JSON, so a reader that catches the padded
+/// state still parses the record it is meant to see. When the new record is at
+/// least as long as the old one there is nothing to cover and the bytes are
+/// returned unchanged.
+fn padded_record(json: &[u8], previous_len: u64) -> Vec<u8> {
+    let mut buf = json.to_vec();
+    let previous_len = usize::try_from(previous_len).unwrap_or(usize::MAX);
+    if previous_len > buf.len() {
+        buf.resize(previous_len, b' ');
+    }
+    buf
+}
+
 /// Best-effort read of an existing `store.lock`'s JSON. `None` on any I/O or
-/// parse failure — [`acquire_inner`] treats that identically to "stale,
-/// unknown owner".
+/// parse failure.
 fn read_lock_info(path: &Path) -> Option<StoreLockInfo> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// How many times [`read_lock_info_settling`] reads before giving up, and how
+/// long it waits between attempts.
+///
+/// Not `[SPEC]` numbers: spec 02 §4.1 names the *mechanism* but no budget for
+/// this internal read, so these are chosen and documented as chosen — the same
+/// precedent [`LIVENESS_PROBE_TIMEOUT_MS`](super::probe::LIVENESS_PROBE_TIMEOUT_MS)
+/// sets for its own internal bounded wait. Together they bound the wait at 8 ms,
+/// which is only ever paid on the one branch that finds an unreadable record.
+const OWNER_READ_ATTEMPTS: u32 = 5;
+const OWNER_READ_RETRY_MS: u64 = 2;
+
+/// [`read_lock_info`], retried a bounded number of times before concluding the
+/// record cannot be read (D-065).
+///
+/// Only ever called from [`acquire_inner`]'s `WouldBlock` branch, where a live
+/// process provably holds the `flock`. Two things can make its record
+/// unreadable there, and both are transient by construction:
+///
+/// - the owner acquired the lock microseconds ago and has not written its
+///   record yet (the file [`ensure_file_0600`] just created is empty);
+/// - the owner is rewriting the record right now ([`mark_ready`] via
+///   [`write_info`]).
+///
+/// Either way the bytes appear almost immediately, so a handful of reads
+/// spread over a few milliseconds turns "some daemon holds this store" into a
+/// message that names the actual `pid`/`instance_uuid`. Returning `None` is
+/// therefore rare, and is *still* a live conflict — never grounds for a
+/// reclaim.
+///
+/// Blocking sleeps are fine here: [`acquire`] runs inside
+/// `tokio::task::spawn_blocking` (see `daemon::lifecycle`), never on an async
+/// executor thread.
+///
+/// [`mark_ready`]: StoreLockGuard::mark_ready
+fn read_lock_info_settling(path: &Path) -> Option<StoreLockInfo> {
+    for attempt in 0..OWNER_READ_ATTEMPTS {
+        if let Some(info) = read_lock_info(path) {
+            return Some(info);
+        }
+        if attempt + 1 < OWNER_READ_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(OWNER_READ_RETRY_MS));
+        }
+    }
+    None
 }
 
 /// The three states `store.lock` can be found in by a pure read (T16-03,
@@ -364,5 +478,55 @@ pub fn read_store_lock_file(layout: &StoreLayout) -> StoreLockFileState {
             Ok(info) => StoreLockFileState::Parsed(info),
             Err(_) => StoreLockFileState::Corrupt,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> StoreLockInfo {
+        StoreLockInfo::fresh("instance-a", 4242, "9.9.9", 1_000)
+    }
+
+    /// The shrinking rewrite — a long `ready: true` record replaced by a short
+    /// fresh one — is the case that used to leave readers an empty file
+    /// (D-065). The padded buffer must cover every byte the old record
+    /// occupied, and must still parse as the new record.
+    #[test]
+    fn a_shorter_record_is_padded_to_cover_the_previous_one() {
+        let json = serde_json::to_vec(&record()).expect("serialize");
+        let previous_len = json.len() as u64 + 40;
+
+        let buf = padded_record(&json, previous_len);
+
+        assert_eq!(buf.len() as u64, previous_len, "must cover the old record");
+        assert!(buf.ends_with(b" "), "the tail must be padding: {buf:?}");
+        let parsed: StoreLockInfo =
+            serde_json::from_slice(&buf).expect("trailing whitespace is valid JSON");
+        assert_eq!(parsed, record(), "padding must not change what is read");
+    }
+
+    /// Growing (or exactly matching) rewrites have nothing to cover, so the
+    /// bytes go out unchanged — no padding is invented for its own sake.
+    #[test]
+    fn a_record_at_least_as_long_as_the_previous_one_is_not_padded() {
+        let json = serde_json::to_vec(&record()).expect("serialize");
+
+        assert_eq!(padded_record(&json, 0), json, "first write, nothing before");
+        assert_eq!(padded_record(&json, json.len() as u64), json, "exact match");
+        assert_eq!(padded_record(&json, 1), json, "previous record was shorter");
+    }
+
+    /// `read_lock_info_settling` is a bounded loop, not an unbounded wait: an
+    /// absent file yields `None` rather than hanging, and does so without any
+    /// dependency on how fast the machine runs.
+    #[test]
+    fn an_unreadable_record_settles_to_none_rather_than_waiting_forever() {
+        // A path under a directory that does not exist: every read fails
+        // immediately, so the loop runs its full course. Nothing is created,
+        // so the test touches no filesystem state at all.
+        let path = Path::new("/nonexistent-local-rag-d065/never-written.lock");
+        assert_eq!(read_lock_info_settling(path), None);
     }
 }

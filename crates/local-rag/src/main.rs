@@ -198,10 +198,20 @@ fn startup_error_message(e: &DaemonStartupError) -> String {
     match e {
         DaemonStartupError::Lock(StoreLockError::Locked { owner }) if !owner.ready => {
             let env = ErrorEnvelope::migration_in_progress();
+            // `pid: 0` is `daemon::lock`'s sentinel for an owner it could not
+            // name (D-065: the holder's record was still unreadable when the
+            // bounded re-read gave up). Printing "pid 0" would be worse than
+            // saying nothing, so the parenthetical is simply dropped — the
+            // advice, and the spec 02 §6 code, are the same either way.
+            let who = if owner.pid == 0 {
+                "another instance".to_string()
+            } else {
+                format!("another instance (pid {})", owner.pid)
+            };
             format!(
-                "another instance (pid {}) appears to still be starting up, possibly \
-                 migrating — retry shortly [{}]",
-                owner.pid, env.code
+                "{who} appears to still be starting up, possibly migrating — \
+                 retry shortly [{}]",
+                env.code
             )
         }
         DaemonStartupError::Lock(StoreLockError::Locked { owner }) => {
@@ -247,6 +257,25 @@ mod tests {
         assert!(message.contains("MIGRATION_IN_PROGRESS"), "{message}");
         assert!(message.contains("still be starting up"), "{message}");
         assert!(message.contains("4242"), "{message}");
+    }
+
+    /// D-065: the same not-yet-ready branch, but for an owner `daemon::lock`
+    /// could not name (its record was unreadable while a live `flock` was
+    /// held). The verdict and the spec code must be unchanged — only the
+    /// meaningless `pid 0` disappears from the text.
+    #[test]
+    fn an_unnamed_owner_reports_migration_in_progress_without_a_pid() {
+        let mut unnamed = owner(false);
+        unnamed.pid = 0;
+        unnamed.instance_uuid = "<unknown>".to_string();
+        let err = DaemonStartupError::Lock(StoreLockError::Locked { owner: unnamed });
+        let message = startup_error_message(&err);
+        assert!(message.contains("MIGRATION_IN_PROGRESS"), "{message}");
+        assert!(message.contains("still be starting up"), "{message}");
+        assert!(
+            !message.contains("pid"),
+            "an unnameable owner must not print a pid at all: {message}"
+        );
     }
 
     /// The sibling branch: a fully-`ready` owner reports `STORE_LOCKED`
