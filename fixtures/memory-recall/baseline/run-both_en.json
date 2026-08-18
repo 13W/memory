@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "v2_commit": "2bcac29",
+    "corpus_path": "/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json",
+    "corpus_version": "1.0.0",
+    "model_id": "embeddinggemma-300m",
+    "config": "both_en",
+    "entry_count": 24,
+    "query_count": 24,
+    "host": "aarch64-macos"
+  },
+  "metrics": {
+    "hit_at_1": 1.0,
+    "hit_at_3": 1.0,
+    "hit_at_5": 1.0,
+    "mrr": 1.0,
+    "query_count": 24
+  },
+  "metrics_by_lang_pair": {
+    "en-en": {
+      "hit_at_1": 1.0,
+      "hit_at_3": 1.0,
+      "hit_at_5": 1.0,
+      "mrr": 1.0,
+      "query_count": 8
+    },
+    "en-ru": {
+      "hit_at_1": 1.0,
+      "hit_at_3": 1.0,
+      "hit_at_5": 1.0,
+      "mrr": 1.0,
+      "query_count": 4
+    },
+    "ru-en": {
+      "hit_at_1": 1.0,
+      "hit_at_3": 1.0,
+      "hit_at_5": 1.0,
+      "mrr": 1.0,
+      "query_count": 4
+    },
+    "ru-ru": {
+      "hit_at_1": 1.0,
+      "hit_at_3": 1.0,
+      "hit_at_5": 1.0,
+      "mrr": 1.0,
+      "query_count": 8
+    }
+  },
+  "per_query": [
+    {
+      "id": "mrq-01",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-01",
+      "rank": 1,
+      "top_result_id": "mr-01",
+      "returned": 24
+    },
+    {
+      "id": "mrq-02",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-02",
+      "rank": 1,
+      "top_result_id": "mr-02",
+      "returned": 24
+    },
+    {
+      "id": "mrq-03",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-03",
+      "rank": 1,
+      "top_result_id": "mr-03",
+      "returned": 24
+    },
+    {
+      "id": "mrq-04",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-04",
+      "rank": 1,
+      "top_result_id": "mr-04",
+      "returned": 24
+    },
+    {
+      "id": "mrq-05",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-05",
+      "rank": 1,
+      "top_result_id": "mr-05",
+      "returned": 24
+    },
+    {
+      "id": "mrq-06",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-06",
+      "rank": 1,
+      "top_result_id": "mr-06",
+      "returned": 24
+    },
+    {
+      "id": "mrq-07",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-07",
+      "rank": 1,
+      "top_result_id": "mr-07",
+      "returned": 24
+    },
+    {
+      "id": "mrq-08",
+      "lang_pair": "ru-ru",
+      "expected_entry_id": "mr-08",
+      "rank": 1,
+      "top_result_id": "mr-08",
+      "returned": 24
+    },
+    {
+      "id": "mrq-09",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-09",
+      "rank": 1,
+      "top_result_id": "mr-09",
+      "returned": 24
+    },
+    {
+      "id": "mrq-10",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-10",
+      "rank": 1,
+      "top_result_id": "mr-10",
+      "returned": 24
+    },
+    {
+      "id": "mrq-11",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-11",
+      "rank": 1,
+      "top_result_id": "mr-11",
+      "returned": 24
+    },
+    {
+      "id": "mrq-12",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-12",
+      "rank": 1,
+      "top_result_id": "mr-12",
+      "returned": 24
+    },
+    {
+      "id": "mrq-13",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-13",
+      "rank": 1,
+      "top_result_id": "mr-13",
+      "returned": 24
+    },
+    {
+      "id": "mrq-14",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-14",
+      "rank": 1,
+      "top_result_id": "mr-14",
+      "returned": 24
+    },
+    {
+      "id": "mrq-15",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-15",
+      "rank": 1,
+      "top_result_id": "mr-15",
+      "returned": 24
+    },
+    {
+      "id": "mrq-16",
+      "lang_pair": "en-en",
+      "expected_entry_id": "mr-16",
+      "rank": 1,
+      "top_result_id": "mr-16",
+      "returned": 24
+    },
+    {
+      "id": "mrq-17",
+      "lang_pair": "ru-en",
+      "expected_entry_id": "mr-17",
+      "rank": 1,
+      "top_result_id": "mr-17",
+      "returned": 24
+    },
+    {
+      "id": "mrq-18",
+      "lang_pair": "ru-en",
+      "expected_entry_id": "mr-18",
+      "rank": 1,
+      "top_result_id": "mr-18",
+      "returned": 24
+    },
+    {
+      "id": "mrq-19",
+      "lang_pair": "ru-en",
+      "expected_entry_id": "mr-19",
+      "rank": 1,
+      "top_result_id": "mr-19",
+      "returned": 24
+    },
+    {
+      "id": "mrq-20",
+      "lang_pair": "ru-en",
+      "expected_entry_id": "mr-20",
+      "rank": 1,
+      "top_result_id": "mr-20",
+      "returned": 24
+    },
+    {
+      "id": "mrq-21",
+      "lang_pair": "en-ru",
+      "expected_entry_id": "mr-21",
+      "rank": 1,
+      "top_result_id": "mr-21",
+      "returned": 24
+    },
+    {
+      "id": "mrq-22",
+      "lang_pair": "en-ru",
+      "expected_entry_id": "mr-22",
+      "rank": 1,
+      "top_result_id": "mr-22",
+      "returned": 24
+    },
+    {
+      "id": "mrq-23",
+      "lang_pair": "en-ru",
+      "expected_entry_id": "mr-23",
+      "rank": 1,
+      "top_result_id": "mr-23",
+      "returned": 24
+    },
+    {
+      "id": "mrq-24",
+      "lang_pair": "en-ru",
+      "expected_entry_id": "mr-24",
+      "rank": 1,
+      "top_result_id": "mr-24",
+      "returned": 24
+    }
+  ],
+  "latency": {
+    "install_ms": 0,
+    "embed_ms": 270,
+    "recall_p50_ms": 43.095625,
+    "recall_p95_ms": 50.555625
+  }
+}

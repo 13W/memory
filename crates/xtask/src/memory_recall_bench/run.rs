@@ -1,10 +1,11 @@
-//! Runs the memory-recall benchmark end to end (spec 08 §6) — X-010.
+//! Runs the memory-recall benchmark end to end (spec 08 §6) — X-010/X-011.
 //!
 //! Deliberately not a test: it needs the installed ONNX weights
 //! (~315 MiB, the same catalog entry `crate::bench` already uses) and a
 //! `libonnxruntime` the repository does not ship. It is invoked as
 //! `cargo xtask memory-recall-bench`. The plumbing itself (seed → recall →
-//! score) is covered by this module's own `#[cfg(test)]` tests, which use
+//! score, and — since X-011 — which text variant a [`Config`] selects) is
+//! covered by this module's own `#[cfg(test)]` tests, which use
 //! `UnavailableEmbedder` and a tiny synthetic corpus instead — no model, no
 //! network, no heavy asset, exercising exactly the parts a corrupted-fixture
 //! or wrong-representation bug would break.
@@ -25,12 +26,20 @@
 //! `a_memory_only_run_embeds_every_memory_entry`, the same shape this
 //! function drives for real).
 //!
-//! # Only the `*_original` text variant (X-010)
+//! # Four configurations (X-011), one embedder session
 //!
-//! This task measures the as-is pipeline only — every entry is seeded from
-//! `Entry::text_original` and every query runs `Query::query_original`.
-//! Comparing against the hand-translated `*_english` variants is X-011's
-//! job, not this module's.
+//! [`Config`] picks which fixture text field feeds the store and which feeds
+//! the query — `baseline` is what a real user experiences today (nothing
+//! translated); `store_en`/`query_en` isolate one side each; `both_en` is
+//! the full v1-style shape (English-only storage, query translated before
+//! search). Nothing here calls a translator at runtime: both variants are
+//! already sitting in the fixture, hand-translated once at authoring time
+//! (X-010's corpus doc). Each configuration gets its **own** fresh store and
+//! its own `run_backfill` pass — `store_en` and `baseline` genuinely embed
+//! different text, so their `embedding_cache` rows cannot be shared; only
+//! the already-open ONNX session ([`Embedder`]) is reused across
+//! configurations, since embedding itself does not depend on which
+//! configuration is asking.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -54,7 +63,7 @@ use local_rag_store::{
 };
 
 use crate::git::git_short_head;
-use crate::memory_recall_bench::corpus::{Corpus, Entry};
+use crate::memory_recall_bench::corpus::{Corpus, Entry, Query};
 use crate::memory_recall_bench::report::{
     Latency, MemoryRecallBenchReport, Provenance, QueryResult,
 };
@@ -77,11 +86,77 @@ const RECALL_TOKEN_BUDGET: u32 = 100_000;
 const WARMUP_PASSES: usize = 1;
 const TIMED_PASSES: usize = 3;
 
+/// Which fixture text variant feeds the store and which feeds the query
+/// (X-011). See the module doc's "four configurations" section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Config {
+    /// Store and query both use `*_original` — today's real, as-is pipeline.
+    Baseline,
+    /// Store uses `*_english`, query stays `*_original`.
+    StoreEn,
+    /// Store stays `*_original`, query uses `*_english`.
+    QueryEn,
+    /// Store and query both use `*_english` — the v1-style shape (English-only
+    /// storage, translated query).
+    BothEn,
+}
+
+impl Config {
+    /// Every configuration, `Baseline` first — `report::compare` looks for
+    /// `Baseline` by name, so any caller sweeping "all" gets a comparable
+    /// baseline in the set by construction.
+    pub const ALL: [Config; 4] = [
+        Config::Baseline,
+        Config::StoreEn,
+        Config::QueryEn,
+        Config::BothEn,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Config::Baseline => "baseline",
+            Config::StoreEn => "store_en",
+            Config::QueryEn => "query_en",
+            Config::BothEn => "both_en",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Config> {
+        match s {
+            "baseline" => Some(Config::Baseline),
+            "store_en" => Some(Config::StoreEn),
+            "query_en" => Some(Config::QueryEn),
+            "both_en" => Some(Config::BothEn),
+            _ => None,
+        }
+    }
+
+    /// Which of `entry`'s two text fields this configuration seeds the store
+    /// with.
+    fn store_text(self, entry: &Entry) -> &str {
+        match self {
+            Config::Baseline | Config::QueryEn => &entry.text_original,
+            Config::StoreEn | Config::BothEn => &entry.text_english,
+        }
+    }
+
+    /// Which of `query`'s two text fields this configuration searches with.
+    fn query_text(self, query: &Query) -> &str {
+        match self {
+            Config::Baseline | Config::StoreEn => &query.query_original,
+            Config::QueryEn | Config::BothEn => &query.query_english,
+        }
+    }
+}
+
 /// What `cargo xtask memory-recall-bench` was asked to do.
 pub struct Options {
     pub corpus_path: PathBuf,
     /// A catalog `model_id` to run instead of [`local_rag_models::DEFAULT_MODEL_ID`].
     pub model_id: Option<String>,
+    /// Which configurations to run, in order. Empty means `[Config::Baseline]`
+    /// — X-010's original, single-configuration behavior.
+    pub configs: Vec<Config>,
 }
 
 /// Adapts a batch [`Embedder`] to `recall`'s single-query [`recall::QueryEmbedder`]
@@ -124,12 +199,10 @@ impl recall::QueryEmbedder for MemoryPoolQueryEmbedder {
     }
 }
 
-pub async fn run(options: &Options) -> Result<MemoryRecallBenchReport, String> {
+/// Run every requested configuration and return one report per configuration,
+/// in the order given (`[Config::Baseline]` if `options.configs` is empty).
+pub async fn run(options: &Options) -> Result<Vec<MemoryRecallBenchReport>, String> {
     let corpus = Corpus::load(&options.corpus_path).map_err(|e| format!("corpus: {e}"))?;
-
-    let home = tempdir()?;
-    let layout = StoreLayout::new(home.join("local-rag"));
-    layout.ensure().map_err(|e| format!("store layout: {e}"))?;
 
     let model_home = model_home()?;
     let model_layout = StoreLayout::new(model_home.join("local-rag"));
@@ -158,6 +231,44 @@ pub async fn run(options: &Options) -> Result<MemoryRecallBenchReport, String> {
             .map_err(|e| format!("open {} (memory representation): {e}", entry.model_id))?,
     );
 
+    let configs = if options.configs.is_empty() {
+        vec![Config::Baseline]
+    } else {
+        options.configs.clone()
+    };
+
+    let mut reports = Vec::with_capacity(configs.len());
+    for config in configs {
+        eprintln!("[memory-recall-bench] running config={}", config.as_str());
+        reports.push(
+            run_one_config(
+                &corpus,
+                entry,
+                embedder.clone(),
+                config,
+                install_ms,
+                &options.corpus_path,
+            )
+            .await?,
+        );
+    }
+    Ok(reports)
+}
+
+/// One configuration's full run: fresh store, seed with `config`'s chosen
+/// store text, embed, then every query against `config`'s chosen query text.
+async fn run_one_config(
+    corpus: &Corpus,
+    entry: &'static ModelCatalogEntry,
+    embedder: Arc<dyn Embedder>,
+    config: Config,
+    install_ms: u64,
+    corpus_path: &std::path::Path,
+) -> Result<MemoryRecallBenchReport, String> {
+    let home = tempdir()?;
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().map_err(|e| format!("store layout: {e}"))?;
+
     let state = StateDb::open(layout.state_db()).map_err(|e| format!("state: {e}"))?;
     let cache = CacheDb::open(layout.cache_db(), "memory-recall-bench")
         .map_err(|e| format!("cache: {e}"))?;
@@ -169,7 +280,14 @@ pub async fn run(options: &Options) -> Result<MemoryRecallBenchReport, String> {
     let mut memory_id_by_corpus_id: BTreeMap<String, String> = BTreeMap::new();
     for corpus_entry in &corpus.entries {
         let memory_id = uuids.next_uuid().to_string();
-        seed_entry(&state, &memory_id, corpus_entry, now_ms).await?;
+        seed_entry(
+            &state,
+            &memory_id,
+            corpus_entry,
+            config.store_text(corpus_entry),
+            now_ms,
+        )
+        .await?;
         memory_id_by_corpus_id.insert(corpus_entry.id.clone(), memory_id);
     }
     let corpus_id_by_memory_id: BTreeMap<String, String> = memory_id_by_corpus_id
@@ -197,7 +315,7 @@ pub async fn run(options: &Options) -> Result<MemoryRecallBenchReport, String> {
     .map_err(|e| format!("backfill: {e}"))?;
     let embed_ms = embedded_at.elapsed().as_millis() as u64;
     eprintln!(
-        "[memory-recall-bench] embedded {} subjects in {embed_ms} ms",
+        "[memory-recall-bench]   embedded {} subjects in {embed_ms} ms",
         backfill.embedded
     );
 
@@ -221,7 +339,7 @@ pub async fn run(options: &Options) -> Result<MemoryRecallBenchReport, String> {
                 worktree_root: None,
                 repo_hint: None,
             },
-            query: &query.query_original,
+            query: config.query_text(query),
         };
 
         let mut ranked_ids: Vec<String> = Vec::new();
@@ -280,10 +398,10 @@ pub async fn run(options: &Options) -> Result<MemoryRecallBenchReport, String> {
     let provenance = Provenance {
         v2_commit: git_short_head(std::path::Path::new("."))
             .unwrap_or_else(|| "unknown".to_string()),
-        corpus_path: options.corpus_path.display().to_string(),
+        corpus_path: corpus_path.display().to_string(),
         corpus_version: corpus.version.clone(),
         model_id: entry.model_id.to_string(),
-        config: "baseline".to_string(),
+        config: config.as_str().to_string(),
         entry_count: corpus.entries.len(),
         query_count: corpus.queries.len(),
         host: std::env::consts::ARCH.to_string() + "-" + std::env::consts::OS,
@@ -314,22 +432,20 @@ async fn register_memory_representation(
         .map_err(|e| format!("register representation: {e}"))
 }
 
-/// Seed one corpus entry as a `scope_kind = Global` memory entry — see the
-/// module doc's "no worktree, no code index" note for why global is the only
-/// scope this benchmark ever uses.
+/// Seed one corpus entry as a `scope_kind = Global` memory entry, using
+/// `text` (the caller's [`Config`]-selected variant) — see the module doc's
+/// "no worktree, no code index" note for why global is the only scope this
+/// benchmark ever uses.
 async fn seed_entry(
     state: &StateDb,
     memory_id: &str,
     entry: &Entry,
+    text: &str,
     now_ms: i64,
 ) -> Result<(), String> {
     let kind = MemoryKind::from_db(&entry.kind)
         .ok_or_else(|| format!("{}: unknown kind {:?}", entry.id, entry.kind))?;
-    let (id, text, entry_id) = (
-        memory_id.to_string(),
-        entry.text_original.clone(),
-        entry.id.clone(),
-    );
+    let (id, text, entry_id) = (memory_id.to_string(), text.to_string(), entry.id.clone());
     state
         .writer()
         .transaction(move |tx| {
@@ -376,6 +492,9 @@ fn model_home() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".local/share/local-rag-bench"))
 }
 
+/// Recreated fresh on every call (`remove_dir_all` then `create_dir_all`),
+/// so [`run`]'s sequential per-[`Config`] loop never leaks state between
+/// configurations despite reusing one directory name across calls.
 fn tempdir() -> Result<PathBuf, String> {
     let base = std::env::temp_dir().join(format!(
         "local-rag-memory-recall-bench-{}",
@@ -392,13 +511,61 @@ mod tests {
     use local_rag_store::CacheDb;
     use local_rag_test_support::TempHome;
 
-    fn entry(id: &str, kind: &str, text: &str) -> Entry {
+    fn entry(id: &str, kind: &str, text_original: &str, text_english: &str) -> Entry {
         Entry {
             id: id.to_string(),
             kind: kind.to_string(),
-            text_original: text.to_string(),
-            text_english: text.to_string(),
+            text_original: text_original.to_string(),
+            text_english: text_english.to_string(),
         }
+    }
+
+    fn query(
+        id: &str,
+        expected_entry_id: &str,
+        query_original: &str,
+        query_english: &str,
+    ) -> Query {
+        Query {
+            id: id.to_string(),
+            lang_pair: "ru-en".to_string(),
+            expected_entry_id: expected_entry_id.to_string(),
+            query_original: query_original.to_string(),
+            query_english: query_english.to_string(),
+        }
+    }
+
+    /// Pins the selection table itself — the one thing a copy-paste error in
+    /// [`Config::store_text`]/[`Config::query_text`] would silently invert.
+    #[test]
+    fn each_config_selects_the_documented_text_variant() {
+        let e = entry("mr-x", "fact", "RU_STORE", "EN_STORE");
+        let q = query("mrq-x", "mr-x", "RU_QUERY", "EN_QUERY");
+
+        assert_eq!(Config::Baseline.store_text(&e), "RU_STORE");
+        assert_eq!(Config::Baseline.query_text(&q), "RU_QUERY");
+
+        assert_eq!(Config::StoreEn.store_text(&e), "EN_STORE");
+        assert_eq!(Config::StoreEn.query_text(&q), "RU_QUERY");
+
+        assert_eq!(Config::QueryEn.store_text(&e), "RU_STORE");
+        assert_eq!(Config::QueryEn.query_text(&q), "EN_QUERY");
+
+        assert_eq!(Config::BothEn.store_text(&e), "EN_STORE");
+        assert_eq!(Config::BothEn.query_text(&q), "EN_QUERY");
+    }
+
+    #[test]
+    fn config_as_str_and_from_str_round_trip() {
+        for config in Config::ALL {
+            assert_eq!(Config::from_str(config.as_str()), Some(config));
+        }
+        assert_eq!(Config::from_str("not-a-real-config"), None);
+    }
+
+    #[test]
+    fn all_starts_with_baseline() {
+        assert_eq!(Config::ALL[0], Config::Baseline);
     }
 
     /// Proves this module's own wiring (seed → recall → rank_of_match) end to
@@ -422,22 +589,25 @@ mod tests {
                 "mr-a",
                 "fact",
                 "the checkout service retries failed payments three times before giving up",
+                "the checkout service retries failed payments three times before giving up",
             ),
             entry(
                 "mr-b",
                 "decision",
+                "the team moved the notification queue off rabbitmq onto nats jetstream",
                 "the team moved the notification queue off rabbitmq onto nats jetstream",
             ),
             entry(
                 "mr-c",
                 "convention",
                 "every schema migration needs a reversible down step before merge",
+                "every schema migration needs a reversible down step before merge",
             ),
         ];
         let mut memory_id_by_corpus_id = BTreeMap::new();
         for e in &entries {
             let memory_id = uuids.next_uuid().to_string();
-            seed_entry(&state, &memory_id, e, now_ms)
+            seed_entry(&state, &memory_id, e, &e.text_original, now_ms)
                 .await
                 .expect("seed");
             memory_id_by_corpus_id.insert(e.id.clone(), memory_id);
@@ -482,10 +652,74 @@ mod tests {
         let layout = StoreLayout::new(home.join("local-rag"));
         layout.ensure().expect("ensure store tree");
         let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
-        let bad = entry("mr-x", "not-a-real-kind", "text");
-        let err = seed_entry(&state, "some-id", &bad, 1_000)
+        let bad = entry("mr-x", "not-a-real-kind", "text", "text");
+        let err = seed_entry(&state, "some-id", &bad, "text", 1_000)
             .await
             .expect_err("an unknown kind must be refused, not silently dropped");
         assert!(err.contains("unknown kind"), "{err}");
+    }
+
+    /// X-011's actual point: seeding under [`Config::StoreEn`] must persist
+    /// the *English* variant, not silently fall back to the original —
+    /// proven end to end (not just via the pure table test above) by seeding
+    /// a Russian-only original whose English translation shares no lexical
+    /// tokens with it, then showing an English-only query only matches once
+    /// the English text is what actually got stored.
+    #[tokio::test]
+    async fn store_en_seeds_the_english_variant_not_the_original() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let cache = CacheDb::open(layout.cache_db(), "test").expect("open cache.sqlite");
+        let uuids = SystemUuidV7;
+        let now_ms = 1_000;
+
+        let bilingual = entry(
+            "mr-b",
+            "decision",
+            "команда перевела очередь уведомлений с rabbitmq на nats jetstream",
+            "the team moved the notification queue off rabbitmq onto nats jetstream",
+        );
+        let memory_id = uuids.next_uuid().to_string();
+        seed_entry(
+            &state,
+            &memory_id,
+            &bilingual,
+            Config::StoreEn.store_text(&bilingual),
+            now_ms,
+        )
+        .await
+        .expect("seed under store_en");
+
+        let state_read = state.open_read().expect("state read");
+        let cache_read = cache.open_read().expect("cache read");
+        let english_query_request = recall::RecallRequest {
+            root: RequestRoot {
+                worktree_root: None,
+                repo_hint: None,
+            },
+            query: "notification queue rabbitmq",
+        };
+        let outcome = recall::recall(
+            &state_read,
+            &cache_read,
+            &recall::UnavailableEmbedder,
+            &recall::BruteForceCosine,
+            &english_query_request,
+            RECALL_TOKEN_BUDGET,
+        )
+        .expect("recall");
+        let ranked_ids: Vec<String> = outcome
+            .entries
+            .iter()
+            .map(|e| e.memory_id.clone())
+            .collect();
+        assert_eq!(
+            rank_of_match(&memory_id, &ranked_ids),
+            Some(1),
+            "the English query must match the stored text — it only can if store_en actually \
+             persisted the English variant, since the Russian original shares no tokens with it"
+        );
     }
 }
