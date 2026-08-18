@@ -37,6 +37,12 @@ pub enum JobKind {
     /// `L2.write` — held only for that active span, not while the task
     /// merely waits for its next `successes`/`failures` trigger.
     Reconcile,
+    /// The startup retention sweep (D-066, spec 06 §5) collecting unpinned
+    /// `retiring`/`failed` generations. Long-running on a store with a
+    /// backlog, and batched through the same global writer queue as every
+    /// other mutation — hence a job of its own, so `doctor`/`stats` can see
+    /// the daemon is busy collecting rather than idle.
+    Gc,
 }
 
 #[derive(Debug, Default)]

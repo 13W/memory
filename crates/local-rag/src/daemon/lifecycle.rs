@@ -526,6 +526,19 @@ impl DaemonHandle {
                 data_policy,
                 Arc::clone(&uuids),
             )));
+            // D-066: planned maintenance, not crash recovery — but it rides in
+            // `resume_handles` for the same reason those two do: spawned so it
+            // cannot delay `daemon ready`, and joined on shutdown so a sweep in
+            // flight is not abandoned mid-batch. Its `JobKind::Gc` guard keeps
+            // the idle-shutdown gate (spec 02 §4.3, "no running
+            // index/consolidation/GC jobs") from firing underneath it.
+            tracing::info!(job = "gc_sweep", "background job spawned");
+            resume_handles.push(tokio::spawn(super::gc::spawn_startup_gc(
+                Arc::clone(db),
+                jobs.clone(),
+                retention,
+                now_ms,
+            )));
         }
 
         // D-024: the continuous consolidation-trigger worker (spec 07 §6) —

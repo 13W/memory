@@ -16,4 +16,5 @@
 //! where both can link against it.
 
 pub mod daemon;
+pub mod gc;
 pub mod indexing;

@@ -456,6 +456,43 @@ pub fn referenced_model_space_ids(
     Ok(map)
 }
 
+/// Every generation id named by any `worktree_projection_state` row, store-wide
+/// (D-066).
+///
+/// The retention sweep's pin set (spec 06 §5, `ExternalPins::referenced_generations`):
+/// a generation this table still names must never be swept, or the `DELETE` from
+/// `generation` violates one of the three foreign keys above and rolls the sweep
+/// batch back.
+///
+/// All three columns are read for the same reason
+/// [`referenced_model_space_ids`] reads all three of its own: spec 05 §5's
+/// write-ahead commits the **target** tuple before any backend mutation, so a
+/// target generation is referenced from before its projection exists, and a
+/// `projected` one keeps being referenced after the registry has already moved
+/// the generation to `retiring`. Reading only `active` would leave exactly the
+/// window in which the sweep and a switch in flight collide.
+///
+/// Flat, not a per-worktree map (unlike [`referenced_model_space_ids`], whose
+/// caller must distinguish "row present, all columns NULL" from "no row"): a
+/// generation id is globally unique and the sweep pins the union across the whole
+/// store, so the worktree it came from carries no information here.
+pub fn referenced_generation_ids(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT active_generation_id, projected_generation_id, target_generation_id \
+         FROM worktree_projection_state",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let columns: [Option<String>; 3] = [r.get(0)?, r.get(1)?, r.get(2)?];
+        Ok(columns)
+    })?;
+
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        ids.extend(row?.into_iter().flatten());
+    }
+    Ok(ids)
+}
+
 /// Initialize a fresh `clean`, empty projection state row for `worktree_id` (all
 /// three tuples NULL, no op in flight). Valid by the clean invariant
 /// (`active == projected` trivially, `target` NULL). The worktree must exist (its

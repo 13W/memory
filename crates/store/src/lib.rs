@@ -505,7 +505,8 @@ pub use registry::{
     IllegalProjectionTransition, PROJECTION_SCHEMA_VERSION, ProjectionInvariantViolation,
     ProjectionStateChange, ProjectionStateError, ProjectionStateRow, ProjectionStatus,
     check_invariants, default_model_space_id, insert_projection_state, projection_state,
-    referenced_model_space_ids, set_default_model_space_id, write_projection_state,
+    referenced_generation_ids, referenced_model_space_ids, set_default_model_space_id,
+    write_projection_state,
 };
 pub use registry::{
     IndexingOutcome, ManagedWorktree, WorktreeIndexingStatus, indexing_status, indexing_statuses,
