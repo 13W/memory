@@ -632,14 +632,15 @@ async fn a_memory_only_run_embeds_every_memory_entry() {
     assert_eq!(report.embedded, 2);
 
     let read = f.cache.open_read().expect("cache read");
-    let rows = local_rag_store::embeddings_for_subject_kind(
-        &read,
-        SubjectKind::MemoryEntry,
-        memory_representation_id,
-        100,
-    )
-    .expect("bulk scan");
-    assert_eq!(rows.len(), 2, "both memory entries were embedded");
+    let rows = all_embedding_meta(&read)
+        .expect("meta")
+        .into_iter()
+        .filter(|m| {
+            m.key.subject_kind == SubjectKind::MemoryEntry
+                && m.key.representation_id == memory_representation_id
+        })
+        .count();
+    assert_eq!(rows, 2, "both memory entries were embedded");
 
     let after = promote_if_covered(
         &f.state,

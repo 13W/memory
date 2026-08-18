@@ -345,10 +345,11 @@ states less precisely than the shipped code:
   (05 §1, ADR-0003) is disk-shard-shaped — `open()` takes a directory, every mutation rewrites
   `points.bin`, a `ProjectionHead` proves generation/model-space consistency on open — none of
   which fits a transient, scope-unioned scan with no shard and no generation.
-  `local_rag_memory::recall::dense::dense_leg` instead bulk-reads `embedding_cache` rows via a
-  new `local_rag_store::embeddings_for_subject_kind(conn, SubjectKind::MemoryEntry,
-  representation_id, limit)` reader and scores them with the exact free function the shard itself
-  calls, `local_rag_projection::contract::similarity` — "behind the relevance-backend trait" is
+  `local_rag_memory::recall::dense::dense_leg` instead bulk-reads `embedding_cache` rows **by
+  exact subject key** via a new `local_rag_store::embeddings_for_subjects(conn,
+  SubjectKind::MemoryEntry, representation_id, &subject_hashes)` reader (D-067 reshaped this
+  reader; see its own as-built note below) and scores them with the exact free function the shard
+  itself calls, `local_rag_projection::contract::similarity` — "behind the relevance-backend trait" is
   `local_rag_memory::recall::dense::MemoryDenseBackend`, whose only impl,
   `BruteForceCosine`, a future ANN swap would replace without touching the pipeline around it.
   Query embedding is a second injected seam, `QueryEmbedder` (mirrors
@@ -398,6 +399,27 @@ states less precisely than the shipped code:
   estimation method. Entries are added in the final deterministic order until the next one would
   overflow the budget, then the walk stops — a ranked prefix, never a skip-ahead search for a
   smaller entry further down the order.
+
+As-built note (D-067, `[SPEC]`): the reader the bullet above names replaces T14-08's own
+`embeddings_for_subject_kind(conn, subject_kind, representation_id, limit)`. That one selected
+**every** `embedding_cache` row of the kind — all scopes, all entry states, plus the hashes
+earlier `edit`/`supersede` ops left stale — under `ORDER BY subject_hash LIMIT ?`, and its single
+production caller passed `candidates.len()` as that limit. As soon as the cache held more memory
+rows than the request's scope union had candidates, the read was truncated at an arbitrary point
+of hash order and every candidate inside the cut silently lost its vector, with no diagnostic at
+all: `dense_degraded` reports an `Err` leg, never a leg that merely came up short. Measured on a
+live store before the fix: 86 cached `memory_entry` rows against 44 non-terminal candidates, i.e.
+an expectation of roughly half the candidates scoring. The replacement hashes each candidate once
+(`subject_memory_entry`), reads exactly those rows (`subject_kind = ? AND representation_id = ?
+AND subject_hash IN (…)`, chunked at `EMBEDDING_SUBJECT_CHUNK` so the statement's parameter count
+stays inside SQLite's portable floor whatever the caller's own bound is), returns them in the
+caller's order, omits absent keys, and takes no `limit` at all. The `[SPEC ≤ 20k entries]` guard
+in the pipeline block above is unchanged and stays exactly where it is: it bounds the **candidate
+set** (`MAX_RECALL_CANDIDATES`, applied in `recall::pipeline` before this leg runs) and therefore
+the number of keys the reader is handed; T14-08 additionally reused that same number as a
+cache-read limit, and that conflation was the defect. Per-entry degradation is unchanged (03
+§4.2): a candidate with no cached row, a row failing `verify_cached_embedding`, or a vector that
+fails to decode is simply absent from this leg.
 
 As-built note (X-010/X-011): this section's own "no equivalent per-query relevance-judged
 benchmark exists for memory recall" (see the fusion-weight bullet above) is closed by a new,

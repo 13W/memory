@@ -279,8 +279,8 @@ pub fn delete_embedding(tx: &Transaction<'_>, key: &EmbeddingKey) -> rusqlite::R
     Ok(removed > 0)
 }
 
-/// One row of a bulk [`embeddings_for_subject_kind`] scan: the row's
-/// `subject_hash` (the other two key fields are the scan's own filter, so
+/// One row of a bulk [`embeddings_for_subjects`] read: the row's
+/// `subject_hash` (the other two key fields are the read's own filter, so
 /// repeating them per row would be redundant) alongside its full vector
 /// payload, undecoded/unverified (same contract as [`get_embedding`] — the
 /// caller decodes via [`decode_vector_le`] and verifies via
@@ -294,34 +294,87 @@ pub struct EmbeddingCacheEntry {
     pub row: EmbeddingCacheRow,
 }
 
-/// Every `embedding_cache` row for one `(subject_kind, representation_id)`,
-/// capped at `limit` rows (T14-08's own `[SPEC ≤ 20k entries]` guard, spec 08
-/// §6 — this reader does not invent the bound, it only accepts one; a caller
-/// with no bound in mind should not call this over an unbounded subject kind).
+/// How many `subject_hash` placeholders one statement of
+/// [`embeddings_for_subjects`] may bind.
 ///
-/// No existing reader serves this shape: [`get_embedding`] is single-key,
-/// [`all_embedding_meta`] is kind-agnostic and carries no vector bytes (it
-/// exists for eviction's LRU scan, which never needs to score anything).
-/// Ordered by `subject_hash` for a deterministic scan order independent of
-/// SQLite's physical row order.
-pub fn embeddings_for_subject_kind(
+/// SQLite's own ceiling here is `SQLITE_MAX_VARIABLE_NUMBER`, which the
+/// bundled build compiles at 32 766 — but that value is a build-time knob
+/// (`libsqlite3-sys` reads it from the environment) and was 999 in every
+/// SQLite before 3.32, so 999 is the portable floor rather than a measured
+/// limit. Chunking at the floor is what lets this reader stay correct without
+/// knowing its caller's own bound: recall's candidate set is capped by
+/// `MAX_RECALL_CANDIDATES` (20 000) in `crates/memory`, a constant this crate
+/// cannot see, and the next caller need not have a cap at all.
+///
+/// Deliberately **not** [`crate::EVICTION_BATCH_ROWS`] (500) or
+/// `DEFAULT_WRITE_BATCH_ROWS`: those bound the rows a *write* transaction may
+/// carry (spec 06 §5), a different axis entirely. Borrowing the number would
+/// invent a lineage this constant does not have.
+pub const EMBEDDING_SUBJECT_CHUNK: usize = 999;
+
+const _: () = assert!(
+    EMBEDDING_SUBJECT_CHUNK > 0 && EMBEDDING_SUBJECT_CHUNK <= 999,
+    "the chunk must stay inside SQLite's portable parameter floor"
+);
+
+/// The `embedding_cache` rows for exactly the given `subject_hashes` under one
+/// `(subject_kind, representation_id)`.
+///
+/// Returns them **in the caller's order**; a hash with no cached row is simply
+/// absent (never an `Err`, never a positional `None`), and a repeated hash
+/// yields one entry, at its first position. An empty request reads nothing at
+/// all. Rows come back undecoded and unverified — the caller decodes via
+/// [`decode_vector_le`] and verifies via [`verify_cached_embedding`], the same
+/// contract [`get_embedding`] has. `last_used_at` is not touched (the LRU
+/// bump lives in [`flush_last_used_embeddings`]).
+///
+/// D-067 replaced the earlier `embeddings_for_subject_kind(conn, kind,
+/// representation_id, limit)`, which selected *every* row of the kind under
+/// `ORDER BY subject_hash LIMIT ?`. Its one production caller — memory
+/// recall's dense leg — passed its candidate count as that limit, so as soon
+/// as the cache held more rows of the kind than the request had candidates
+/// (other scopes, terminal entries, hashes left stale by earlier
+/// `edit`/`supersede`), the read was truncated at an arbitrary point of hash
+/// order and the candidates inside the cut silently lost their vectors.
+/// Asking for the keys you actually want removes the failure mode instead of
+/// documenting it.
+///
+/// The `IN (…)` list is built rather than bound through a carray/JSON
+/// extension, keeping this on the same plain-SQL footing as
+/// [`crate::occurrences_by_id`], and chunked at [`EMBEDDING_SUBJECT_CHUNK`]
+/// so the statement's parameter count stays inside SQLite's portable floor
+/// whatever the caller's own bound is.
+pub fn embeddings_for_subjects(
     conn: &Connection,
     subject_kind: SubjectKind,
     representation_id: &str,
-    limit: i64,
+    subject_hashes: &[&str],
 ) -> rusqlite::Result<Vec<EmbeddingCacheEntry>> {
-    let mut stmt = conn.prepare(
-        "SELECT subject_hash, dimensions, vector_f32, byte_size, checksum, created_at, \
-                last_used_at \
-         FROM embedding_cache \
-         WHERE subject_kind = ?1 AND representation_id = ?2 \
-         ORDER BY subject_hash \
-         LIMIT ?3",
-    )?;
-    let rows = stmt
-        .query_map(
-            params![subject_kind.as_str(), representation_id, limit],
-            |r| {
+    if subject_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kind = subject_kind.as_str();
+    let mut found: HashMap<String, EmbeddingCacheEntry> =
+        HashMap::with_capacity(subject_hashes.len());
+    for chunk in subject_hashes.chunks(EMBEDDING_SUBJECT_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT subject_hash, dimensions, vector_f32, byte_size, checksum, created_at, \
+                    last_used_at \
+             FROM embedding_cache \
+             WHERE subject_kind = ?1 AND representation_id = ?2 \
+               AND subject_hash IN ({placeholders})"
+        ))?;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 2);
+        bound.push(&kind);
+        bound.push(&representation_id);
+        for hash in chunk {
+            bound.push(hash);
+        }
+        let rows = stmt
+            .query_map(bound.as_slice(), |r| {
                 Ok(EmbeddingCacheEntry {
                     subject_hash: r.get(0)?,
                     row: EmbeddingCacheRow {
@@ -333,10 +386,16 @@ pub fn embeddings_for_subject_kind(
                         last_used_at: r.get(6)?,
                     },
                 })
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for entry in rows {
+            found.insert(entry.subject_hash.clone(), entry);
+        }
+    }
+    Ok(subject_hashes
+        .iter()
+        .filter_map(|hash| found.remove(*hash))
+        .collect())
 }
 
 /// Every `embedding_cache` row's meta projection, for the eviction scan

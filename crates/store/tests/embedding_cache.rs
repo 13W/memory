@@ -731,85 +731,225 @@ async fn all_embedding_meta_reflects_real_rows_for_pure_eviction_planning() {
     assert_eq!(evict, vec![a]);
 }
 
-// ---- embeddings_for_subject_kind (T14-08) -----------------------------------
+// ---- embeddings_for_subjects (T14-08, reshaped by D-067) --------------------
 
 #[tokio::test]
-async fn embeddings_for_subject_kind_filters_by_kind_and_representation() {
+async fn embeddings_for_subjects_returns_requested_keys_in_caller_order() {
     let (_home, _state, cache) = open_both();
 
-    let memory_a = EmbeddingKey {
-        subject_kind: SubjectKind::MemoryEntry,
-        subject_hash: subject_memory_entry("memory-a", "text a"),
-        representation_id: "memory-repr".to_string(),
-    };
-    let memory_b = EmbeddingKey {
-        subject_kind: SubjectKind::MemoryEntry,
-        subject_hash: subject_memory_entry("memory-b", "text b"),
-        representation_id: "memory-repr".to_string(),
-    };
-    // Same subject kind, different representation — must not leak in.
-    let memory_other_repr = EmbeddingKey {
-        subject_kind: SubjectKind::MemoryEntry,
-        subject_hash: subject_memory_entry("memory-c", "text c"),
-        representation_id: "other-repr".to_string(),
-    };
-    // Same representation, different subject kind — must not leak in either.
-    let content_same_repr = EmbeddingKey {
-        subject_kind: SubjectKind::ContentBlob,
-        subject_hash: subject_content_blob("blob-shares-repr-id"),
-        representation_id: "memory-repr".to_string(),
-    };
+    let keys: Vec<EmbeddingKey> = (0..4u8)
+        .map(|seed| EmbeddingKey {
+            subject_kind: SubjectKind::MemoryEntry,
+            subject_hash: subject_memory_entry(&format!("memory-{seed}"), "t"),
+            representation_id: "memory-repr".to_string(),
+        })
+        .collect();
+    for (seed, key) in keys.iter().enumerate() {
+        put(&cache, key, 1, &[seed as f32], NOW).await;
+    }
 
-    put(&cache, &memory_a, 2, &[1.0, 0.0], NOW).await;
-    put(&cache, &memory_b, 2, &[0.0, 1.0], NOW).await;
-    put(&cache, &memory_other_repr, 2, &[9.0, 9.0], NOW).await;
-    put(&cache, &content_same_repr, 2, &[8.0, 8.0], NOW).await;
+    // Ask in an order that is deliberately not the stored hash order, and
+    // include one key that was never cached.
+    let mut requested: Vec<String> = keys.iter().map(|k| k.subject_hash.clone()).collect();
+    requested.sort_unstable();
+    requested.reverse();
+    requested.truncate(3);
+    let absent = subject_memory_entry("memory-never-embedded", "t");
+    requested.push(absent.clone());
+    let borrowed: Vec<&str> = requested.iter().map(String::as_str).collect();
 
     let read = cache.open_read().expect("read conn");
-    let rows = local_rag_store::embeddings_for_subject_kind(
+    let rows = local_rag_store::embeddings_for_subjects(
         &read,
         SubjectKind::MemoryEntry,
         "memory-repr",
-        100,
+        &borrowed,
     )
-    .expect("bulk scan");
+    .expect("keyed read");
 
-    let hashes: Vec<&str> = rows.iter().map(|r| r.subject_hash.as_str()).collect();
-    let mut expected = vec![
-        memory_a.subject_hash.as_str(),
-        memory_b.subject_hash.as_str(),
-    ];
-    expected.sort_unstable();
+    let returned: Vec<&str> = rows.iter().map(|r| r.subject_hash.as_str()).collect();
+    let expected: Vec<&str> = requested[..3].iter().map(String::as_str).collect();
     assert_eq!(
-        hashes, expected,
-        "deterministic subject_hash-ascending order, other kind/representation excluded"
+        returned, expected,
+        "the caller's order is the contract, and an absent key is simply omitted"
     );
-
     for row in &rows {
         assert_eq!(verify_cached_embedding(&row.row), Ok(()));
     }
 }
 
 #[tokio::test]
-async fn embeddings_for_subject_kind_respects_the_limit() {
+async fn embeddings_for_subjects_ignores_other_kinds_and_representations_with_the_same_hash() {
     let (_home, _state, cache) = open_both();
 
-    for seed in 0..5u8 {
-        let key = EmbeddingKey {
-            subject_kind: SubjectKind::MemoryEntry,
-            subject_hash: subject_memory_entry(&format!("memory-{seed}"), "t"),
-            representation_id: "memory-repr".to_string(),
-        };
-        put(&cache, &key, 1, &[seed as f32], NOW).await;
-    }
+    let shared_hash = subject_memory_entry("memory-a", "text a");
+    let wanted = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: shared_hash.clone(),
+        representation_id: "memory-repr".to_string(),
+    };
+    // The very same subject hash under a different representation, and a
+    // different subject kind under the wanted representation: the composite
+    // primary key makes all three distinct rows, and only one is ours.
+    let other_repr = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: shared_hash.clone(),
+        representation_id: "other-repr".to_string(),
+    };
+    let blob_hash = subject_content_blob("blob-shares-repr-id");
+    let other_kind = EmbeddingKey {
+        subject_kind: SubjectKind::ContentBlob,
+        subject_hash: blob_hash.clone(),
+        representation_id: "memory-repr".to_string(),
+    };
+
+    put(&cache, &wanted, 2, &[1.0, 0.0], NOW).await;
+    put(&cache, &other_repr, 2, &[9.0, 9.0], NOW).await;
+    put(&cache, &other_kind, 2, &[8.0, 8.0], NOW).await;
 
     let read = cache.open_read().expect("read conn");
-    let rows = local_rag_store::embeddings_for_subject_kind(
+    let rows = local_rag_store::embeddings_for_subjects(
         &read,
         SubjectKind::MemoryEntry,
         "memory-repr",
-        3,
+        &[shared_hash.as_str(), blob_hash.as_str()],
     )
-    .expect("bulk scan");
-    assert_eq!(rows.len(), 3, "bounded by the caller-supplied limit");
+    .expect("keyed read");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "neither the other kind nor the other representation may leak in"
+    );
+    assert_eq!(rows[0].subject_hash, shared_hash);
+    assert_eq!(
+        local_rag_store::decode_vector_le(&rows[0].row.vector_f32).expect("decode"),
+        vec![1.0, 0.0]
+    );
+}
+
+#[tokio::test]
+async fn embeddings_for_subjects_collapses_a_repeated_key() {
+    let (_home, _state, cache) = open_both();
+
+    let key = EmbeddingKey {
+        subject_kind: SubjectKind::MemoryEntry,
+        subject_hash: subject_memory_entry("memory-a", "text a"),
+        representation_id: "memory-repr".to_string(),
+    };
+    put(&cache, &key, 1, &[1.0], NOW).await;
+
+    let read = cache.open_read().expect("read conn");
+    let rows = local_rag_store::embeddings_for_subjects(
+        &read,
+        SubjectKind::MemoryEntry,
+        "memory-repr",
+        &[key.subject_hash.as_str(), key.subject_hash.as_str()],
+    )
+    .expect("keyed read");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "a repeated key yields one entry, at its first position"
+    );
+}
+
+#[tokio::test]
+async fn embeddings_for_subjects_on_an_empty_request_reads_nothing() {
+    let (_home, _state, cache) = open_both();
+
+    // Drop the table the reader would touch: an empty request must return
+    // before it ever issues SQL, so this stays `Ok` while a non-empty one on
+    // the same connection cannot.
+    cache
+        .writer()
+        .transaction(|tx| tx.execute("DROP TABLE embedding_cache", []).map(|_| ()))
+        .await
+        .expect("drop table");
+
+    let read = cache.open_read().expect("read conn");
+    assert_eq!(
+        local_rag_store::embeddings_for_subjects(
+            &read,
+            SubjectKind::MemoryEntry,
+            "memory-repr",
+            &[]
+        )
+        .expect("an empty request issues no SQL at all"),
+        vec![]
+    );
+    assert!(
+        local_rag_store::embeddings_for_subjects(
+            &read,
+            SubjectKind::MemoryEntry,
+            "memory-repr",
+            &["deadbeef"],
+        )
+        .is_err(),
+        "a non-empty request on the same connection does issue SQL"
+    );
+}
+
+#[tokio::test]
+async fn embeddings_for_subjects_reads_every_key_across_chunk_boundaries() {
+    let (_home, _state, cache) = open_both();
+
+    // One row more than two full chunks, so the last chunk is a short one.
+    let total = 2 * local_rag_store::EMBEDDING_SUBJECT_CHUNK + 1;
+    let hashes: Vec<String> = (0..total)
+        .map(|i| subject_memory_entry(&format!("memory-{i:05}"), "t"))
+        .collect();
+    let seeded = hashes.clone();
+    cache
+        .writer()
+        .transaction(move |tx| {
+            for hash in &seeded {
+                insert_embedding(
+                    tx,
+                    &EmbeddingKey {
+                        subject_kind: SubjectKind::MemoryEntry,
+                        subject_hash: hash.clone(),
+                        representation_id: "memory-repr".to_string(),
+                    },
+                    1,
+                    &[1.0],
+                    NOW,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed rows");
+
+    let read = cache.open_read().expect("read conn");
+    for prefix in [
+        local_rag_store::EMBEDDING_SUBJECT_CHUNK,
+        local_rag_store::EMBEDDING_SUBJECT_CHUNK + 1,
+        total,
+    ] {
+        // Reverse order so a chunk that silently re-bound the previous one's
+        // parameters could not accidentally produce the right answer.
+        let mut requested: Vec<&str> = hashes[..prefix].iter().map(String::as_str).collect();
+        requested.reverse();
+        let absent = subject_memory_entry("memory-never-embedded", "t");
+        requested.push(absent.as_str());
+
+        let rows = local_rag_store::embeddings_for_subjects(
+            &read,
+            SubjectKind::MemoryEntry,
+            "memory-repr",
+            &requested,
+        )
+        .expect("keyed read");
+
+        let returned: Vec<&str> = rows.iter().map(|r| r.subject_hash.as_str()).collect();
+        assert_eq!(
+            returned,
+            requested[..prefix],
+            "every key of a {prefix}-key request must come back, in order"
+        );
+        let distinct: std::collections::BTreeSet<&str> = returned.iter().copied().collect();
+        assert_eq!(distinct.len(), prefix, "no key may be returned twice");
+    }
 }

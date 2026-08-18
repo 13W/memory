@@ -39,7 +39,7 @@ use local_rag_core::identity::domain::subject_memory_entry;
 use local_rag_projection::contract::{DistanceMetric, similarity};
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
-    RecallCandidate, RepresentationKey, SubjectKind, decode_vector_le, embeddings_for_subject_kind,
+    RecallCandidate, RepresentationKey, SubjectKind, decode_vector_le, embeddings_for_subjects,
     verify_cached_embedding,
 };
 
@@ -166,6 +166,13 @@ impl MemoryDenseBackend for BruteForceCosine {
 /// not appear in the output — this leg degrades per-entry, not as a whole,
 /// exactly like a code occurrence with no dense point is just absent from
 /// that leg's results.
+///
+/// Each candidate is hashed once, up front, and those hashes are the keys the
+/// cache is read by (D-067). Reading the whole `memory_entry` population and
+/// trusting a row limit to bound it does not work: the cache also holds other
+/// scopes, terminal entries, and hashes left stale by earlier
+/// `edit`/`supersede`, so any limit derived from *this* request truncates a
+/// population it does not describe.
 #[allow(clippy::too_many_arguments)]
 pub fn dense_leg(
     cache_read: &Connection,
@@ -195,10 +202,18 @@ pub fn dense_leg(
         });
     }
 
-    let cap = i64::try_from(candidates.len()).unwrap_or(i64::MAX);
-    let cached =
-        embeddings_for_subject_kind(cache_read, SubjectKind::MemoryEntry, representation_id, cap)
-            .map_err(|_| DenseLegUnavailable::NoRepresentation)?;
+    let hashes: Vec<String> = candidates
+        .iter()
+        .map(|c| subject_memory_entry(&c.memory_id, &c.text))
+        .collect();
+    let keys: Vec<&str> = hashes.iter().map(String::as_str).collect();
+    let cached = embeddings_for_subjects(
+        cache_read,
+        SubjectKind::MemoryEntry,
+        representation_id,
+        &keys,
+    )
+    .map_err(|_| DenseLegUnavailable::NoRepresentation)?;
     let by_subject_hash: BTreeMap<&str, &local_rag_store::EmbeddingCacheRow> = cached
         .iter()
         .filter(|entry| verify_cached_embedding(&entry.row).is_ok())
@@ -207,8 +222,8 @@ pub fn dense_leg(
 
     let scoreable: Vec<(String, Vec<f32>)> = candidates
         .iter()
-        .filter_map(|c| {
-            let hash = subject_memory_entry(&c.memory_id, &c.text);
+        .zip(hashes.iter())
+        .filter_map(|(c, hash)| {
             let row = by_subject_hash.get(hash.as_str())?;
             let decoded = decode_vector_le(&row.vector_f32).ok()?;
             Some((c.memory_id.clone(), decoded))
@@ -321,5 +336,269 @@ mod tests {
         )
         .expect("empty query is healthy, not an error");
         assert!(hits.is_empty());
+    }
+
+    struct FixedEmbedder(Vec<f32>);
+    impl QueryEmbedder for FixedEmbedder {
+        fn embed_query(
+            &self,
+            _q: &str,
+            _k: &RepresentationKey,
+        ) -> Result<Vec<f32>, QueryEmbedError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn memory_key() -> RepresentationKey {
+        RepresentationKey {
+            kind: local_rag_store::RepresentationKind::Memory,
+            representation_version: 1,
+            normalization_version: 1,
+            model_id: "m".to_string(),
+            dimensions: 3,
+            distance_metric: DistanceMetric::Cosine,
+        }
+    }
+
+    fn open_cache() -> (local_rag_test_support::TempHome, local_rag_store::CacheDb) {
+        let home = local_rag_test_support::TempHome::new().expect("home");
+        let layout = local_rag_core::paths::StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure");
+        let cache = local_rag_store::CacheDb::open(layout.cache_db(), "store-uuid").expect("cache");
+        (home, cache)
+    }
+
+    /// Seed `(subject_hash, vector)` rows for one representation in a single
+    /// writer transaction.
+    async fn seed_rows(
+        cache: &local_rag_store::CacheDb,
+        representation_id: &str,
+        rows: Vec<(String, Vec<f32>)>,
+    ) {
+        let representation_id = representation_id.to_string();
+        cache
+            .writer()
+            .transaction(move |tx| {
+                for (subject_hash, vector) in rows {
+                    local_rag_store::insert_embedding(
+                        tx,
+                        &local_rag_store::EmbeddingKey {
+                            subject_kind: SubjectKind::MemoryEntry,
+                            subject_hash,
+                            representation_id: representation_id.clone(),
+                        },
+                        3,
+                        &vector,
+                        1_000,
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed rows");
+    }
+
+    /// `2 * n` `(subject_hash, memory_id, text)` triples in ascending hash
+    /// order. SQLite's `TEXT` collation here is `BINARY` and `subject_hash` is
+    /// lowercase hex, so this order is byte-for-byte the one
+    /// `ORDER BY subject_hash` produces — which is what makes the D-067
+    /// regression test below exact rather than probabilistic.
+    fn hash_ordered_pairs(n: usize) -> Vec<(String, String, String)> {
+        let mut pairs: Vec<(String, String, String)> = (0..2 * n)
+            .map(|i| {
+                let memory_id = format!("mem-{i:02}");
+                let text = format!("text {i:02}");
+                (subject_memory_entry(&memory_id, &text), memory_id, text)
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[tokio::test]
+    async fn every_candidate_with_a_cached_vector_is_ranked_even_when_the_cache_holds_foreign_memory_rows()
+     {
+        // D-067. The cache holds `2N` memory rows while only `N` of them are
+        // candidates: the rest stand for the stale hashes earlier
+        // `edit`/`supersede` ops left behind and for entries of other scopes,
+        // which is what a real store holds (86 cached memory rows against 44
+        // candidates when this was measured). The foreign half deliberately
+        // owns the *lower* hashes, so a reader that scans the whole kind in
+        // `subject_hash` order and stops after `candidates.len()` rows returns
+        // exactly the rows nobody asked for.
+        const N: usize = 8;
+        let pairs = hash_ordered_pairs(N);
+        let (foreign, mine) = pairs.split_at(N);
+
+        let (_home, cache) = open_cache();
+        let mut rows: Vec<(String, Vec<f32>)> = foreign
+            .iter()
+            .map(|(hash, _, _)| (hash.clone(), vec![0.0, 0.0, 1.0]))
+            .collect();
+        // The candidate with the *highest* hash — the first one a truncating
+        // read loses — is the exact match for the query vector.
+        for (j, (hash, _, _)) in mine.iter().enumerate() {
+            let off = (N - 1 - j) as f32 * 0.5;
+            rows.push((hash.clone(), vec![1.0, off, 0.0]));
+        }
+        seed_rows(&cache, "repr-1", rows).await;
+
+        let candidates: Vec<RecallCandidate> = mine
+            .iter()
+            .map(|(_, memory_id, text)| candidate(memory_id, text))
+            .collect();
+        let read = cache.open_read().expect("read");
+        let hits = dense_leg(
+            &read,
+            "query",
+            &memory_key(),
+            "repr-1",
+            &FixedEmbedder(vec![1.0, 0.0, 0.0]),
+            &BruteForceCosine,
+            &candidates,
+            50,
+        )
+        .expect("healthy leg");
+
+        assert_eq!(
+            hits.len(),
+            N,
+            "every candidate with a cached vector must be scored, not only the ones \
+             that happen to sort low"
+        );
+        assert_eq!(
+            hits[0].memory_id,
+            mine[N - 1].1,
+            "the highest-hash candidate is the exact match and must rank first"
+        );
+        assert_eq!(
+            hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
+            (1..=N).collect::<Vec<_>>()
+        );
+        let returned: std::collections::BTreeSet<&str> =
+            hits.iter().map(|h| h.memory_id.as_str()).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            mine.iter().map(|(_, id, _)| id.as_str()).collect();
+        assert_eq!(returned, expected, "no foreign row may leak into the leg");
+    }
+
+    #[tokio::test]
+    async fn a_cache_holding_exactly_the_candidate_rows_ranks_them_all() {
+        // The control group for the test above: same shape, no foreign rows.
+        // Green both before and after D-067's fix.
+        const N: usize = 4;
+        let pairs = hash_ordered_pairs(N);
+        let mine = &pairs[N..];
+
+        let (_home, cache) = open_cache();
+        let rows: Vec<(String, Vec<f32>)> = mine
+            .iter()
+            .enumerate()
+            .map(|(j, (hash, _, _))| (hash.clone(), vec![1.0, (N - 1 - j) as f32 * 0.5, 0.0]))
+            .collect();
+        seed_rows(&cache, "repr-1", rows).await;
+
+        let candidates: Vec<RecallCandidate> = mine
+            .iter()
+            .map(|(_, memory_id, text)| candidate(memory_id, text))
+            .collect();
+        let read = cache.open_read().expect("read");
+        let hits = dense_leg(
+            &read,
+            "query",
+            &memory_key(),
+            "repr-1",
+            &FixedEmbedder(vec![1.0, 0.0, 0.0]),
+            &BruteForceCosine,
+            &candidates,
+            50,
+        )
+        .expect("healthy leg");
+
+        assert_eq!(hits.len(), N);
+        assert_eq!(hits[0].memory_id, mine[N - 1].1);
+        assert_eq!(
+            hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
+            (1..=N).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_candidate_without_a_cached_row_is_simply_absent() {
+        let (_home, cache) = open_cache();
+        let hash = subject_memory_entry("mem-1", "text one");
+        seed_rows(&cache, "repr-1", vec![(hash, vec![1.0, 0.0, 0.0])]).await;
+
+        let read = cache.open_read().expect("read");
+        let hits = dense_leg(
+            &read,
+            "query",
+            &memory_key(),
+            "repr-1",
+            &FixedEmbedder(vec![1.0, 0.0, 0.0]),
+            &BruteForceCosine,
+            &[
+                candidate("mem-1", "text one"),
+                candidate("mem-2", "text two"),
+            ],
+            50,
+        )
+        .expect("healthy leg");
+
+        assert_eq!(hits.len(), 1, "the leg degrades per entry, not as a whole");
+        assert_eq!(hits[0].memory_id, "mem-1");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_cached_row_drops_only_its_own_candidate() {
+        let (_home, cache) = open_cache();
+        let hashes: Vec<String> = (1..=3)
+            .map(|i| subject_memory_entry(&format!("mem-{i}"), &format!("text {i}")))
+            .collect();
+        let rows: Vec<(String, Vec<f32>)> = hashes
+            .iter()
+            .map(|h| (h.clone(), vec![1.0, 0.0, 0.0]))
+            .collect();
+        seed_rows(&cache, "repr-1", rows).await;
+
+        // Rewrite one row's bytes without its checksum: `verify_cached_embedding`
+        // must reject it (the idiom `crates/store/tests/embedding_cache.rs`
+        // already uses for corruption).
+        let corrupt = hashes[1].clone();
+        cache
+            .writer()
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE embedding_cache SET vector_f32 = ?2 \
+                     WHERE subject_kind = 'memory_entry' AND subject_hash = ?1",
+                    local_rag_store::rusqlite::params![
+                        corrupt,
+                        local_rag_store::encode_vector_le(&[9.0, 9.0, 9.0])
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("corrupt one row");
+
+        let read = cache.open_read().expect("read");
+        let hits = dense_leg(
+            &read,
+            "query",
+            &memory_key(),
+            "repr-1",
+            &FixedEmbedder(vec![1.0, 0.0, 0.0]),
+            &BruteForceCosine,
+            &[
+                candidate("mem-1", "text 1"),
+                candidate("mem-2", "text 2"),
+                candidate("mem-3", "text 3"),
+            ],
+            50,
+        )
+        .expect("a corrupt row degrades one entry, never the leg");
+
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.memory_id != "mem-2"));
     }
 }
