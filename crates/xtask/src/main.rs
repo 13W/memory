@@ -321,10 +321,17 @@ fn run_memory_bench() -> ExitCode {
 }
 
 /// `cargo xtask memory-recall-bench [--corpus <path>] [--model <catalog-id>] [--out <path>]`
+/// `[--config baseline|store_en|query_en|both_en|all[,...]]`
+///
+/// A single (default) config behaves exactly as X-010 shipped it: one report
+/// at `--out`. More than one config additionally writes a
+/// `<out-stem>-comparison.json`/`.report.md` pair (X-011) — the delta of
+/// every other configuration against whichever one is `baseline`.
 fn run_memory_recall_bench() -> ExitCode {
     let mut corpus_path: Option<PathBuf> = None;
     let mut model_id: Option<String> = None;
     let mut out: Option<PathBuf> = None;
+    let mut configs: Vec<memory_recall_bench::run::Config> = Vec::new();
 
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
@@ -332,6 +339,28 @@ fn run_memory_recall_bench() -> ExitCode {
             "--corpus" => corpus_path = args.next().map(PathBuf::from),
             "--model" => model_id = args.next(),
             "--out" => out = args.next().map(PathBuf::from),
+            "--config" => {
+                let Some(raw) = args.next() else {
+                    eprintln!("--config needs a value (comma-separated, or \"all\")");
+                    return ExitCode::from(2);
+                };
+                for piece in raw.split(',') {
+                    let piece = piece.trim();
+                    if piece == "all" {
+                        configs = memory_recall_bench::run::Config::ALL.to_vec();
+                        continue;
+                    }
+                    match memory_recall_bench::run::Config::from_str(piece) {
+                        Some(c) => configs.push(c),
+                        None => {
+                            eprintln!(
+                                "--config takes baseline|store_en|query_en|both_en|all, got {piece:?}"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+            }
             other => {
                 eprintln!("unknown argument {other:?}");
                 return ExitCode::from(2);
@@ -348,58 +377,112 @@ fn run_memory_recall_bench() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = match runtime.block_on(memory_recall_bench::run::run(
+    let reports = match runtime.block_on(memory_recall_bench::run::run(
         &memory_recall_bench::run::Options {
             corpus_path,
             model_id,
+            configs,
         },
     )) {
-        Ok(report) => report,
+        Ok(reports) => reports,
         Err(e) => {
             eprintln!("memory-recall-bench: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    if let Some(parent) = out.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        eprintln!("memory-recall-bench: creating {}: {e}", parent.display());
-        return ExitCode::FAILURE;
-    }
-    let json = serde_json::to_string_pretty(&report).expect("report serializes");
-    if let Err(e) = std::fs::write(&out, json + "\n") {
-        eprintln!("memory-recall-bench: writing {}: {e}", out.display());
-        return ExitCode::FAILURE;
-    }
-    let md_path = out.with_extension("report.md");
-    if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
-        eprintln!("memory-recall-bench: writing {}: {e}", md_path.display());
-        return ExitCode::FAILURE;
-    }
-    eprintln!(
-        "memory-recall-bench: wrote {} and {}",
-        out.display(),
-        md_path.display()
-    );
-    eprintln!(
-        "[memory-recall-bench] config={} Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (n={})",
-        report.provenance.config,
-        report.metrics.hit_at_1,
-        report.metrics.hit_at_3,
-        report.metrics.hit_at_5,
-        report.metrics.mrr,
-        report.metrics.query_count,
-    );
-    for (pair, m) in &report.metrics_by_lang_pair {
+    let sweep = reports.len() > 1;
+    for report in &reports {
+        let out = if sweep {
+            let stem = out
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "run".to_string());
+            out.with_file_name(format!("{stem}-{}.json", report.provenance.config))
+        } else {
+            out.clone()
+        };
+        if let Some(parent) = out.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("memory-recall-bench: creating {}: {e}", parent.display());
+            return ExitCode::FAILURE;
+        }
+        let json = serde_json::to_string_pretty(report).expect("report serializes");
+        if let Err(e) = std::fs::write(&out, json + "\n") {
+            eprintln!("memory-recall-bench: writing {}: {e}", out.display());
+            return ExitCode::FAILURE;
+        }
+        let md_path = out.with_extension("report.md");
+        if let Err(e) = std::fs::write(&md_path, report.to_markdown()) {
+            eprintln!("memory-recall-bench: writing {}: {e}", md_path.display());
+            return ExitCode::FAILURE;
+        }
         eprintln!(
-            "[memory-recall-bench]   {pair}: Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (n={})",
-            m.hit_at_1, m.hit_at_3, m.hit_at_5, m.mrr, m.query_count,
+            "memory-recall-bench: wrote {} and {}",
+            out.display(),
+            md_path.display()
         );
+        eprintln!(
+            "[memory-recall-bench] config={} Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (n={})",
+            report.provenance.config,
+            report.metrics.hit_at_1,
+            report.metrics.hit_at_3,
+            report.metrics.hit_at_5,
+            report.metrics.mrr,
+            report.metrics.query_count,
+        );
+        for (pair, m) in &report.metrics_by_lang_pair {
+            eprintln!(
+                "[memory-recall-bench]   {pair}: Hit@1={:.4} Hit@3={:.4} Hit@5={:.4} MRR={:.4} (n={})",
+                m.hit_at_1, m.hit_at_3, m.hit_at_5, m.mrr, m.query_count,
+            );
+        }
     }
 
-    // No gate yet — this benchmark has no prior baseline to gate against (see
-    // this task's own module doc: the run *is* the evidence a future
+    if sweep {
+        let stem = out
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "run".to_string());
+        match memory_recall_bench::report::compare(reports) {
+            Ok(comparison) => {
+                let cmp_out = out.with_file_name(format!("{stem}-comparison.json"));
+                let json =
+                    serde_json::to_string_pretty(&comparison).expect("comparison serializes");
+                if let Err(e) = std::fs::write(&cmp_out, json + "\n") {
+                    eprintln!("memory-recall-bench: writing {}: {e}", cmp_out.display());
+                    return ExitCode::FAILURE;
+                }
+                let md_path = cmp_out.with_extension("report.md");
+                if let Err(e) = std::fs::write(&md_path, comparison.to_markdown()) {
+                    eprintln!("memory-recall-bench: writing {}: {e}", md_path.display());
+                    return ExitCode::FAILURE;
+                }
+                eprintln!(
+                    "memory-recall-bench: wrote {} and {}",
+                    cmp_out.display(),
+                    md_path.display()
+                );
+                for c in &comparison.configs {
+                    eprintln!(
+                        "[memory-recall-bench] Δ MRR {} vs baseline: overall {:+.4}",
+                        c.report.provenance.config, c.delta_overall.mrr
+                    );
+                    for (pair, d) in &c.delta_by_lang_pair {
+                        eprintln!("[memory-recall-bench]   {pair}: Δ MRR {:+.4}", d.mrr);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("memory-recall-bench: comparison: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // No gate — this benchmark has no committed threshold to gate against
+    // (see this task's own module doc: the run *is* the evidence a future
     // threshold would be derived from, O2's "collect metrics, never invent
     // thresholds").
     ExitCode::SUCCESS

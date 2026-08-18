@@ -399,6 +399,51 @@ states less precisely than the shipped code:
   overflow the budget, then the walk stops — a ranked prefix, never a skip-ahead search for a
   smaller entry further down the order.
 
+As-built note (X-010/X-011): this section's own "no equivalent per-query relevance-judged
+benchmark exists for memory recall" (see the fusion-weight bullet above) is closed by a new,
+independent harness — `cargo xtask memory-recall-bench`
+(`crates/xtask/src/memory_recall_bench/`), scoring Hit@1/3/5 and MRR over a 24-entry bilingual
+fixture (`fixtures/memory-recall/corpus.json`, `family: "memory-recall"`) stratified by
+`lang_pair` (8 `ru-ru` / 8 `en-en` same-language controls, 4 `ru-en` / 4 `en-ru` cross-lingual).
+This does **not** derive the fusion weight the bullet above defers — 24 queries is too small a
+corpus to fit one responsibly, and that remains future work if a weight is ever derived. What it
+does answer, with data instead of a guess, is the question the repository owner asked directly
+after confirming this codebase (unlike v1) never forces memory text or queries to English: does
+normalizing to English actually help recall quality? Four configurations were run over the exact
+same corpus/model (`embeddinggemma-300m`) — `baseline` (today's real, as-is pipeline: nothing
+translated), `store_en` (only stored text translated), `query_en` (only the query translated),
+`both_en` (both sides translated — the v1-style shape) — each a real, hand-authored English
+translation living in the fixture already (`text_english`/`query_english`), never a runtime
+translation call. Measured MRR, `baseline` → `both_en`:
+
+| Group | `baseline` | `store_en` | `query_en` | `both_en` |
+| --- | --- | --- | --- | --- |
+| overall (n=24) | 0.8021 | 0.9792 | 0.9062 | **1.0000** |
+| `en-en` (n=8) | 1.0000 | 0.9375 | 1.0000 | 1.0000 |
+| `ru-ru` (n=8) | 1.0000 | 1.0000 | 0.9375 | 1.0000 |
+| `ru-en` (n=4) | 0.5625 | 1.0000 | 0.5625 | 1.0000 |
+| `en-ru` (n=4) | 0.2500 | 1.0000 | 1.0000 | 1.0000 |
+
+The same-language groups were already perfect under `baseline` (as expected: nothing about
+this pipeline mishandles a single language); the entire gap is in the cross-lingual groups, and
+`both_en` closes it completely — Hit@1/3/5 and MRR all `1.0000` across every one of the 24
+queries, with none of `store_en`'s or `query_en`'s small (1-in-8) regressions on an
+already-perfect same-language group (plausible cause: translating only one side of a pair, or
+translating unrelated candidates in the same small pool, can shift the competitive ranking at the
+margin even for a query whose own match did not change — an effect `both_en` does not exhibit,
+since nothing is asymmetric once every text is in one language). Full run artifacts:
+`fixtures/memory-recall/baseline/run-{baseline,store_en,query_en,both_en,comparison}.json` and
+`.report.md`.
+
+**This is evidence, not a resolved design decision** — no `[OPEN]` item in 15 §4 names this
+question, so there is nothing here to close silently, and building a real translation component
+is a separate, real architecture decision (which mechanism, whether it can satisfy
+`local_only`/no-mandatory-external-daemon, where in the pipeline it runs) that needs the owner's
+explicit sign-off, not an inference from a 24-query synthetic corpus. What the measurement does
+support: on this fixture, full bilateral normalization (`both_en`'s shape) fully closes a real,
+substantial cross-lingual recall gap with no observed downside, which is a real point in favor of
+pursuing it — should the owner decide to.
+
 ## 7. Memory-quality benchmark `[FIXED, new in rev 6]`
 
 A labeled fixture set of observation streams → expected memory ops
