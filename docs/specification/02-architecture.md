@@ -327,6 +327,21 @@ second:
   *path*, leaving two daemons each convinced they alone own the store). Once `ready: true`, the
   full two-part check applies exactly as written above.
 
+As-built note (D-065, `[SPEC]`, amends the bullet above): reclaiming on `WouldBlock` requires a
+lock record that was **read and parsed** and whose named owner was then proven gone. A record that
+cannot be read at all — absent, empty, or partial — is `STORE_LOCKED`/`MIGRATION_IN_PROGRESS`,
+never a reclaim. This follows from the branch's own premise: `WouldBlock` proves a live process
+holds the `flock` at that instant, and a dead one cannot hold it (POSIX releases it on exit), so an
+unreadable record can only belong to an owner that has not written it yet or is rewriting it —
+never to a crashed owner. Recovery from a crash's torn write is the **successful**-`flock` branch's
+job, where the content is simply overwritten. Two supporting details: `acquire` re-reads the record
+a bounded number of times (`local_rag::daemon::lock::OWNER_READ_ATTEMPTS` × `OWNER_READ_RETRY_MS`,
+8 ms total — chosen, not `[SPEC]`) so the refusal usually still names the owner, and `store.lock`
+is rewritten in place over at least its previous length instead of being truncated first, so a
+concurrent reader (`read_store_lock_file`, behind `status`/`doctor`) sees the old record or the new
+one but never an empty file. Before this rule, two daemons started in the same millisecond both
+reported acquiring the lock, and the loser left a record naming itself behind.
+
 As-built note (T15-01, `[SPEC]`): step 2's `store_instance_uuid` (03 §2.1, consumed by step 3's
 cache-open) is seeded here, inside the same step — `local_rag_store::registry::
 ensure_store_instance_uuid`, a first-writer-wins atomic upsert (`INSERT ... ON CONFLICT DO UPDATE

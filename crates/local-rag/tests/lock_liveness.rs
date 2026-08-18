@@ -16,7 +16,8 @@ use std::sync::mpsc;
 
 use local_rag::daemon::probe::{LivenessOutcome, LivenessProbe};
 use local_rag::daemon::{
-    SocketLivenessProbe, StoreLockError, StoreLockFileState, acquire, read_store_lock_file,
+    SocketLivenessProbe, StoreLockError, StoreLockFileState, StoreLockGuard, StoreLockInfo,
+    acquire, read_store_lock_file,
 };
 use local_rag_core::paths::StoreLayout;
 use local_rag_protocol::{Message, PROTO_VERSION, Welcome, encode_message};
@@ -482,6 +483,163 @@ fn a_not_yet_ready_owner_with_a_dead_pid_is_reclaimed() {
     let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, &probe)
         .expect("a dead not-yet-ready owner must be reclaimed");
     assert_eq!(guard.info().instance_uuid, "fresh-instance");
+}
+
+// ---------------------------------------------------------------------------
+// D-065: an *unreadable* record on the `WouldBlock` branch is a live conflict,
+// never grounds for a reclaim. Reaching that branch already proves a live
+// holder (POSIX releases `flock` on exit), so the record can only belong to an
+// owner that has not written it yet or is rewriting it — the two windows these
+// tests stand in for. Neither existing unparseable-content test covers this:
+// both write their garbage with no `flock` held at all, which is the success
+// branch. Production hit this window on 2026-08-18 and ended up with two
+// daemons each believing it owned the store.
+// ---------------------------------------------------------------------------
+
+/// Hold a real `flock` on `store.lock`, seed `content`, and run `acquire`
+/// against it. Returns the result plus the lock file's inode before and after
+/// — a changed inode is precisely the reclaim this must never perform.
+///
+/// The `mpsc` handshake (this file's own idiom) proves the holder is in place
+/// before the foreground `acquire` runs, so there is no wall-clock dependency.
+fn acquire_against_a_live_holder(
+    layout: &StoreLayout,
+    content: Option<&'static [u8]>,
+) -> (Result<StoreLockGuard, StoreLockError>, u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let lock_path = layout.store_lock();
+
+    let holder = std::thread::spawn(move || {
+        local_rag_core::paths::ensure_file_0600(&lock_path).expect("ensure lock file");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        file.lock().expect("blocking lock");
+        if let Some(bytes) = content {
+            file.write_all(bytes).expect("seed content");
+            file.flush().expect("flush");
+        }
+        ready_tx.send(()).expect("signal ready");
+        release_rx.recv().expect("wait for release signal");
+    });
+    ready_rx.recv().expect("holder ready");
+
+    let ino_before = std::fs::metadata(layout.store_lock())
+        .expect("lock file exists before acquire")
+        .ino();
+
+    // `Stale` on purpose: under the pre-D-065 code this verdict is what drove
+    // the reclaim, so a probe that says "dead" makes the regression loud. With
+    // the fix the probe is never consulted at all — there is no parsed record
+    // to consult it about.
+    let probe = FixedProbe(LivenessOutcome::Stale);
+    let result = acquire(layout, "candidate-uuid", 999_999, "0.0.0", 2_000, &probe);
+
+    let ino_after = std::fs::metadata(layout.store_lock())
+        .expect("lock file must still exist — a reclaim would have unlinked it")
+        .ino();
+
+    release_tx.send(()).expect("release holder");
+    holder.join().expect("holder thread");
+
+    (result, ino_before, ino_after)
+}
+
+fn assert_locked_by_an_unnamed_owner(
+    result: Result<StoreLockGuard, StoreLockError>,
+    ino_before: u64,
+    ino_after: u64,
+) {
+    match result {
+        Err(StoreLockError::Locked { owner }) => {
+            assert_eq!(owner.pid, 0, "an unreadable record cannot name a pid");
+            assert!(!owner.ready, "an owner mid-startup is not ready");
+        }
+        other => panic!(
+            "expected Locked (a live holder whose record cannot be read must never be \
+             reclaimed), got {other:?}"
+        ),
+    }
+    assert_eq!(
+        ino_before, ino_after,
+        "the lock file was unlinked and recreated — this is the reclaim that leaves two \
+         daemons each owning the store"
+    );
+}
+
+/// The owner took the `flock` microseconds ago and has not written its record
+/// yet: the file `ensure_file_0600` created is still empty.
+#[test]
+fn an_unwritten_record_under_a_live_flock_is_locked_not_reclaimed() {
+    let (_home, layout) = open_layout();
+    let (result, before, after) = acquire_against_a_live_holder(&layout, None);
+    assert_locked_by_an_unnamed_owner(result, before, after);
+}
+
+/// The owner is rewriting its record right now (`mark_ready` through
+/// `write_info`) and a reader caught a partial one.
+#[test]
+fn a_torn_record_under_a_live_flock_is_locked_not_reclaimed() {
+    let (_home, layout) = open_layout();
+    let (result, before, after) =
+        acquire_against_a_live_holder(&layout, Some(b"{\"instance_uuid\":\"half-writ"));
+    assert_locked_by_an_unnamed_owner(result, before, after);
+}
+
+/// `write_info`'s padding covers the previous record only while the write is
+/// in flight — the file left on disk is exactly the new record, with no
+/// trailing spaces for the next reader to puzzle over.
+#[test]
+fn a_shrinking_rewrite_leaves_no_padding_on_disk() {
+    let (_home, layout) = open_layout();
+
+    // A long record first: `ready: true` carries `ready_at` and `socket_path`.
+    let mut guard = acquire(
+        &layout,
+        "long-instance-uuid",
+        4242,
+        "0.0.0",
+        1_000,
+        &FixedProbe(LivenessOutcome::Stale),
+    )
+    .expect("first acquire");
+    guard
+        .mark_ready(1_500, &layout.socket_path())
+        .expect("mark ready");
+    let long_len = std::fs::metadata(layout.store_lock())
+        .expect("metadata")
+        .len();
+    drop(guard); // releases the `flock`, leaves the content behind
+
+    // Now a shorter one over it: fresh records carry neither field.
+    let _guard = acquire(
+        &layout,
+        "short",
+        7,
+        "0.0.0",
+        2_000,
+        &FixedProbe(LivenessOutcome::Stale),
+    )
+    .expect("second acquire");
+
+    let bytes = std::fs::read(layout.store_lock()).expect("read lock file");
+    assert!(
+        (bytes.len() as u64) < long_len,
+        "the shorter record must not keep the old one's length: {} vs {long_len}",
+        bytes.len()
+    );
+    assert!(
+        !bytes.ends_with(b" "),
+        "padding must be truncated away: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let parsed: StoreLockInfo = serde_json::from_slice(&bytes).expect("parses");
+    assert_eq!(parsed.instance_uuid, "short");
 }
 
 // ---------------------------------------------------------------------------
