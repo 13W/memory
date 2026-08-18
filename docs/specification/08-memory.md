@@ -466,6 +466,24 @@ support: on this fixture, full bilateral normalization (`both_en`'s shape) fully
 substantial cross-lingual recall gap with no observed downside, which is a real point in favor of
 pursuing it — should the owner decide to.
 
+As-built note (D-068, `[SPEC]`): the "1-in-8 regression" the paragraph above attributes to
+`store_en` on `en-en` is an **artifact of the harness, not a property of one-sided
+normalization**, and the guessed cause offered there ("translating unrelated candidates in the
+same small pool") is wrong. `store_en` and `both_en` seed the store identically — `text_english`
+for all 24 entries — and differ only in query text; the single query where their ranks diverge is
+`mrq-13`, an `en-en` pair for which the fixture has `text_original == text_english` **and**
+`query_original == query_english` byte for byte. Both runs therefore had byte-identical inputs
+for that query. The harness minted `memory_id` with `SystemUuidV7` while seeding every entry at
+one `created_at`, so this section's own `(score desc, created_at desc, memory_id)` tie-break was
+decided by OS entropy whenever scores tied. That half-point is also the whole `store_en` ↔
+`both_en` overall delta (1.0000 − 0.9792 = 0.0208 = 0.5/24): on this corpus the two configurations
+are indistinguishable, and **the entire measured benefit comes from normalizing the stored text**.
+The `query_en` drop on `ru-ru` is by contrast genuine — there an English query really is matched
+against a Russian store. The harness now seeds its `UuidSource` and gives each entry a distinct
+`created_at`, so the documented tie-break decides and two runs of one configuration agree query
+for query. The recorded artifacts above predate that fix and are kept as-is (evidence is never
+rewritten); the numbers a comparison may be drawn from are the ones a re-run produces.
+
 ## 7. Memory-quality benchmark `[FIXED, new in rev 6]`
 
 A labeled fixture set of observation streams → expected memory ops
