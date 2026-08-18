@@ -21,11 +21,11 @@ mod validate;
 mod writer;
 
 pub use embedding::{
-    BatchingLastUsedEmbeddings, EmbeddingCacheEntry, EmbeddingCacheMeta, EmbeddingCacheRow,
-    EmbeddingDivergence, EmbeddingKey, LastUsedSinkEmbedding, SubjectKind, VectorLengthError,
-    all_embedding_meta, decode_vector_le, delete_embedding, embeddings_for_subject_kind,
-    encode_vector_le, flush_last_used_embeddings, get_embedding, insert_embedding,
-    verify_cached_embedding,
+    BatchingLastUsedEmbeddings, EMBEDDING_SUBJECT_CHUNK, EmbeddingCacheEntry, EmbeddingCacheMeta,
+    EmbeddingCacheRow, EmbeddingDivergence, EmbeddingKey, LastUsedSinkEmbedding, SubjectKind,
+    VectorLengthError, all_embedding_meta, decode_vector_le, delete_embedding,
+    embeddings_for_subjects, encode_vector_le, flush_last_used_embeddings, get_embedding,
+    insert_embedding, verify_cached_embedding,
 };
 pub use fts::{
     FtsMaterializeError, FtsMaterializeOutcome, FtsProjectionHeadRow, LEXICAL_SCHEMA_VERSION,
