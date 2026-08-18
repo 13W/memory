@@ -587,6 +587,45 @@ v0-очередь (T00-01…G17) закрыта; задачи в этом раз
   возраст активной генерации.
 - **Evidence:** заполняется после выполнения в `PROGRESS.md`'s «Task evidence».
 
+#### D-065 — Реклейм store-lock'а не должен путать «не прочитал» с «мёртв»
+
+- **Зависит от:** ничего; найдена живой приёмкой X-006/X-007/X-008 и не переоткрывает ни один
+  гейт `G00–G20`. Строка в `DEVIATIONS.md` — `open`.
+- **Спецификация:** `docs/specification/02-architecture.md` §4.1 (as-built `[SPEC]` T15-01, ветка
+  «On `WouldBlock`» с оговоркой про `ready: false`) и §4.4 `[FIXED]` «Ownership invariants».
+- **Наблюдаемое:** два демона, стартовавшие в одну миллисекунду, оба рапортуют `store lock
+  acquired`. `acquire_inner` (`crates/local-rag/src/daemon/lock.rs:218-243`) вычисляет
+  `let alive = owner.as_ref().is_some_and(|o| is_owner_alive(o, probe))`, поэтому
+  `read_lock_info() == None` даёт `alive == false` и уводит управление в ветку реклейма, которая
+  делает `remove_file(&path)` — уничтожает файл **живого** владельца. Правило «`ready: false` →
+  верить одному PID» реализовано корректно в `is_owner_alive` (`lock.rs:266-271`), но при
+  нечитаемой записи до него не доходит управление. Окно нечитаемости создаёт `write_info`
+  (`lock.rs:319-326`): `set_len(0)` → seek → запись, между усечением и байтами читатель законно
+  видит пустой файл.
+- **Результат:** реклейм происходит только при доказанной смерти владельца. «Запись не читается,
+  но `flock` кем-то удерживается» — это проигрыш гонки (`Locked`), а не повод удалять файл.
+- **В scope:** ветка `TryAcquireError::WouldBlock` в `acquire_inner`; различение
+  `read_lock_info() == None` (повтор чтения с коротким бэкоффом, затем `Locked`) и
+  распарсенной записи мёртвого владельца (реклейм как сейчас). При желании — атомизация
+  `write_info` так, чтобы читатель никогда не видел усечённый файл, **без** смены inode: файл
+  фиксированного размера с padding'ом либо одиночный `pwrite` поверх без `set_len(0)` (identity
+  файла остаётся тем, на что полагаются другие процессы — это уже зафиксировано в комментарии
+  `write_info` и не разворачивается).
+- **Не в scope:** незажатые зомби у `local-rag-proxy` (`reap_exited_daemons` существует; то, что
+  проигравший висит `Z <defunct>` и потому проходит `pid_exists`, — усилитель, а не причина;
+  отдельная задача, если владелец решит); поведение `stop`/`status`/`doctor` — они читают
+  `store.lock` корректно, врут им данные; сама ветка «успешный `flock`» (её обоснование в спеке
+  верно: `flock` освобождается ядром при смерти процесса).
+- **Тесты:** два конкурентных `acquire` против одного `StoreLayout` — ровно один `Ok`, второй
+  `Err(StoreLockError::Locked)`, и файл на диске принадлежит победителю; детерминированный случай
+  «файл нулевой длины при удерживаемом `flock`» → `Locked`, а не реклейм (в существующем стиле
+  `crates/local-rag/tests` с `LivenessProbe`-дублёром, без `sleep`); регрессия — уже существующие
+  тесты реклейма мёртвого владельца остаются зелёными без правки ассертов.
+- **Приёмка:** повторный холодный старт при двух живых прокси не даёт второй строки `store lock
+  acquired` в `logs/daemon.<дата>.log`; `local-rag status` сразу после старта показывает тот же
+  pid, что реально слушает сокет.
+- **Evidence:** заполняется после выполнения в `PROGRESS.md`'s «Task evidence».
+
 - [x] D-036 Продуктовая регистрация `memory`-representation никогда не выполняется — `remember`/`recall`'s
       dense-плечо навсегда `no_representation` в реальном запуске; переоткрывает memory-половину D-013
       (найдено post-v0 при живом MCP-dogfood-тестировании)
@@ -744,6 +783,22 @@ v0-очередь (T00-01…G17) закрыта; задачи в этом раз
       table says memory tools *work* in repo/global scope) — what changes is that `remember` now
       always reports the scope it actually used, plus a typed `degraded` marker and hint when it
       fell back
+- [ ] D-065 `daemon::lock::acquire_inner`'s stale-reclaim branch treats an **unreadable** lock
+      record the same as a dead one and unlinks the file, so two daemons starting in the same
+      millisecond both report "store lock acquired". Spec 02 §4.1's own as-built `[SPEC]` note
+      forbids exactly this: when the owner's record has `ready: false` the liveness check must
+      "trust the PID alone rather than misreading 'no listener yet' as 'dead' and wrongly
+      reclaiming a lock a live, still-starting daemon still holds." `is_owner_alive` implements
+      that rule correctly, but it is never consulted when `read_lock_info` returns `None`, and
+      `write_info`'s `set_len(0)`-then-write leaves a window in which a concurrent reader
+      legitimately sees zero bytes. Live capture (2026-08-18, first daemon start after X-007 made
+      the file log readable): pids 7490/7491 both logged `store lock acquired` 4.6 ms apart; 7491
+      bound the socket and serves, 7490 lost the bind, died, and left `store.lock` naming itself
+      with `ready:false`. Consequences observed on the owner's store: `local-rag status` reports
+      `starting (pid 7490, possibly migrating)` exit 3 while the daemon answers MCP requests
+      normally; `doctor` reports `alive=true` because the loser is an unreaped zombie of its
+      spawning proxy; `stop` would signal the zombie; and the next `serve` would take the now
+      unlocked file, delete the live daemon's socket and bind its own
 
 ## 19 — MCP adoption
 
