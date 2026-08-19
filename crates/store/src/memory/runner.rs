@@ -82,7 +82,7 @@
 //! [`super::consolidation::stale_runs`] therefore selects `failed` runs too,
 //! not lease-expiry alone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::pin;
 use std::time::Duration;
@@ -246,6 +246,36 @@ struct OwnedEvidence {
     commit_hash: Option<String>,
 }
 
+/// D-069: collapse repeated citations, keeping the router's order.
+///
+/// A generated op's `evidence_observation_ids` is **untrusted model output**
+/// (spec 12 §4), and both evidence tables are keyed on `(owner_id,
+/// observation_id)` — so one `observation_id` repeated inside a single op's
+/// citation list violates a PRIMARY KEY and rolls back the *whole* window,
+/// which is how one three-observation window burned ~6 hours of GPU across
+/// 627 identical retries before this fix.
+///
+/// The deduplication belongs here, at the boundary where untrusted input
+/// enters the store, and **not** as `INSERT OR IGNORE` inside
+/// [`super::candidate::insert_candidate_evidence`]/
+/// [`super::evidence::insert_memory_evidence`]: those primitives document
+/// "a duplicate surfaces as the natural PRIMARY KEY error", which stays
+/// exactly right for callers that mint already-unique ids. Every path that
+/// carries router output into the store goes through [`apply_run`], so one
+/// call site per branch covers all of them.
+///
+/// Duplication *across* two ops in one batch (two reinforces of the same
+/// entry citing the same observation) is deliberately out of this helper's
+/// reach — it is a semantically different batch, and [`run_once`]'s
+/// `Mechanical` classification of a constraint violation is what bounds it.
+fn dedup_evidence_ids(ids: &[String]) -> Vec<&str> {
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.iter()
+        .map(String::as_str)
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
 /// Resolve `ids` against the already-loaded window first (fast path, no
 /// read); on a miss, fall back to [`observation_evidence_source`] — citing
 /// evidence from outside the current window (e.g. reinforcing an older
@@ -253,14 +283,14 @@ struct OwnedEvidence {
 fn resolve_evidence(
     tx: &Transaction<'_>,
     by_id: &HashMap<&str, &WindowObservation>,
-    ids: &[String],
+    ids: &[&str],
     op_index: usize,
 ) -> rusqlite::Result<Result<Vec<OwnedEvidence>, RunnerApplyError>> {
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        if let Some(w) = by_id.get(id.as_str()) {
+        if let Some(w) = by_id.get(id) {
             out.push(OwnedEvidence {
-                observation_id: id.clone(),
+                observation_id: (*id).to_string(),
                 evidence_kind: w.evidence_kind,
                 session_id: w.session_id.clone(),
                 agent_id: w.agent_id.clone(),
@@ -270,7 +300,7 @@ fn resolve_evidence(
         }
         match observation_evidence_source(tx, id)? {
             Some((evidence_kind, session_id)) => out.push(OwnedEvidence {
-                observation_id: id.clone(),
+                observation_id: (*id).to_string(),
                 evidence_kind,
                 session_id,
                 agent_id: None,
@@ -279,7 +309,7 @@ fn resolve_evidence(
             None => {
                 return Ok(Err(RunnerApplyError::UnknownEvidenceObservation {
                     op_index,
-                    observation_id: id.clone(),
+                    observation_id: (*id).to_string(),
                 }));
             }
         }
@@ -323,8 +353,8 @@ fn apply_run(
                 operation,
                 evidence_observation_ids,
             } => {
-                let owned = match resolve_evidence(tx, &by_id, evidence_observation_ids, op_index)?
-                {
+                let cited = dedup_evidence_ids(evidence_observation_ids);
+                let owned = match resolve_evidence(tx, &by_id, &cited, op_index)? {
                     Ok(owned) => owned,
                     Err(e) => return Ok(Err(e)),
                 };
@@ -368,10 +398,7 @@ fn apply_run(
                 // already-proposed candidate_id is simply left alone.
                 if candidate_state(tx, candidate_id)?.is_none() {
                     let conflict_refs: Vec<&str> = conflicts.iter().map(String::as_str).collect();
-                    let evidence_refs: Vec<&str> = evidence_observation_ids
-                        .iter()
-                        .map(String::as_str)
-                        .collect();
+                    let evidence_refs = dedup_evidence_ids(evidence_observation_ids);
                     propose_candidate(
                         tx,
                         candidate_id,
@@ -433,6 +460,38 @@ impl std::error::Error for RunOutcomeError {
             RunOutcomeError::Rejected(_) => None,
             RunOutcomeError::Write(e) => Some(e),
         }
+    }
+}
+
+/// D-069: classify a [`commit_apply_run`] failure for
+/// [`record_run_failure`](super::consolidation::record_run_failure)'s
+/// retry-storm circuit breaker.
+///
+/// A SQLite **constraint violation** is `Mechanical`: the ops are already
+/// generated and fixed, the rows they touch are unchanged (the whole attempt
+/// rolled back), so re-running the identical batch on the identical build
+/// reproduces the identical violation — which is exactly what
+/// `Mechanical` means, and exactly what a fingerprint-gated dead-letter is
+/// for. Before this, every apply failure was `Transient`, so a repeated
+/// evidence citation retried on the 4s backoff cap forever, one full local
+/// generation per attempt.
+///
+/// Everything else stays `Transient`, deliberately:
+/// [`RunOutcomeError::Rejected`]'s variants are timing-shaped (a lease
+/// fencing race, an optimistic conflict) and the remaining
+/// [`WriteError`]s are genuine infrastructure (writer gone, disk I/O) that
+/// waiting can resolve. Splitting [`RunnerApplyError`] per variant is still
+/// future work; the transient attempt ceiling
+/// ([`TRANSIENT_ATTEMPT_CAP`](super::consolidation::TRANSIENT_ATTEMPT_CAP))
+/// bounds those paths in the meantime.
+fn classify_apply_failure(error: &RunOutcomeError) -> ClassifiedFailure {
+    match error {
+        RunOutcomeError::Write(WriteError::Sqlite(e))
+            if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+        {
+            ClassifiedFailure::mechanical(error.to_string())
+        }
+        _ => ClassifiedFailure::transient(error.to_string()),
     }
 }
 
@@ -704,19 +763,15 @@ where
     {
         Ok(report) => Ok(RunOutcome::Applied(report)),
         Err(rejected) => {
-            // Apply-time rejections (a stale lease fencing race, an
-            // op-engine precondition) are classified `Transient` by default
-            // (D-050): unlike a router/parse failure, none of the three
-            // `RunnerApplyError` variants reproduce deterministically from
-            // the *same* input on a *same-code* retry the way a schema/parse
-            // defect does — `Superseded` and an optimistic-conflict-shaped
-            // `Materialization` are inherently timing-dependent, and even
-            // the more code-looking ones are rare enough in practice (0 of
-            // the live retry-storm incidents that motivated this task went
-            // through this path) that a fingerprint-gated dead-letter is not
-            // yet justified here — a future deviation can split
-            // `RunnerApplyError` per-variant if that changes.
-            let failure = ClassifiedFailure::transient(rejected.to_string());
+            // D-050 classified every apply failure `Transient`, on the
+            // reasoning that `RunnerApplyError`'s variants are all
+            // timing-shaped. D-069 disproved the general claim: the live
+            // retry storm did not arrive as a `Rejected` variant at all, it
+            // arrived as a genuine SQLite constraint violation on the
+            // `Write` path — deterministic, and retried forever because of
+            // this default. `classify_apply_failure` now splits exactly that
+            // case out; the timing-shaped rejections keep the old default.
+            let failure = classify_apply_failure(&rejected);
             mark_failed(state_db, &window.run_id, &failure, build_id, now_ms).await?;
             Ok(RunOutcome::Failed(failure.reason))
         }

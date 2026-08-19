@@ -24,8 +24,9 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::RunnerError;
 use local_rag_store::memory::{
     ApplyReport, ClassifiedFailure, ConsolidationWindow, GeneratedOp, NewMemoryEntry,
-    ProposedOperation, RunOutcome, RunOutcomeError, RunState, SnapshotOutcome, commit_apply_run,
-    consolidation_run_state, create_memory_entry, open_next_run, processing_cursor, run_once,
+    ProposedOperation, RunOutcome, RunOutcomeError, RunState, SnapshotOutcome,
+    candidate_evidence_for, commit_apply_run, consolidation_run_state, create_memory_entry,
+    memory_evidence_for, open_next_run, processing_cursor, run_once, stale_runs,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, MemoryKind, ScopeKind, StateDb};
@@ -697,4 +698,254 @@ async fn crash_before_cursor_advance_rolls_back_the_whole_apply() {
         consolidation_run_state(&read, &run_id).expect("state"),
         Some(RunState::Applied)
     );
+}
+
+// ---------------------------------------------------------------------------
+// D-069: a repeated citation inside one op, and the dead-letter that bounds
+// every other deterministic apply failure
+// ---------------------------------------------------------------------------
+
+/// `(last_failure_kind, last_failure_fingerprint, next_retry_at, attempt_count)`
+/// — D-050's circuit-breaker bookkeeping, read back raw.
+fn failure_row(
+    conn: &Connection,
+    run_id: &str,
+) -> (Option<String>, Option<String>, Option<i64>, i64) {
+    conn.query_row(
+        "SELECT last_failure_kind, last_failure_fingerprint, next_retry_at, attempt_count \
+         FROM consolidation_run WHERE run_id = ?1",
+        params![run_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .expect("read failure bookkeeping")
+}
+
+/// The live D-069 defect, on the `Materialize` branch: router output is
+/// untrusted data and cited the *same* `observation_id` twice inside one op.
+/// `memory_evidence` is keyed `(memory_id, observation_id)`, so before the fix
+/// the repeat aborted the whole window transaction — and, classified
+/// `Transient`, was retried forever at one full local-model generation per
+/// ~15s. The duplicate must simply collapse.
+#[tokio::test]
+async fn a_repeated_citation_inside_one_materialize_op_still_applies() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let ids = seed_envelopes(&db, "sess-1", 60, 2).await;
+    let run_id = uuid(62);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    let owner = uuid(63);
+    let memory_id = uuid(64);
+    create_memory(&db, &memory_id, &owner).await;
+
+    let ops = vec![GeneratedOp::Materialize {
+        operation: ProposedOperation::Reinforce {
+            memory_id: memory_id.clone(),
+            expected_version: 1,
+            confidence: Some(0.9),
+        },
+        // ids[0] cited twice -- exactly the shape run 01a01648 hit.
+        evidence_observation_ids: vec![ids[0].clone(), ids[1].clone(), ids[0].clone()],
+    }];
+    let generated = ops.clone();
+    let outcome = run_once(
+        &db,
+        window.clone(),
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        "build-test",
+        move |_w| async move { Ok::<_, ClassifiedFailure>(generated) },
+    )
+    .await
+    .expect("run_once");
+    assert!(matches!(outcome, RunOutcome::Applied(_)), "{outcome:?}");
+
+    let read = db.open_read().expect("read conn");
+    let mut expected = vec![ids[0].clone(), ids[1].clone()];
+    expected.sort();
+    assert_eq!(
+        memory_evidence_for(&read, &memory_id).expect("evidence"),
+        expected,
+        "the repeated citation collapses to one row, the distinct one survives"
+    );
+    assert_eq!(
+        processing_cursor(&read, "sess-1").expect("cursor"),
+        Some(window.to_received_seq),
+        "the window really consolidated"
+    );
+    assert_eq!(
+        consolidation_run_state(&read, &run_id).expect("state"),
+        Some(RunState::Applied)
+    );
+    drop(read);
+
+    // Idempotence: replaying the very same window writes no second evidence
+    // row (lease fencing rejects it -- the run is terminal).
+    let err = commit_apply_run(&db, window, vec![], lease_until, ops, 3_000)
+        .await
+        .expect_err("an applied run can never be applied twice");
+    assert!(matches!(err, RunOutcomeError::Rejected(_)), "{err:?}");
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_evidence_for(&read, &memory_id).expect("evidence"),
+        expected,
+        "still exactly the same two rows"
+    );
+}
+
+/// The same defect on the `ProposeCandidate` branch — the one the live
+/// incident actually hit (`candidate_evidence.candidate_id,
+/// candidate_evidence.observation_id`).
+#[tokio::test]
+async fn a_repeated_citation_inside_one_propose_candidate_op_still_applies() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let ids = seed_envelopes(&db, "sess-1", 70, 2).await;
+    let run_id = uuid(72);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    let candidate_id = uuid(73);
+    let ops = vec![GeneratedOp::ProposeCandidate {
+        candidate_id: candidate_id.clone(),
+        operation: ProposedOperation::Create {
+            memory_id: uuid(74),
+            kind: "fact".to_string(),
+            text: "some proposed durable text".to_string(),
+            canonical_key: None,
+            scope_kind: "worktree".to_string(),
+            scope_owner_id: uuid(75),
+            confidence: 0.5,
+            importance: 0.5,
+            valid_from_tree: None,
+            last_verified_tree: None,
+        },
+        conflicts: vec![],
+        evidence_observation_ids: vec![ids[0].clone(), ids[0].clone()],
+    }];
+    let outcome = run_once(
+        &db,
+        window,
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        "build-test",
+        move |_w| async move { Ok::<_, ClassifiedFailure>(ops) },
+    )
+    .await
+    .expect("run_once");
+    assert!(matches!(outcome, RunOutcome::Applied(_)), "{outcome:?}");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_evidence_for(&read, &candidate_id).expect("evidence"),
+        vec![ids[0].clone()],
+        "one candidate_evidence row, not a rolled-back window"
+    );
+    assert_eq!(
+        consolidation_run_state(&read, &run_id).expect("state"),
+        Some(RunState::Applied)
+    );
+}
+
+/// Per-op deduplication deliberately does not cover a duplicate *across* two
+/// ops (here: two reinforces of the same entry citing the same observation),
+/// so the constraint violation is still reachable — and that is the point:
+/// a violation reproduces byte-for-byte on the same build, so it must be
+/// classified `Mechanical` and dead-lettered after one attempt, never retried
+/// on a 4s cap forever.
+#[tokio::test]
+async fn a_constraint_violation_dead_letters_instead_of_retrying_forever() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let ids = seed_envelopes(&db, "sess-1", 80, 2).await;
+    let run_id = uuid(82);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+
+    let owner = uuid(83);
+    let memory_id = uuid(84);
+    create_memory(&db, &memory_id, &owner).await;
+
+    let ops = vec![
+        GeneratedOp::Materialize {
+            operation: ProposedOperation::Reinforce {
+                memory_id: memory_id.clone(),
+                expected_version: 1,
+                confidence: Some(0.9),
+            },
+            evidence_observation_ids: vec![ids[0].clone()],
+        },
+        GeneratedOp::Materialize {
+            operation: ProposedOperation::Reinforce {
+                memory_id: memory_id.clone(),
+                expected_version: 2,
+                confidence: Some(0.95),
+            },
+            // Same (memory_id, observation_id) pair as op 0 -> PRIMARY KEY.
+            evidence_observation_ids: vec![ids[0].clone()],
+        },
+    ];
+    let outcome = run_once(
+        &db,
+        window,
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        "build-test",
+        move |_w| async move { Ok::<_, ClassifiedFailure>(ops) },
+    )
+    .await
+    .expect("run_once");
+    let RunOutcome::Failed(reason) = outcome else {
+        panic!("expected Failed, got {outcome:?}");
+    };
+    assert!(
+        reason.contains("UNIQUE constraint failed"),
+        "the whole window rolled back on the constraint: {reason}"
+    );
+
+    let read = db.open_read().expect("read conn");
+    let (kind, fingerprint, next_retry_at, attempts) = failure_row(&read, &run_id);
+    assert_eq!(
+        kind.as_deref(),
+        Some("mechanical"),
+        "a constraint violation reproduces identically on the same build"
+    );
+    assert_eq!(fingerprint.as_deref(), Some("build-test"));
+    assert_eq!(
+        next_retry_at, None,
+        "mechanical failures are fingerprint-gated, never time-gated"
+    );
+    assert_eq!(attempts, 1);
+    assert_eq!(
+        entry_version(&read, &memory_id),
+        1,
+        "nothing committed -- the whole batch rolled back"
+    );
+
+    assert!(
+        stale_runs(&read, 100_000, "build-test")
+            .expect("stale runs")
+            .is_empty(),
+        "dead-lettered on this build: no second attempt, no matter how long"
+    );
+    let after_rebuild = stale_runs(&read, 100_000, "build-next").expect("stale runs");
+    assert_eq!(
+        after_rebuild.len(),
+        1,
+        "a rebuild (the fix) grants exactly one more attempt"
+    );
+    assert_eq!(after_rebuild[0].run_id, run_id);
 }
