@@ -14,11 +14,11 @@ use local_rag_memory::recall as recall_pipeline;
 use local_rag_protocol::ErrorEnvelope;
 use local_rag_store::{
     CandidateState, MemoryEntryRow, MemoryKind, MemoryState, ProposedOperation, RequestRoot,
-    Resolution, ScopeKind, consolidation_run_counts, list_candidates,
+    Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, ScopeKind, consolidation_run_counts, list_candidates,
     list_memory_entries_for_scope, memory_entry_counts, memory_evidence_for,
     observation_envelope_count, observations_applied_since, oldest_open_run_created_at,
     pending_candidate_counts, projection_state, resolve, store_instance_uuid,
-    total_pending_backlog,
+    stuck_consolidation_runs, total_pending_backlog,
 };
 
 use crate::daemon::memory::MemoryContext;
@@ -497,6 +497,36 @@ impl From<local_rag_store::RunCountRow> for RunCountWire {
     }
 }
 
+/// D-071: one consolidation run that needs a human — retried without
+/// converging, or dead-lettered on the running build. The MCP twin of
+/// `cli::stats`'s own block; both surfaces read the same store primitive.
+#[derive(Debug, Serialize)]
+struct StuckRunWire {
+    run_id: String,
+    session_id: String,
+    attempt_count: i64,
+    dead_lettered: bool,
+    last_failure_kind: Option<String>,
+    last_failure_reason: Option<String>,
+    from_received_seq: i64,
+    to_received_seq: i64,
+}
+
+impl From<local_rag_store::StuckRunRow> for StuckRunWire {
+    fn from(r: local_rag_store::StuckRunRow) -> Self {
+        StuckRunWire {
+            run_id: r.run_id,
+            session_id: r.session_id,
+            attempt_count: r.attempt_count,
+            dead_lettered: r.dead_lettered,
+            last_failure_kind: r.last_failure_kind,
+            last_failure_reason: r.last_failure_reason,
+            from_received_seq: r.from_received_seq,
+            to_received_seq: r.to_received_seq,
+        }
+    }
+}
+
 /// D-049: the observations pillar (`01-overview.md` §5-9), previously
 /// unreported by `stats()` entirely.
 #[derive(Debug, Serialize)]
@@ -515,6 +545,9 @@ struct ConsolidationStatsWire {
     throughput_observations_per_min: f64,
     eta_seconds: Option<i64>,
     oldest_pending_run_created_at: Option<i64>,
+    /// D-071: empty on a healthy store; every entry is a run no amount of
+    /// waiting will fix on its own.
+    stuck_runs: Vec<StuckRunWire>,
 }
 
 #[derive(Debug, Serialize)]
@@ -648,6 +681,15 @@ pub async fn stats(
         Ok(v) => v,
         Err(e) => return Ok(infra_err(e)),
     };
+    // D-071: the retry bookkeeping D-050 has been recording all along.
+    let stuck_runs = match stuck_consolidation_runs(
+        &state_read,
+        local_rag_core::BUILD_ID,
+        STUCK_RUN_ATTEMPT_THRESHOLD,
+    ) {
+        Ok(v) => v,
+        Err(e) => return Ok(infra_err(e)),
+    };
     let throughput_observations_per_min =
         applied_recently as f64 / (CONSOLIDATION_THROUGHPUT_WINDOW_MS as f64 / 60_000.0);
     let progress_pct = if observations_total > 0 {
@@ -720,6 +762,7 @@ pub async fn stats(
             throughput_observations_per_min,
             eta_seconds,
             oldest_pending_run_created_at,
+            stuck_runs: stuck_runs.into_iter().map(StuckRunWire::from).collect(),
         },
         scope: scope_label,
         worktree,

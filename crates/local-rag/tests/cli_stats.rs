@@ -11,11 +11,11 @@ use std::process::{Output, Stdio};
 use local_rag::daemon::gitroot;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    FailureKind, GLOBAL_SCOPE_OWNER_ID, GenerationState, MemoryKind, NewConsolidationRun,
-    NewMemoryEntry, ProposedOperation, RunState, ScopeKind, StateDb, allocate_generation,
-    create_consolidation_run, create_memory_entry, create_repository, create_worktree,
-    insert_projection_state, observe_repository_path, observe_worktree_path, propose_candidate,
-    record_run_failure, transition_generation, transition_run,
+    FailureKind, GLOBAL_SCOPE_OWNER_ID, GenerationState, LEASE_DURATION_MS, MemoryKind,
+    NewConsolidationRun, NewMemoryEntry, ProposedOperation, RunState, ScopeKind, StateDb,
+    allocate_generation, create_consolidation_run, create_memory_entry, create_repository,
+    create_worktree, insert_projection_state, observe_repository_path, observe_worktree_path,
+    propose_candidate, record_run_failure, retry_run, transition_generation, transition_run,
 };
 use local_rag_test_support::TempHome;
 
@@ -190,6 +190,60 @@ async fn seed_unconsolidatable_run(
         })
         .await
         .expect("seed unconsolidatable run");
+}
+
+/// D-071: a run that really went through `attempts` recorded failures and
+/// ended dead-lettered on the running build — the shape of the D-069 incident
+/// (run `01a01648-…`, three observations, 627 attempts, the same
+/// `UNIQUE constraint` failure every time), reproduced through the real
+/// `retry_run`/`record_run_failure` cycle rather than a hand-written row.
+async fn seed_stuck_run(
+    state: &StateDb,
+    run_id: &str,
+    session_id: &str,
+    from_received_seq: i64,
+    to_received_seq: i64,
+    attempts: i64,
+    now_ms: i64,
+) {
+    let (run_id, session_id) = (run_id.to_string(), session_id.to_string());
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: &run_id,
+                    session_id: &session_id,
+                    from_received_seq,
+                    to_received_seq,
+                    router_version: "v1",
+                },
+                now_ms,
+            )?;
+            for attempt in 0..attempts {
+                if attempt == 0 {
+                    transition_run(tx, &run_id, RunState::Running, now_ms)?
+                        .expect("pending -> running");
+                } else {
+                    retry_run(tx, &run_id, LEASE_DURATION_MS, now_ms)?.expect("failed -> running");
+                }
+                record_run_failure(
+                    tx,
+                    &run_id,
+                    FailureKind::Mechanical,
+                    "state transaction failed (rolled back): UNIQUE constraint failed: \
+                     candidate_evidence.candidate_id, candidate_evidence.observation_id",
+                    false,
+                    Some(local_rag_core::BUILD_ID),
+                    now_ms,
+                )?
+                .expect("running -> failed");
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed stuck run");
 }
 
 async fn seed_candidate(state: &StateDb, candidate_id: &str, now_ms: i64) {
@@ -409,5 +463,86 @@ async fn stats_reports_the_index_age_and_any_stuck_generation() {
     assert!(
         text.contains("STUCK: generation #1 is projection_ready but never became active"),
         "and the built-but-unserved generation must be named: {text}"
+    );
+}
+
+/// D-071: the blind spot the D-069 incident exposed — every number `stats`
+/// printed looked healthy while one run was on its 627th attempt, each attempt
+/// a full local-model generation. The run must now be named, in both output
+/// modes, without a single manual SQL query.
+#[tokio::test]
+async fn stats_reports_a_stuck_consolidation_run_with_its_attempt_count() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_observation_envelope(&state, "obs-1", "sess-wedged").await;
+        seed_stuck_run(
+            &state,
+            "run-wedged",
+            "sess-wedged",
+            26115,
+            26117,
+            627,
+            1_000,
+        )
+        .await;
+    }
+
+    let output = run_cli(&home, home.path(), &["stats"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("consolidation stuck runs: 1"), "{text}");
+    assert!(
+        text.contains("run run-wedged session sess-wedged"),
+        "{text}"
+    );
+    assert!(text.contains("received_seq 26115..=26117"), "{text}");
+    assert!(text.contains("627 attempt(s)"), "{text}");
+    assert!(text.contains("dead-lettered on this build"), "{text}");
+    assert!(
+        text.contains("UNIQUE constraint failed: candidate_evidence"),
+        "the recorded failure itself, not just a count: {text}"
+    );
+
+    let output = run_cli(&home, home.path(), &["stats", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let stuck = json["consolidation"]["stuck_runs"].as_array().unwrap();
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0]["run_id"], "run-wedged");
+    assert_eq!(stuck[0]["session_id"], "sess-wedged");
+    assert_eq!(stuck[0]["attempt_count"], 627);
+    assert_eq!(stuck[0]["dead_lettered"], true);
+    assert_eq!(stuck[0]["last_failure_kind"], "mechanical");
+    assert_eq!(stuck[0]["from_received_seq"], 26115);
+    assert_eq!(stuck[0]["to_received_seq"], 26117);
+}
+
+/// The counterpart: a healthy store prints no stuck-run block at all, and its
+/// JSON carries an empty list — the same "silent when there is nothing to say"
+/// discipline the D-058 block next to it already follows.
+#[tokio::test]
+async fn stats_says_nothing_about_stuck_runs_on_a_healthy_store() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_observation_envelope(&state, "obs-1", "sess-ok").await;
+        seed_consolidation_run(&state, "run-ok", "sess-ok", 1, 1, 1_000).await;
+    }
+
+    let output = run_cli(&home, home.path(), &["stats"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !stdout(&output).contains("stuck runs"),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = run_cli(&home, home.path(), &["stats", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(
+        json["consolidation"]["stuck_runs"],
+        serde_json::json!([]),
+        "the key is always present, so a consumer never has to guess"
     );
 }

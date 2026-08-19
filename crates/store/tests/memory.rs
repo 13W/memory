@@ -20,15 +20,18 @@ use local_rag_store::memory::{
     IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition, MemoryCountRow,
     MemoryKind, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
     NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunCountRow, RunState,
-    RunTransitionError, ScopeKind, active_entries_for_scope, candidate_state, canonical_key_owner,
-    consolidation_run_counts, consolidation_run_state, create_candidate, create_consolidation_run,
-    create_memory_entry, insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
+    RunTransitionError, STUCK_RUN_ATTEMPT_THRESHOLD, STUCK_RUN_REASON_MAX_CHARS, ScopeKind,
+    active_entries_for_scope, candidate_state, canonical_key_owner, consolidation_run_counts,
+    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
+    insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
     list_memory_entries_for_scope, memory_entry_by_id, memory_entry_counts, memory_entry_state,
     memory_entry_summary, memory_evidence_for, observations_applied_since,
     oldest_open_run_created_at, processing_cursor, read_audit_events_for_entity,
-    recall_candidates_for_scope, total_pending_backlog, transition_candidate,
-    transition_memory_entry, transition_run, upsert_processing_cursor,
+    recall_candidates_for_scope, stuck_consolidation_runs, total_pending_backlog,
+    transition_candidate, transition_memory_entry, transition_run, upsert_processing_cursor,
 };
+use local_rag_store::rusqlite::params;
+use local_rag_store::{FailureKind, LEASE_DURATION_MS, StuckRunRow, record_run_failure, retry_run};
 use local_rag_store::{StateDb, WriteError};
 use local_rag_test_support::TempHome;
 
@@ -2057,4 +2060,308 @@ async fn oldest_open_run_created_at_is_none_for_an_empty_store() {
         oldest_open_run_created_at(&read).expect("oldest open run"),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// D-071: which consolidation runs a human has to look at
+// ---------------------------------------------------------------------------
+
+/// Insert `observation_envelope` rows covering `from_seq..=to_seq` for
+/// `session_id` — [`stuck_consolidation_runs`]'s shrink-carve-out asks how
+/// many observations a run's window actually spans.
+async fn seed_window_envelopes(db: &StateDb, session_id: &str, from_seq: i64, to_seq: i64) {
+    let session = session_id.to_string();
+    db.writer()
+        .transaction(move |tx| {
+            for seq in from_seq..=to_seq {
+                tx.execute(
+                    "INSERT INTO observation_envelope \
+                       (received_seq, observation_id, source_event_id, payload_hash, event_type, \
+                        evidence_kind, trust, session_id) \
+                     VALUES (?1, ?2, ?3, 'deadbeef', 'Stop', 'user_statement', 'normal', ?4)",
+                    params![
+                        seq,
+                        format!("obs-{session}-{seq}"),
+                        format!("evt-{session}-{seq}"),
+                        session
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed window envelopes");
+}
+
+/// A `failed` run that really went through `attempts` recorded failures —
+/// `create -> running -> failed`, then `retry_run -> failed` for each further
+/// attempt, exactly the cycle the runner drives.
+#[allow(clippy::too_many_arguments)]
+async fn seed_failed_run(
+    db: &StateDb,
+    run_id: &str,
+    session_id: &str,
+    from_seq: i64,
+    to_seq: i64,
+    kind: FailureKind,
+    context_overflow: bool,
+    fingerprint: &str,
+    reason: &str,
+    attempts: i64,
+    created_at: i64,
+) {
+    let (rid, sid) = (run_id.to_string(), session_id.to_string());
+    let (fp, rsn) = (fingerprint.to_string(), reason.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: &rid,
+                    session_id: &sid,
+                    from_received_seq: from_seq,
+                    to_received_seq: to_seq,
+                    router_version: "v1",
+                },
+                created_at,
+            )?;
+            for attempt in 0..attempts {
+                if attempt == 0 {
+                    transition_run(tx, &rid, RunState::Running, created_at)?
+                        .expect("pending -> running");
+                } else {
+                    retry_run(tx, &rid, LEASE_DURATION_MS, created_at)?.expect("failed -> running");
+                }
+                record_run_failure(
+                    tx,
+                    &rid,
+                    kind,
+                    &rsn,
+                    context_overflow,
+                    Some(&fp),
+                    created_at,
+                )?
+                .expect("running -> failed");
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed failed run");
+}
+
+/// A healthy store has nothing to report: an `applied` run is never stuck, and
+/// neither is a run that has failed fewer times than the threshold.
+#[tokio::test]
+async fn stuck_consolidation_runs_is_empty_for_a_healthy_store() {
+    let (_home, db) = open_state();
+    seed_window_envelopes(&db, "sess-1", 1, 4).await;
+    db.writer()
+        .transaction(|tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-applied",
+                    session_id: "sess-1",
+                    from_received_seq: 1,
+                    to_received_seq: 2,
+                    router_version: "v1",
+                },
+                1_000,
+            )?;
+            transition_run(tx, "run-applied", RunState::Running, 1_100)?.expect("legal");
+            transition_run(tx, "run-applied", RunState::Applied, 1_200)?.expect("legal");
+            Ok(())
+        })
+        .await
+        .expect("seed applied run");
+    seed_failed_run(
+        &db,
+        "run-young",
+        "sess-1",
+        3,
+        4,
+        FailureKind::Transient,
+        false,
+        "build-1",
+        "no generation provider configured",
+        STUCK_RUN_ATTEMPT_THRESHOLD - 1,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        stuck_consolidation_runs(&read, "build-1", STUCK_RUN_ATTEMPT_THRESHOLD).expect("stuck"),
+        Vec::new(),
+        "one attempt short of the threshold is still just a retry"
+    );
+}
+
+/// The threshold is a real boundary, and the row carries what a report needs
+/// to name the run without opening `sqlite3`.
+#[tokio::test]
+async fn stuck_consolidation_runs_reports_a_run_at_the_attempt_threshold() {
+    let (_home, db) = open_state();
+    seed_window_envelopes(&db, "sess-1", 1, 3).await;
+    seed_failed_run(
+        &db,
+        "run-looping",
+        "sess-1",
+        1,
+        3,
+        FailureKind::Transient,
+        false,
+        "build-1",
+        "state transaction failed (rolled back): database is locked",
+        STUCK_RUN_ATTEMPT_THRESHOLD,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let stuck =
+        stuck_consolidation_runs(&read, "build-1", STUCK_RUN_ATTEMPT_THRESHOLD).expect("stuck");
+    assert_eq!(
+        stuck,
+        vec![StuckRunRow {
+            run_id: "run-looping".to_string(),
+            session_id: "sess-1".to_string(),
+            attempt_count: STUCK_RUN_ATTEMPT_THRESHOLD,
+            dead_lettered: false,
+            last_failure_kind: Some("transient".to_string()),
+            last_failure_reason: Some(
+                "state transaction failed (rolled back): database is locked".to_string()
+            ),
+            from_received_seq: 1,
+            to_received_seq: 3,
+        }],
+        "still retry-eligible, but visibly not converging"
+    );
+}
+
+/// A dead-letter is reported from its very first attempt — nothing but a
+/// rebuild will ever pick it up again — but only while the fingerprint
+/// matches the running build.
+#[tokio::test]
+async fn stuck_consolidation_runs_reports_a_dead_letter_on_this_build_only() {
+    let (_home, db) = open_state();
+    seed_window_envelopes(&db, "sess-1", 1, 3).await;
+    seed_failed_run(
+        &db,
+        "run-dead",
+        "sess-1",
+        1,
+        3,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        "state transaction failed (rolled back): UNIQUE constraint failed: \
+         candidate_evidence.candidate_id, candidate_evidence.observation_id",
+        1,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let stuck =
+        stuck_consolidation_runs(&read, "build-1", STUCK_RUN_ATTEMPT_THRESHOLD).expect("stuck");
+    assert_eq!(
+        stuck.len(),
+        1,
+        "a single attempt is enough once it is final"
+    );
+    assert_eq!(stuck[0].run_id, "run-dead");
+    assert!(stuck[0].dead_lettered);
+    assert_eq!(stuck[0].attempt_count, 1);
+
+    assert_eq!(
+        stuck_consolidation_runs(&read, "build-2", STUCK_RUN_ATTEMPT_THRESHOLD).expect("stuck"),
+        Vec::new(),
+        "on a different build the very same row is retry-eligible again, not stuck"
+    );
+}
+
+/// D-058's shrink-and-retry resolves a context-overflow dead-letter by itself
+/// as long as the window still has room to halve — reporting that would be a
+/// false alarm. The floor case (a window already down to one observation) has
+/// no room left and stays reported.
+#[tokio::test]
+async fn stuck_consolidation_runs_skips_the_overflow_run_shrink_and_retry_will_fix() {
+    let (_home, db) = open_state();
+    seed_window_envelopes(&db, "sess-wide", 1, 4).await;
+    seed_window_envelopes(&db, "sess-floor", 5, 5).await;
+    seed_failed_run(
+        &db,
+        "run-wide",
+        "sess-wide",
+        1,
+        4,
+        FailureKind::Mechanical,
+        true,
+        "build-1",
+        "deterministic context overflow for this window, retrying will not help",
+        1,
+        1_000,
+    )
+    .await;
+    seed_failed_run(
+        &db,
+        "run-floor",
+        "sess-floor",
+        5,
+        5,
+        FailureKind::Mechanical,
+        true,
+        "build-1",
+        "deterministic context overflow for this window, retrying will not help",
+        1,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let stuck =
+        stuck_consolidation_runs(&read, "build-1", STUCK_RUN_ATTEMPT_THRESHOLD).expect("stuck");
+    assert_eq!(
+        stuck.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run-floor"],
+        "the four-observation window will simply be halved on the next tick"
+    );
+}
+
+/// A failure reason is arbitrary text; the reported row is meant to be
+/// printed, so it is bounded — and bounded by characters, never by bytes.
+#[tokio::test]
+async fn stuck_consolidation_runs_truncates_a_long_failure_reason() {
+    let (_home, db) = open_state();
+    seed_window_envelopes(&db, "sess-1", 1, 2).await;
+    let reason = "и".repeat(STUCK_RUN_REASON_MAX_CHARS + 50);
+    seed_failed_run(
+        &db,
+        "run-verbose",
+        "sess-1",
+        1,
+        2,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        &reason,
+        1,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let stuck =
+        stuck_consolidation_runs(&read, "build-1", STUCK_RUN_ATTEMPT_THRESHOLD).expect("stuck");
+    let reported = stuck[0]
+        .last_failure_reason
+        .as_deref()
+        .expect("a reason was recorded");
+    assert_eq!(
+        reported.chars().count(),
+        STUCK_RUN_REASON_MAX_CHARS + 1,
+        "truncated to the cap plus the ellipsis"
+    );
+    assert!(reported.ends_with('…'), "{reported}");
 }

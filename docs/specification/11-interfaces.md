@@ -827,6 +827,36 @@ built before D-062, `created_at` is always used.
 - **`stats`** — next to `active_generation` it prints when that generation was built and how old
   it is, plus the same stuck-generation lines.
 
+As-built note (D-071, `[SPEC]`): the consolidation pillar's own "nothing degrades silently"
+(02 §6) line, missing until now. During the D-069 incident one `consolidation_run` was retried 627
+times — a full local-model generation every ~15s, hours of GPU — while `stats` printed
+`runs applied: 8469 / failed: 6`, `progress: 99.7%`, `eta: 114s`, and `doctor` had no
+consolidation section at all. Every fact needed to say so was already in the store (D-050's
+`attempt_count`/`last_failure_kind`/`last_failure_fingerprint`/`last_failure_reason`, schema v11);
+nothing read it.
+
+One store primitive now does: `local_rag_store::stuck_consolidation_runs(conn, build_id,
+attempt_threshold)`, next to `consolidation_run_counts`. A `failed` run is reported when it has
+failed at least `STUCK_RUN_ATTEMPT_THRESHOLD` times (`[SPEC]`-chosen 3 — an early warning, well
+below D-069's `TRANSIENT_ATTEMPT_CAP` of 8) **or** it is dead-lettered on the running build
+(`mechanical` + matching fingerprint, exactly what `stale_runs` will never pick up again).
+Subtracted from both: the one shape that resolves itself — a context-overflow dead-letter that is
+its session's latest non-`applied` run and still spans more than one observation, i.e. D-058's
+shrink-and-retry carve-out, which opens a narrower window on the next tick. The floor case (a
+window already down to one observation) stays reported; it is the same set
+`unconsolidatable_sessions` reports from the session's side, and each names a different fact
+(which run, with what failure, versus which session needs a human). `last_failure_reason` is
+truncated to `STUCK_RUN_REASON_MAX_CHARS` (200) **characters**, never bytes.
+
+Three surfaces read it: `stats`'s CLI implementation (a human block that stays silent when empty,
+the same discipline as the D-058 block beside it, plus an always-present `consolidation.stuck_runs`
+JSON array), its MCP twin (`StatsResult`'s `consolidation.stuck_runs` — the two implementations
+stay duplicated, per this section's own precedent), and a new `consolidation:` section in `doctor`
+that prints `ok` when clean and, when not, one line per run plus its recorded failure. **Verdict
+rule:** a non-empty list makes `is_clean()` false and the exit code 1, for the same reason X-008's
+stuck generation does — work the system performed and could not land; a dead-lettered run
+additionally blocks its session's entire backlog until the binary is rebuilt.
+
 As-built note (T16-03, `[SPEC]`, D-025). `doctor [--worktree <id>] [--json]` is implemented in
 `crates/local-rag/src/cli/doctor.rs`. Its defining constraint, not visible in this section's
 one-line sketch, is that `doctor` must be categorically read-only, but every normal constructor
