@@ -251,8 +251,9 @@ earns it exactly one more attempt, never an unlimited budget — and gates a `Tr
 `next_retry_at`, an exponential backoff (`transient_backoff_delay_ms`, the same 250ms-base-doubling
 shape `local-rag-proxy::connect::DEFAULT_BACKOFF` already established for "wait, then retry a call
 that might just be temporarily down"). Apply-time rejections (`RunnerApplyError`) are classified
-`Transient` by default, not split per variant — none of the live retry-storm incidents that
-motivated this task went through that path. `consolidation_run` gains five nullable, unbackfilled
+`Transient` by default, not split per variant — none of the live retry-storm incidents *known at
+the time* went through that path (D-069 later found one that did, on the neighbouring
+`WriteError::Sqlite` path; see its own note below). `consolidation_run` gains five nullable, unbackfilled
 columns (`last_failure_kind`/`last_failure_reason`/`last_failure_fingerprint`/`attempt_count`/
 `next_retry_at`, schema v11): a pre-existing `failed` row with none of them set is never classified
 `Mechanical`, so it stays retry-eligible — the safe default, not a special case.
@@ -282,6 +283,31 @@ reserved for the case a partial recovery structurally cannot help — the *first
 to parse at all. Deliberate tradeoff, not an oversight: prefix-stop recovers "good prefix, bad
 suffix" (the two shapes actually observed) but no longer searches for valid content after *leading*
 prose the way the pre-D-051 whole-array recovery did — an unobserved failure shape, not defended.
+
+As-built note (D-069, `[SPEC]`): D-050's "`Transient` by default" for apply-time failures had a
+hole neither D-050 nor D-051 closed, found in live dogfooding: an op's `evidence_observation_ids`
+is untrusted model output (12 §4), and both evidence tables are keyed `(owner_id, observation_id)`,
+so one `observation_id` the router repeated inside a *single* op's citation list violated a PRIMARY
+KEY and rolled the whole window transaction back. That failure arrives as
+`RunOutcomeError::Write(WriteError::Sqlite(_))`, not as a `RunnerApplyError`, and was therefore
+classified `Transient` — whose backoff caps at 4s and never terminates. One window of **three**
+observations was retried 627 times at one full local-model generation per attempt (~6h of GPU in a
+day) before it was stopped by hand. Three changes, all in
+`local_rag_store::memory`: (1) `runner::apply_run` deduplicates each op's citation list,
+order-preserving, on both the `Materialize` and `ProposeCandidate` branches — the boundary where
+untrusted output enters the store, deliberately *not* an `INSERT OR IGNORE` inside
+`insert_candidate_evidence`/`insert_memory_evidence`, whose "a duplicate surfaces as the natural
+PRIMARY KEY error" contract stays right for callers minting unique ids; (2) a SQLite constraint
+violation is classified `Mechanical`, since the generated ops and the rolled-back rows are both
+unchanged on a retry, so the same build reproduces it exactly — the fingerprint dead-letter now
+covers it; (3) `consolidation::record_run_failure` escalates a `Transient` failure that reaches
+`TRANSIENT_ATTEMPT_CAP` (8 attempts — the backoff has been pinned at its 4s cap for three of them)
+into an ordinary fingerprinted `Mechanical` dead-letter, so no failure class can retry unboundedly
+any more. Duplication *across* two ops of one batch is not deduplicated (a semantically different
+batch); it is bounded by (2) instead. Knowingly accepted cost of (3): a genuinely long generator
+outage parks the runs it hits until the binary is rebuilt — a daemon restart does not revive them
+— and `open_next_run` blocks that session's whole backlog meanwhile. D-071 is the observability
+half that surfaces such a row in `stats`/`doctor`.
 
 ## 5. Explicit tool-initiated memory (`remember`, review tools)
 

@@ -884,6 +884,28 @@ impl std::error::Error for ClassifiedFailure {}
 pub const TRANSIENT_BACKOFF_BASE_MS: i64 = 250;
 pub const TRANSIENT_BACKOFF_CAP_MS: i64 = 4_000;
 
+/// D-069's ceiling on `Transient` retries: the attempt at which
+/// [`record_run_failure`] stops believing "this might resolve on its own"
+/// and dead-letters the run instead.
+///
+/// D-050 gave `Mechanical` failures a terminal state but left `Transient`
+/// ones retrying forever on a 4s cap — and a whole class of deterministic
+/// failures reached that path anyway (D-069), each retry costing a full
+/// local-model generation. By attempt 8 the backoff table above has been
+/// pinned at [`TRANSIENT_BACKOFF_CAP_MS`] for three consecutive attempts
+/// (0, 250, 500, 1000, 2000, then 4000, 4000, 4000): whatever this is, it is
+/// not momentary.
+///
+/// The escalated row is an ordinary fingerprint dead-letter, so a rebuild
+/// still grants exactly one more attempt. The cost of that bound, accepted
+/// knowingly: a genuinely long infrastructure outage (the generator
+/// unavailable for minutes) parks the runs it hits until the binary is
+/// rebuilt — a daemon restart does not revive them — and
+/// [`open_next_run`] blocks a session's whole backlog while any non-`applied`
+/// row exists for it. D-071 is the observability half that makes such a row
+/// visible in `stats`/`doctor`.
+pub const TRANSIENT_ATTEMPT_CAP: i64 = 8;
+
 /// `attempt_count` (1-based: the first recorded failure is attempt 1) to a
 /// backoff delay in ms: `0` for the first attempt (most transient failures
 /// are momentary — retry promptly), then [`TRANSIENT_BACKOFF_BASE_MS`]
@@ -910,6 +932,13 @@ pub fn transient_backoff_delay_ms(attempt_count: i64) -> i64 {
 /// not by time — a `Mechanical` failure that would still fail identically
 /// in 4 seconds would still fail identically in 4 years, on the same build.
 ///
+/// D-069: a `Transient` failure whose bumped `attempt_count` reaches
+/// [`TRANSIENT_ATTEMPT_CAP`] is recorded as `Mechanical` instead, with the
+/// current fingerprint and a reason prefixed `transient failure did not
+/// resolve in N attempts:` — the backoff alone never terminates, so without
+/// this ceiling a deterministic failure that lands on the transient path
+/// retries forever.
+///
 /// Mirrors [`transition_run`]'s own "silently left alone, not an error"
 /// contract for a rejected transition (a racing attempt already moved the
 /// row elsewhere) — the bookkeeping columns are only written when the
@@ -933,6 +962,20 @@ pub fn record_run_failure(
         |r| r.get(0),
     )?;
     let attempt_count = prior_attempts + 1;
+    // D-069: a `Transient` failure that has not resolved in
+    // `TRANSIENT_ATTEMPT_CAP` attempts is treated as a dead-letter from here
+    // on. It becomes an ordinary fingerprinted `Mechanical` row so that
+    // `stale_runs`, `open_next_run` and every future reader need no separate
+    // notion of "escalated"; the reason string keeps the distinction legible.
+    let (kind, reason) = if kind == FailureKind::Transient && attempt_count >= TRANSIENT_ATTEMPT_CAP
+    {
+        (
+            FailureKind::Mechanical,
+            format!("transient failure did not resolve in {attempt_count} attempts: {reason}"),
+        )
+    } else {
+        (kind, reason.to_string())
+    };
     let (fingerprint, next_retry_at) = match kind {
         FailureKind::Mechanical => (current_fingerprint, None),
         FailureKind::Transient => (
@@ -980,7 +1023,8 @@ pub struct StaleRun {
 ///
 /// - A `failed` row whose last failure was [`FailureKind::Mechanical`] **and**
 ///   whose `last_failure_fingerprint` matches `current_build_id` is
-///   dead-lettered: retrying it would re-run the exact same code against the
+///   dead-lettered (D-069: including a `Transient` failure
+///   [`record_run_failure`] escalated at [`TRANSIENT_ATTEMPT_CAP`]): retrying it would re-run the exact same code against the
 ///   exact same window and reproduce the exact same failure (already proven —
 ///   that is what `Mechanical` means). It becomes eligible again the moment
 ///   `current_build_id` changes (a rebuild), for exactly one more attempt.
@@ -2464,6 +2508,123 @@ mod tests {
                 .expect("read attempt_count");
             assert_eq!(count, attempt, "attempt {attempt}");
         }
+    }
+
+    /// D-069: the backoff table alone never terminates, so a `Transient`
+    /// failure that keeps reproducing must eventually become a dead-letter —
+    /// the run that motivated this reached 627 identical attempts, each one a
+    /// full local-model generation.
+    #[tokio::test]
+    async fn record_run_failure_escalates_a_stuck_transient_run_to_a_dead_letter() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-1", "sess-1", 1_000).await;
+
+        for attempt in 1..=TRANSIENT_ATTEMPT_CAP {
+            let now_ms = 5_000 + attempt * 1_000;
+            db.writer()
+                .transaction(move |tx| {
+                    if attempt > 1 {
+                        retry_run(tx, "run-1", LEASE_DURATION_MS, now_ms - 500)?.expect("legal");
+                    }
+                    record_run_failure(
+                        tx,
+                        "run-1",
+                        FailureKind::Transient,
+                        "state transaction failed (rolled back): disk I/O error",
+                        false,
+                        Some("build-1"),
+                        now_ms,
+                    )
+                })
+                .await
+                .expect("record tx")
+                .expect("legal");
+
+            let read = db.open_read().expect("read conn");
+            let (kind, reason, fingerprint, next_retry_at): (
+                String,
+                String,
+                Option<String>,
+                Option<i64>,
+            ) = read
+                .query_row(
+                    "SELECT last_failure_kind, last_failure_reason, last_failure_fingerprint, \
+                            next_retry_at \
+                     FROM consolidation_run WHERE run_id = 'run-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .expect("read failure bookkeeping");
+
+            if attempt < TRANSIENT_ATTEMPT_CAP {
+                assert_eq!(kind, "transient", "attempt {attempt} is still retryable");
+                assert_eq!(fingerprint, None, "transient rows are never fingerprinted");
+                assert_eq!(
+                    next_retry_at,
+                    Some(now_ms + transient_backoff_delay_ms(attempt)),
+                    "attempt {attempt} backs off"
+                );
+                assert_eq!(
+                    reason,
+                    "state transaction failed (rolled back): disk I/O error"
+                );
+            } else {
+                assert_eq!(kind, "mechanical", "the cap turns it into a dead-letter");
+                assert_eq!(
+                    fingerprint.as_deref(),
+                    Some("build-1"),
+                    "fingerprinted, so a rebuild still grants one more attempt"
+                );
+                assert_eq!(next_retry_at, None, "no timer left to wait on");
+                assert_eq!(
+                    reason,
+                    format!(
+                        "transient failure did not resolve in {TRANSIENT_ATTEMPT_CAP} attempts: \
+                         state transaction failed (rolled back): disk I/O error"
+                    ),
+                    "the escalation stays legible against a natively mechanical row"
+                );
+            }
+        }
+    }
+
+    /// The escalated row behaves as an ordinary D-050 dead-letter: no further
+    /// sweep picks it up on this build, a rebuild picks it up exactly once.
+    #[tokio::test]
+    async fn stale_runs_excludes_a_transient_run_escalated_at_the_attempt_cap() {
+        let (_home, db) = open_state();
+        seed_running_run(&db, "run-1", "sess-1", 1_000).await;
+        for attempt in 1..=TRANSIENT_ATTEMPT_CAP {
+            db.writer()
+                .transaction(move |tx| {
+                    if attempt > 1 {
+                        retry_run(tx, "run-1", LEASE_DURATION_MS, 2_000)?.expect("legal");
+                    }
+                    record_run_failure(
+                        tx,
+                        "run-1",
+                        FailureKind::Transient,
+                        "no generation provider configured",
+                        false,
+                        Some("build-1"),
+                        2_000,
+                    )
+                })
+                .await
+                .expect("record tx")
+                .expect("legal");
+        }
+
+        let read = db.open_read().expect("read conn");
+        assert!(
+            stale_runs(&read, 100_000, "build-1")
+                .expect("stale runs")
+                .is_empty(),
+            "the retry loop really stops, no matter how much time passes"
+        );
+        let after_rebuild = stale_runs(&read, 100_000, "build-2").expect("stale runs");
+        assert_eq!(after_rebuild.len(), 1, "a rebuild gets one more attempt");
+        assert_eq!(after_rebuild[0].run_id, "run-1");
     }
 
     #[tokio::test]
