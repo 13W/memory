@@ -187,6 +187,39 @@ A single XML tag is not a boundary. Defenses, all mandatory:
 5. **Adversarial tests** in the acceptance suite (14 §6): prompt-injection payloads stored as
    memories must survive round-trip as inert text.
 
+As-built note (T21-04, `[SPEC]`, ADR-0010): item 5 gains a second surface. Until group 21 an
+entry's text was only ever *rendered* to a model inside a recall block; the translator
+(`local_rag_memory::normalize::translate`) is the first component that sends one entry's text to a
+model as its own subject, so the injection question is asked again from the other side.
+
+**The input is data, structurally.** The user message is not a concatenation but `serde_json`'s
+encoding of `{"src": <the entry's text>}`. Quotes, braces, newlines, control characters and chat
+template markers inside the entry all become escaped content of one JSON string: there is nothing
+to break out of, because nothing was built by string-joining. The entry's `memory_id` is carried
+for diagnostics only and never enters the prompt, so the injection surface is exactly one string.
+The system prompt states that `src` is data and shows a fourth few-shot example in which an
+injection payload is translated as ordinary text — advisory reinforcement, never the defence
+itself.
+
+**The output is validated before anyone may store it.** `validate` is pure and ordered by trust:
+`FinishReason::Length` is a rejection *before* parsing (a truncated object can parse cleanly), the
+parse admits exactly one `{"en": …}` object with `deny_unknown_fields`, an empty answer is a
+refusal, an answer still in a non-Latin script means the source was echoed rather than translated,
+a length outside a sane band of the source is a fragment or an essay, and the byte ceiling rejects
+rather than truncates.
+
+**The adversarial set, by name** (`normalize::translate`'s `ADVERSARIAL` table, seven payloads —
+each asserted twice: the built message stays one JSON object with exactly one `src` key, and a
+"compromised" answer to it is rejected by the validator): *instruction injection*,
+*memory-block terminator literal* (`</memory>`), *answer-envelope literal* (`{"en":`), *the entry
+is itself json*, *control characters*, *chat template marker* (`<start_of_turn>system`), *demand
+to return nothing*.
+
+Every failure is classified before it can be acted on (`classify_translate_failure`), so the
+lesson of D-050/D-057 holds here too: a deterministic rejection is `Mechanical`, a missing or
+policy-blocked generator is `Unavailable` and marks no entry as failed at all, and only a genuine
+infrastructure failure is `Transient`.
+
 As-built note (T16-04, `[FIXED]`): item 5 (GAP-05) is closed end to end, plus the adjacent
 malicious-indexed-code/secret/symlink corpus the group-16 card also names — see 14 §6's own
 as-built note for the full list of tests, one per property.

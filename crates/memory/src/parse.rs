@@ -126,7 +126,7 @@ pub fn parse_ops(text: &str) -> Result<ParseOutcome, ParseError> {
 /// closing `` ``` `` somewhere after it. Not found (no fence, or a fence
 /// with no matching close — e.g. the close itself got truncated) → `text`
 /// unchanged, left to the normal per-line parse below.
-fn strip_markdown_fence(text: &str) -> &str {
+pub(crate) fn strip_markdown_fence(text: &str) -> &str {
     let trimmed = text.trim();
     let Some(after_open) = trimmed.strip_prefix("```") else {
         return text;
