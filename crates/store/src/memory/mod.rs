@@ -89,6 +89,7 @@
 mod audit;
 mod candidate;
 mod consolidation;
+mod effective_text;
 mod entry;
 mod evidence;
 mod normalization;
@@ -116,11 +117,14 @@ pub use consolidation::{
     session_idle_since, sessions_with_pending_backlog, stale_runs, transient_backoff_delay_ms,
     transition_run, unconsolidatable_sessions, upsert_processing_cursor,
 };
+pub use effective_text::{
+    EffectiveText, NormalizationView, decide_effective_text, memory_entry_subject_hash,
+};
 pub(crate) use entry::all_memory_entry_ids;
 pub use entry::{
     CreateMemoryEntryError, IllegalMemoryTransition, MemoryEntryRow, MemoryEntrySummary,
     MemoryKind, MemoryState, MemoryTransitionError, NewMemoryEntry, RecallCandidate, ScopeKind,
-    active_entries_for_scope, all_memory_entries_with_text, canonical_key_owner,
+    active_entries_for_scope, all_memory_entries_with_effective_text, canonical_key_owner,
     create_memory_entry, list_memory_entries_for_scope, memory_entry_by_id, memory_entry_state,
     memory_entry_summary, recall_candidate_by_id, recall_candidates_for_scope,
     transition_memory_entry,

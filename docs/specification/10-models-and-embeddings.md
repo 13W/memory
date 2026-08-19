@@ -246,6 +246,31 @@ path; D-016). A `required` kind with no subject function — `memory` alone sinc
 makes the worker refuse with `UnsupportedRequiredKind` rather than report zero expected, which
 `Coverage::fully_covered` would read as "covered".
 
+As-built note (T21-02, `[SPEC]`, ADR-0010): the `memory` kind's subject function takes the
+entry's **effective text**, not `memory_entry.text`. Since T21-01 an entry may also carry an
+English variant (`memory_text_normalization`), and the variant — when it is `ready`, current
+against the entry's text, and non-blank — is what the embedder is fed and therefore what the
+subject hashes.
+
+The risk this creates is not a wrong answer but a silent one: three readers derive this hash
+independently — the expected-key set here, the backfill worker, and recall's dense leg — and if
+any of them picked a different text, its lookup would find no vector, the dense leg would return
+nothing, and nothing anywhere would report an error. `local_rag_store::memory::effective_text`
+therefore makes the divergence unrepresentable: `EffectiveText` has private fields and no
+constructor, the only way to obtain one is the pure `decide_effective_text`, and the only way to
+hash a stored entry is `memory_entry_subject_hash`, which takes one. The entry and its
+normalization are read in a **single statement** (one shared join, one shared row mapper), so
+"new text with an old variant" is excluded by the SQLite snapshot rather than by discipline, and
+a source lint pins the raw `subject_memory_entry` to exactly two files.
+
+Every degraded case — no row, a hash that no longer matches, `skipped`, `failed`, a blank
+variant — yields the entry's own text, which is the hash the store has always used and for which
+a vector already exists. So a store with an empty normalization table (every store, on upgrade)
+behaves byte-identically to one that predates this group. The **lexical** leg is deliberately
+untouched and keeps scoring the original text: BM25 over a partly-translated corpus would
+otherwise be biased by the mere fact of having been translated (08 §6's `[FIXED pipeline]` is not
+amended — the stages are unchanged, only the dense leg's input).
+
 **Resumability is recomputation, not a journal.** There is no progress table: each run recomputes
 `missing = expected \ valid_cached`, embeds in bounded batches outside any transaction (02 §5, "L4
 queues are leaves"), commits ≤ `write_batch_rows` rows per `cache.sqlite` transaction, and finally

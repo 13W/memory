@@ -227,6 +227,18 @@ pub fn subject_occurrence_context(context_version: u32, serialization: &[u8]) ->
 /// family the vector-bytes `embedding_cache.checksum` uses, not a spec 03 §1.2
 /// content-identity domain (no domain exists for raw memory text, and the memory
 /// tables this would back do not exist before group 14).
+///
+/// **For a stored entry, do not call this — call
+/// `local_rag_store::memory_entry_subject_hash`** (T21-02, ADR-0010
+/// Decision 4). Since T21-01 an entry's text and the text it is *embedded*
+/// under can differ (an English variant), and three readers derive this hash
+/// independently; a caller passing whichever text it happens to hold produces
+/// a hash no vector was written under, which fails silently — the dense leg
+/// simply finds nothing. `memory_entry_subject_hash` takes an
+/// `EffectiveText`, which only the store can produce, and a source lint
+/// (`crates/store/tests/memory_subject_lint.rs`) keeps this function's call
+/// sites at exactly two: here and there. This entry point remains for the
+/// known-answer tests below, which pin the hash framing itself.
 pub fn subject_memory_entry(memory_id: &str, text: &str) -> String {
     let text_hash = crate::hash::sha256_hex(text.as_bytes());
     hash(

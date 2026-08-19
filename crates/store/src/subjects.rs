@@ -65,7 +65,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::Connection;
 
-use local_rag_core::identity::domain::{subject_content_blob, subject_memory_entry};
+use local_rag_core::identity::domain::subject_content_blob;
 
 use crate::cache::{EmbeddingKey, SubjectKind};
 use crate::code::{content_blob_ids_for_generation, context_subjects_for_generation};
@@ -263,11 +263,13 @@ pub fn memory_entry_subject_keys(
     conn: &Connection,
     representation_id: &str,
 ) -> rusqlite::Result<BTreeSet<EmbeddingKey>> {
-    Ok(crate::memory::all_memory_entries_with_text(conn)?
-        .into_iter()
-        .map(|(memory_id, text)| EmbeddingKey {
+    Ok(crate::memory::all_memory_entries_with_effective_text(conn)?
+        .iter()
+        .map(|effective| EmbeddingKey {
             subject_kind: SubjectKind::MemoryEntry,
-            subject_hash: subject_memory_entry(&memory_id, &text),
+            // T21-02: the one hasher — never `subject_memory_entry` directly,
+            // or this set could drift from what recall's dense leg looks up.
+            subject_hash: crate::memory::memory_entry_subject_hash(effective),
             representation_id: representation_id.to_string(),
         })
         .collect())
