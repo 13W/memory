@@ -8,11 +8,11 @@ use std::process::ExitCode;
 
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
-    RequestRoot, Resolution, UnconsolidatableSession, consolidation_run_counts,
-    generation_meta_for_worktree, memory_entry_counts, observation_envelope_count,
-    observations_applied_since, oldest_open_run_created_at, pending_candidate_counts,
-    projection_state, resolve, store_instance_uuid, total_pending_backlog,
-    unconsolidatable_sessions,
+    RequestRoot, Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, StuckRunRow, UnconsolidatableSession,
+    consolidation_run_counts, generation_meta_for_worktree, memory_entry_counts,
+    observation_envelope_count, observations_applied_since, oldest_open_run_created_at,
+    pending_candidate_counts, projection_state, resolve, store_instance_uuid,
+    stuck_consolidation_runs, total_pending_backlog, unconsolidatable_sessions,
 };
 
 use local_rag::daemon::gitroot;
@@ -57,6 +57,11 @@ struct ConsolidationStats {
     /// overwhelmingly common case; every non-empty session here needs a
     /// human decision, not another retry.
     unconsolidatable: Vec<UnconsolidatableSession>,
+    /// D-071: runs that keep failing or have been given up on. During the
+    /// D-069 incident every number above this line looked healthy while one
+    /// run was on its 627th attempt — this is the line that would have said
+    /// so.
+    stuck_runs: Vec<StuckRunRow>,
 }
 
 fn compute_consolidation_stats(
@@ -84,6 +89,8 @@ fn compute_consolidation_stats(
     };
     let oldest_pending_run_created_at = oldest_open_run_created_at(conn)?;
     let unconsolidatable = unconsolidatable_sessions(conn, local_rag_core::BUILD_ID)?;
+    let stuck_runs =
+        stuck_consolidation_runs(conn, local_rag_core::BUILD_ID, STUCK_RUN_ATTEMPT_THRESHOLD)?;
     Ok(ConsolidationStats {
         runs_by_state,
         pending_backlog_total,
@@ -92,7 +99,34 @@ fn compute_consolidation_stats(
         eta_seconds,
         oldest_pending_run_created_at,
         unconsolidatable,
+        stuck_runs,
     })
+}
+
+/// One [`StuckRunRow`] as a single human-readable line (D-071) — the run, its
+/// session, the window it covers, how many times it has failed, whether
+/// anything will ever retry it, and the failure the store already recorded.
+fn describe_stuck_run(r: &StuckRunRow) -> String {
+    let verdict = if r.dead_lettered {
+        "dead-lettered on this build — only a rebuild retries it"
+    } else {
+        "still retrying"
+    };
+    format!(
+        "run {} session {} received_seq {}..={} — {} attempt(s), {}{}",
+        r.run_id,
+        r.session_id,
+        r.from_received_seq,
+        r.to_received_seq,
+        r.attempt_count,
+        verdict,
+        match (&r.last_failure_kind, &r.last_failure_reason) {
+            (Some(kind), Some(reason)) => format!(" ({kind}): {reason}"),
+            (Some(kind), None) => format!(" ({kind})"),
+            (None, Some(reason)) => format!(": {reason}"),
+            (None, None) => String::new(),
+        }
+    )
 }
 
 pub fn run(args: StatsArgs) -> ExitCode {
@@ -237,6 +271,16 @@ pub fn run(args: StatsArgs) -> ExitCode {
                     "from_received_seq": s.from_received_seq,
                     "to_received_seq": s.to_received_seq,
                 })).collect::<Vec<_>>(),
+                "stuck_runs": consolidation.stuck_runs.iter().map(|r| serde_json::json!({
+                    "run_id": r.run_id,
+                    "session_id": r.session_id,
+                    "attempt_count": r.attempt_count,
+                    "dead_lettered": r.dead_lettered,
+                    "last_failure_kind": r.last_failure_kind,
+                    "last_failure_reason": r.last_failure_reason,
+                    "from_received_seq": r.from_received_seq,
+                    "to_received_seq": r.to_received_seq,
+                })).collect::<Vec<_>>(),
             },
             "scope": scope_label,
             "worktree": worktree_json,
@@ -322,6 +366,18 @@ pub fn run(args: StatsArgs) -> ExitCode {
                 "  session {} received_seq {}..={} — dead-letter run {}",
                 s.session_id, s.from_received_seq, s.to_received_seq, s.dead_letter_run_id
             );
+        }
+    }
+    // D-071: same discipline as the D-058 block above — silent on a healthy
+    // store, and every line printed here names a run that is either being
+    // retried without converging or has been given up on entirely.
+    if !consolidation.stuck_runs.is_empty() {
+        println!(
+            "consolidation stuck runs: {} — retried without converging, or dead-lettered",
+            consolidation.stuck_runs.len()
+        );
+        for r in &consolidation.stuck_runs {
+            println!("  {}", describe_stuck_run(r));
         }
     }
     match &worktree {

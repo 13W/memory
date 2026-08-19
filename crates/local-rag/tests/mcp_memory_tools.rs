@@ -12,10 +12,11 @@ use local_rag::daemon::DaemonHandle;
 use local_rag_core::identity::domain::subject_memory_entry;
 use local_rag_memory::recall::{QueryEmbedError, QueryEmbedder};
 use local_rag_store::{
-    CacheDb, DEFAULT_MODEL_SPACE_ID, DistanceMetric, EmbeddingKey, GLOBAL_SCOPE_OWNER_ID,
-    MemoryKind, MemoryState, NewConsolidationRun, RepresentationKey, RepresentationKind, ScopeKind,
-    StateDb, SubjectKind, create_consolidation_run, ensure_store_instance_uuid, insert_embedding,
-    register_representation, set_model_space_representation,
+    CacheDb, DEFAULT_MODEL_SPACE_ID, DistanceMetric, EmbeddingKey, FailureKind,
+    GLOBAL_SCOPE_OWNER_ID, MemoryKind, MemoryState, NewConsolidationRun, RepresentationKey,
+    RepresentationKind, RunState, ScopeKind, StateDb, SubjectKind, create_consolidation_run,
+    ensure_store_instance_uuid, insert_embedding, record_run_failure, register_representation,
+    set_model_space_representation, transition_run,
 };
 use serde_json::Value;
 use support::{
@@ -909,6 +910,83 @@ async fn stats_reports_counts_by_kind_state_and_pending_candidates_by_state() {
     assert_eq!(
         parsed["tool_calls"]["since_daemon_start"],
         serde_json::json!([{"name": "stats", "count": 1}]),
+        "{text}"
+    );
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+/// D-071: the MCP `stats` surface carries the same stuck-run report as the
+/// CLI — during the D-069 incident this tool answered "healthy" while one run
+/// was on its 627th attempt.
+#[tokio::test]
+async fn stats_reports_a_stuck_consolidation_run() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_observation(&state, "obs-1").await;
+        state
+            .writer()
+            .transaction(|tx| {
+                create_consolidation_run(
+                    tx,
+                    &NewConsolidationRun {
+                        run_id: "run-wedged",
+                        session_id: "sess-wedged",
+                        from_received_seq: 26115,
+                        to_received_seq: 26117,
+                        router_version: "v1",
+                    },
+                    1_000,
+                )?;
+                transition_run(tx, "run-wedged", RunState::Running, 1_000)?
+                    .expect("pending -> running");
+                record_run_failure(
+                    tx,
+                    "run-wedged",
+                    FailureKind::Mechanical,
+                    "state transaction failed (rolled back): UNIQUE constraint failed: \
+                     candidate_evidence.candidate_id, candidate_evidence.observation_id",
+                    false,
+                    Some(local_rag_core::BUILD_ID),
+                    1_000,
+                )?
+                .expect("running -> failed");
+                Ok(())
+            })
+            .await
+            .expect("seed dead-lettered run");
+    }
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+
+    let stuck = parsed["consolidation"]["stuck_runs"].as_array().unwrap();
+    assert_eq!(stuck.len(), 1, "{text}");
+    assert_eq!(stuck[0]["run_id"], "run-wedged", "{text}");
+    assert_eq!(stuck[0]["session_id"], "sess-wedged", "{text}");
+    assert_eq!(stuck[0]["attempt_count"], 1, "{text}");
+    assert_eq!(stuck[0]["dead_lettered"], true, "{text}");
+    assert_eq!(stuck[0]["last_failure_kind"], "mechanical", "{text}");
+    assert!(
+        stuck[0]["last_failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("UNIQUE constraint failed: candidate_evidence"),
         "{text}"
     );
 

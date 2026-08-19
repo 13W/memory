@@ -165,3 +165,125 @@ pub fn oldest_open_run_created_at(conn: &Connection) -> rusqlite::Result<Option<
         |r| r.get(0),
     )
 }
+
+/// One consolidation run D-071 reports as stuck: retried past
+/// [`STUCK_RUN_ATTEMPT_THRESHOLD`], or dead-lettered on the running build.
+///
+/// `last_failure_reason` is already truncated to
+/// [`STUCK_RUN_REASON_MAX_CHARS`] — this row exists to be printed, and a
+/// router-failure reason can be arbitrarily long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StuckRunRow {
+    pub run_id: String,
+    pub session_id: String,
+    pub attempt_count: i64,
+    /// `mechanical` **and** fingerprinted with the running build: D-050's
+    /// dead-letter, which no sweep will retry until the binary changes.
+    pub dead_lettered: bool,
+    pub last_failure_kind: Option<String>,
+    pub last_failure_reason: Option<String>,
+    pub from_received_seq: i64,
+    pub to_received_seq: i64,
+}
+
+/// How many recorded failures make a still-retryable run worth reporting
+/// (D-071, `[SPEC]`-chosen like `CONSOLIDATION_THROUGHPUT_WINDOW_MS`, not
+/// measured). Low on purpose: it is an early warning, meant to fire well
+/// before
+/// [`TRANSIENT_ATTEMPT_CAP`](super::consolidation::TRANSIENT_ATTEMPT_CAP)
+/// gives up entirely, and a healthy run reaches `applied` on its first
+/// attempt.
+pub const STUCK_RUN_ATTEMPT_THRESHOLD: i64 = 3;
+
+/// Ceiling on the reported `last_failure_reason`, in **characters** (not
+/// bytes — a reason can carry any UTF-8 the router or SQLite produced, and a
+/// byte slice would split a multi-byte character).
+pub const STUCK_RUN_REASON_MAX_CHARS: usize = 200;
+
+fn truncate_reason(reason: Option<String>) -> Option<String> {
+    reason.map(|r| {
+        if r.chars().count() <= STUCK_RUN_REASON_MAX_CHARS {
+            return r;
+        }
+        let mut out: String = r.chars().take(STUCK_RUN_REASON_MAX_CHARS).collect();
+        out.push('…');
+        out
+    })
+}
+
+/// Every `failed` consolidation run that needs a human's attention (D-071):
+/// the store-side half of "nothing degrades silently" (spec 02 §6) for the
+/// consolidation pillar, whose retry bookkeeping (D-050, schema v11) has been
+/// recorded but never reported by `stats`/`doctor`.
+///
+/// A run qualifies when it is `failed` **and** either
+///
+/// - it has failed at least `attempt_threshold` times (callers pass
+///   [`STUCK_RUN_ATTEMPT_THRESHOLD`]) — still retry-eligible, but visibly not
+///   converging; or
+/// - it is dead-lettered on `current_build_id` (`mechanical` +
+///   matching fingerprint) — exactly the rows
+///   [`stale_runs`](super::consolidation::stale_runs) will never pick up
+///   again, so nothing but a rebuild can move them.
+///
+/// **Minus** the one shape that resolves itself: a context-overflow
+/// dead-letter that is its session's latest non-`applied` run and still spans
+/// more than one observation is
+/// [`open_next_run`](super::consolidation::open_next_run)'s shrink-and-retry
+/// carve-out (D-058) — the next tick opens a narrower window for it, so
+/// calling it stuck would be a false alarm. The floor case (a window already
+/// down to a single observation) stays: that one really is stuck, and is the
+/// same set [`unconsolidatable_sessions`](super::consolidation::unconsolidatable_sessions)
+/// reports from the session's side.
+///
+/// Ordered worst-first (`attempt_count` descending, then `run_id`) so a
+/// truncated human report still shows the loudest row.
+pub fn stuck_consolidation_runs(
+    conn: &Connection,
+    current_build_id: &str,
+    attempt_threshold: i64,
+) -> rusqlite::Result<Vec<StuckRunRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.run_id, c.session_id, c.attempt_count, c.last_failure_kind, \
+                c.last_failure_reason, c.from_received_seq, c.to_received_seq, \
+                (COALESCE(c.last_failure_kind, '') = 'mechanical' \
+                 AND COALESCE(c.last_failure_fingerprint, '') = ?1) AS dead_lettered \
+         FROM consolidation_run c \
+         WHERE c.state = 'failed' \
+           AND ( \
+                 c.attempt_count >= ?2 \
+                 OR ( \
+                      COALESCE(c.last_failure_kind, '') = 'mechanical' \
+                      AND COALESCE(c.last_failure_fingerprint, '') = ?1 \
+                    ) \
+               ) \
+           AND NOT ( \
+                 c.last_failure_context_overflow = 1 \
+                 AND COALESCE(c.last_failure_kind, '') = 'mechanical' \
+                 AND COALESCE(c.last_failure_fingerprint, '') = ?1 \
+                 AND c.created_at = ( \
+                       SELECT MAX(c2.created_at) FROM consolidation_run c2 \
+                       WHERE c2.session_id = c.session_id AND c2.state != 'applied' \
+                     ) \
+                 AND ( \
+                       SELECT COUNT(*) FROM observation_envelope e \
+                       WHERE e.session_id = c.session_id \
+                         AND e.received_seq BETWEEN c.from_received_seq AND c.to_received_seq \
+                     ) > 1 \
+               ) \
+         ORDER BY c.attempt_count DESC, c.run_id",
+    )?;
+    stmt.query_map(params![current_build_id, attempt_threshold], |r| {
+        Ok(StuckRunRow {
+            run_id: r.get(0)?,
+            session_id: r.get(1)?,
+            attempt_count: r.get(2)?,
+            dead_lettered: r.get(7)?,
+            last_failure_kind: r.get(3)?,
+            last_failure_reason: truncate_reason(r.get(4)?),
+            from_received_seq: r.get(5)?,
+            to_received_seq: r.get(6)?,
+        })
+    })?
+    .collect()
+}

@@ -44,11 +44,12 @@ use local_rag_projection::{
 };
 use local_rag_store::{
     CacheDb, CacheDiagnosis, DEFAULT_MODEL_SPACE_ID, FtsAvailability, FtsCheckOutcome,
-    HousekeepingError, SHARD_DESTROY_GRACE_MS, ShardSweepReport, StateDb, ValidationDepth,
-    VersionDiagnosis, WorktreeIndexingStatus, all_worktree_ids, check_fts, current_worktree_path,
-    generation_meta_for_worktree, indexing_status, managed_worktrees, requires_index_unavailable,
-    run_expired_shard_sweep, run_orphan_shard_sweep, run_unreferenced_space_sweep,
-    store_instance_uuid,
+    HousekeepingError, SHARD_DESTROY_GRACE_MS, STUCK_RUN_ATTEMPT_THRESHOLD, ShardSweepReport,
+    StateDb, StuckRunRow, ValidationDepth, VersionDiagnosis, WorktreeIndexingStatus,
+    all_worktree_ids, check_fts, current_worktree_path, generation_meta_for_worktree,
+    indexing_status, managed_worktrees, requires_index_unavailable, run_expired_shard_sweep,
+    run_orphan_shard_sweep, run_unreferenced_space_sweep, store_instance_uuid,
+    stuck_consolidation_runs,
 };
 
 use local_rag::daemon::{StoreLockFileState, read_store_lock_file};
@@ -73,6 +74,18 @@ pub struct DoctorReport {
     /// X-008: is background indexing enrolled for each worktree, how old is
     /// what search serves, and is newer work built but stuck?
     pub indexing: IndexingFinding,
+    /// D-071: consolidation runs that are being retried without converging,
+    /// or that the retry machinery has given up on entirely.
+    pub consolidation: ConsolidationFinding,
+}
+
+/// D-071: the consolidation section — `doctor` had none at all, which is why
+/// a run on its 627th attempt could pin the GPU for eight hours while this
+/// report still said `clean`. Non-empty means a human has to look: every row
+/// is either not converging or permanently parked.
+pub enum ConsolidationFinding {
+    Skipped { reason: String },
+    Checked(Vec<StuckRunRow>),
 }
 
 /// X-008: the background-indexing section — one entry per worktree.
@@ -212,6 +225,14 @@ impl DoctorReport {
             &self.indexing,
             IndexingFinding::Checked(list) if list.iter().all(|w| !w.freshness.has_fault())
         );
+        // D-071: a stuck consolidation run is a fault for the same reason a
+        // stuck generation is — work the system performed and could not
+        // land. A dead-lettered run additionally blocks its whole session's
+        // backlog until the binary is rebuilt.
+        let consolidation_ok = matches!(
+            &self.consolidation,
+            ConsolidationFinding::Checked(list) if list.is_empty()
+        );
         lock_ok
             && permissions_ok
             && versions_ok
@@ -220,6 +241,7 @@ impl DoctorReport {
             && heads_ok
             && spool_ok
             && indexing_ok
+            && consolidation_ok
     }
 }
 
@@ -297,7 +319,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
             spool: SpoolFinding::Skipped {
                 reason: reason.clone(),
             },
-            indexing: IndexingFinding::Skipped { reason },
+            indexing: IndexingFinding::Skipped {
+                reason: reason.clone(),
+            },
+            consolidation: ConsolidationFinding::Skipped { reason },
         };
     }
 
@@ -319,7 +344,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 spool: SpoolFinding::Skipped {
                     reason: reason.clone(),
                 },
-                indexing: IndexingFinding::Skipped { reason },
+                indexing: IndexingFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                consolidation: ConsolidationFinding::Skipped { reason },
             };
         }
     };
@@ -341,7 +369,10 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 spool: SpoolFinding::Skipped {
                     reason: reason.clone(),
                 },
-                indexing: IndexingFinding::Skipped { reason },
+                indexing: IndexingFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                consolidation: ConsolidationFinding::Skipped { reason },
             };
         }
     };
@@ -356,6 +387,7 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
     let heads = build_heads(&read, layout, &cache_binding, worktree_filter);
     let spool = build_spool(&read, layout);
     let indexing = build_indexing(&read, worktree_filter);
+    let consolidation = build_consolidation(&read);
 
     DoctorReport {
         lock,
@@ -366,6 +398,21 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
         heads,
         spool,
         indexing,
+        consolidation,
+    }
+}
+
+/// D-071: every consolidation run that needs a human, from the same read
+/// connection every other section uses. One store call
+/// (`stuck_consolidation_runs`), whose own doc carries the "stuck" rule — a
+/// read that fails degrades this one section to `Skipped`, exactly as its
+/// neighbours do, rather than blinding the whole report.
+fn build_consolidation(read: &rusqlite::Connection) -> ConsolidationFinding {
+    match stuck_consolidation_runs(read, local_rag_core::BUILD_ID, STUCK_RUN_ATTEMPT_THRESHOLD) {
+        Ok(runs) => ConsolidationFinding::Checked(runs),
+        Err(e) => ConsolidationFinding::Skipped {
+            reason: format!("could not read consolidation runs: {e}"),
+        },
     }
 }
 
@@ -695,6 +742,25 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         ),
     };
 
+    let consolidation = match &report.consolidation {
+        ConsolidationFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
+        ConsolidationFinding::Checked(list) => serde_json::json!({
+            "stuck_runs": list
+                .iter()
+                .map(|r| serde_json::json!({
+                    "run_id": r.run_id,
+                    "session_id": r.session_id,
+                    "attempt_count": r.attempt_count,
+                    "dead_lettered": r.dead_lettered,
+                    "last_failure_kind": r.last_failure_kind,
+                    "last_failure_reason": r.last_failure_reason,
+                    "from_received_seq": r.from_received_seq,
+                    "to_received_seq": r.to_received_seq,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    };
+
     let indexing = match &report.indexing {
         IndexingFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
         IndexingFinding::Checked(list) => serde_json::Value::Array(
@@ -739,6 +805,7 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         "heads": heads,
         "spool": spool,
         "indexing": indexing,
+        "consolidation": consolidation,
     })
 }
 
@@ -868,6 +935,44 @@ fn print_human(report: &DoctorReport) {
     }
 
     print_indexing(&report.indexing);
+    print_consolidation(&report.consolidation);
+}
+
+/// D-071's `consolidation:` section — the memory pillar's own "is anything
+/// wedged?" line. Silent-but-present when healthy (one `ok` line, like
+/// `permissions:`), loud and per-run when not: during the D-069 incident this
+/// report had nothing to say at all while one run was on its 627th attempt.
+fn print_consolidation(finding: &ConsolidationFinding) {
+    match finding {
+        ConsolidationFinding::Skipped { reason } => {
+            println!("consolidation: skipped — {reason}")
+        }
+        ConsolidationFinding::Checked(list) if list.is_empty() => {
+            println!("consolidation: ok — no run is stuck or dead-lettered")
+        }
+        ConsolidationFinding::Checked(list) => {
+            for r in list {
+                let verdict = if r.dead_lettered {
+                    "DEAD-LETTERED on this build — nothing retries it until the binary changes"
+                } else {
+                    "STUCK: retried without converging"
+                };
+                println!(
+                    "consolidation: run {} session {} received_seq {}..={} — {} attempt(s), {}",
+                    r.run_id,
+                    r.session_id,
+                    r.from_received_seq,
+                    r.to_received_seq,
+                    r.attempt_count,
+                    verdict,
+                );
+                if let Some(reason) = &r.last_failure_reason {
+                    let kind = r.last_failure_kind.as_deref().unwrap_or("unclassified");
+                    println!("  last failure ({kind}): {reason}");
+                }
+            }
+        }
+    }
 }
 
 /// X-008's `indexing:` section — for each worktree: enrolled or not, how old the

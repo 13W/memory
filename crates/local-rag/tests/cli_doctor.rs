@@ -35,13 +35,15 @@ use local_rag_projection::{
     VectorSource, switch,
 };
 use local_rag_store::{
-    DEFAULT_MODEL_SPACE_ID, DistanceMetric, GenerationState, NewContentBlob, NewFileRevision,
-    NewOccurrence, NewParsedUnit, NewlineStyle, RepresentationKey, RepresentationKind,
-    SourceCompression, StateDb, UnitKind, WorktreeKind, allocate_generation, create_repository,
+    DEFAULT_MODEL_SPACE_ID, DistanceMetric, FailureKind, GenerationState, LEASE_DURATION_MS,
+    NewConsolidationRun, NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit,
+    NewlineStyle, RepresentationKey, RepresentationKind, RunState, SourceCompression, StateDb,
+    UnitKind, WorktreeKind, allocate_generation, create_consolidation_run, create_repository,
     create_worktree, derive_content_blob, ensure_store_instance_uuid, insert_content_blob,
     insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
-    insert_projection_state, materialize_fts, occurrence_id, register_representation,
-    set_model_space_representation, transition_generation,
+    insert_projection_state, materialize_fts, occurrence_id, record_run_failure,
+    register_representation, retry_run, set_model_space_representation, transition_generation,
+    transition_run,
 };
 use local_rag_test_support::TempHome;
 
@@ -964,5 +966,115 @@ async fn indexing_json_carries_enrollment_freshness_and_stuck_generations() {
     assert_eq!(
         entry["stuck_generations"][0]["state"],
         serde_json::json!("projection_ready")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-071: the consolidation section
+// ---------------------------------------------------------------------------
+
+/// A `consolidation_run` that failed `attempts` times and ended dead-lettered
+/// on the running build — the D-069 incident's shape, driven through the real
+/// `retry_run`/`record_run_failure` cycle.
+async fn seed_stuck_run(db: &StateDb, run_id: &str, session_id: &str, attempts: i64) {
+    let (rid, sid) = (run_id.to_string(), session_id.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: &rid,
+                    session_id: &sid,
+                    from_received_seq: 26115,
+                    to_received_seq: 26117,
+                    router_version: "v1",
+                },
+                1_000,
+            )?;
+            for attempt in 0..attempts {
+                if attempt == 0 {
+                    transition_run(tx, &rid, RunState::Running, 1_000)?
+                        .expect("pending -> running");
+                } else {
+                    retry_run(tx, &rid, LEASE_DURATION_MS, 1_000)?.expect("failed -> running");
+                }
+                record_run_failure(
+                    tx,
+                    &rid,
+                    FailureKind::Mechanical,
+                    "state transaction failed (rolled back): UNIQUE constraint failed: \
+                     candidate_evidence.candidate_id, candidate_evidence.observation_id",
+                    false,
+                    Some(local_rag_core::BUILD_ID),
+                    1_000,
+                )?
+                .expect("running -> failed");
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed stuck run");
+}
+
+/// `doctor` had no consolidation section at all, so it reported `clean` while
+/// one run was being retried into the ground — the whole point of D-071. A
+/// dead-lettered run is a fault for the same reason a stuck generation is:
+/// work the system performed and could not land, and here it additionally
+/// blocks its session's whole backlog until the binary is rebuilt.
+#[tokio::test]
+async fn consolidation_section_reports_a_dead_lettered_run_and_fails_the_verdict() {
+    let (home, layout) = open_layout();
+    {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        bootstrap_store(&db, &layout).await;
+        seed_stuck_run(&db, "run-wedged", "sess-wedged", 627).await;
+    }
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a dead-lettered run must fail the verdict: {output:?}"
+    );
+    let text = stdout(&output);
+    assert!(text.contains("local-rag doctor: issues found"), "{text}");
+    assert!(
+        text.contains("consolidation: run run-wedged session sess-wedged"),
+        "{text}"
+    );
+    assert!(text.contains("627 attempt(s)"), "{text}");
+    assert!(text.contains("DEAD-LETTERED on this build"), "{text}");
+    assert!(
+        text.contains("UNIQUE constraint failed: candidate_evidence"),
+        "the recorded failure is what tells an operator what to fix: {text}"
+    );
+
+    let output = run_cli(&home, &["doctor", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(json["clean"], serde_json::json!(false));
+    let stuck = json["consolidation"]["stuck_runs"].as_array().unwrap();
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0]["run_id"], "run-wedged");
+    assert_eq!(stuck[0]["attempt_count"], 627);
+    assert_eq!(stuck[0]["dead_lettered"], true);
+}
+
+/// The healthy counterpart: an initialized store with nothing wedged says so
+/// explicitly (an `ok` line, like `permissions:`) and stays clean.
+#[tokio::test]
+async fn consolidation_section_is_ok_when_no_run_is_stuck() {
+    let (home, layout) = open_layout();
+    {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        bootstrap_store(&db, &layout).await;
+    }
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("local-rag doctor: clean"), "{text}");
+    assert!(
+        text.contains("consolidation: ok — no run is stuck or dead-lettered"),
+        "{text}"
     );
 }

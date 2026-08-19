@@ -141,9 +141,10 @@ pub use runner::{
     RunnerError, WindowObservation, commit_apply_run, run_once,
 };
 pub use stats::{
-    CandidateCountRow, MemoryCountRow, RunCountRow, consolidation_run_counts, memory_entry_counts,
+    CandidateCountRow, MemoryCountRow, RunCountRow, STUCK_RUN_ATTEMPT_THRESHOLD,
+    STUCK_RUN_REASON_MAX_CHARS, StuckRunRow, consolidation_run_counts, memory_entry_counts,
     observations_applied_since, oldest_open_run_created_at, pending_candidate_counts,
-    total_pending_backlog,
+    stuck_consolidation_runs, total_pending_backlog,
 };
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the
