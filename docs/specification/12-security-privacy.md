@@ -170,6 +170,40 @@ partially-completed purge is a worse outcome than a slow one for an all-or-nothi
 operation. `local_rag_store::retention::ExternalPins.referenced_generations` (06 §5) is not wired
 by this task: no column on `memory_entry`/`observation_envelope` carries an actual `generation_id`
 reference today, so there is nothing yet for that pin to name.
+As-built note (T21-07, `[SPEC]`, ADR-0010): since migration 14 an entry may carry a second copy of
+the user's own writing — `memory_text_normalization.normalized_text`, the English variant a local
+model produced from it (03 §2.5) — and all three operations above now account for it.
+
+**`purge`**: `purge_memory_rows` deletes the row **explicitly and first**, before the
+`memory_entry` delete, and reports it as `PurgeMemoryReport.normalization_rows_removed` (0 or 1 —
+the table holds at most one row per entry). The table's own `ON DELETE CASCADE` would take it
+anyway; the explicit delete exists because a cascade cannot be *counted*, and a number inferred
+from "the cascade must have fired" would be a claim about a pragma rather than an observation. The
+cascade stays as the safety net for any delete path that does not come through this module.
+`purge --all` inherits the behaviour through the same shared function.
+
+**`edit`**: `apply_edit` drops the row in its own transaction when — and only when — the text
+actually changes, compared against the stored text rather than against "the caller supplied a text
+field". A translation of text the user has since replaced is derived data that must not outlive its
+source; an edit that re-submits the identical string changes nothing to translate, and dropping the
+row there would make the normalization worker pay for the same inference twice.
+`apply_reinforce` never touches the row, because it may not touch the text (08 §3 `[FIXED]`).
+
+**`export`/`inspect`**: `MemoryInspection` carries `normalization: Option<NormalizationRow>`, filled
+by the same `normalization_for` reader in both `inspect_memory` and `export_scope` — the shared
+shape is what keeps export from being poorer than inspect. The rendered object includes
+`normalized_text` **itself**, not merely metadata about it (owner decision, 2026-08-19): an export
+exists to show everything the store holds about the user, whose original text is already printed
+alongside it. Provenance travels with it — status, `source_text_sha256`, detected language,
+normalizer model id, prompt and normalizer versions, attempt count, and, on a `failed` row, the
+reason there is no translation at all.
+
+A **known, accepted gap**, registered as `D-074` rather than left implicit: `purge` never touches
+`cache.sqlite`, so the purged entry's embedding survives in `embedding_cache` until LRU eviction or
+a full cache rebuild. A writable cross-database transaction is forbidden (03 §1.4) and no sweep
+collects a cache row merely because its subject stopped existing. This predates group 21 and
+applies to every memory entry, normalized or not.
+
 - Optional encryption at rest (SQLite-level, e.g. SQLCipher-compatible) — optional feature,
   off by default `[FIXED optionality]`.
 

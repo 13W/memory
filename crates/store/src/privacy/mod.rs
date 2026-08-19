@@ -43,6 +43,25 @@
 //! own module doc), so a row outliving its `memory_entry` parent is not a
 //! constraint violation.
 //!
+//! # Derived text is purged with its entry (T21-07, ADR-0010)
+//!
+//! Since migration 14 an entry may also have a `memory_text_normalization` row
+//! holding an English variant of its text — a *second copy of the user's own
+//! writing*, produced by a local model. `purge_memory_rows` deletes it
+//! explicitly, and counts it
+//! ([`PurgeMemoryReport::normalization_rows_removed`]), rather than letting the
+//! table's `ON DELETE CASCADE` take it silently: a cascade cannot be reported,
+//! and a count derived from "the cascade must have fired" would be a guess
+//! about a pragma rather than an observation. The cascade remains as the safety
+//! net for any delete path that does not come through this module.
+//!
+//! The same rule is why [`crate::memory::apply_edit`] drops the row when — and
+//! only when — the text actually changes: a translation of text the user has
+//! since replaced is exactly the kind of derived data that must not outlive its
+//! source. [`inspect_memory`]/[`export_scope`] carry the row (translation and
+//! provenance both), because an export exists to show everything the store
+//! holds, and the original `entry.text` is already in that output.
+//!
 //! # `purge --all` is one transaction, not batched
 //!
 //! Unlike [`crate::retention`]'s sweep (which batches on purpose — partial
@@ -69,6 +88,15 @@
 //!   (`apply_merge`) stores a JSON array of loser memory-ids, never raw
 //!   observation/session content — there is structurally nothing to
 //!   tombstone there.
+//! - `purge` never touches `cache.sqlite`, so the purged entry's **embedding**
+//!   survives in `embedding_cache` until LRU eviction or a full cache rebuild:
+//!   a writable cross-database transaction is forbidden (spec 03 §1.4), and no
+//!   sweep collects a cache row merely because its subject stopped existing
+//!   (`local_rag_embed::backfill` deletes only rows that fail their integrity
+//!   check). Registered as **D-074** rather than left implicit — spec 12 §3
+//!   calls purge the *only* hard-delete path, and a derived vector of the
+//!   user's own text outliving it is a gap, not a design choice. It predates
+//!   group 21 and applies to every memory entry, normalized or not.
 //! - Retention's `ExternalPins.referenced_generations` ([`crate::retention`])
 //!   is not wired by this module: no column on `memory_entry` or
 //!   `observation_envelope` carries a real `generation_id` reference today

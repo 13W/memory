@@ -4,7 +4,9 @@
 
 use rusqlite::Connection;
 
-use crate::memory::{ScopeKind, list_memory_entries_for_scope, read_audit_events_for_entity};
+use crate::memory::{
+    ScopeKind, list_memory_entries_for_scope, normalization_for, read_audit_events_for_entity,
+};
 
 use super::inspect::{MemoryInspection, evidence_summaries_for};
 
@@ -43,10 +45,15 @@ pub fn export_scope(
     for entry in entries {
         let evidence = evidence_summaries_for(conn, &entry.memory_id, now_ms)?;
         let audit_trail = read_audit_events_for_entity(conn, "memory_entry", &entry.memory_id)?;
+        // T21-07: read through the same shape `inspect` uses, so export is
+        // never poorer than inspect for the identical relationship — the rule
+        // `EvidenceSummary` already states for evidence.
+        let normalization = normalization_for(conn, &entry.memory_id)?;
         out.push(MemoryInspection {
             entry,
             evidence,
             audit_trail,
+            normalization,
         });
     }
     Ok(out)

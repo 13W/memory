@@ -7,7 +7,10 @@
 
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
-use local_rag_store::memory::{NewMemoryEntry, ScopeKind, create_memory_entry};
+use local_rag_store::memory::{
+    NewMemoryEntry, NormalizationStatus, NormalizationWrite, ScopeKind, UpsertOutcome,
+    create_memory_entry, upsert_normalization,
+};
 use local_rag_store::observation::{EvidenceKind, NewObservationEnvelope, insert_envelope};
 use local_rag_store::privacy::export_scope;
 use local_rag_store::rusqlite::params;
@@ -21,6 +24,10 @@ fn open_state() -> (TempHome, StateDb) {
     let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
     (home, db)
 }
+
+/// The text [`create_memory`] writes; a normalization fixture must hash exactly
+/// this, since `upsert_normalization` refuses a stale write.
+const CREATED_TEXT: &str = "some durable text";
 
 fn uuid(seed: u8) -> String {
     let mut rand = [0u8; 10];
@@ -86,7 +93,7 @@ async fn create_memory(
                 &NewMemoryEntry {
                     memory_id: &id,
                     kind: local_rag_store::MemoryKind::Fact,
-                    text: "some durable text",
+                    text: CREATED_TEXT,
                     canonical_key: None,
                     scope_kind,
                     scope_owner_id: &owner,
@@ -230,4 +237,66 @@ async fn export_scope_includes_full_audit_trail_per_entry() {
     let exported = export_scope(&read, &[(ScopeKind::Worktree, owner)], 1000).expect("export");
     assert_eq!(exported.len(), 1);
     assert_eq!(exported[0].audit_trail, Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// T21-07: an export shows the English variant too
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn export_carries_the_translation_and_leaves_unnormalized_entries_as_none() {
+    let (_home, db) = open_state();
+    let owner = uuid(80);
+    let normalized = uuid(81);
+    let plain = uuid(82);
+    create_memory(&db, &normalized, ScopeKind::Worktree, &owner, 1000).await;
+    create_memory(&db, &plain, ScopeKind::Worktree, &owner, 2000).await;
+
+    let id = normalized.clone();
+    let sha = local_rag_core::hash::sha256_hex(CREATED_TEXT.as_bytes());
+    let outcome = db
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status: NormalizationStatus::Ready,
+                    source_text_sha256: &sha,
+                    normalized_text: Some("the English variant"),
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-normalizer"),
+                    prompt_version: Some(1),
+                    normalizer_version: 1,
+                    attempt_count: 1,
+                    last_error: None,
+                    next_attempt_at: None,
+                },
+                3000,
+            )
+        })
+        .await
+        .expect("infra");
+    assert_eq!(outcome, UpsertOutcome::Written);
+
+    let read = db.open_read().expect("read conn");
+    let exported = export_scope(&read, &[(ScopeKind::Worktree, owner.clone())], 4000)
+        .expect("export succeeds");
+
+    assert_eq!(exported.len(), 2);
+    let first = &exported[0];
+    assert_eq!(first.entry.memory_id, normalized);
+    let row = first
+        .normalization
+        .as_ref()
+        .expect("export is never poorer than inspect");
+    assert_eq!(
+        row.normalized_text.as_deref(),
+        Some("the English variant"),
+        "an export exists to show everything the store holds about the user",
+    );
+    assert_eq!(row.normalizer_model_id.as_deref(), Some("test-normalizer"));
+
+    assert_eq!(exported[1].entry.memory_id, plain);
+    assert!(exported[1].normalization.is_none());
 }

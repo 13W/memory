@@ -20,10 +20,11 @@ use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
     Actor, CreateMemoryOp, EditMemoryOp, EvidenceInput, IllegalMemoryTransition, MemoryOpError,
-    MemoryOpOutcome, MergeLoser, MergeMemoryOp, ReinforceMemoryOp, ResolveMemoryOp,
-    RetractMemoryOp, ScopeKind, SupersedeMemoryOp, apply_create, apply_edit, apply_merge,
-    apply_noop, apply_reinforce, apply_resolve, apply_retract, apply_supersede, memory_entry_state,
-    memory_evidence_for, read_audit_events_for_entity,
+    MemoryOpOutcome, MergeLoser, MergeMemoryOp, NormalizationStatus, NormalizationWrite,
+    ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp, ScopeKind, SupersedeMemoryOp,
+    UpsertOutcome, apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce,
+    apply_resolve, apply_retract, apply_supersede, memory_entry_state, memory_evidence_for,
+    normalization_for, read_audit_events_for_entity, upsert_normalization,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{MemoryKind, MemoryState, StateDb};
@@ -34,6 +35,10 @@ use tokio::sync::Mutex;
 use local_rag_test_support::Action;
 
 static SERIAL: Mutex<()> = Mutex::const_new(());
+
+/// The text [`create`] writes. A normalization fixture must hash exactly this,
+/// since `upsert_normalization` refuses a write whose source hash has moved.
+const CREATED_TEXT: &str = "original durable text";
 
 /// A temporary store with an ensured tree and an opened [`StateDb`].
 fn open_state() -> (TempHome, StateDb) {
@@ -129,7 +134,7 @@ async fn create(
                 &CreateMemoryOp {
                     memory_id: &id,
                     kind,
-                    text: "original durable text",
+                    text: CREATED_TEXT,
                     canonical_key: key.as_deref(),
                     scope_kind: ScopeKind::Worktree,
                     scope_owner_id: &owner,
@@ -1964,7 +1969,7 @@ async fn create_rolls_back_completely_on_failpoint() {
                 &CreateMemoryOp {
                     memory_id: &mid,
                     kind: MemoryKind::Fact,
-                    text: "original durable text",
+                    text: CREATED_TEXT,
                     canonical_key: None,
                     scope_kind: ScopeKind::Worktree,
                     scope_owner_id: &owner_arg,
@@ -2313,4 +2318,141 @@ async fn supersede_new_entry_model_claim_only_is_rejected_and_old_entry_is_untou
         "the old entry must be completely untouched -- not just the new one refused"
     );
     assert_eq!(memory_entry_state(&read, &new_id).expect("state"), None);
+}
+
+// ---------------------------------------------------------------------------
+// T21-07: an edit invalidates the entry's English variant — but only a real one
+// ---------------------------------------------------------------------------
+
+/// Give `memory_id` a `ready` normalization row over the text [`create`] wrote.
+async fn seed_normalization(db: &StateDb, memory_id: &str) {
+    let id = memory_id.to_string();
+    let sha = local_rag_core::hash::sha256_hex(CREATED_TEXT.as_bytes());
+    let outcome = db
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status: NormalizationStatus::Ready,
+                    source_text_sha256: &sha,
+                    normalized_text: Some("the English variant"),
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-normalizer"),
+                    prompt_version: Some(1),
+                    normalizer_version: 1,
+                    attempt_count: 1,
+                    last_error: None,
+                    next_attempt_at: None,
+                },
+                1000,
+            )
+        })
+        .await
+        .expect("infra");
+    assert_eq!(
+        outcome,
+        UpsertOutcome::Written,
+        "fixture must actually land"
+    );
+}
+
+async fn has_normalization(db: &StateDb, memory_id: &str) -> bool {
+    let read = db.open_read().expect("read conn");
+    normalization_for(&read, memory_id)
+        .expect("read normalization")
+        .is_some()
+}
+
+#[tokio::test]
+async fn edit_with_new_text_drops_the_translation() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(200);
+    let id = uuid(201);
+    create(&db, &id, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create");
+    seed_normalization(&db, &id).await;
+
+    edit(
+        &db,
+        &id,
+        1,
+        Some("a genuinely different durable text"),
+        None,
+        Actor::User,
+        None,
+    )
+    .await
+    .expect("edit applies");
+
+    assert!(
+        !has_normalization(&db, &id).await,
+        "a translation of text the user replaced must not survive the edit",
+    );
+}
+
+#[tokio::test]
+async fn edit_resubmitting_the_same_text_keeps_the_translation() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(202);
+    let id = uuid(203);
+    create(&db, &id, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create");
+    seed_normalization(&db, &id).await;
+
+    edit(&db, &id, 1, Some(CREATED_TEXT), None, Actor::User, None)
+        .await
+        .expect("edit applies");
+
+    assert!(
+        has_normalization(&db, &id).await,
+        "nothing changed, so nothing is stale — re-translating would be paid for twice",
+    );
+}
+
+#[tokio::test]
+async fn edit_of_importance_alone_keeps_the_translation() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(204);
+    let id = uuid(205);
+    create(&db, &id, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create");
+    seed_normalization(&db, &id).await;
+
+    edit(&db, &id, 1, None, Some(0.9), Actor::User, None)
+        .await
+        .expect("edit applies");
+
+    assert!(
+        has_normalization(&db, &id).await,
+        "importance is not text; the English variant is still accurate",
+    );
+}
+
+#[tokio::test]
+async fn reinforce_keeps_the_translation() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(206);
+    let id = uuid(207);
+    create(&db, &id, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create");
+    seed_normalization(&db, &id).await;
+
+    reinforce(&db, &id, 1, Some(0.8), vec![], None)
+        .await
+        .expect("reinforce applies");
+
+    assert!(
+        has_normalization(&db, &id).await,
+        "reinforce may not touch the text, so it may not invalidate its translation",
+    );
 }

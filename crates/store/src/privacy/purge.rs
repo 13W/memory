@@ -5,7 +5,8 @@
 use rusqlite::{Connection, Transaction, params};
 
 use crate::memory::{
-    Actor, NewAuditEvent, all_memory_entry_ids, insert_audit_event, memory_entry_by_id,
+    Actor, NewAuditEvent, all_memory_entry_ids, delete_normalization, insert_audit_event,
+    memory_entry_by_id,
 };
 use crate::observation::all_session_ids;
 
@@ -27,12 +28,17 @@ pub struct PurgeMemoryReport {
     pub descendants_relinked: u64,
     pub evidence_rows_removed: u64,
     pub audit_rows_tombstoned: u64,
+    /// `memory_text_normalization` rows removed — 0 or 1, since the table
+    /// holds at most one row per entry (T21-07, ADR-0010).
+    pub normalization_rows_removed: u64,
 }
 
 /// Hard-delete `memory_id` (spec 08 §3 "hard removal exists only as an
 /// explicit privacy purge, which also rewrites audit references to
 /// tombstones"): relinks any descendant whose `supersedes_id` pointed at it,
-/// deletes its `memory_evidence` rows, deletes the row itself, tombstones
+/// deletes its `memory_evidence` rows and its `memory_text_normalization` row
+/// (T21-07 — the English variant dies with the text it was derived from),
+/// deletes the row itself, tombstones
 /// every prior `audit_event` payload for it, and appends a terminal
 /// `op = "purge"` audit row (see `super`'s module doc for why both the
 /// tombstone rewrite and the new row exist). Refuses with no mutation on an
@@ -76,6 +82,15 @@ fn purge_memory_rows(
         "DELETE FROM memory_evidence WHERE memory_id = ?1",
         params![memory_id],
     )?;
+    // T21-07: the entry's English variant (`memory_text_normalization`, T21-01)
+    // is a second copy of the user's own text, so purge must account for it
+    // rather than let it leave silently. Deleted **explicitly and first**, even
+    // though the table's `ON DELETE CASCADE` would take it anyway: the cascade
+    // cannot be counted, and a report that quietly assumed `foreign_keys=ON`
+    // would be wrong the moment anything opened this database without that
+    // pragma. The cascade stays as the safety net for any delete path that
+    // never comes through here.
+    let normalization_rows_removed = u64::from(delete_normalization(tx, memory_id)?);
     tx.execute(
         "DELETE FROM memory_entry WHERE memory_id = ?1",
         params![memory_id],
@@ -111,6 +126,7 @@ fn purge_memory_rows(
         descendants_relinked: descendants_relinked as u64,
         evidence_rows_removed: evidence_rows_removed as u64,
         audit_rows_tombstoned: audit_rows_tombstoned as u64,
+        normalization_rows_removed,
     })
 }
 
