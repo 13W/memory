@@ -42,6 +42,7 @@
 //! place spec 12 §4 is real.
 
 pub mod guard;
+pub mod normalize;
 pub mod parse;
 pub mod prompt;
 pub mod recall;
