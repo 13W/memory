@@ -322,6 +322,34 @@ Changing the embedding model (or dimensions/metric/normalization):
 No in-place re-embed, no migration without rollback: until step 4 commits for a worktree, that
 worktree still runs A entirely `[FIXED]`.
 
+As-built note (T21-05, `[SPEC]`, ADR-0010): step 2 gains a second, narrower entry point and one
+ordering rule that only exists because two databases are involved.
+
+**Vector first, row second.** Normalizing an entry *moves its subject hash* (T21-02): the vector in
+`embedding_cache` was computed for the original text. `local_rag::daemon::normalization::write::
+apply_normalization` therefore embeds the English variant and commits it to `cache.sqlite`
+**before** committing the normalization row to `state.sqlite`. 03 §1.4 `[FIXED]` forbids a writable
+cross-database transaction, so atomicity across the pair is not available and the order is what
+stands in for it: a crash between the two leaves an unreferenced cache row — harmless under the
+"`cache.sqlite` is fully rebuildable" invariant and reclaimed by ordinary eviction — whereas the
+reverse order would leave a *referenced* hash with no vector, which nothing reclaims and nothing
+reports, since a missing vector silently drops the entry from the dense leg. A named crash point
+(`memory.normalization.after_vector`) sits between the two so the order is proven from the
+production path. The passthrough case (already-English text) writes a `skipped` row and does not
+touch `cache.sqlite` at all: the hash does not move, so the existing vector is still the right one.
+The row's own conditional write is what settles a race with `edit` — if the entry's text changed
+while the translation was running, the write refuses and the stale variant is never committed.
+
+**`run_memory_backfill`.** Until now memory vectors were only ever produced inside a *code*
+indexing cycle (`run_backfill` is a step of `project_generation`), so a store whose code is not
+indexed had no way to repair them. `local_rag_embed::run_memory_backfill` is the same machinery
+restricted to the `memory` kind, with `generations` empty because memory is not generation-scoped.
+It deliberately does **not** write coverage: coverage is computed over every `required` kind, and a
+memory-only pass never looked at `code_raw`/`code_context`, so recomputing here would let
+`Coverage::fully_covered` — the gate `transition_model_space` reads for `projection_ready`
+(04 §3) — be decided by a number this run did not produce. A space with no registered `memory`
+representation is "nothing to do", not an error.
+
 As-built note (T11-05, `[SPEC]`): steps 4–6 are `local_rag_projection::model_switch`.
 
 * **Step 4** is `switch_model_space` — the *same* `switch()` the generation axis uses (05 §5), given

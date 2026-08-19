@@ -49,8 +49,8 @@ mod lexical;
 pub mod pipeline;
 
 pub use dense::{
-    BruteForceCosine, DenseLegUnavailable, MemoryDenseBackend, QueryEmbedError, QueryEmbedder,
-    UnavailableEmbedder,
+    BruteForceCosine, DenseLegUnavailable, DenseRecallHit, MemoryDenseBackend, QueryEmbedError,
+    QueryEmbedder, UnavailableEmbedder, dense_leg,
 };
 pub use format::{
     RECALL_ENTRY_CAP_BYTES, RecallEntry, format_additional_context, prepare_entry_text,

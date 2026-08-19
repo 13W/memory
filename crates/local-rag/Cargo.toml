@@ -115,6 +115,13 @@ tracing-appender = "0.2"
 # table (`local-rag-core` was previously the sole `libc` consumer).
 libc = "0.2"
 
+# T21-05: an optional *regular* dependency (not only a dev one) so
+# `daemon::normalization::write` can host its named crash point — the same move
+# `crates/embed` made for the backfill worker's own `fail_point!`. A
+# dev-dependency is invisible to `src/`, and the whole point of that failpoint
+# is to prove the two-database write order from inside the production path.
+local-rag-test-support = { path = "../test-support", optional = true }
+
 [dev-dependencies]
 local-rag-test-support = { path = "../test-support" }
 
@@ -140,7 +147,14 @@ local-rag-test-support = { path = "../test-support" }
 # failure ("падение reconcile не останавливает цикл") without depending on a
 # real filesystem fault, reusing named injection points those crates already
 # declared for exactly this purpose.
+#
+# T21-05: also pulls `local-rag-test-support` itself, because
+# `daemon::normalization::write` hosts its own named crash point
+# (`memory.normalization.after_vector`) between the `cache.sqlite` and
+# `state.sqlite` writes — the one place where the ADR-0010 write order is
+# provable from the production path rather than argued in a comment.
 failpoints = [
+    "dep:local-rag-test-support",
     "local-rag-store/failpoints",
     "local-rag-index/failpoints",
     "local-rag-projection/failpoints",

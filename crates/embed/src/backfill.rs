@@ -41,7 +41,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Mutex;
 
 use local_rag_core::config::DataPolicy;
-use local_rag_store::memory_entry_subject_hash;
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
     CacheDb, CacheOpenError, CacheWriteError, Coverage, CoverageEntry, EmbeddingKey, ExternalPins,
@@ -52,6 +51,7 @@ use local_rag_store::{
     recompute_coverage, rusqlite, source_bytes, transition_model_space, verify_cached_embedding,
     verify_cached_text, write_model_space_coverage,
 };
+use local_rag_store::{memory_entry_subject_hash, memory_entry_subject_keys};
 
 use crate::contract::{EmbedError, EmbedRequest};
 use crate::pool::ProviderPool;
@@ -374,6 +374,113 @@ pub async fn run_backfill(
         now_ms,
     )
     .await?;
+
+    Ok(report)
+}
+
+/// Run one **memory-only** backfill pass for `model_space_id` (T21-05).
+///
+/// Same machinery as [`run_backfill`] — the expected set, the reuse/repair
+/// partition, the bounded embed batches, the bounded cache transactions — but
+/// restricted to the `memory` representation kind, and with the coverage step
+/// deliberately omitted.
+///
+/// # Why this exists
+///
+/// Until now memory vectors were only ever produced *inside a code-indexing
+/// cycle*: `run_backfill` runs as one step of `project_generation`. A store
+/// whose code is not indexed — or an operator who simply does not want to run a
+/// full generation cycle to repair memory — had no way to (re)embed durable
+/// memory at all. Group 21 makes that gap matter: a translation moves an
+/// entry's subject hash, so memory vectors now change for reasons that have
+/// nothing to do with code.
+///
+/// # Why it does **not** write coverage
+///
+/// This is the load-bearing decision of the function, not an omission.
+/// `write_coverage` recomputes and stores the coverage of **every** `required`
+/// kind of the space. A memory-only pass never looked at `code_raw` or
+/// `code_context`, so recomputing here would record what those kinds happen to
+/// have in the cache at this instant as if this run had verified it — and
+/// `Coverage::fully_covered`, which `transition_model_space` reads to gate
+/// `projection_ready` (spec 04 §3), would then be deciding on a number this run
+/// had no business producing. Coverage stays owned by the full pass; a caller
+/// that needs it current runs [`run_backfill`].
+///
+/// A space with no registered `memory` representation is not an error — it is
+/// "nothing to do", and the report comes back empty. That is the shape of every
+/// store that has not registered the kind yet (`set_model_space_representation`
+/// is still only called by `init`, tests and `xtask bench`).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_memory_backfill(
+    state_db: &StateDb,
+    cache: &CacheDb,
+    pool: &ProviderPool,
+    policy: DataPolicy,
+    model_space_id: &str,
+    params: &BackfillParams,
+    in_flight: &InFlight,
+    now_ms: i64,
+) -> Result<BackfillReport, BackfillError> {
+    let state_read = state_db.open_read().map_err(BackfillError::StateOpen)?;
+
+    let Some((kind, representation_id)) =
+        model_space_required_representation_ids(&state_read, model_space_id)?
+            .into_iter()
+            .find(|(kind, _)| *kind == RepresentationKind::Memory)
+    else {
+        return Ok(BackfillReport::default());
+    };
+
+    // Memory is not generation-scoped (see `local_rag_store::subjects`'s own
+    // module doc), so the expected set is the whole `memory_entry` table
+    // collapsed by its subject function — and `generations` stays empty rather
+    // than being filled with something irrelevant.
+    let expected = SubjectSet {
+        keys: memory_entry_subject_keys(&state_read, &representation_id)?,
+        unsupported: BTreeSet::new(),
+        generations: BTreeSet::new(),
+    };
+    let representations = vec![(kind, representation_id)];
+
+    let mut report = BackfillReport::default();
+    let (pending, corrupt) = partition_expected(cache, &expected, &representations, &mut report)?;
+    if !corrupt.is_empty() {
+        let to_delete = corrupt.clone();
+        cache
+            .writer()
+            .transaction(move |tx| {
+                for key in &to_delete {
+                    delete_embedding(tx, key)?;
+                }
+                Ok(())
+            })
+            .await?;
+    }
+
+    let pending_keys: Vec<EmbeddingKey> = pending.iter().map(|p| p.key.clone()).collect();
+    let reserved: BTreeSet<EmbeddingKey> = in_flight.reserve(&pending_keys).into_iter().collect();
+    report.deferred = (pending.len() - reserved.len()) as u64;
+    let mine: Vec<PendingSubject> = pending
+        .into_iter()
+        .filter(|p| reserved.contains(&p.key))
+        .collect();
+    let reserved_keys: Vec<EmbeddingKey> = mine.iter().map(|p| p.key.clone()).collect();
+
+    let outcome = embed_and_write(
+        &state_read,
+        cache,
+        pool,
+        policy,
+        &mine,
+        params,
+        &expected,
+        now_ms,
+        &mut report,
+    )
+    .await;
+    in_flight.release(&reserved_keys);
+    outcome?;
 
     Ok(report)
 }

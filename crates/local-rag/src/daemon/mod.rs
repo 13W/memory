@@ -45,6 +45,7 @@ pub mod lock;
 pub mod mcp;
 pub mod memory;
 pub mod mode;
+pub mod normalization;
 pub mod probe;
 pub mod query_embedder;
 pub mod resume;
