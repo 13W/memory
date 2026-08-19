@@ -170,11 +170,7 @@ pub async fn apply_normalization(
         Translation::Passthrough { class } => {
             let outcome = write_row(
                 state_db,
-                target.memory_id,
-                NormalizationStatus::Skipped,
-                &source_sha,
-                None,
-                Some(class),
+                RowDraft::passthrough(target.memory_id, target.text, class),
                 now_ms,
             )
             .await?;
@@ -224,11 +220,7 @@ pub async fn apply_normalization(
     // makes the write refuse rather than overwrite.
     let outcome = write_row(
         state_db,
-        target.memory_id,
-        NormalizationStatus::Ready,
-        &source_sha,
-        Some(&english),
-        None,
+        RowDraft::ready(target.memory_id, &source_sha, &english),
         now_ms,
     )
     .await?;
@@ -358,44 +350,138 @@ fn memory_representation_ids(state_db: &StateDb) -> Result<Vec<String>, Normaliz
     Ok(ids)
 }
 
-/// Commit one normalization row through the store's own conditional write.
-async fn write_row(
-    state_db: &StateDb,
-    memory_id: &str,
+/// One normalization row, owned — the single description both the
+/// single-entry path and the tick's passthrough batch write through, so the
+/// two can never disagree about what a row looks like.
+#[derive(Debug, Clone)]
+pub struct RowDraft {
+    memory_id: String,
     status: NormalizationStatus,
-    source_sha: &str,
-    normalized_text: Option<&str>,
-    class: Option<ScriptClass>,
+    source_text_sha256: String,
+    normalized_text: Option<String>,
+    source_language: Option<String>,
+    attempt_count: i64,
+    last_error: Option<String>,
+    next_attempt_at: Option<i64>,
+}
+
+impl RowDraft {
+    /// Nothing to translate: the detector's own answer, recorded.
+    pub fn passthrough(memory_id: &str, text: &str, class: ScriptClass) -> Self {
+        RowDraft {
+            memory_id: memory_id.to_string(),
+            status: NormalizationStatus::Skipped,
+            source_text_sha256: sha256_hex(text.as_bytes()),
+            normalized_text: None,
+            source_language: Some(script_label(class).to_string()),
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+        }
+    }
+
+    /// A validated English variant, for text whose hash is `source_sha`.
+    pub fn ready(memory_id: &str, source_sha: &str, english: &str) -> Self {
+        RowDraft {
+            memory_id: memory_id.to_string(),
+            status: NormalizationStatus::Ready,
+            source_text_sha256: source_sha.to_string(),
+            normalized_text: Some(english.to_string()),
+            source_language: Some(script_label(ScriptClass::NonLatin).to_string()),
+            attempt_count: 1,
+            last_error: None,
+            next_attempt_at: None,
+        }
+    }
+
+    /// A recorded failure. `attempt_count`/`next_attempt_at` are the caller's
+    /// retry bookkeeping — see the worker's own classification.
+    pub fn failure(
+        memory_id: &str,
+        source_sha: &str,
+        attempt_count: i64,
+        last_error: &str,
+        next_attempt_at: Option<i64>,
+    ) -> Self {
+        RowDraft {
+            memory_id: memory_id.to_string(),
+            status: NormalizationStatus::Failed,
+            source_text_sha256: source_sha.to_string(),
+            normalized_text: None,
+            source_language: None,
+            attempt_count,
+            last_error: Some(last_error.to_string()),
+            next_attempt_at,
+        }
+    }
+
+    fn as_write(&self) -> NormalizationWrite<'_> {
+        NormalizationWrite {
+            memory_id: &self.memory_id,
+            status: self.status,
+            source_text_sha256: &self.source_text_sha256,
+            normalized_text: self.normalized_text.as_deref(),
+            source_language: self.source_language.as_deref(),
+            normalizer_model_id: None,
+            prompt_version: Some(TRANSLATOR_VERSION),
+            normalizer_version: CURRENT_NORMALIZER_VERSION,
+            attempt_count: self.attempt_count,
+            last_error: self.last_error.as_deref(),
+            next_attempt_at: self.next_attempt_at,
+        }
+    }
+}
+
+fn script_label(class: ScriptClass) -> &'static str {
+    match class {
+        ScriptClass::English => "latin",
+        ScriptClass::NonLatin => "non-latin",
+        ScriptClass::Undetermined => "undetermined",
+    }
+}
+
+/// Commit `drafts` in **one** `state.sqlite` transaction, returning each row's
+/// outcome in order.
+///
+/// The tick's passthrough batch is the reason this takes a slice: an
+/// all-English store would otherwise pay one transaction per entry for work
+/// that costs no inference at all. Each row still carries its own conditional
+/// guard, so one entry whose text moved refuses on its own without touching
+/// the rest.
+pub async fn write_rows(
+    state_db: &StateDb,
+    drafts: Vec<RowDraft>,
     now_ms: i64,
-) -> Result<UpsertOutcome, NormalizationError> {
-    let (memory_id, source_sha) = (memory_id.to_string(), source_sha.to_string());
-    let normalized_text = normalized_text.map(str::to_string);
-    let source_language = class.map(|class| match class {
-        ScriptClass::English => "latin".to_string(),
-        ScriptClass::NonLatin => "non-latin".to_string(),
-        ScriptClass::Undetermined => "undetermined".to_string(),
-    });
+) -> Result<Vec<UpsertOutcome>, NormalizationError> {
+    if drafts.is_empty() {
+        return Ok(Vec::new());
+    }
     state_db
         .writer()
         .transaction(move |tx| {
-            local_rag_store::upsert_normalization(
-                tx,
-                &NormalizationWrite {
-                    memory_id: &memory_id,
-                    status,
-                    source_text_sha256: &source_sha,
-                    normalized_text: normalized_text.as_deref(),
-                    source_language: source_language.as_deref(),
-                    normalizer_model_id: None,
-                    prompt_version: Some(TRANSLATOR_VERSION),
-                    normalizer_version: CURRENT_NORMALIZER_VERSION,
-                    attempt_count: 1,
-                    last_error: None,
-                    next_attempt_at: None,
-                },
-                now_ms,
-            )
+            let mut outcomes = Vec::with_capacity(drafts.len());
+            for draft in &drafts {
+                outcomes.push(local_rag_store::upsert_normalization(
+                    tx,
+                    &draft.as_write(),
+                    now_ms,
+                )?);
+            }
+            Ok(outcomes)
         })
         .await
         .map_err(NormalizationError::StateWrite)
+}
+
+/// Commit exactly one row — the single-entry path's thin wrapper over
+/// [`write_rows`].
+async fn write_row(
+    state_db: &StateDb,
+    draft: RowDraft,
+    now_ms: i64,
+) -> Result<UpsertOutcome, NormalizationError> {
+    Ok(write_rows(state_db, vec![draft], now_ms)
+        .await?
+        .pop()
+        .expect("one draft in, one outcome out"))
 }

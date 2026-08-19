@@ -37,6 +37,12 @@ pub enum JobKind {
     /// `L2.write` — held only for that active span, not while the task
     /// merely waits for its next `successes`/`failures` trigger.
     Reconcile,
+    /// One tick of the durable-memory normalization worker (T21-06, ADR-0010):
+    /// detecting which entries lag, writing the passthrough batch, and
+    /// translating a bounded number of them. Held only while a tick is
+    /// actually doing that work — never across the wait between ticks, so an
+    /// idle daemon stays idle-shutdown eligible (02 §4.3).
+    Normalization,
     /// The startup retention sweep (D-066, spec 06 §5) collecting unpinned
     /// `retiring`/`failed` generations. Long-running on a store with a
     /// backlog, and batched through the same global writer queue as every
@@ -99,6 +105,19 @@ impl JobRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Whether a job of any of `kinds` is running right now.
+    ///
+    /// This is an *advisory* read, not a lock: by the time a caller acts on
+    /// the answer the job may have finished, or another may have started. It
+    /// exists for cooperative yielding between two consumers of the same
+    /// scarce resource — T21-06's normalization worker skips its inference
+    /// half while a consolidation job holds the process-wide local model — and
+    /// must never be used where correctness depends on mutual exclusion.
+    pub fn any_running(&self, kinds: &[JobKind]) -> bool {
+        let jobs = self.inner.jobs.lock().expect("job registry mutex poisoned");
+        jobs.values().any(|kind| kinds.contains(kind))
+    }
 }
 
 /// An RAII handle for one running job: marks it finished on drop.
@@ -142,6 +161,20 @@ mod tests {
         assert_eq!(registry.len(), 1);
         drop(b);
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn any_running_answers_per_kind() {
+        let registry = JobRegistry::new();
+        assert!(!registry.any_running(&[JobKind::ConsolidationTrigger]));
+
+        let guard = registry.begin(JobKind::ConsolidationTrigger);
+        assert!(registry.any_running(&[JobKind::ConsolidationTrigger]));
+        assert!(registry.any_running(&[JobKind::Gc, JobKind::ConsolidationTrigger]));
+        assert!(!registry.any_running(&[JobKind::Gc]));
+
+        drop(guard);
+        assert!(!registry.any_running(&[JobKind::ConsolidationTrigger]));
     }
 
     #[test]

@@ -581,6 +581,59 @@ a real window, between the lock being marked ready and the wait loop actually st
 signal kills the process ungracefully instead of draining it — caught by
 `tests/serve_subprocess.rs` flaking under concurrent test-suite load before the fix.
 
+As-built note (T21-06, `[SPEC]`, ADR-0010): the durable-memory English-normalization worker
+(`local_rag::daemon::normalization::run_normalization_worker`) is this section's newest
+`running_jobs` producer, `JobKind::Normalization`, and it is deliberately built to D-024's shape
+rather than a new one: a `tokio::time::interval` loop (`main.rs::NORMALIZATION_POLL_INTERVAL`),
+spawned in `DaemonHandle::start` under the same `state_db.is_some()` guard (never in
+`MigrationOnly`), cancelled through its own `(oneshot::Sender<()>, JoinHandle<()>)` pair signalled
+then awaited in `shutdown`, with its `JobGuard` acquired **inside** one tick and dropped before
+the next tick's wait — so a live-but-idle normalization worker is exactly as idle-eligible as a
+daemon without one (`tests/memory_normalization_worker.rs::
+the_normalization_worker_alive_between_ticks_does_not_block_idle_shutdown`). Three properties of a
+tick are normative here, each one a lesson this repository already paid for:
+
+- **an already-English store costs zero inference.** The T21-03 detector runs over the whole
+  selected batch first, and every passthrough row is written in a single transaction without ever
+  reaching the generator (200 English entries ⇒ 0 generator calls, asserted).
+- **inference is bounded per tick** by `translate_batch`, each entry through T21-05's own
+  vector-first `apply_normalization` pair of transactions, so a kill mid-tick can never leave an
+  entry normalized without its vector.
+- **consolidation owns the shared model first.** Both workers drive the same process-wide local
+  model (D-054), so a tick that starts while a consolidation job is registered
+  (`JobRegistry::any_running`, an advisory read, never a lock) still commits its passthrough batch
+  — pure detection, `state.sqlite` only — and defers every translation to a later tick instead of
+  queueing behind consolidation inside the pool. Consolidation is latency-sensitive (a session has
+  ended and its observations are waiting); normalization is catch-up that loses nothing by
+  arriving a tick later.
+- **`Unavailable` aborts the whole tick and blames no entry.** A missing model, missing assets, a
+  `PolicyBlockedRemote`, or a representation the embedder cannot serve is a condition of the
+  *daemon*, not a defect of the row (ADR-0010 Decision 10) — no `attempt_count` moves, nothing is
+  marked `failed`, and the log line is emitted only when that answer *changes*, not every tick.
+
+Failure classification mirrors D-050/D-057: `Mechanical` dead-letters immediately
+(`attempt_count = MAX_NORMALIZATION_ATTEMPTS`), `Transient` re-arms with the existing
+`transient_backoff_delay_ms` curve — no second backoff curve was introduced. The dead-letter is
+keyed by `normalizer_version`, not by build fingerprint as D-050's consolidation equivalent is:
+`memory_text_normalization` has no fingerprint column, and the normalizer version *is* the product
+equivalent — changing the normalizer is a decision, whereas a rebuild is not, so three ticks on one
+version cost exactly one attempt and bumping the version grants exactly one more. `tracing` lines
+carry identifiers and counts only; entry text never appears in any of them (asserted by log
+capture), which is 12 §1's `local_only` posture applied to the daemon's own log file.
+
+The worker ships **disabled** (`NormalizationParams::enabled = false` in `lifecycle`). Its switch,
+`config.memory.normalize_to_english`, belongs to T21-08 and is what turns it on; until then the
+worker is registered and wired but no tick does any work — a background job that spends GPU before
+its own switch exists is not something to hand a user.
+
+The generator pool is built exactly once per process and shared by `Arc` with all three consumers
+(consolidation resume, consolidation trigger, normalization) — D-054's warning verbatim:
+llama.cpp's backend handle is a process-wide singleton, so a second `build_best_effort_pool` in the
+same process fails with `BackendAlreadyInitialized` and silently leaves that consumer with an empty
+pool for the rest of the daemon's uptime. The embedder is the existing
+`LazyEmbedderProvider::memory()`, not a fourth ONNX session; its laziness also picks up a model
+installed after startup for free (D-037).
+
 ### 4.4 Ownership invariants
 
 One daemon per OS user per store `[FIXED]`. Identity = `instance_uuid` (+ PID as advisory)

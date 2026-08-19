@@ -83,6 +83,8 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         // (this crate has no tokio `test-util` feature; see
         // `consolidation_trigger.rs`'s own unit tests for why).
         consolidation_poll_interval: Duration::from_millis(10),
+        normalization_poll_interval: Duration::from_millis(10),
+        normalization: local_rag::daemon::normalization::NormalizationParams::default(),
         retention: RetentionParams {
             keep_last_k: 2,
             window_ms: 7 * 24 * 60 * 60 * 1000,

@@ -159,6 +159,16 @@ pub struct StartOptions {
     /// parameter, not a config field, so lifecycle-level tests can drive it
     /// directly.
     pub consolidation_poll_interval: Duration,
+    /// How often the durable-memory normalization worker ticks (T21-06). Same
+    /// bucket, same reasoning as `consolidation_poll_interval` above: a plain
+    /// parameter, not a config field, so a lifecycle-level test can drive it
+    /// directly instead of waiting out a production cadence.
+    pub normalization_poll_interval: Duration,
+    /// T21-06's normalization worker's own budget and switch. Shipped with
+    /// `enabled: false` until T21-08 wires `MemoryConfig.normalize_to_english`
+    /// — a worker that spends GPU before the switch that stops it exists is not
+    /// something to hand a user.
+    pub normalization: super::normalization::NormalizationParams,
     /// T20-06's indexing supervisor's per-worktree retention defaults
     /// (`config.storage`, `RetentionParams::from_storage_config`) — the same
     /// derivation `local_rag::indexing::finish_index_ctx` already uses for
@@ -226,6 +236,8 @@ pub struct DaemonHandle {
     /// `handshake_stop`/`handshake_join`.
     consolidation_trigger_stop: Option<oneshot::Sender<()>>,
     consolidation_trigger_join: Option<JoinHandle<()>>,
+    normalization_stop: Option<oneshot::Sender<()>>,
+    normalization_join: Option<JoinHandle<()>>,
     /// The daemon-managed indexing supervisor (T20-06) — one background task
     /// per `enabled` `managed_worktree` row. `None` exactly in
     /// `DaemonMode::MigrationOnly` (same `state_db.as_ref()` gate as
@@ -288,6 +300,8 @@ impl DaemonHandle {
             consolidation_queue_threshold,
             consolidation_idle_checkpoint_hours,
             consolidation_poll_interval,
+            normalization_poll_interval,
+            normalization,
             retention,
             classifier,
             indexing_backstop_poll_interval,
@@ -572,6 +586,46 @@ impl DaemonHandle {
             None => (None, None),
         };
 
+        // T21-06: the durable-memory normalization worker — the **third**
+        // consumer of the single `pool` built above, never a fourth
+        // `build_best_effort_pool` call. D-054's warning applies verbatim:
+        // llama.cpp's backend handle is a process-wide singleton, so a second
+        // `LlamaBackend::init()` in this process fails with
+        // `BackendAlreadyInitialized` and silently leaves that consumer with an
+        // empty pool for the rest of the daemon's uptime. Its embedder is the
+        // existing `LazyEmbedderProvider::memory()` for the same reason — a
+        // fourth ONNX session would be pure cost, and the laziness picks up a
+        // model installed after startup for free (D-037).
+        //
+        // Shipped **off**: the switch that turns it off
+        // (`MemoryConfig.normalize_to_english`) is T21-08's, and a worker that
+        // spends GPU before its own switch exists is not something to hand a
+        // user.
+        let (normalization_stop, normalization_join) = match state_db.as_ref() {
+            Some(db) => {
+                tracing::info!(job = "normalization", "background job spawned");
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let provider = Arc::clone(&embedder_provider);
+                let cache = cache_db.clone();
+                let join = cache.map(|cache| {
+                    tokio::spawn(super::normalization::run_normalization_worker(
+                        Arc::clone(db),
+                        cache,
+                        Arc::clone(pool.as_ref().expect("state_db present implies pool built")),
+                        move || provider.memory(),
+                        jobs.clone(),
+                        normalization,
+                        data_policy,
+                        normalization_poll_interval,
+                        system_now_ms,
+                        stop_rx,
+                    ))
+                });
+                (Some(stop_tx), join)
+            }
+            None => (None, None),
+        };
+
         Ok(DaemonHandle {
             socket_path: layout.socket_path(),
             layout,
@@ -590,6 +644,8 @@ impl DaemonHandle {
             resume_handles,
             consolidation_trigger_stop,
             consolidation_trigger_join,
+            normalization_stop,
+            normalization_join,
             indexing_supervisor,
         })
     }
@@ -639,6 +695,15 @@ impl DaemonHandle {
         }
         if let Some(join) = self.consolidation_trigger_join.take() {
             log_if_task_panicked("the consolidation-trigger worker", join.await);
+        }
+        // T21-06: same signal-then-await pair — a tick in flight holds a
+        // `JobKind::Normalization` guard and is mid-way through two databases,
+        // so it must finish before the store closes below.
+        if let Some(stop) = self.normalization_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.normalization_join.take() {
+            log_if_task_panicked("the memory-normalization worker", join.await);
         }
         if let Some(supervisor) = self.indexing_supervisor.take() {
             // Stops every worktree task it owns (each flushing its own last

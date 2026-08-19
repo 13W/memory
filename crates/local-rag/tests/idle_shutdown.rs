@@ -72,6 +72,8 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         consolidation_queue_threshold: 50,
         consolidation_idle_checkpoint_hours: 24,
         consolidation_poll_interval: Duration::from_millis(50),
+        normalization_poll_interval: std::time::Duration::from_millis(10),
+        normalization: local_rag::daemon::normalization::NormalizationParams::default(),
         retention: RetentionParams {
             keep_last_k: 2,
             window_ms: 7 * 24 * 60 * 60 * 1000,
