@@ -8,11 +8,13 @@ use std::process::ExitCode;
 
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
-    RequestRoot, Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, StuckRunRow, UnconsolidatableSession,
+    CURRENT_NORMALIZER_VERSION, NormalizationBacklog, NormalizationCountRow, RequestRoot,
+    Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, StuckRunRow, UnconsolidatableSession,
     consolidation_run_counts, generation_meta_for_worktree, memory_entry_counts,
-    observation_envelope_count, observations_applied_since, oldest_open_run_created_at,
-    pending_candidate_counts, projection_state, resolve, store_instance_uuid,
-    stuck_consolidation_runs, total_pending_backlog, unconsolidatable_sessions,
+    normalization_backlog, normalization_counts, observation_envelope_count,
+    observations_applied_since, oldest_open_run_created_at, pending_candidate_counts,
+    projection_state, resolve, store_instance_uuid, stuck_consolidation_runs,
+    total_pending_backlog, unconsolidatable_sessions,
 };
 
 use local_rag::daemon::gitroot;
@@ -106,6 +108,52 @@ fn compute_consolidation_stats(
 /// One [`StuckRunRow`] as a single human-readable line (D-071) — the run, its
 /// session, the window it covers, how many times it has failed, whether
 /// anything will ever retry it, and the failure the store already recorded.
+/// T21-08: the `memory.normalization` block, in the exact shape the MCP
+/// `stats` tool serializes — both surfaces render the same two store reads, and
+/// a test asserts the two blocks are equal on one store.
+///
+/// Deliberately store-state only: whether the worker is switched on, and why it
+/// might be stopped, is `doctor`'s job. `stats` answers "where is this store",
+/// `doctor` answers "why is it there".
+fn normalization_json(
+    by_status: &[NormalizationCountRow],
+    backlog: &NormalizationBacklog,
+) -> serde_json::Value {
+    serde_json::json!({
+        "counts_by_status": by_status.iter().map(|r| serde_json::json!({
+            "status": r.status.as_str(), "count": r.count,
+        })).collect::<Vec<_>>(),
+        "pending": backlog.pending,
+        "dead_letter": backlog.dead_letter,
+        "normalizer_version": CURRENT_NORMALIZER_VERSION,
+    })
+}
+
+/// The human half of the block above. The dead-letter line follows the same
+/// discipline as D-058's and D-071's: silent when zero, so a healthy store
+/// gains no noise, and impossible to miss when not.
+fn print_normalization(by_status: &[NormalizationCountRow], backlog: &NormalizationBacklog) {
+    if by_status.is_empty() {
+        println!("memory normalization: none recorded");
+    } else {
+        for row in by_status {
+            println!(
+                "memory normalization  {}: {}",
+                row.status.as_str(),
+                row.count
+            );
+        }
+    }
+    println!("memory normalization pending: {}", backlog.pending);
+    if backlog.dead_letter > 0 {
+        println!(
+            "memory normalization dead-letter: {} entry(ies) given up on under normalizer v{} \
+             — they keep using their original text",
+            backlog.dead_letter, CURRENT_NORMALIZER_VERSION,
+        );
+    }
+}
+
 fn describe_stuck_run(r: &StuckRunRow) -> String {
     let verdict = if r.dead_lettered {
         "dead-lettered on this build — only a rebuild retries it"
@@ -158,6 +206,18 @@ pub fn run(args: StatsArgs) -> ExitCode {
         Ok(v) => v,
         Err(e) => return fail(BIN, &format!("could not read candidate counts: {e}")),
     };
+    // T21-08: the normalization axis (ADR-0010) — what has been normalized,
+    // what still lags, and what the worker has given up on. Two store reads,
+    // the same two the MCP `stats` tool makes, so both surfaces cannot drift.
+    let normalization_by_status = match normalization_counts(&conn) {
+        Ok(v) => v,
+        Err(e) => return fail(BIN, &format!("could not read normalization counts: {e}")),
+    };
+    let normalization =
+        match normalization_backlog(&conn, CURRENT_NORMALIZER_VERSION, system_now_ms()) {
+            Ok(v) => v,
+            Err(e) => return fail(BIN, &format!("could not read normalization backlog: {e}")),
+        };
 
     // D-049: the observations pillar (`01-overview.md` §5-9) and the
     // consolidation backlog/progress — store-wide, same as the memory
@@ -252,6 +312,7 @@ pub fn run(args: StatsArgs) -> ExitCode {
                 "pending_candidates_by_state": pending_candidates_by_state.iter().map(|r| serde_json::json!({
                     "state": r.state.as_str(), "count": r.count,
                 })).collect::<Vec<_>>(),
+                "normalization": normalization_json(&normalization_by_status, &normalization),
             },
             "observations": {
                 "total": observations_total,
@@ -323,6 +384,7 @@ pub fn run(args: StatsArgs) -> ExitCode {
             println!("pending candidates  {}: {}", row.state.as_str(), row.count);
         }
     }
+    print_normalization(&normalization_by_status, &normalization);
     println!("observations: {observations_total} total");
     if consolidation.runs_by_state.is_empty() {
         println!("consolidation runs: none");

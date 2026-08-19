@@ -186,6 +186,13 @@ nothing (Decision 8); with no generator installed it is a no-op (Decision 10); t
 where it does work is the case where it was measured to help. The owner can disable it in
 `[memory]`.
 
+*As built (T21-08):* `config.memory.normalize_to_english = true` and
+`config.memory.normalization_batch = 4` (`crates/core/src/config`), read into the worker's
+`NormalizationParams` at daemon start. Switching it off stops the work, not the reading — entries
+already normalized keep being recalled through their English variant, whose vector is already
+cached. `local-rag doctor` reports the switch's state, the backlog, and any dead-lettered entry;
+`local-rag stats` reports the counts on both the CLI and the MCP surface.
+
 ## Consequences
 
 - Cross-lingual memory recall goes from MRR 0.25–0.56 to a measured 1.0 on the benchmark corpus;

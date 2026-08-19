@@ -284,6 +284,29 @@ pub struct MemoryConfig {
     /// `consolidation_batch_size`/`consolidation_queue_threshold`, a
     /// `[SPEC]`-chosen value, not derived from any normative text.
     pub consolidation_idle_checkpoint_hours: u64,
+    /// Whether the daemon translates non-English memory entries into English
+    /// in the background (ADR-0010 Decision 11, T21-06's worker; default
+    /// `true`).
+    ///
+    /// This switches off the **work**, not the reading: entries already
+    /// normalized keep being recalled through their English variant, because
+    /// the vector under that variant is already in the cache and nothing about
+    /// it becomes wrong when the worker stops. Turning it off therefore freezes
+    /// the store where it stands rather than reverting it — the honest
+    /// behaviour for a switch a user flips to stop spending GPU, not to undo
+    /// work already paid for.
+    pub normalize_to_english: bool,
+    /// How many entries the normalization worker translates per tick — its
+    /// inference bound (`NormalizationParams.translate_batch`, T21-06).
+    ///
+    /// Deliberately small: one translation is ~a second of local GPU, and the
+    /// queue is a backlog to drain across ticks rather than an event to react
+    /// to. `0` is a supported mode, not a misconfiguration — the worker still
+    /// runs its detector and commits every already-English entry's passthrough
+    /// row, and spends no inference at all. The companion `scan_limit` stays a
+    /// code constant: examining is free, so there is nothing for a user to tune
+    /// there.
+    pub normalization_batch: i64,
 }
 
 impl Default for MemoryConfig {
@@ -293,6 +316,8 @@ impl Default for MemoryConfig {
             consolidation_batch_size: 20,
             consolidation_queue_threshold: 50,
             consolidation_idle_checkpoint_hours: 24,
+            normalize_to_english: true,
+            normalization_batch: 4,
         }
     }
 }
@@ -582,6 +607,8 @@ recall_token_budget = 1500
 consolidation_batch_size = 20
 consolidation_queue_threshold = 50
 consolidation_idle_checkpoint_hours = 24
+normalize_to_english = true
+normalization_batch = 4
 ";
 
     const ALL_POLICIES: [DataPolicy; 4] = [
@@ -785,6 +812,49 @@ consolidation_idle_checkpoint_hours = 24
         assert_eq!(cfg.memory.consolidation_queue_threshold, 30);
         // A partial `[memory]` section still defaults the untouched key.
         assert_eq!(cfg.memory.recall_token_budget, 1500);
+    }
+
+    // ---- `[memory]` English normalization (T21-08, ADR-0010) ----------------
+
+    #[test]
+    fn normalization_defaults_to_on_with_a_batch_of_four() {
+        let cfg = MemoryConfig::default();
+        assert!(
+            cfg.normalize_to_english,
+            "ADR-0010 Decision 11: on by default"
+        );
+        assert_eq!(cfg.normalization_batch, 4);
+    }
+
+    #[test]
+    fn a_memory_section_without_the_normalization_keys_still_defaults_them() {
+        let cfg = Config::parse_toml("[memory]\nrecall_token_budget = 3000\n").unwrap();
+        assert_eq!(cfg.memory.recall_token_budget, 3000);
+        assert!(cfg.memory.normalize_to_english);
+        assert_eq!(cfg.memory.normalization_batch, 4);
+    }
+
+    #[test]
+    fn normalization_can_be_switched_off_and_its_batch_retuned() {
+        let cfg =
+            Config::parse_toml("[memory]\nnormalize_to_english = false\nnormalization_batch = 0\n")
+                .unwrap();
+        assert!(!cfg.memory.normalize_to_english);
+        assert_eq!(
+            cfg.memory.normalization_batch, 0,
+            "zero is a supported mode — detect and record, spend no inference",
+        );
+        // A partial `[memory]` section still defaults the untouched keys.
+        assert_eq!(cfg.memory.recall_token_budget, 1500);
+    }
+
+    #[test]
+    fn normalization_settings_survive_a_toml_round_trip() {
+        let mut cfg = Config::default();
+        cfg.memory.normalize_to_english = false;
+        cfg.memory.normalization_batch = 16;
+        let text = cfg.to_toml_string().expect("serialize");
+        assert_eq!(Config::parse_toml(&text).expect("re-parse"), cfg);
     }
 
     // ---- `[memory]` idle-timeout implicit checkpoint (X-005) ----------------

@@ -11,11 +11,13 @@ use std::process::{Output, Stdio};
 use local_rag::daemon::gitroot;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    FailureKind, GLOBAL_SCOPE_OWNER_ID, GenerationState, LEASE_DURATION_MS, MemoryKind,
-    NewConsolidationRun, NewMemoryEntry, ProposedOperation, RunState, ScopeKind, StateDb,
-    allocate_generation, create_consolidation_run, create_memory_entry, create_repository,
-    create_worktree, insert_projection_state, observe_repository_path, observe_worktree_path,
-    propose_candidate, record_run_failure, retry_run, transition_generation, transition_run,
+    CURRENT_NORMALIZER_VERSION, FailureKind, GLOBAL_SCOPE_OWNER_ID, GenerationState,
+    LEASE_DURATION_MS, MAX_NORMALIZATION_ATTEMPTS, MemoryKind, NewConsolidationRun, NewMemoryEntry,
+    NormalizationStatus, NormalizationWrite, ProposedOperation, RunState, ScopeKind, StateDb,
+    UpsertOutcome, allocate_generation, create_consolidation_run, create_memory_entry,
+    create_repository, create_worktree, insert_projection_state, observe_repository_path,
+    observe_worktree_path, propose_candidate, record_run_failure, retry_run, transition_generation,
+    transition_run, upsert_normalization,
 };
 use local_rag_test_support::TempHome;
 
@@ -544,5 +546,220 @@ async fn stats_says_nothing_about_stuck_runs_on_a_healthy_store() {
         json["consolidation"]["stuck_runs"],
         serde_json::json!([]),
         "the key is always present, so a consumer never has to guess"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T21-08: the `memory.normalization` block (ADR-0010)
+// ---------------------------------------------------------------------------
+
+/// Record one normalization outcome over `text` — which must be the entry's
+/// current text, since `upsert_normalization` refuses a stale write.
+async fn seed_normalization(
+    state: &StateDb,
+    memory_id: &str,
+    text: &str,
+    status: NormalizationStatus,
+    attempt_count: i64,
+) {
+    let id = memory_id.to_string();
+    let sha = local_rag_core::hash::sha256_hex(text.as_bytes());
+    let outcome = state
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status,
+                    source_text_sha256: &sha,
+                    normalized_text: match status {
+                        NormalizationStatus::Ready => Some("the English variant"),
+                        _ => None,
+                    },
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-normalizer"),
+                    prompt_version: Some(1),
+                    normalizer_version: CURRENT_NORMALIZER_VERSION,
+                    attempt_count,
+                    last_error: match status {
+                        NormalizationStatus::Failed => Some("answer was not one object"),
+                        _ => None,
+                    },
+                    next_attempt_at: None,
+                },
+                3_000,
+            )
+        })
+        .await
+        .expect("seed normalization tx");
+    assert_eq!(
+        outcome,
+        UpsertOutcome::Written,
+        "fixture must actually land"
+    );
+}
+
+fn normalization_block(text: &str) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_str(text).expect("valid json");
+    value["memory"]["normalization"].clone()
+}
+
+#[test]
+fn stats_on_an_empty_store_reports_an_empty_normalization_block() {
+    let (home, _layout) = open_layout();
+    let output = run_cli(&home, home.path(), &["stats", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let block = normalization_block(&stdout(&output));
+
+    assert_eq!(block["counts_by_status"], serde_json::json!([]));
+    assert_eq!(block["pending"], 0);
+    assert_eq!(block["dead_letter"], 0);
+    assert_eq!(block["normalizer_version"], CURRENT_NORMALIZER_VERSION);
+
+    let human = stdout(&run_cli(&home, home.path(), &["stats"]));
+    assert!(
+        human.contains("memory normalization: none recorded"),
+        "{human}"
+    );
+    assert!(human.contains("memory normalization pending: 0"), "{human}");
+    // Silent when there is nothing to say, like D-058's and D-071's blocks.
+    assert!(!human.contains("dead-letter"), "{human}");
+}
+
+#[tokio::test]
+async fn stats_reports_a_partially_normalized_store() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(
+            &state,
+            "mem-ru",
+            MemoryKind::Fact,
+            "запись по-русски",
+            1_000,
+        )
+        .await;
+        seed_entry(&state, "mem-en", MemoryKind::Fact, "an english note", 2_000).await;
+        seed_entry(
+            &state,
+            "mem-new",
+            MemoryKind::Fact,
+            "ещё одна запись",
+            3_000,
+        )
+        .await;
+        seed_normalization(
+            &state,
+            "mem-ru",
+            "запись по-русски",
+            NormalizationStatus::Ready,
+            1,
+        )
+        .await;
+        seed_normalization(
+            &state,
+            "mem-en",
+            "an english note",
+            NormalizationStatus::Skipped,
+            0,
+        )
+        .await;
+    }
+
+    let output = run_cli(&home, home.path(), &["stats", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let block = normalization_block(&stdout(&output));
+
+    assert_eq!(
+        block["counts_by_status"],
+        serde_json::json!([
+            {"status": "ready", "count": 1},
+            {"status": "skipped", "count": 1},
+        ]),
+        "empty buckets are omitted, not reported as zero",
+    );
+    assert_eq!(block["pending"], 1, "only mem-new still lags");
+    assert_eq!(block["dead_letter"], 0);
+
+    let human = stdout(&run_cli(&home, home.path(), &["stats"]));
+    assert!(human.contains("memory normalization  ready: 1"), "{human}");
+    assert!(
+        human.contains("memory normalization  skipped: 1"),
+        "{human}"
+    );
+    assert!(human.contains("memory normalization pending: 1"), "{human}");
+}
+
+#[tokio::test]
+async fn stats_reports_a_fully_normalized_store_as_zero_pending() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(
+            &state,
+            "mem-ru",
+            MemoryKind::Fact,
+            "запись по-русски",
+            1_000,
+        )
+        .await;
+        seed_normalization(
+            &state,
+            "mem-ru",
+            "запись по-русски",
+            NormalizationStatus::Ready,
+            1,
+        )
+        .await;
+    }
+
+    let block = normalization_block(&stdout(&run_cli(&home, home.path(), &["stats", "--json"])));
+    assert_eq!(
+        block["counts_by_status"],
+        serde_json::json!([{"status": "ready", "count": 1}]),
+    );
+    assert_eq!(block["pending"], 0, "nothing left to translate");
+    assert_eq!(block["dead_letter"], 0);
+}
+
+#[tokio::test]
+async fn stats_reports_a_dead_lettered_entry_and_stops_counting_it_as_pending() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(
+            &state,
+            "mem-ru",
+            MemoryKind::Fact,
+            "непереводимая запись",
+            1_000,
+        )
+        .await;
+        seed_normalization(
+            &state,
+            "mem-ru",
+            "непереводимая запись",
+            NormalizationStatus::Failed,
+            MAX_NORMALIZATION_ATTEMPTS,
+        )
+        .await;
+    }
+
+    let block = normalization_block(&stdout(&run_cli(&home, home.path(), &["stats", "--json"])));
+    assert_eq!(block["dead_letter"], 1);
+    assert_eq!(
+        block["pending"], 0,
+        "no tick will offer it again under this normalizer",
+    );
+
+    let human = stdout(&run_cli(&home, home.path(), &["stats"]));
+    assert!(
+        human.contains("memory normalization dead-letter: 1 entry(ies)"),
+        "{human}",
+    );
+    assert!(
+        human.contains("keep using their original text"),
+        "the line says what the consequence actually is: {human}",
     );
 }

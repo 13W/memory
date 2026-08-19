@@ -12,11 +12,12 @@ use local_rag::daemon::DaemonHandle;
 use local_rag_core::identity::domain::subject_memory_entry;
 use local_rag_memory::recall::{QueryEmbedError, QueryEmbedder};
 use local_rag_store::{
-    CacheDb, DEFAULT_MODEL_SPACE_ID, DistanceMetric, EmbeddingKey, FailureKind,
-    GLOBAL_SCOPE_OWNER_ID, MemoryKind, MemoryState, NewConsolidationRun, RepresentationKey,
-    RepresentationKind, RunState, ScopeKind, StateDb, SubjectKind, create_consolidation_run,
-    ensure_store_instance_uuid, insert_embedding, record_run_failure, register_representation,
-    set_model_space_representation, transition_run,
+    CURRENT_NORMALIZER_VERSION, CacheDb, DEFAULT_MODEL_SPACE_ID, DistanceMetric, EmbeddingKey,
+    FailureKind, GLOBAL_SCOPE_OWNER_ID, MAX_NORMALIZATION_ATTEMPTS, MemoryKind, MemoryState,
+    NewConsolidationRun, NormalizationStatus, NormalizationWrite, RepresentationKey,
+    RepresentationKind, RunState, ScopeKind, StateDb, SubjectKind, UpsertOutcome,
+    create_consolidation_run, ensure_store_instance_uuid, insert_embedding, record_run_failure,
+    register_representation, set_model_space_representation, transition_run, upsert_normalization,
 };
 use serde_json::Value;
 use support::{
@@ -1198,6 +1199,212 @@ async fn read_tool_calls_produce_no_state_sqlite_writes() {
     assert_eq!(count("memory_entry"), 1);
     assert_eq!(count("pending_memory_candidate"), 1);
     assert_eq!(count("memory_evidence"), 0);
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+// ---------------------------------------------------------------------
+// T21-08: `memory.normalization` — and that both surfaces agree
+// ---------------------------------------------------------------------
+
+async fn seed_normalization(
+    state: &StateDb,
+    memory_id: &str,
+    text: &str,
+    status: NormalizationStatus,
+    attempt_count: i64,
+) {
+    let (id, sha) = (
+        memory_id.to_string(),
+        local_rag_core::hash::sha256_hex(text.as_bytes()),
+    );
+    let outcome = state
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status,
+                    source_text_sha256: &sha,
+                    normalized_text: match status {
+                        NormalizationStatus::Ready => Some("the English variant"),
+                        _ => None,
+                    },
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-normalizer"),
+                    prompt_version: Some(1),
+                    normalizer_version: CURRENT_NORMALIZER_VERSION,
+                    attempt_count,
+                    last_error: match status {
+                        NormalizationStatus::Failed => Some("answer was not one object"),
+                        _ => None,
+                    },
+                    next_attempt_at: None,
+                },
+                3_000,
+            )
+        })
+        .await
+        .expect("seed normalization tx");
+    assert_eq!(outcome, UpsertOutcome::Written);
+}
+
+async fn call_stats(layout: &local_rag_core::paths::StoreLayout) -> Value {
+    let socket_path = layout.socket_path();
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stats","arguments":{}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// The normalization block over a store with one of each outcome.
+#[tokio::test]
+async fn stats_reports_the_normalization_axis() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        for (id, text) in [
+            ("mem-ru", "запись по-русски"),
+            ("mem-en", "an english note"),
+            ("mem-bad", "непереводимая запись"),
+            ("mem-new", "ещё не обработана"),
+        ] {
+            seed_memory_entry(
+                &state,
+                id,
+                MemoryKind::Fact,
+                ScopeKind::Global,
+                GLOBAL_SCOPE_OWNER_ID,
+                text,
+                1_000,
+            )
+            .await;
+        }
+        seed_normalization(
+            &state,
+            "mem-ru",
+            "запись по-русски",
+            NormalizationStatus::Ready,
+            1,
+        )
+        .await;
+        seed_normalization(
+            &state,
+            "mem-en",
+            "an english note",
+            NormalizationStatus::Skipped,
+            0,
+        )
+        .await;
+        seed_normalization(
+            &state,
+            "mem-bad",
+            "непереводимая запись",
+            NormalizationStatus::Failed,
+            MAX_NORMALIZATION_ATTEMPTS,
+        )
+        .await;
+    }
+
+    let handle = start(&layout).await;
+    let parsed = call_stats(&layout).await;
+    let block = &parsed["memory"]["normalization"];
+
+    assert_eq!(
+        block["counts_by_status"],
+        serde_json::json!([
+            {"status": "failed", "count": 1},
+            {"status": "ready", "count": 1},
+            {"status": "skipped", "count": 1},
+        ]),
+        "{parsed}",
+    );
+    assert_eq!(block["pending"], 1, "only mem-new still lags: {parsed}");
+    assert_eq!(block["dead_letter"], 1, "{parsed}");
+    assert_eq!(block["normalizer_version"], CURRENT_NORMALIZER_VERSION);
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+/// One store, both surfaces: the MCP tool and the real CLI binary must report
+/// the identical block. They are independently written (this crate's own
+/// precedent for `stats`), so nothing but a test keeps them from drifting.
+#[tokio::test]
+async fn the_cli_and_the_mcp_tool_report_the_same_normalization_block() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        for (id, text) in [
+            ("mem-ru", "запись по-русски"),
+            ("mem-bad", "непереводимая запись"),
+            ("mem-new", "ещё не обработана"),
+        ] {
+            seed_memory_entry(
+                &state,
+                id,
+                MemoryKind::Fact,
+                ScopeKind::Global,
+                GLOBAL_SCOPE_OWNER_ID,
+                text,
+                1_000,
+            )
+            .await;
+        }
+        seed_normalization(
+            &state,
+            "mem-ru",
+            "запись по-русски",
+            NormalizationStatus::Ready,
+            1,
+        )
+        .await;
+        seed_normalization(
+            &state,
+            "mem-bad",
+            "непереводимая запись",
+            NormalizationStatus::Failed,
+            MAX_NORMALIZATION_ATTEMPTS,
+        )
+        .await;
+    }
+
+    let handle = start(&layout).await;
+    let from_mcp = call_stats(&layout).await["memory"]["normalization"].clone();
+
+    // The CLI reads the same store directly — it takes no store lock, so the
+    // running daemon does not stand in its way.
+    let output = tokio::task::spawn_blocking({
+        let mut cmd = home.command(env!("CARGO_BIN_EXE_local-rag"));
+        cmd.args(["stats", "--json"]);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        move || cmd.output().expect("run local-rag stats")
+    })
+    .await
+    .expect("blocking task");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let from_cli: Value =
+        serde_json::from_slice::<Value>(&output.stdout).expect("valid json")["memory"]
+            ["normalization"]
+            .clone();
+
+    assert_eq!(
+        from_cli, from_mcp,
+        "the two surfaces must describe one store identically",
+    );
+    assert_eq!(from_cli["pending"], 1);
+    assert_eq!(from_cli["dead_letter"], 1);
 
     drop(home);
     handle.shutdown().await;
