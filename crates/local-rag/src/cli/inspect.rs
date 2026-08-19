@@ -16,7 +16,7 @@ use local_rag_store::privacy::{
     EvidenceSummary, MemoryInspection, ObservationInspection, inspect_generation, inspect_memory,
     inspect_observation,
 };
-use local_rag_store::{AuditEventRow, GenerationRow, PayloadStatus};
+use local_rag_store::{AuditEventRow, GenerationRow, NormalizationRow, PayloadStatus};
 
 use super::{fail, resolve_layout_and_config, system_now_ms};
 use local_rag::indexing::open_state;
@@ -169,6 +169,32 @@ pub(crate) fn memory_inspection_json(found: &MemoryInspection) -> serde_json::Va
         },
         "evidence": found.evidence.iter().map(evidence_summary_json).collect::<Vec<_>>(),
         "audit_trail": found.audit_trail.iter().map(audit_event_json).collect::<Vec<_>>(),
+        "normalization": found.normalization.as_ref().map(normalization_json),
+    })
+}
+
+/// The entry's English variant and where it came from (T21-07, ADR-0010).
+///
+/// `normalized_text` is included, not elided: `export` reuses this renderer and
+/// exists to show everything the store holds about the user, whose original
+/// text is printed two keys above. Provenance travels with it so a reader can
+/// tell a translation by a known model under a known prompt version from one
+/// left behind by an older normalizer — and, on a `failed` row, why there is no
+/// translation at all.
+fn normalization_json(row: &NormalizationRow) -> serde_json::Value {
+    serde_json::json!({
+        "status": row.status.as_str(),
+        "source_text_sha256": row.source_text_sha256,
+        "normalized_text": row.normalized_text,
+        "source_language": row.source_language,
+        "normalizer_model_id": row.normalizer_model_id,
+        "prompt_version": row.prompt_version,
+        "normalizer_version": row.normalizer_version,
+        "attempt_count": row.attempt_count,
+        "last_error": row.last_error,
+        "next_attempt_at": row.next_attempt_at,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
     })
 }
 

@@ -129,10 +129,11 @@ fn run_purge_memory(
     match outcome {
         Ok(Ok(report)) => {
             println!(
-                "{BIN}: purged memory {id} ({} evidence rows removed, {} descendants relinked, {} audit rows tombstoned)",
+                "{BIN}: purged memory {id} ({} evidence rows removed, {} descendants relinked, {} audit rows tombstoned, {} normalization rows removed)",
                 report.evidence_rows_removed,
                 report.descendants_relinked,
                 report.audit_rows_tombstoned,
+                report.normalization_rows_removed,
             );
             ExitCode::SUCCESS
         }

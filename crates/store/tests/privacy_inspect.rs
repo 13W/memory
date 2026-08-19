@@ -8,8 +8,9 @@
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
-    Actor, CreateMemoryOp, EvidenceInput, MemoryKind, MemoryOpOutcome, ReinforceMemoryOp,
-    ScopeKind, apply_create, apply_reinforce,
+    Actor, CreateMemoryOp, EvidenceInput, MemoryKind, MemoryOpOutcome, NormalizationStatus,
+    NormalizationWrite, ReinforceMemoryOp, ScopeKind, UpsertOutcome, apply_create, apply_reinforce,
+    upsert_normalization,
 };
 use local_rag_store::observation::{
     EvidenceKind, NewObservationEnvelope, TrustLevel, insert_envelope,
@@ -29,6 +30,10 @@ fn open_state() -> (TempHome, StateDb) {
     let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
     (home, db)
 }
+
+/// The text [`create_with_evidence`] writes; a normalization fixture must hash
+/// exactly this, since `upsert_normalization` refuses a stale write.
+const CREATED_TEXT: &str = "some durable text";
 
 fn uuid(seed: u8) -> String {
     let mut rand = [0u8; 10];
@@ -116,7 +121,7 @@ async fn create_with_evidence(
                 &CreateMemoryOp {
                     memory_id: &id,
                     kind: MemoryKind::Fact,
-                    text: "some durable text",
+                    text: CREATED_TEXT,
                     canonical_key: None,
                     scope_kind: ScopeKind::Worktree,
                     scope_owner_id: &owner,
@@ -322,4 +327,144 @@ async fn inspect_generation_reads_full_row_then_none_for_unknown_id() {
     assert_eq!(found.generation_number, 1);
 
     assert_eq!(inspect_generation(&read, "unknown").unwrap(), None);
+}
+
+// ---------------------------------------------------------------------------
+// T21-07: the entry's English variant is part of what `inspect` shows
+// ---------------------------------------------------------------------------
+
+/// Write one normalization row for `memory_id` over the text
+/// [`create_with_evidence`] wrote — `upsert_normalization` refuses anything
+/// whose source hash does not match the entry as it stands.
+async fn seed_normalization(
+    db: &StateDb,
+    memory_id: &str,
+    status: NormalizationStatus,
+    normalized_text: Option<&'static str>,
+    last_error: Option<&'static str>,
+) {
+    let id = memory_id.to_string();
+    let sha = local_rag_core::hash::sha256_hex(CREATED_TEXT.as_bytes());
+    let outcome = db
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status,
+                    source_text_sha256: &sha,
+                    normalized_text,
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-normalizer"),
+                    prompt_version: Some(1),
+                    normalizer_version: 1,
+                    attempt_count: if last_error.is_some() { 3 } else { 1 },
+                    last_error,
+                    next_attempt_at: None,
+                },
+                2000,
+            )
+        })
+        .await
+        .expect("infra");
+    assert_eq!(
+        outcome,
+        UpsertOutcome::Written,
+        "fixture must actually land"
+    );
+}
+
+#[tokio::test]
+async fn inspect_memory_carries_the_translation_and_its_provenance() {
+    let (_home, db) = open_state();
+    let owner = uuid(60);
+    let id = uuid(61);
+    create_with_evidence(&db, &id, &owner, vec![]).await;
+    seed_normalization(
+        &db,
+        &id,
+        NormalizationStatus::Ready,
+        Some("the English variant"),
+        None,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let found = inspect_memory(&read, &id, 3000)
+        .expect("infra")
+        .expect("entry exists");
+    let normalization = found.normalization.expect("the row is part of inspect");
+
+    assert_eq!(normalization.status, NormalizationStatus::Ready);
+    assert_eq!(
+        normalization.normalized_text.as_deref(),
+        Some("the English variant"),
+        "an export of everything the store holds must include the stored translation",
+    );
+    assert_eq!(
+        normalization.source_text_sha256,
+        local_rag_core::hash::sha256_hex(CREATED_TEXT.as_bytes()),
+        "the hash says which text this translation belongs to",
+    );
+    assert_eq!(normalization.source_language.as_deref(), Some("ru"));
+    assert_eq!(
+        normalization.normalizer_model_id.as_deref(),
+        Some("test-normalizer"),
+    );
+    assert_eq!(normalization.prompt_version, Some(1));
+    assert_eq!(normalization.normalizer_version, 1);
+    assert_eq!(
+        found.entry.text, CREATED_TEXT,
+        "the original is still the canonical text, untouched",
+    );
+}
+
+#[tokio::test]
+async fn inspect_memory_reports_a_failed_normalization_with_its_reason() {
+    let (_home, db) = open_state();
+    let owner = uuid(62);
+    let id = uuid(63);
+    create_with_evidence(&db, &id, &owner, vec![]).await;
+    seed_normalization(
+        &db,
+        &id,
+        NormalizationStatus::Failed,
+        None,
+        Some("answer was not one {\"en\": …} object"),
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let normalization = inspect_memory(&read, &id, 3000)
+        .expect("infra")
+        .expect("entry exists")
+        .normalization
+        .expect("a failed row is still a row");
+
+    assert_eq!(normalization.status, NormalizationStatus::Failed);
+    assert_eq!(normalization.normalized_text, None);
+    assert_eq!(
+        normalization.last_error.as_deref(),
+        Some("answer was not one {\"en\": …} object"),
+        "why there is no translation is provenance too",
+    );
+    assert_eq!(normalization.attempt_count, 3);
+}
+
+#[tokio::test]
+async fn an_entry_that_was_never_normalized_reports_none() {
+    let (_home, db) = open_state();
+    let owner = uuid(64);
+    let id = uuid(65);
+    create_with_evidence(&db, &id, &owner, vec![]).await;
+
+    let read = db.open_read().expect("read conn");
+    let found = inspect_memory(&read, &id, 3000)
+        .expect("infra")
+        .expect("entry exists");
+    assert!(
+        found.normalization.is_none(),
+        "no row is the honest answer on a store whose worker never ran",
+    );
 }

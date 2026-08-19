@@ -10,8 +10,9 @@ use std::process::{Output, Stdio};
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, ScopeKind, StateDb, WorktreeKind,
-    allocate_generation, create_memory_entry, create_repository, create_worktree,
+    GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, NormalizationStatus, NormalizationWrite,
+    ScopeKind, StateDb, UpsertOutcome, WorktreeKind, allocate_generation, create_memory_entry,
+    create_repository, create_worktree, upsert_normalization,
 };
 use local_rag_test_support::TempHome;
 
@@ -180,6 +181,67 @@ async fn inspect_memory_prints_entry_evidence_and_audit() {
     assert_eq!(value["entry"]["entry_version"], 1);
     assert_eq!(value["evidence"], serde_json::json!([]));
     assert_eq!(value["audit_trail"], serde_json::json!([]));
+    assert_eq!(
+        value["normalization"],
+        serde_json::Value::Null,
+        "an entry that was never normalized reports the key as null, not omitted",
+    );
+}
+
+/// T21-07: the English variant and its provenance are part of what `inspect`
+/// prints — including the translated text itself, since `export` reuses this
+/// renderer and exists to show everything the store holds.
+#[tokio::test]
+async fn inspect_memory_prints_the_translation_and_its_provenance() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(&state, "mem-1", 1000).await;
+        let sha = local_rag_core::hash::sha256_hex(b"some durable text");
+        let outcome = state
+            .writer()
+            .transaction(move |tx| {
+                upsert_normalization(
+                    tx,
+                    &NormalizationWrite {
+                        memory_id: "mem-1",
+                        status: NormalizationStatus::Ready,
+                        source_text_sha256: &sha,
+                        normalized_text: Some("the English variant"),
+                        source_language: Some("ru"),
+                        normalizer_model_id: Some("test-normalizer"),
+                        prompt_version: Some(1),
+                        normalizer_version: 1,
+                        attempt_count: 1,
+                        last_error: None,
+                        next_attempt_at: None,
+                    },
+                    2000,
+                )
+            })
+            .await
+            .expect("seed normalization tx");
+        assert_eq!(outcome, UpsertOutcome::Written);
+    }
+
+    let output = run_cli(&home, &["inspect", "memory", "mem-1"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("valid json");
+    assert_eq!(value["normalization"]["status"], "ready");
+    assert_eq!(
+        value["normalization"]["normalized_text"],
+        "the English variant"
+    );
+    assert_eq!(value["normalization"]["source_language"], "ru");
+    assert_eq!(
+        value["normalization"]["normalizer_model_id"],
+        "test-normalizer"
+    );
+    assert_eq!(value["normalization"]["normalizer_version"], 1);
+    assert_eq!(
+        value["entry"]["text"], "some durable text",
+        "the canonical text is untouched next to it",
+    );
 }
 
 #[tokio::test]

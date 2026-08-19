@@ -7,8 +7,8 @@
 use rusqlite::Connection;
 
 use crate::memory::{
-    AuditEventRow, MemoryEntryRow, memory_entry_by_id, memory_evidence_for,
-    read_audit_events_for_entity,
+    AuditEventRow, MemoryEntryRow, NormalizationRow, memory_entry_by_id, memory_evidence_for,
+    normalization_for, read_audit_events_for_entity,
 };
 use crate::observation::{
     EvidenceKind, PayloadStatus, TrustLevel, observation_envelope_row, observation_paths_for,
@@ -129,12 +129,23 @@ pub(crate) fn evidence_summaries_for(
 }
 
 /// `inspect memory <id>`'s result: the full entry row, its resolved evidence,
-/// and its complete `audit_event` trail (spec 03 §2.5, 08 §3).
+/// its complete `audit_event` trail (spec 03 §2.5, 08 §3), and — since T21-07 —
+/// its English variant with that variant's provenance, when one exists.
+///
+/// The normalization row carries `normalized_text` itself, not just metadata
+/// about it: this shape is what both `inspect` and
+/// [`export`](super::export::export_scope) render, and an export whose whole
+/// purpose is to show everything the store holds about the user would be
+/// dishonest while hiding a stored copy of their own words. The original
+/// `entry.text` is already in the same output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryInspection {
     pub entry: MemoryEntryRow,
     pub evidence: Vec<EvidenceSummary>,
     pub audit_trail: Vec<AuditEventRow>,
+    /// `None` when the entry has never been normalized — including on a store
+    /// where the worker is switched off (its default until T21-08).
+    pub normalization: Option<NormalizationRow>,
 }
 
 /// The full `memory_entry` row for `memory_id`, its evidence, and its audit
@@ -154,10 +165,12 @@ pub fn inspect_memory(
     };
     let evidence = evidence_summaries_for(conn, memory_id, now_ms)?;
     let audit_trail = read_audit_events_for_entity(conn, "memory_entry", memory_id)?;
+    let normalization = normalization_for(conn, memory_id)?;
     Ok(Some(MemoryInspection {
         entry,
         evidence,
         audit_trail,
+        normalization,
     }))
 }
 

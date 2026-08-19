@@ -950,6 +950,16 @@ pub fn apply_supersede(
 /// ([`MemoryOpError::EntryTerminal`] — an as-built guard, see the module
 /// doc), unlike `apply_reinforce`, which this task's card does not ask to
 /// guard by state.
+///
+/// T21-07: an edit that genuinely changes the text also drops the entry's
+/// `memory_text_normalization` row, in this same transaction — a translation of
+/// text the user has since replaced is derived data that must not outlive its
+/// source (`crate::privacy`'s own module doc). "Genuinely" is load-bearing and
+/// is compared against the stored text, not against `request.text.is_some()`:
+/// an edit that re-submits the identical string changes nothing to translate,
+/// and deleting the row would make the daemon's normalization worker pay for
+/// the same inference a second time. `apply_reinforce` never touches the row at
+/// all, because it may not touch the text.
 pub fn apply_edit(
     tx: &Transaction<'_>,
     request: &EditMemoryOp<'_>,
@@ -973,6 +983,20 @@ pub fn apply_edit(
     }
     if state.is_terminal() {
         return Ok(Err(MemoryOpError::EntryTerminal));
+    }
+
+    // Read the text only when the caller actually offered a new one; the
+    // comparison — not the presence of the field — is what decides whether the
+    // English variant is now stale (T21-07, ADR-0010).
+    if let Some(new_text) = request.text {
+        let current_text: String = tx.query_row(
+            "SELECT text FROM memory_entry WHERE memory_id = ?1",
+            params![request.memory_id],
+            |r| r.get(0),
+        )?;
+        if current_text != new_text {
+            super::delete_normalization(tx, request.memory_id)?;
+        }
     }
 
     let new_version = current_version + 1;

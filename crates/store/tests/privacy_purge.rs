@@ -18,9 +18,10 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_store::StateDb;
 use local_rag_store::memory::{
     Actor, CreateMemoryOp, MemoryKind, MemoryOpOutcome, MergeLoser, MergeMemoryOp, NewCandidate,
-    RetractMemoryOp, ScopeKind, SupersedeMemoryOp, apply_create, apply_merge, apply_retract,
-    apply_supersede, candidate_evidence_for, create_candidate, insert_candidate_evidence,
-    memory_entry_state, read_audit_events_for_entity,
+    NormalizationStatus, NormalizationWrite, RetractMemoryOp, ScopeKind, SupersedeMemoryOp,
+    UpsertOutcome, apply_create, apply_merge, apply_retract, apply_supersede,
+    candidate_evidence_for, create_candidate, insert_candidate_evidence, memory_entry_state,
+    normalization_for, read_audit_events_for_entity, upsert_normalization,
 };
 use local_rag_store::observation::{NewObservationEnvelope, insert_envelope};
 use local_rag_store::privacy::{
@@ -35,6 +36,10 @@ use tokio::sync::Mutex;
 use local_rag_test_support::Action;
 
 static SERIAL: Mutex<()> = Mutex::const_new(());
+
+/// The text [`create`] writes; a normalization fixture must hash exactly this,
+/// since `upsert_normalization` refuses a write whose source hash has moved.
+const CREATED_TEXT: &str = "some durable text";
 
 fn open_state() -> (TempHome, StateDb) {
     let home = TempHome::new().expect("temp home");
@@ -109,7 +114,7 @@ async fn create(db: &StateDb, memory_id: &str, scope_owner_id: &str) -> i64 {
                 &CreateMemoryOp {
                     memory_id: &id,
                     kind: MemoryKind::Fact,
-                    text: "some durable text",
+                    text: CREATED_TEXT,
                     canonical_key: None,
                     scope_kind: ScopeKind::Worktree,
                     scope_owner_id: &owner,
@@ -934,4 +939,198 @@ async fn purge_all_rolls_back_every_purged_entity_together_on_a_single_failpoint
     let read = db.open_read().expect("read conn");
     assert_eq!(row_count(&read, "memory_entry"), 0);
     assert_eq!(row_count(&read, "observation_envelope"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// T21-07: the entry's English variant dies with it
+// ---------------------------------------------------------------------------
+
+/// Give `memory_id` a `ready` normalization row derived from the text `create`
+/// wrote, so it is the row a purge/edit is actually supposed to remove (an
+/// upsert whose `source_text_sha256` did not match would be refused outright).
+async fn seed_normalization(db: &StateDb, memory_id: &str, normalized: &'static str) {
+    let id = memory_id.to_string();
+    let sha = local_rag_core::hash::sha256_hex(CREATED_TEXT.as_bytes());
+    let outcome = db
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status: NormalizationStatus::Ready,
+                    source_text_sha256: &sha,
+                    normalized_text: Some(normalized),
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-normalizer"),
+                    prompt_version: Some(1),
+                    normalizer_version: 1,
+                    attempt_count: 1,
+                    last_error: None,
+                    next_attempt_at: None,
+                },
+                1000,
+            )
+        })
+        .await
+        .expect("infra");
+    assert_eq!(
+        outcome,
+        UpsertOutcome::Written,
+        "fixture must actually land"
+    );
+}
+
+#[tokio::test]
+async fn purge_memory_removes_the_normalization_row_and_counts_it() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(1);
+    let id = uuid(2);
+    create(&db, &id, &owner).await;
+    seed_normalization(&db, &id, "the English variant").await;
+
+    let read = db.open_read().expect("read conn");
+    assert!(
+        normalization_for(&read, &id).unwrap().is_some(),
+        "sanity: the translation is there before the purge"
+    );
+    drop(read);
+
+    let id_arg = id.clone();
+    let report = db
+        .writer()
+        .transaction(move |tx| purge_memory(tx, &id_arg, 1, 1000))
+        .await
+        .expect("infra")
+        .expect("purge applies");
+
+    assert_eq!(report.normalization_rows_removed, 1);
+    let read = db.open_read().expect("read conn");
+    assert!(
+        normalization_for(&read, &id).unwrap().is_none(),
+        "the English variant does not outlive the text it came from",
+    );
+    assert_eq!(row_count(&read, "memory_text_normalization"), 0);
+}
+
+#[tokio::test]
+async fn an_entry_with_no_translation_reports_zero() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(1);
+    let id = uuid(2);
+    create(&db, &id, &owner).await;
+
+    let id_arg = id.clone();
+    let report = db
+        .writer()
+        .transaction(move |tx| purge_memory(tx, &id_arg, 1, 1000))
+        .await
+        .expect("infra")
+        .expect("purge applies");
+
+    assert_eq!(
+        report.normalization_rows_removed, 0,
+        "the counter reports what was removed, not what could have been",
+    );
+}
+
+#[tokio::test]
+async fn purge_all_leaves_no_normalization_rows() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(1);
+    let first = uuid(2);
+    let second = uuid(3);
+    create(&db, &first, &owner).await;
+    create(&db, &second, &owner).await;
+    seed_normalization(&db, &first, "first English variant").await;
+    seed_normalization(&db, &second, "second English variant").await;
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(row_count(&read, "memory_text_normalization"), 2);
+    drop(read);
+
+    let report = db
+        .writer()
+        .transaction(move |tx| purge_all(tx, 1000))
+        .await
+        .expect("infra");
+    assert_eq!(report.memory_entries_purged, 2);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        row_count(&read, "memory_text_normalization"),
+        0,
+        "an all-or-nothing privacy purge leaves no derived text behind",
+    );
+    assert!(foreign_key_violations(&read).is_empty());
+}
+
+/// The explicit `DELETE` is what the report counts; the schema's
+/// `ON DELETE CASCADE` is the safety net for any delete path that never comes
+/// through `purge_memory_rows`. This test exercises that net directly.
+#[tokio::test]
+async fn deleting_the_entry_outside_the_purge_path_still_cascades() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(1);
+    let id = uuid(2);
+    create(&db, &id, &owner).await;
+    seed_normalization(&db, &id, "the English variant").await;
+
+    let id_arg = id.clone();
+    db.writer()
+        .transaction(move |tx| {
+            tx.execute(
+                "DELETE FROM memory_entry WHERE memory_id = ?1",
+                params![id_arg],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("raw delete");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        row_count(&read, "memory_text_normalization"),
+        0,
+        "the FK cascade removes it even with no explicit DELETE",
+    );
+    assert!(foreign_key_violations(&read).is_empty());
+}
+
+#[tokio::test]
+async fn purging_the_same_entry_twice_is_idempotent() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(1);
+    let id = uuid(2);
+    create(&db, &id, &owner).await;
+    seed_normalization(&db, &id, "the English variant").await;
+
+    let id_arg = id.clone();
+    let first = db
+        .writer()
+        .transaction(move |tx| purge_memory(tx, &id_arg, 1, 1000))
+        .await
+        .expect("infra")
+        .expect("purge applies");
+    assert_eq!(first.normalization_rows_removed, 1);
+
+    let id_arg = id.clone();
+    let second = db
+        .writer()
+        .transaction(move |tx| purge_memory(tx, &id_arg, 1, 1000))
+        .await
+        .expect("infra");
+    assert_eq!(
+        second,
+        Err(PurgeMemoryError::UnknownMemory),
+        "a second purge finds nothing left to purge",
+    );
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(row_count(&read, "memory_text_normalization"), 0);
 }
