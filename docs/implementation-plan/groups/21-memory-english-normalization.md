@@ -403,6 +403,21 @@ spec 10 §3; spec 12 §2/§4 `[FIXED]` (untrusted-текст, purge); spec 14 §
   `last_failure_kind='mechanical'`, fingerprint текущего билда), `stats` и `doctor` показывают ран
   без единого ручного SQL-запроса; строка `D-071` в `DEVIATIONS.md` переведена в `resolved`.
 
+## D-072 — Отчёт о залипших ранах не мигает
+
+- **Зависит от:** `D-071` (правит её же правило отбора).
+- **Спецификация:** spec 02 §6 («nothing degrades silently»); spec 11 §2 (`stats`/`doctor` как health
+  report); spec 08 §4 (as-built D-058 — shrink-and-retry, чьё условие правило и зеркалит).
+- **Результат:** на неизменном сторе `stats` и `doctor` дают один и тот же набор залипших ранов
+  независимо от того, выполняется ли в этот момент какой-нибудь ран.
+- **В scope:** якорь «последний ран сессии» в `stuck_consolidation_runs`
+  (`crates/store/src/memory/stats.rs`) меняется с `state <> 'applied'` на `state = 'failed'`;
+  док-комментарий объясняет, почему этот вопрос отличается от `latest_non_applied_run`.
+- **Не в scope:** сам `open_next_run` и логика D-058; поверхности вывода (они читают примитив как есть).
+- **Тесты:** regression на живой конфигурации сессии `4b92bfd5` — старый мёртвый ран, свежий
+  shrink-eligible и идущий `running` ⇒ набор не меняется (тест обязан падать до правки).
+- **Приёмка:** тест красный до правки, зелёный после; вся группа `stuck_consolidation_runs_*` зелёная.
+
 ## G21 — Сверка English normalization
 
 - **Зависит от:** `T21-00…T21-10`.

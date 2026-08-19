@@ -227,7 +227,7 @@ fn truncate_reason(reason: Option<String>) -> Option<String> {
 ///   again, so nothing but a rebuild can move them.
 ///
 /// **Minus** the one shape that resolves itself: a context-overflow
-/// dead-letter that is its session's latest non-`applied` run and still spans
+/// dead-letter that is its session's latest `failed` run and still spans
 /// more than one observation is
 /// [`open_next_run`](super::consolidation::open_next_run)'s shrink-and-retry
 /// carve-out (D-058) — the next tick opens a narrower window for it, so
@@ -235,6 +235,17 @@ fn truncate_reason(reason: Option<String>) -> Option<String> {
 /// down to a single observation) stays: that one really is stuck, and is the
 /// same set [`unconsolidatable_sessions`](super::consolidation::unconsolidatable_sessions)
 /// reports from the session's side.
+///
+/// D-072: "latest" there means latest **`failed`**, deliberately not latest
+/// non-`applied` the way `open_next_run`'s own `latest_non_applied_run` asks.
+/// The two questions differ: `open_next_run` asks what blocks this session
+/// *right now*, so a run in flight counts; this report asks whether anything
+/// will ever act on this row again, which a transient `running` neighbour
+/// does not change. Keyed off non-`applied`, the answer depended on whether
+/// some run happened to be executing at the instant of the query — live
+/// verification caught `doctor` and `stats`, minutes apart, reporting three
+/// runs and then two on an unchanged store. A health report that flickers is
+/// worse than one that says nothing.
 ///
 /// Ordered worst-first (`attempt_count` descending, then `run_id`) so a
 /// truncated human report still shows the loudest row.
@@ -263,7 +274,7 @@ pub fn stuck_consolidation_runs(
                  AND COALESCE(c.last_failure_fingerprint, '') = ?1 \
                  AND c.created_at = ( \
                        SELECT MAX(c2.created_at) FROM consolidation_run c2 \
-                       WHERE c2.session_id = c.session_id AND c2.state != 'applied' \
+                       WHERE c2.session_id = c.session_id AND c2.state = 'failed' \
                      ) \
                  AND ( \
                        SELECT COUNT(*) FROM observation_envelope e \
