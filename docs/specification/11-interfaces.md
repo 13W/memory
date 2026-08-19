@@ -984,6 +984,53 @@ already satisfies the card's full required result without one — a suppression 
 command files (one of which, `watch`, does not carry a `clap::Args` struct today) was judged not
 worth adding speculatively.
 
+As-built note (T21-08, `[SPEC]`, ADR-0010): `stats` and `doctor` gain the English-normalization
+axis, and `[memory]` gains its switch.
+
+**Config.** `config.memory.normalize_to_english` (default `true`, ADR-0010 Decision 11) is the
+background worker's switch, and `config.memory.normalization_batch` (default `4`) its per-tick
+inference bound — both read once at daemon start into `NormalizationParams` (02 §4.3's own T21-06
+note has the worker's shape). The switch stops the *work*, not the reading: entries already
+normalized keep being recalled through their English variant, whose vector is already in the cache
+and does not become wrong when the worker stops. A `normalization_batch` of `0` is a supported
+mode, not a misconfiguration — the detector still runs and every already-English entry still gets
+its passthrough row, at zero inference cost.
+
+**`stats` (both surfaces).** `memory.normalization` carries `counts_by_status` (`GROUP BY` over
+`memory_text_normalization`, empty buckets omitted rather than reported as zero), `pending`,
+`dead_letter`, and `normalizer_version`. `pending` is computed by the **same** predicate the
+worker's own queue uses (`local_rag_store::normalization_backlog` shares one private scan with
+`entries_needing_normalization`), so the number a user reads and the work the daemon picks up can
+never describe different sets. The CLI and the MCP tool are independently written — this file's own
+D-049 note explains why — so a test drives both against one store and compares the block.
+Deliberately store-state only: `stats` answers *where this store is*, `doctor` answers *why*.
+
+**`doctor`.** Two new sections. `normalization:` reports the switch's state first (a switched-off
+worker is the most common reason a user thinks normalization is broken, the same reasoning X-008's
+"NOT ENROLLED" line already follows), then the counts, the backlog, and — when non-empty — the
+dead-lettered entries by id with their recorded reason, capped at ten rows with the count carrying
+the true scale. It always ends with the detector's **declared limitation**: it distinguishes
+scripts, not languages, so Latin-script non-English text (German, French, Spanish, Polish, …)
+counts as English and is never translated. That line is unconditional by design — it is the answer
+to "why is my German note untranslated?", which no count can give, and T21-03's own module doc
+promises this exact surface.
+
+`generator:` reports whether the local generative model both consolidation (08 §4) and
+normalization need is installed — `local_rag_generate::is_installed`, i.e. the `.ok` marker the
+installer writes last (10 §5 `[FIXED policy]`), which is the same precondition
+`LlamaGenerator::open` applies. **No weights are loaded and `LlamaBackend` is never initialized**:
+that handle is a process-wide singleton (D-054), the daemon running alongside this command may
+already hold it, and a read-only diagnostic has no business competing for it. A test proves the
+point by reporting `installed` from a marker file with no GGUF behind it at all. The section is
+built before the store-readiness gate, so a store that cannot be opened still gets this answer.
+
+**Exit code** (owner decision, 2026-08-19): of the two new sections only a **dead-lettered**
+normalization makes the report unclean — work the normalizer performed and gave up on, the same
+class as D-071's stuck run and X-008's built-but-never-activated generation. An uninstalled
+generative model and a switched-off worker are printed but never move the exit code, for the reason
+`is_clean`'s own comments already give for "never indexed": a bootstrap state and a user's choice
+are not faults (02 §6's "explicit, never silent" is about *reporting*, not about failing).
+
 ## 7. TUI dashboard `[SPEC surface, post-v0 — ADR-0008]`
 
 A fourth user-facing surface, alongside §§1–6: a terminal client reading/writing the same

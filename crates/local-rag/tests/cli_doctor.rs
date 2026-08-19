@@ -35,15 +35,17 @@ use local_rag_projection::{
     VectorSource, switch,
 };
 use local_rag_store::{
-    DEFAULT_MODEL_SPACE_ID, DistanceMetric, FailureKind, GenerationState, LEASE_DURATION_MS,
-    NewConsolidationRun, NewContentBlob, NewFileRevision, NewOccurrence, NewParsedUnit,
-    NewlineStyle, RepresentationKey, RepresentationKind, RunState, SourceCompression, StateDb,
-    UnitKind, WorktreeKind, allocate_generation, create_consolidation_run, create_repository,
-    create_worktree, derive_content_blob, ensure_store_instance_uuid, insert_content_blob,
-    insert_file_revision, insert_generation_file, insert_occurrence, insert_parsed_unit,
-    insert_projection_state, materialize_fts, occurrence_id, record_run_failure,
-    register_representation, retry_run, set_model_space_representation, transition_generation,
-    transition_run,
+    CURRENT_NORMALIZER_VERSION, DEFAULT_MODEL_SPACE_ID, DistanceMetric, FailureKind,
+    GLOBAL_SCOPE_OWNER_ID, GenerationState, LEASE_DURATION_MS, MAX_NORMALIZATION_ATTEMPTS,
+    MemoryKind, NewConsolidationRun, NewContentBlob, NewFileRevision, NewMemoryEntry,
+    NewOccurrence, NewParsedUnit, NewlineStyle, NormalizationStatus, NormalizationWrite,
+    RepresentationKey, RepresentationKind, RunState, ScopeKind, SourceCompression, StateDb,
+    UnitKind, UpsertOutcome, WorktreeKind, allocate_generation, create_consolidation_run,
+    create_memory_entry, create_repository, create_worktree, derive_content_blob,
+    ensure_store_instance_uuid, insert_content_blob, insert_file_revision, insert_generation_file,
+    insert_occurrence, insert_parsed_unit, insert_projection_state, materialize_fts, occurrence_id,
+    record_run_failure, register_representation, retry_run, set_model_space_representation,
+    transition_generation, transition_run, upsert_normalization,
 };
 use local_rag_test_support::TempHome;
 
@@ -1077,4 +1079,275 @@ async fn consolidation_section_is_ok_when_no_run_is_stuck() {
         text.contains("consolidation: ok — no run is stuck or dead-lettered"),
         "{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// T21-08: normalization + generator sections (ADR-0010)
+// ---------------------------------------------------------------------------
+
+/// A store `doctor` reports as clean: migrated, with a bound cache — the same
+/// `bootstrap_store` every other section's tests use here.
+async fn initialize_store(layout: &StoreLayout) {
+    let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    bootstrap_store(&db, layout).await;
+}
+
+fn write_config(home: &TempHome, body: &str) {
+    let dir = home.join("config");
+    std::fs::create_dir_all(&dir).expect("mk config dir");
+    std::fs::write(dir.join("config.toml"), body).expect("write config.toml");
+}
+
+/// The `.ok` marker the installer writes last (spec 10 §5) — and **only** it.
+/// A `doctor` that reported "installed" here while loading nothing is exactly
+/// the behaviour under test; a `doctor` that tried to load would fail on the
+/// missing GGUF.
+fn fake_installed_generator(layout: &StoreLayout) {
+    let dir = layout.model_dir(local_rag_generate::DEFAULT_MODEL_ID);
+    std::fs::create_dir_all(&dir).expect("mk model dir");
+    std::fs::write(dir.join(".ok"), b"").expect("write .ok marker");
+}
+
+async fn seed_entry_with_normalization(
+    layout: &StoreLayout,
+    memory_id: &str,
+    text: &str,
+    status: Option<(NormalizationStatus, i64)>,
+) {
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (id, body) = (memory_id.to_string(), text.to_string());
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_memory_entry(
+                tx,
+                &NewMemoryEntry {
+                    memory_id: &id,
+                    kind: MemoryKind::Fact,
+                    text: &body,
+                    canonical_key: None,
+                    scope_kind: ScopeKind::Global,
+                    scope_owner_id: GLOBAL_SCOPE_OWNER_ID,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                1_000,
+            )
+        })
+        .await
+        .expect("seed entry tx")
+        .expect("seed entry domain");
+
+    let Some((status, attempt_count)) = status else {
+        return;
+    };
+    let (id, sha) = (
+        memory_id.to_string(),
+        local_rag_core::hash::sha256_hex(text.as_bytes()),
+    );
+    let outcome = state
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status,
+                    source_text_sha256: &sha,
+                    normalized_text: match status {
+                        NormalizationStatus::Ready => Some("the English variant"),
+                        _ => None,
+                    },
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-normalizer"),
+                    prompt_version: Some(1),
+                    normalizer_version: CURRENT_NORMALIZER_VERSION,
+                    attempt_count,
+                    last_error: match status {
+                        NormalizationStatus::Failed => Some("answer was not one object"),
+                        _ => None,
+                    },
+                    next_attempt_at: None,
+                },
+                2_000,
+            )
+        })
+        .await
+        .expect("seed normalization tx");
+    assert_eq!(outcome, UpsertOutcome::Written);
+}
+
+#[tokio::test]
+async fn normalization_section_reports_the_switch_being_off() {
+    let (home, layout) = open_layout();
+    initialize_store(&layout).await;
+    seed_entry_with_normalization(&layout, "mem-ru", "запись по-русски", None).await;
+    write_config(&home, "[memory]\nnormalize_to_english = false\n");
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "off is a choice, not a fault"
+    );
+    let text = stdout(&output);
+    assert!(text.contains("normalization: OFF"), "{text}");
+    assert!(text.contains("normalize_to_english = false"), "{text}");
+    assert!(
+        text.contains("1 pending"),
+        "the backlog is still reported while off: {text}",
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&run_cli(&home, &["doctor", "--json"]).stdout).expect("valid json");
+    assert_eq!(json["normalization"]["enabled"], serde_json::json!(false));
+    assert_eq!(json["normalization"]["pending"], 1);
+    assert_eq!(json["clean"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn normalization_section_is_clean_when_on_with_nothing_wrong() {
+    let (home, layout) = open_layout();
+    initialize_store(&layout).await;
+    seed_entry_with_normalization(
+        &layout,
+        "mem-ru",
+        "запись по-русски",
+        Some((NormalizationStatus::Ready, 1)),
+    )
+    .await;
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("normalization: on"), "{text}");
+    assert!(text.contains("0 pending"), "{text}");
+    assert!(text.contains("ready: 1"), "{text}");
+    assert!(!text.contains("DEAD-LETTERED"), "{text}");
+}
+
+#[tokio::test]
+async fn a_dead_lettered_entry_makes_the_report_unclean_and_names_itself() {
+    let (home, layout) = open_layout();
+    initialize_store(&layout).await;
+    seed_entry_with_normalization(
+        &layout,
+        "mem-ru",
+        "непереводимая запись",
+        Some((NormalizationStatus::Failed, MAX_NORMALIZATION_ATTEMPTS)),
+    )
+    .await;
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "work the normalizer gave up on is a fault, like a stuck run",
+    );
+    let text = stdout(&output);
+    assert!(text.contains("DEAD-LETTERED: 1 entry(ies)"), "{text}");
+    assert!(text.contains("mem-ru after 5 attempt(s)"), "{text}");
+    assert!(text.contains("answer was not one object"), "{text}");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&run_cli(&home, &["doctor", "--json"]).stdout).expect("valid json");
+    assert_eq!(json["clean"], serde_json::json!(false));
+    assert_eq!(json["normalization"]["dead_letter"], 1);
+    assert_eq!(
+        json["normalization"]["dead_letters"][0]["memory_id"],
+        "mem-ru"
+    );
+}
+
+#[tokio::test]
+async fn the_detector_limitation_is_printed_on_every_healthy_run() {
+    let (home, layout) = open_layout();
+    initialize_store(&layout).await;
+
+    let text = stdout(&run_cli(&home, &["doctor"]));
+    assert!(
+        text.contains("detects scripts, not languages"),
+        "the declared limitation is permanent, not conditional: {text}",
+    );
+    assert!(text.contains("German, French, Spanish, Polish"), "{text}");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&run_cli(&home, &["doctor", "--json"]).stdout).expect("valid json");
+    assert!(
+        json["normalization"]["detector_limitation"]
+            .as_str()
+            .is_some_and(|s| s.contains("scripts, not languages")),
+    );
+}
+
+#[tokio::test]
+async fn generator_section_reports_a_model_that_is_not_installed() {
+    let (home, layout) = open_layout();
+    initialize_store(&layout).await;
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an uninstalled model is a bootstrap state, not a fault",
+    );
+    let text = stdout(&output);
+    assert!(text.contains("NOT INSTALLED"), "{text}");
+    assert!(text.contains("init --download-models"), "{text}");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&run_cli(&home, &["doctor", "--json"]).stdout).expect("valid json");
+    assert_eq!(json["generator"]["installed"], serde_json::json!(false));
+    assert_eq!(json["generator"]["catalogued"], serde_json::json!(true));
+    assert_eq!(
+        json["generator"]["model_id"],
+        local_rag_generate::DEFAULT_MODEL_ID
+    );
+    assert_eq!(json["clean"], serde_json::json!(true));
+}
+
+/// The whole point of the file-only check: an `.ok` marker with **no weights
+/// whatsoever** reports "installed", which is only possible because nothing
+/// here opens `LlamaBackend` (a process-wide singleton, D-054) or reads a
+/// single byte of GGUF.
+#[tokio::test]
+async fn generator_section_reports_installed_from_the_marker_alone() {
+    let (home, layout) = open_layout();
+    initialize_store(&layout).await;
+    fake_installed_generator(&layout);
+
+    let output = run_cli(&home, &["doctor"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!(
+            "generator: {} installed",
+            local_rag_generate::DEFAULT_MODEL_ID
+        )),
+        "{text}",
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&run_cli(&home, &["doctor", "--json"]).stdout).expect("valid json");
+    assert_eq!(json["generator"]["installed"], serde_json::json!(true));
+}
+
+/// A store `doctor` cannot open yet reports the sections it *can*: whether the
+/// model is on disk is a filesystem fact and does not depend on SQLite.
+#[test]
+fn the_generator_section_answers_even_on_an_uninitialized_store() {
+    let (home, layout) = open_layout();
+    fake_installed_generator(&layout);
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&run_cli(&home, &["doctor", "--json"]).stdout).expect("valid json");
+    assert_eq!(json["generator"]["installed"], serde_json::json!(true));
+    assert!(
+        json["normalization"]["skipped"].is_string(),
+        "the store-backed half honestly says it could not look",
+    );
+    assert_eq!(json["clean"], serde_json::json!(true));
 }

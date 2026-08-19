@@ -43,13 +43,15 @@ use local_rag_projection::{
     BruteForceProjectionStore, DenseCheckOutcome, ModelSwitchError, check_dense,
 };
 use local_rag_store::{
-    CacheDb, CacheDiagnosis, DEFAULT_MODEL_SPACE_ID, FtsAvailability, FtsCheckOutcome,
-    HousekeepingError, SHARD_DESTROY_GRACE_MS, STUCK_RUN_ATTEMPT_THRESHOLD, ShardSweepReport,
-    StateDb, StuckRunRow, ValidationDepth, VersionDiagnosis, WorktreeIndexingStatus,
-    all_worktree_ids, check_fts, current_worktree_path, generation_meta_for_worktree,
-    indexing_status, managed_worktrees, requires_index_unavailable, run_expired_shard_sweep,
-    run_orphan_shard_sweep, run_unreferenced_space_sweep, store_instance_uuid,
-    stuck_consolidation_runs,
+    CURRENT_NORMALIZER_VERSION, CacheDb, CacheDiagnosis, DEFAULT_MODEL_SPACE_ID,
+    DeadLetteredNormalization, FtsAvailability, FtsCheckOutcome, HousekeepingError,
+    NormalizationBacklog, NormalizationCountRow, SHARD_DESTROY_GRACE_MS,
+    STUCK_RUN_ATTEMPT_THRESHOLD, ShardSweepReport, StateDb, StuckRunRow, ValidationDepth,
+    VersionDiagnosis, WorktreeIndexingStatus, all_worktree_ids, check_fts, current_worktree_path,
+    dead_lettered_normalizations, generation_meta_for_worktree, indexing_status, managed_worktrees,
+    normalization_backlog, normalization_counts, requires_index_unavailable,
+    run_expired_shard_sweep, run_orphan_shard_sweep, run_unreferenced_space_sweep,
+    store_instance_uuid, stuck_consolidation_runs,
 };
 
 use local_rag::daemon::{StoreLockFileState, read_store_lock_file};
@@ -77,7 +79,64 @@ pub struct DoctorReport {
     /// D-071: consolidation runs that are being retried without converging,
     /// or that the retry machinery has given up on entirely.
     pub consolidation: ConsolidationFinding,
+    /// T21-08: how much durable memory has been normalized to English, how
+    /// much still lags, and which entries the normalizer gave up on.
+    pub normalization: NormalizationFinding,
+    /// T21-08: whether the local generative model both consolidation and
+    /// normalization need is installed at all — a **file** check, never a load.
+    pub generator: GeneratorFinding,
 }
+
+/// T21-08: the English-normalization section (ADR-0010).
+pub enum NormalizationFinding {
+    Skipped { reason: String },
+    Checked(NormalizationHealth),
+}
+
+pub struct NormalizationHealth {
+    /// `config.memory.normalize_to_english` — whether the worker does anything
+    /// at all. Reported because "nothing is happening" has two very different
+    /// causes, and a user should not have to guess which one they are in.
+    pub enabled: bool,
+    pub counts_by_status: Vec<NormalizationCountRow>,
+    pub backlog: NormalizationBacklog,
+    /// At most [`DEAD_LETTER_LIST_LIMIT`] rows; `backlog.dead_letter` carries
+    /// the true scale.
+    pub dead_letters: Vec<DeadLetteredNormalization>,
+}
+
+/// T21-08: the local generative model's installed state — the one dependency
+/// shared by consolidation (spec 08 §4) and normalization (ADR-0010).
+///
+/// **Purely a filesystem check.** `local_rag_generate::is_installed` reads the
+/// `.ok` marker the installer writes last (spec 10 §5 `[FIXED policy]`), the
+/// same precondition `LlamaGenerator::open` itself applies. Nothing here loads
+/// weights or touches `LlamaBackend`: that handle is a process-wide singleton
+/// (D-054), the daemon running alongside this command may already hold it, and
+/// a diagnostic command has no business competing for it.
+pub struct GeneratorFinding {
+    pub model_id: String,
+    /// The binary knows this model id at all (`local_rag_generate::find`).
+    /// False means a catalog/config mismatch, not a missing download.
+    pub catalogued: bool,
+    pub installed: bool,
+    /// Where the assets are expected, so the message is actionable.
+    pub expected_path: String,
+}
+
+/// How many dead-lettered entries `doctor` lists before deferring to the count
+/// (T21-08). A report is meant to be read; the number above the list carries
+/// the scale.
+const DEAD_LETTER_LIST_LIMIT: usize = 10;
+
+/// The detector's declared limitation, printed on **every** run — healthy or
+/// not (T21-03's own module doc promises this exact surface, alongside
+/// ADR-0010's Consequences section).
+///
+/// It is not a fault and never affects the exit code: it is the answer to "why
+/// is my German note not translated?", which no count in this section can give.
+const DETECTOR_LIMITATION: &str = "detects scripts, not languages: Latin-script non-English text \
+     (German, French, Spanish, Polish, …) counts as English and is never translated";
 
 /// D-071: the consolidation section — `doctor` had none at all, which is why
 /// a run on its 627th attempt could pin the GPU for eight hours while this
@@ -233,6 +292,17 @@ impl DoctorReport {
             &self.consolidation,
             ConsolidationFinding::Checked(list) if list.is_empty()
         );
+        // T21-08, the owner's explicit decision: of everything the two new
+        // sections report, only a **dead-lettered** entry is a fault — work the
+        // normalizer performed and gave up on, the same class as a stuck run
+        // (D-071) and a generation built but never activated (X-008). A
+        // switched-off worker is a choice, and an uninstalled generative model
+        // is a bootstrap state, exactly like "never indexed" above: both are
+        // printed, neither moves the exit code.
+        let normalization_ok = matches!(
+            &self.normalization,
+            NormalizationFinding::Checked(health) if health.backlog.dead_letter == 0
+        );
         lock_ok
             && permissions_ok
             && versions_ok
@@ -242,6 +312,7 @@ impl DoctorReport {
             && spool_ok
             && indexing_ok
             && consolidation_ok
+            && normalization_ok
     }
 }
 
@@ -269,12 +340,12 @@ pub fn run(args: DoctorArgs) -> ExitCode {
     };
     let json = args.json;
 
-    let (layout, _config) = match resolve_layout_and_config() {
+    let (layout, config) = match resolve_layout_and_config() {
         Ok(v) => v,
         Err(e) => return fail(BIN, &e),
     };
 
-    let report = build_report(&layout, worktree_filter);
+    let report = build_report(&layout, worktree_filter, config.memory.normalize_to_english);
     let clean = report.is_clean();
     if json {
         println!(
@@ -296,8 +367,16 @@ pub fn run(args: DoctorArgs) -> ExitCode {
 // Composition — see the module doc for why this exact order is load-bearing
 // ---------------------------------------------------------------------------
 
-fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorReport {
+fn build_report(
+    layout: &StoreLayout,
+    worktree_filter: Option<Uuid>,
+    normalize_to_english: bool,
+) -> DoctorReport {
     let lock = read_store_lock_file(layout);
+    // Built first and unconditionally: whether the model is on disk is a
+    // filesystem fact, independent of whether the store opens at all, and it is
+    // exactly what a user on a fresh install needs to be told.
+    let generator = build_generator(layout);
     let permissions = layout.audit_permissions();
     let versions = StateDb::diagnose_versions(&layout.state_db(), local_rag_store::ALL)
         .map_err(|e| e.to_string());
@@ -322,7 +401,11 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
             indexing: IndexingFinding::Skipped {
                 reason: reason.clone(),
             },
-            consolidation: ConsolidationFinding::Skipped { reason },
+            consolidation: ConsolidationFinding::Skipped {
+                reason: reason.clone(),
+            },
+            normalization: NormalizationFinding::Skipped { reason },
+            generator,
         };
     }
 
@@ -347,7 +430,11 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 indexing: IndexingFinding::Skipped {
                     reason: reason.clone(),
                 },
-                consolidation: ConsolidationFinding::Skipped { reason },
+                consolidation: ConsolidationFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                normalization: NormalizationFinding::Skipped { reason },
+                generator,
             };
         }
     };
@@ -372,7 +459,11 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
                 indexing: IndexingFinding::Skipped {
                     reason: reason.clone(),
                 },
-                consolidation: ConsolidationFinding::Skipped { reason },
+                consolidation: ConsolidationFinding::Skipped {
+                    reason: reason.clone(),
+                },
+                normalization: NormalizationFinding::Skipped { reason },
+                generator,
             };
         }
     };
@@ -388,6 +479,7 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
     let spool = build_spool(&read, layout);
     let indexing = build_indexing(&read, worktree_filter);
     let consolidation = build_consolidation(&read);
+    let normalization = build_normalization(&read, normalize_to_english);
 
     DoctorReport {
         lock,
@@ -399,6 +491,64 @@ fn build_report(layout: &StoreLayout, worktree_filter: Option<Uuid>) -> DoctorRe
         spool,
         indexing,
         consolidation,
+        normalization,
+        generator,
+    }
+}
+
+/// T21-08: the normalization section, from the same read connection every other
+/// section uses. Three store calls, each already carrying its own rule
+/// (`normalization_counts`, `normalization_backlog`, and — only to *name* what
+/// the third number counts — `dead_lettered_normalizations`). A read that fails
+/// degrades this one section to `Skipped`, exactly as its neighbours do.
+fn build_normalization(read: &rusqlite::Connection, enabled: bool) -> NormalizationFinding {
+    let counts_by_status = match normalization_counts(read) {
+        Ok(v) => v,
+        Err(e) => {
+            return NormalizationFinding::Skipped {
+                reason: format!("could not read normalization counts: {e}"),
+            };
+        }
+    };
+    let backlog = match normalization_backlog(read, CURRENT_NORMALIZER_VERSION, system_now_ms()) {
+        Ok(v) => v,
+        Err(e) => {
+            return NormalizationFinding::Skipped {
+                reason: format!("could not read the normalization backlog: {e}"),
+            };
+        }
+    };
+    let dead_letters = if backlog.dead_letter > 0 {
+        match dead_lettered_normalizations(read, CURRENT_NORMALIZER_VERSION, DEAD_LETTER_LIST_LIMIT)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return NormalizationFinding::Skipped {
+                    reason: format!("could not read dead-lettered normalizations: {e}"),
+                };
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    NormalizationFinding::Checked(NormalizationHealth {
+        enabled,
+        counts_by_status,
+        backlog,
+        dead_letters,
+    })
+}
+
+/// T21-08: is the local generative model installed? A `.ok`-marker file check
+/// and nothing more — see [`GeneratorFinding`] for why loading it here would be
+/// wrong rather than merely slow.
+fn build_generator(layout: &StoreLayout) -> GeneratorFinding {
+    let model_id = local_rag_generate::DEFAULT_MODEL_ID;
+    GeneratorFinding {
+        model_id: model_id.to_string(),
+        catalogued: local_rag_generate::find(model_id).is_some(),
+        installed: local_rag_generate::is_installed(layout, model_id),
+        expected_path: layout.model_dir(model_id).display().to_string(),
     }
 }
 
@@ -761,6 +911,33 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         }),
     };
 
+    let normalization = match &report.normalization {
+        NormalizationFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
+        NormalizationFinding::Checked(health) => serde_json::json!({
+            "enabled": health.enabled,
+            "counts_by_status": health.counts_by_status.iter().map(|r| serde_json::json!({
+                "status": r.status.as_str(), "count": r.count,
+            })).collect::<Vec<_>>(),
+            "pending": health.backlog.pending,
+            "dead_letter": health.backlog.dead_letter,
+            "dead_letters": health.dead_letters.iter().map(|r| serde_json::json!({
+                "memory_id": r.memory_id,
+                "attempt_count": r.attempt_count,
+                "last_error": r.last_error,
+                "updated_at": r.updated_at,
+            })).collect::<Vec<_>>(),
+            "normalizer_version": CURRENT_NORMALIZER_VERSION,
+            "detector_limitation": DETECTOR_LIMITATION,
+        }),
+    };
+
+    let generator = serde_json::json!({
+        "model_id": report.generator.model_id,
+        "catalogued": report.generator.catalogued,
+        "installed": report.generator.installed,
+        "expected_path": report.generator.expected_path,
+    });
+
     let indexing = match &report.indexing {
         IndexingFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
         IndexingFinding::Checked(list) => serde_json::Value::Array(
@@ -806,6 +983,8 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         "spool": spool,
         "indexing": indexing,
         "consolidation": consolidation,
+        "normalization": normalization,
+        "generator": generator,
     })
 }
 
@@ -936,6 +1115,81 @@ fn print_human(report: &DoctorReport) {
 
     print_indexing(&report.indexing);
     print_consolidation(&report.consolidation);
+    print_normalization(&report.normalization);
+    print_generator(&report.generator);
+}
+
+/// T21-08's `normalization:` section — how much of durable memory speaks
+/// English, what still lags, and (loudly) what the normalizer gave up on.
+///
+/// The switch's state leads the line, for the same reason "NOT ENROLLED" leads
+/// the indexing line: "nothing is happening" is the most common thing a user
+/// misreads as broken, and the answer is usually that they turned it off.
+fn print_normalization(finding: &NormalizationFinding) {
+    match finding {
+        NormalizationFinding::Skipped { reason } => {
+            println!("normalization: skipped — {reason}")
+        }
+        NormalizationFinding::Checked(health) => {
+            let switch = if health.enabled {
+                "on"
+            } else {
+                "OFF (`normalize_to_english = false` in [memory])"
+            };
+            println!(
+                "normalization: {switch} — {} pending, normalizer v{}",
+                health.backlog.pending, CURRENT_NORMALIZER_VERSION,
+            );
+            for row in &health.counts_by_status {
+                println!("  {}: {}", row.status.as_str(), row.count);
+            }
+            if health.backlog.dead_letter > 0 {
+                println!(
+                    "  DEAD-LETTERED: {} entry(ies) — no tick retries them until the normalizer \
+                     version changes; each keeps using its original text",
+                    health.backlog.dead_letter,
+                );
+                for row in &health.dead_letters {
+                    let reason = row.last_error.as_deref().unwrap_or("(no reason recorded)");
+                    println!(
+                        "    {} after {} attempt(s): {reason}",
+                        row.memory_id, row.attempt_count,
+                    );
+                }
+                if (health.dead_letters.len() as i64) < health.backlog.dead_letter {
+                    println!(
+                        "    … and {} more",
+                        health.backlog.dead_letter - health.dead_letters.len() as i64,
+                    );
+                }
+            }
+            // Always printed, healthy or not: it is the answer to "why is my
+            // German note untranslated?", which no count above can give.
+            println!("  note: {DETECTOR_LIMITATION}");
+        }
+    }
+}
+
+/// T21-08's `generator:` section — the one dependency both consolidation and
+/// normalization need, reported without loading a single byte of it.
+fn print_generator(finding: &GeneratorFinding) {
+    if !finding.catalogued {
+        println!(
+            "generator: {} is not in this binary's catalog — consolidation and normalization \
+             cannot run",
+            finding.model_id,
+        );
+        return;
+    }
+    if finding.installed {
+        println!("generator: {} installed", finding.model_id);
+    } else {
+        println!(
+            "generator: {} NOT INSTALLED (expected {}) — run `local-rag init --download-models`; \
+             until then consolidation and normalization have no provider",
+            finding.model_id, finding.expected_path,
+        );
+    }
 }
 
 /// D-071's `consolidation:` section — the memory pillar's own "is anything

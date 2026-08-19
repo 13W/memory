@@ -344,6 +344,20 @@ pub fn entries_needing_normalization(
     now_ms: i64,
     limit: usize,
 ) -> rusqlite::Result<Vec<PendingNormalization>> {
+    scan_pending(conn, normalizer_version, now_ms, limit)
+}
+
+/// The one implementation of "which entries lag": both
+/// [`entries_needing_normalization`] (the worker's queue) and
+/// [`normalization_backlog`] (the `stats`/`doctor` number) go through it, so
+/// the count a user reads and the work the daemon does can never describe
+/// different sets.
+fn scan_pending(
+    conn: &Connection,
+    normalizer_version: i64,
+    now_ms: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<PendingNormalization>> {
     let sql = format!(
         "SELECT e.memory_id, e.text, COALESCE(n.attempt_count, 0), n.status, \
                 n.source_text_sha256, n.normalizer_version \
@@ -436,6 +450,116 @@ pub fn normalization_counts(conn: &Connection) -> rusqlite::Result<Vec<Normaliza
         })
     })?;
     rows.collect()
+}
+
+/// How much normalization work is outstanding, and how much has been given up
+/// on ([`NormalizationBacklog`]).
+///
+/// `pending` runs the worker's own queue predicate ([`scan_pending`]) with no
+/// limit rather than re-deriving it: a `stats` number that disagreed with what
+/// the daemon actually picks up would be worse than no number. The scan is
+/// bounded by the memory-entry count — the same bound spec 08 §6 already
+/// accepts for recall — and reads each entry's text because the staleness
+/// comparison is a SHA-256 in Rust (SQLite has no `sha256()`, and ADR-0010
+/// rejected a UDF precisely to avoid a second definition of the effective
+/// text).
+///
+/// `dead_letter` is pure SQL: rows the queue will never offer again under this
+/// normalizer — `failed` at the attempt ceiling, at or past the current
+/// version. Changing `CURRENT_NORMALIZER_VERSION` re-queues them, which is
+/// exactly the "a new normalizer is a decision" rule T21-06's dead-letter is
+/// keyed on.
+pub fn normalization_backlog(
+    conn: &Connection,
+    normalizer_version: i64,
+    now_ms: i64,
+) -> rusqlite::Result<NormalizationBacklog> {
+    let pending = scan_pending(conn, normalizer_version, now_ms, usize::MAX)?.len() as i64;
+    let dead_letter: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memory_text_normalization \
+         WHERE status = 'failed' AND attempt_count >= ?1 AND normalizer_version >= ?2",
+        params![MAX_NORMALIZATION_ATTEMPTS, normalizer_version],
+        |r| r.get(0),
+    )?;
+    Ok(NormalizationBacklog {
+        pending,
+        dead_letter,
+    })
+}
+
+/// What [`normalization_backlog`] answers: work outstanding, and work
+/// abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NormalizationBacklog {
+    /// Non-terminal entries the worker's queue would offer right now — never
+    /// normalized, normalized by an older normalizer, edited since, or failed
+    /// and due for another attempt.
+    pub pending: i64,
+    /// `failed` rows at the attempt ceiling under the current normalizer: no
+    /// tick will pick them up again until the normalizer version changes.
+    pub dead_letter: i64,
+}
+
+/// The entries [`normalization_backlog`] counts as `dead_letter`, named — for
+/// `doctor`, which has to answer *why* work stopped, not just how much of it
+/// did (T21-08, the normalization twin of
+/// [`stuck_consolidation_runs`](super::stats::stuck_consolidation_runs)).
+///
+/// `limit` bounds the report, not the count: a store with hundreds of
+/// dead-lettered entries should print a readable list and let the number above
+/// it carry the scale. `last_error` is truncated to
+/// [`STUCK_RUN_REASON_MAX_CHARS`](super::stats::STUCK_RUN_REASON_MAX_CHARS) for
+/// the same reason that constant exists — these rows exist to be printed, and a
+/// model's refusal can be arbitrarily long.
+pub fn dead_lettered_normalizations(
+    conn: &Connection,
+    normalizer_version: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<DeadLetteredNormalization>> {
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, attempt_count, last_error, updated_at \
+         FROM memory_text_normalization \
+         WHERE status = 'failed' AND attempt_count >= ?1 AND normalizer_version >= ?2 \
+         ORDER BY updated_at DESC, memory_id \
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![MAX_NORMALIZATION_ATTEMPTS, normalizer_version, limit as i64],
+        |r| {
+            Ok(DeadLetteredNormalization {
+                memory_id: r.get(0)?,
+                attempt_count: r.get(1)?,
+                last_error: truncate_error(r.get(2)?),
+                updated_at: r.get(3)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
+/// One entry the normalizer has given up on under the current normalizer
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetteredNormalization {
+    pub memory_id: String,
+    pub attempt_count: i64,
+    /// Already truncated — see [`dead_lettered_normalizations`].
+    pub last_error: Option<String>,
+    pub updated_at: i64,
+}
+
+fn truncate_error(reason: Option<String>) -> Option<String> {
+    reason.map(|r| {
+        if r.chars().count() <= super::stats::STUCK_RUN_REASON_MAX_CHARS {
+            return r;
+        }
+        let mut out: String = r
+            .chars()
+            .take(super::stats::STUCK_RUN_REASON_MAX_CHARS)
+            .collect();
+        out.push('…');
+        out
+    })
 }
 
 /// Drop one entry's normalization, returning whether a row was there.
@@ -760,5 +884,130 @@ mod tests {
         assert!(!delete_normalization(&tx, "m-1").unwrap());
         tx.commit().unwrap();
         assert_eq!(normalization_for(&conn, "m-1").unwrap(), None);
+    }
+
+    // ---- T21-08: the numbers `stats`/`doctor` report -----------------------
+
+    #[test]
+    fn the_backlog_counts_exactly_what_the_queue_would_offer() {
+        let mut conn = conn_with_normalization();
+        seed_entry(&conn, "m-fresh", "active", "никогда не переводилась", 1);
+        seed_entry(&conn, "m-done", "active", "already english", 2);
+        seed_entry(&conn, "m-moved", "active", "текст уехал после перевода", 3);
+        seed_entry(&conn, "m-terminal", "retracted", "отозванная запись", 4);
+
+        upsert(
+            &mut conn,
+            &ready("m-done", &sha256_hex(b"already english"), "already english"),
+            100,
+        );
+        // Written against the text as it was, then the entry was edited: the
+        // row is stale and the entry is due again.
+        upsert(
+            &mut conn,
+            &ready(
+                "m-moved",
+                &sha256_hex("текст уехал после перевода".as_bytes()),
+                "the text moved after translation",
+            ),
+            100,
+        );
+        conn.execute(
+            "UPDATE memory_entry SET text = ?2 WHERE memory_id = ?1",
+            params!["m-moved", "текст уже другой"],
+        )
+        .unwrap();
+
+        let backlog = normalization_backlog(&conn, CURRENT_NORMALIZER_VERSION, 200).unwrap();
+        assert_eq!(
+            backlog.pending, 2,
+            "m-fresh and m-moved; the terminal entry is never offered",
+        );
+        assert_eq!(backlog.dead_letter, 0);
+
+        // The count and the queue describe the same set, by construction.
+        let queued =
+            entries_needing_normalization(&conn, CURRENT_NORMALIZER_VERSION, 200, usize::MAX)
+                .unwrap();
+        assert_eq!(queued.len() as i64, backlog.pending);
+    }
+
+    #[test]
+    fn a_row_at_the_attempt_ceiling_is_dead_letter_not_pending() {
+        let mut conn = conn_with_normalization();
+        seed_entry(&conn, "m-1", "active", "текст, который не поддался", 1);
+        let sha = sha256_hex("текст, который не поддался".as_bytes());
+        upsert(
+            &mut conn,
+            &NormalizationWrite {
+                memory_id: "m-1",
+                status: NormalizationStatus::Failed,
+                source_text_sha256: &sha,
+                normalized_text: None,
+                source_language: Some("ru"),
+                normalizer_model_id: Some("gemma-4-e2b-it-gguf-q4-0"),
+                prompt_version: Some(1),
+                normalizer_version: CURRENT_NORMALIZER_VERSION,
+                attempt_count: MAX_NORMALIZATION_ATTEMPTS,
+                last_error: Some("answer was not one {\"en\": …} object"),
+                next_attempt_at: None,
+            },
+            100,
+        );
+
+        let backlog = normalization_backlog(&conn, CURRENT_NORMALIZER_VERSION, 200).unwrap();
+        assert_eq!(backlog.dead_letter, 1);
+        assert_eq!(
+            backlog.pending, 0,
+            "nothing will pick it up again under this normalizer",
+        );
+
+        // A new normalizer is a decision, and it re-queues the row.
+        let next = normalization_backlog(&conn, CURRENT_NORMALIZER_VERSION + 1, 200).unwrap();
+        assert_eq!(next.pending, 1);
+        assert_eq!(
+            next.dead_letter, 0,
+            "the ceiling is per normalizer version, not forever",
+        );
+    }
+
+    #[test]
+    fn a_failed_row_still_within_its_backoff_is_neither_pending_nor_dead_letter() {
+        let mut conn = conn_with_normalization();
+        seed_entry(&conn, "m-1", "active", "текст на повторную попытку", 1);
+        let sha = sha256_hex("текст на повторную попытку".as_bytes());
+        upsert(
+            &mut conn,
+            &NormalizationWrite {
+                memory_id: "m-1",
+                status: NormalizationStatus::Failed,
+                source_text_sha256: &sha,
+                normalized_text: None,
+                source_language: Some("ru"),
+                normalizer_model_id: Some("gemma-4-e2b-it-gguf-q4-0"),
+                prompt_version: Some(1),
+                normalizer_version: CURRENT_NORMALIZER_VERSION,
+                attempt_count: 1,
+                last_error: Some("model busy"),
+                next_attempt_at: Some(5_000),
+            },
+            100,
+        );
+
+        let waiting = normalization_backlog(&conn, CURRENT_NORMALIZER_VERSION, 1_000).unwrap();
+        assert_eq!(waiting.pending, 0, "the backoff gate has not opened yet");
+        assert_eq!(waiting.dead_letter, 0, "one attempt is not a dead letter");
+
+        let due = normalization_backlog(&conn, CURRENT_NORMALIZER_VERSION, 5_000).unwrap();
+        assert_eq!(due.pending, 1, "at the deadline it is due again");
+    }
+
+    #[test]
+    fn an_empty_store_reports_zero_of_both() {
+        let conn = conn_with_normalization();
+        assert_eq!(
+            normalization_backlog(&conn, CURRENT_NORMALIZER_VERSION, 1_000).unwrap(),
+            NormalizationBacklog::default(),
+        );
     }
 }

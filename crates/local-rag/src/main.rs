@@ -153,9 +153,16 @@ async fn serve() -> ExitCode {
         consolidation_idle_checkpoint_hours: config.memory.consolidation_idle_checkpoint_hours,
         consolidation_poll_interval: CONSOLIDATION_POLL_INTERVAL,
         normalization_poll_interval: NORMALIZATION_POLL_INTERVAL,
-        // T21-06 ships the worker off; T21-08 wires
-        // `MemoryConfig.normalize_to_english` here.
-        normalization: local_rag::daemon::normalization::NormalizationParams::default(),
+        // T21-08: the worker's switch and its inference bound, straight from
+        // `[memory]`. A negative `normalization_batch` is read as zero rather
+        // than rejected — the config layer validates no other numeric field
+        // either, and "detect but translate nothing" is a coherent state, not
+        // a reason to refuse to start a daemon.
+        normalization: local_rag::daemon::normalization::NormalizationParams {
+            enabled: config.memory.normalize_to_english,
+            translate_batch: config.memory.normalization_batch.max(0) as usize,
+            ..local_rag::daemon::normalization::NormalizationParams::default()
+        },
         retention: local_rag_store::RetentionParams::from_storage_config(&config.storage),
         classifier: local_rag_index::classify::ClassifierConfig::from_index_config(&config.index),
         indexing_backstop_poll_interval: INDEXING_BACKSTOP_POLL_INTERVAL,

@@ -13,12 +13,13 @@ use serde_json::{Map, Value};
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_protocol::ErrorEnvelope;
 use local_rag_store::{
-    CandidateState, MemoryEntryRow, MemoryKind, MemoryState, ProposedOperation, RequestRoot,
-    Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, ScopeKind, consolidation_run_counts, list_candidates,
-    list_memory_entries_for_scope, memory_entry_counts, memory_evidence_for,
-    observation_envelope_count, observations_applied_since, oldest_open_run_created_at,
-    pending_candidate_counts, projection_state, resolve, store_instance_uuid,
-    stuck_consolidation_runs, total_pending_backlog,
+    CURRENT_NORMALIZER_VERSION, CandidateState, MemoryEntryRow, MemoryKind, MemoryState,
+    ProposedOperation, RequestRoot, Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, ScopeKind,
+    consolidation_run_counts, list_candidates, list_memory_entries_for_scope, memory_entry_counts,
+    memory_evidence_for, normalization_backlog, normalization_counts, observation_envelope_count,
+    observations_applied_since, oldest_open_run_created_at, pending_candidate_counts,
+    projection_state, resolve, store_instance_uuid, stuck_consolidation_runs,
+    total_pending_backlog,
 };
 
 use crate::daemon::memory::MemoryContext;
@@ -478,6 +479,39 @@ impl From<local_rag_store::CandidateCountRow> for CandidateCountWire {
 struct MemoryStatsWire {
     entries_by_kind_state: Vec<MemoryCountWire>,
     pending_candidates_by_state: Vec<CandidateCountWire>,
+    /// T21-08: the English-normalization axis (ADR-0010).
+    normalization: NormalizationStatsWire,
+}
+
+/// T21-08: one `(status, count)` bucket of `memory_text_normalization`.
+#[derive(Debug, Serialize)]
+struct NormalizationCountWire {
+    status: String,
+    count: i64,
+}
+
+impl From<local_rag_store::NormalizationCountRow> for NormalizationCountWire {
+    fn from(r: local_rag_store::NormalizationCountRow) -> Self {
+        NormalizationCountWire {
+            status: r.status.as_str().to_string(),
+            count: r.count,
+        }
+    }
+}
+
+/// T21-08: what has been normalized, what still lags, and what the worker has
+/// given up on — store state only. Whether the worker is switched on, and why
+/// it might be stopped, is `local-rag doctor`'s section, not this one.
+///
+/// The CLI's own `stats` renders the identical shape from the identical two
+/// store reads (`normalization_counts` + `normalization_backlog`); a test
+/// compares the two blocks on one store.
+#[derive(Debug, Serialize)]
+struct NormalizationStatsWire {
+    counts_by_status: Vec<NormalizationCountWire>,
+    pending: i64,
+    dead_letter: i64,
+    normalizer_version: i64,
 }
 
 /// D-049: `consolidation_run` count-by-state bucket, the run twin of
@@ -653,6 +687,16 @@ pub async fn stats(
         Ok(v) => v,
         Err(e) => return Ok(infra_err(e)),
     };
+    // T21-08: the same two reads `cli::stats` makes, in the same order.
+    let normalization_by_status = match normalization_counts(&state_read) {
+        Ok(v) => v,
+        Err(e) => return Ok(infra_err(e)),
+    };
+    let normalization =
+        match normalization_backlog(&state_read, CURRENT_NORMALIZER_VERSION, system_now_ms()) {
+            Ok(v) => v,
+            Err(e) => return Ok(infra_err(e)),
+        };
 
     // D-049: the observations pillar (`01-overview.md` §5-9) and the
     // consolidation backlog/progress -- store-wide, same as the memory
@@ -751,6 +795,15 @@ pub async fn stats(
                 .into_iter()
                 .map(CandidateCountWire::from)
                 .collect(),
+            normalization: NormalizationStatsWire {
+                counts_by_status: normalization_by_status
+                    .into_iter()
+                    .map(NormalizationCountWire::from)
+                    .collect(),
+                pending: normalization.pending,
+                dead_letter: normalization.dead_letter,
+                normalizer_version: CURRENT_NORMALIZER_VERSION,
+            },
         },
         observations: ObservationStatsWire {
             total: observations_total,
