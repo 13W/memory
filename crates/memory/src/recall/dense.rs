@@ -35,12 +35,11 @@
 
 use std::collections::BTreeMap;
 
-use local_rag_core::identity::domain::subject_memory_entry;
 use local_rag_projection::contract::{DistanceMetric, similarity};
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
     RecallCandidate, RepresentationKey, SubjectKind, decode_vector_le, embeddings_for_subjects,
-    verify_cached_embedding,
+    memory_entry_subject_hash, verify_cached_embedding,
 };
 
 /// Why the dense leg produced no hits at all — a degradation, never an error
@@ -204,7 +203,9 @@ pub fn dense_leg(
 
     let hashes: Vec<String> = candidates
         .iter()
-        .map(|c| subject_memory_entry(&c.memory_id, &c.text))
+        // T21-02: the dense leg looks up exactly what the backfill wrote —
+        // one hasher, one definition of the effective text.
+        .map(|c| memory_entry_subject_hash(&c.embed_text))
         .collect();
     let keys: Vec<&str> = hashes.iter().map(String::as_str).collect();
     let cached = embeddings_for_subjects(
@@ -253,6 +254,9 @@ mod tests {
             kind: local_rag_store::MemoryKind::Fact,
             state: local_rag_store::MemoryState::Active,
             text: text.to_string(),
+            // T21-02: no normalization row, so the effective text is the
+            // entry's own — the only way to build one is to ask `decide`.
+            embed_text: local_rag_store::decide_effective_text(memory_id, text, None),
             confidence: 0.5,
             created_at: 1000,
         }
@@ -408,7 +412,13 @@ mod tests {
             .map(|i| {
                 let memory_id = format!("mem-{i:02}");
                 let text = format!("text {i:02}");
-                (subject_memory_entry(&memory_id, &text), memory_id, text)
+                (
+                    memory_entry_subject_hash(&local_rag_store::decide_effective_text(
+                        &memory_id, &text, None,
+                    )),
+                    memory_id,
+                    text,
+                )
             })
             .collect();
         pairs.sort();
@@ -526,7 +536,9 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_without_a_cached_row_is_simply_absent() {
         let (_home, cache) = open_cache();
-        let hash = subject_memory_entry("mem-1", "text one");
+        let hash = memory_entry_subject_hash(&local_rag_store::decide_effective_text(
+            "mem-1", "text one", None,
+        ));
         seed_rows(&cache, "repr-1", vec![(hash, vec![1.0, 0.0, 0.0])]).await;
 
         let read = cache.open_read().expect("read");
@@ -553,7 +565,13 @@ mod tests {
     async fn a_corrupt_cached_row_drops_only_its_own_candidate() {
         let (_home, cache) = open_cache();
         let hashes: Vec<String> = (1..=3)
-            .map(|i| subject_memory_entry(&format!("mem-{i}"), &format!("text {i}")))
+            .map(|i| {
+                memory_entry_subject_hash(&local_rag_store::decide_effective_text(
+                    &format!("mem-{i}"),
+                    &format!("text {i}"),
+                    None,
+                ))
+            })
             .collect();
         let rows: Vec<(String, Vec<f32>)> = hashes
             .iter()

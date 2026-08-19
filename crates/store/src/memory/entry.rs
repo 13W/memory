@@ -16,6 +16,9 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, Error, OptionalExtension, Transaction, params};
 
 use super::GLOBAL_SCOPE_OWNER_ID;
+use super::effective_text::{
+    EffectiveText, NORMALIZATION_COLUMNS, NORMALIZATION_JOIN, effective_text_from_row,
+};
 
 /// `memory_entry.kind` (spec 03 §2.5 CHECK domain) — origin, immutable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,7 +547,16 @@ pub struct RecallCandidate {
     pub memory_id: String,
     pub kind: MemoryKind,
     pub state: MemoryState,
+    /// The entry's own text, exactly as stored — what recall renders, what the
+    /// lexical leg scores, and what the token budget is spent on. Never a
+    /// translation: 08 §3 `[FIXED]` keeps this canonical, and ADR-0010 keeps
+    /// BM25 raw-against-raw so a partly-normalized store cannot bias the
+    /// lexical leg by the mere fact of having been translated.
     pub text: String,
+    /// What the **dense** leg embeds and hashes (T21-02) — the English variant
+    /// when one is usable, otherwise `text` itself. Obtained in the same
+    /// statement as `text`, so the two can never straddle a commit.
+    pub embed_text: EffectiveText,
     pub confidence: f64,
     pub created_at: i64,
 }
@@ -566,11 +578,17 @@ fn read_recall_candidate_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecallCa
             format!("invalid memory_entry.state {raw_state:?}").into(),
         )
     })?;
+    let memory_id: String = r.get(0)?;
+    let text: String = r.get(3)?;
+    // Columns 6..8 are `NORMALIZATION_COLUMNS`, read in the same statement as
+    // the text above — see `super::effective_text`'s "one statement" section.
+    let embed_text = effective_text_from_row(r, &memory_id, &text, 6)?;
     Ok(RecallCandidate {
-        memory_id: r.get(0)?,
+        memory_id,
         kind,
         state,
-        text: r.get(3)?,
+        text,
+        embed_text,
         confidence: r.get(4)?,
         created_at: r.get(5)?,
     })
@@ -589,12 +607,15 @@ pub fn recall_candidates_for_scope(
     scope_kind: ScopeKind,
     scope_owner_id: &str,
 ) -> rusqlite::Result<Vec<RecallCandidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT memory_id, kind, state, text, confidence, created_at FROM memory_entry \
-         WHERE scope_kind = ?1 AND scope_owner_id = ?2 \
-           AND state NOT IN ('resolved', 'retracted', 'rejected', 'superseded') \
-         ORDER BY memory_id",
-    )?;
+    let sql = format!(
+        "SELECT e.memory_id, e.kind, e.state, e.text, e.confidence, e.created_at, \
+                {NORMALIZATION_COLUMNS} \
+         FROM memory_entry e{NORMALIZATION_JOIN}\
+         WHERE e.scope_kind = ?1 AND e.scope_owner_id = ?2 \
+           AND e.state NOT IN ('resolved', 'retracted', 'rejected', 'superseded') \
+         ORDER BY e.memory_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(
             params![scope_kind.as_str(), scope_owner_id],
@@ -619,25 +640,40 @@ pub fn recall_candidate_by_id(
     conn: &Connection,
     memory_id: &str,
 ) -> rusqlite::Result<Option<RecallCandidate>> {
-    conn.query_row(
-        "SELECT memory_id, kind, state, text, confidence, created_at FROM memory_entry \
-         WHERE memory_id = ?1",
-        params![memory_id],
-        read_recall_candidate_row,
-    )
-    .optional()
+    let sql = format!(
+        "SELECT e.memory_id, e.kind, e.state, e.text, e.confidence, e.created_at, \
+                {NORMALIZATION_COLUMNS} \
+         FROM memory_entry e{NORMALIZATION_JOIN}\
+         WHERE e.memory_id = ?1"
+    );
+    conn.query_row(&sql, params![memory_id], read_recall_candidate_row)
+        .optional()
 }
 
-/// Every `memory_entry` row's `(memory_id, text)`, regardless of scope or
-/// state — the raw material [`crate::subjects::memory_entry_subject_keys`]
-/// hashes into subject keys and the backfill worker
-/// (`local_rag_embed::backfill`) resolves a pending subject's text from, the
-/// same "one crate owns the SQL" discipline every other cross-crate memory
+/// Every `memory_entry` row's effective text, regardless of scope or state —
+/// the raw material [`crate::subjects::memory_entry_subject_keys`] hashes into
+/// subject keys and the backfill worker (`local_rag_embed::backfill`) embeds,
+/// the same "one crate owns the SQL" discipline every other cross-crate memory
 /// reader here follows.
-pub fn all_memory_entries_with_text(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare("SELECT memory_id, text FROM memory_entry")?;
-    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect()
+///
+/// T21-02: this is the effective text, not `memory_entry.text` — the two
+/// differ exactly when a usable English variant exists, and the whole point of
+/// [`EffectiveText`] is that both of those readers and recall's dense leg
+/// cannot disagree about which one it is.
+pub fn all_memory_entries_with_effective_text(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<EffectiveText>> {
+    let sql = format!(
+        "SELECT e.memory_id, e.text, {NORMALIZATION_COLUMNS} \
+         FROM memory_entry e{NORMALIZATION_JOIN}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| {
+        let memory_id: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        effective_text_from_row(r, &memory_id, &text, 2)
+    })?;
+    rows.collect()
 }
 
 /// Which `memory_id`, if any, already owns `canonical_key` in `(scope_kind,
