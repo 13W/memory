@@ -69,7 +69,7 @@ pub mod policy;
 
 pub use backfill::{
     BackfillError, BackfillParams, BackfillReport, DEFAULT_EMBED_BATCH, DEFAULT_WRITE_BATCH_ROWS,
-    InFlight, promote_if_covered, run_backfill,
+    InFlight, promote_if_covered, run_backfill, run_memory_backfill,
 };
 pub use contract::{
     EmbedError, EmbedRequest, Embedder, FinishReason, GenError, GenMessage, GenRequest,
