@@ -152,6 +152,10 @@ async fn serve() -> ExitCode {
         consolidation_queue_threshold: config.memory.consolidation_queue_threshold,
         consolidation_idle_checkpoint_hours: config.memory.consolidation_idle_checkpoint_hours,
         consolidation_poll_interval: CONSOLIDATION_POLL_INTERVAL,
+        normalization_poll_interval: NORMALIZATION_POLL_INTERVAL,
+        // T21-06 ships the worker off; T21-08 wires
+        // `MemoryConfig.normalize_to_english` here.
+        normalization: local_rag::daemon::normalization::NormalizationParams::default(),
         retention: local_rag_store::RetentionParams::from_storage_config(&config.storage),
         classifier: local_rag_index::classify::ClassifierConfig::from_index_config(&config.index),
         indexing_backstop_poll_interval: INDEXING_BACKSTOP_POLL_INTERVAL,
@@ -174,6 +178,12 @@ const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// `[SPEC]` number exists for it — the same bucket `IDLE_POLL_INTERVAL`
 /// above occupies.
 const CONSOLIDATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How often the durable-memory normalization worker ticks (T21-06).
+/// Slower than consolidation on purpose: nothing waits on a translation,
+/// each one costs real GPU, and the queue is a backlog to drain rather than
+/// an event to react to.
+const NORMALIZATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often the indexing supervisor's (T20-06) backstop poll re-reads
 /// `managed_worktree` — the same "notify is a hint, table is truth" backstop
 /// cadence bucket, ~60s per the group card.
