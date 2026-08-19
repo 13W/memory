@@ -26,7 +26,9 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
 use local_rag_index::classify::ClassifierConfig;
 use local_rag_store::{
-    LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, RetentionParams, WorktreeLockRegistry,
+    FailureKind, LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, NewConsolidationRun, RetentionParams,
+    RunState, StateDb, WorktreeLockRegistry, create_consolidation_run, record_run_failure,
+    transition_run,
 };
 use local_rag_test_support::TempHome;
 
@@ -198,4 +200,95 @@ async fn shutdown_completes_within_a_bounded_timeout_with_the_worker_alive() {
     tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
         .await
         .expect("shutdown must complete within the bound even with the D-024 worker alive");
+}
+
+// ---------------------------------------------------------------------------
+// D-073: one owner of the stale-run sweep, so one attempt per start
+// ---------------------------------------------------------------------------
+
+/// Read one run's `attempt_count` straight from the store.
+fn attempt_count(layout: &StoreLayout, run_id: &str) -> i64 {
+    let conn = rusqlite::Connection::open_with_flags(
+        layout.state_db(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open state.sqlite read-only");
+    conn.query_row(
+        "SELECT attempt_count FROM consolidation_run WHERE run_id = ?1",
+        [run_id],
+        |r| r.get(0),
+    )
+    .expect("read attempt_count")
+}
+
+/// D-073: a parked run must get **one** attempt per daemon start, not two.
+///
+/// The fixture is a `failed` run whose last failure was `Mechanical` under a
+/// *foreign* build fingerprint — D-050's "a rebuild earns it exactly one more
+/// attempt" shape, which `stale_runs` therefore hands out exactly once. With
+/// a poll interval far longer than the test's own bound, the only sweep that
+/// can run is the startup one, so the attempt count after startup measures
+/// precisely how many drivers performed it: before this fix the one-shot
+/// `lifecycle::spawn_consolidation_resume` and the trigger's own immediate
+/// first tick both did, and the count moved by two.
+#[tokio::test]
+async fn a_parked_run_gets_exactly_one_attempt_per_daemon_start() {
+    let (_home, layout) = open_layout();
+    {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        db.writer()
+            .transaction(|tx| {
+                create_consolidation_run(
+                    tx,
+                    &NewConsolidationRun {
+                        run_id: "run-parked",
+                        session_id: "sess-parked",
+                        from_received_seq: 1,
+                        to_received_seq: 3,
+                        router_version: "v1",
+                    },
+                    1_000,
+                )?;
+                transition_run(tx, "run-parked", RunState::Running, 1_000)?
+                    .expect("pending -> running");
+                record_run_failure(
+                    tx,
+                    "run-parked",
+                    FailureKind::Mechanical,
+                    "seeded: dead-lettered under an older build",
+                    false,
+                    Some("some-older-build"),
+                    1_000,
+                )?
+                .expect("running -> failed");
+                Ok(())
+            })
+            .await
+            .expect("seed parked run");
+    }
+    assert_eq!(attempt_count(&layout, "run-parked"), 1, "fixture");
+
+    // Long enough that the trigger's *second* tick cannot land inside this
+    // test: whatever the count reaches here was produced by startup alone.
+    let mut opts = start_options(layout.clone());
+    opts.consolidation_poll_interval = Duration::from_secs(30);
+    let handle = DaemonHandle::start(opts).await.expect("start");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while attempt_count(&layout, "run-parked") == 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the startup sweep must retry the parked run within the bound");
+
+    // Give a second sweep every chance to appear before asserting it did not.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        attempt_count(&layout, "run-parked"),
+        2,
+        "exactly one retry per start — two means two drivers swept the same rows"
+    );
+
+    handle.shutdown().await;
 }
