@@ -3,12 +3,31 @@
 //!
 //! `stale_runs`/`retry_run`/`run_once` (`local_rag_store::memory`, T14-06)
 //! are the ready-made primitives; this module is the daemon-side driver that
-//! walks every stale run at startup. Continuous consolidation triggering
-//! (checkpoint on `Stop`, queue-size threshold, best-effort `SessionEnd`) is
-//! explicitly **not** this module's job — T14-06's own as-built note names
-//! **T15-06** as the owner of that daemon-level trigger; this module's own
-//! card text is the narrower "crashed runs with expired leases" — a
-//! **startup catch-up pass**, not a scheduler.
+//! walks every stale run. Continuous consolidation triggering (checkpoint on
+//! `Stop`, queue-size threshold, best-effort `SessionEnd`) is explicitly
+//! **not** this module's job — T14-06's own as-built note names **T15-06**
+//! as the owner of that daemon-level trigger; this module's own card text is
+//! the narrower "crashed runs with expired leases".
+//!
+//! # Exactly one caller (D-073)
+//!
+//! [`resume_stale_consolidation_runs`] is driven **only** from
+//! `daemon::consolidation_trigger::consolidation_trigger_tick`, whose
+//! `tokio::time::interval` fires its first tick immediately — so spec 02
+//! §4.1 step 5's startup catch-up still happens at startup, it is simply the
+//! trigger's first tick rather than a second spawned pass.
+//!
+//! It used to have two callers: this one and a one-shot
+//! `lifecycle::spawn_consolidation_resume`, both `tokio::spawn`ed at startup.
+//! They read [`stale_runs`] in the same instant — before either had written
+//! its failures back — so both retried the identical set, and every parked
+//! run burned **two** attempts (and two local-model calls) per daemon start
+//! against D-050's documented "a rebuild earns it exactly one more attempt".
+//! Measured on a live store: all nine dead-lettered runs gained exactly two
+//! attempts across two consecutive restarts, with each `run_id` appearing
+//! twice in one microsecond of `logs/daemon.<date>.log`. The lease is no
+//! defence here — it serialises the two attempts, it does not prevent the
+//! second.
 
 use std::future::Future;
 use std::sync::Arc;

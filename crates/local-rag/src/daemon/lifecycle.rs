@@ -34,9 +34,7 @@ use super::mode::DaemonMode;
 #[cfg(unix)]
 use super::probe::SocketLivenessProbe;
 use super::query_embedder::{code_query_embedder, memory_query_embedder};
-use super::resume::{
-    build_best_effort_pool, log_resume_sweep, resume_spool_import, resume_stale_consolidation_runs,
-};
+use super::resume::{build_best_effort_pool, resume_spool_import};
 use super::search::build_search_engine;
 use super::session::SessionRegistry;
 #[cfg(unix)]
@@ -489,18 +487,32 @@ impl DaemonHandle {
         // Step 5: resume passes — startup catch-up only (see `daemon::resume`'s
         // own scope note), spawned non-blocking relative to readiness.
         //
-        // D-054: built exactly once, here, and shared (via `Arc`) between
-        // `spawn_consolidation_resume` and `spawn_consolidation_trigger`
-        // below — each used to call `build_best_effort_pool` independently,
-        // and since both are `tokio::spawn`ed concurrently, whichever one's
+        // D-054: built exactly once, here, and shared (via `Arc`) with
+        // `spawn_consolidation_trigger` below — the consolidation-resume
+        // pass used to call `build_best_effort_pool` independently, and
+        // since both were `tokio::spawn`ed concurrently, whichever one's
         // `LlamaBackend::init()` lost that race failed with
         // `BackendAlreadyInitialized` (llama.cpp's backend handle is a
         // process-wide singleton, not reentrant) and silently fell back to
         // an empty pool for the rest of the daemon's uptime — no amount of
         // waiting or retrying recovered it, only a restart, and even then
-        // only a coin flip on which task won. `.map` keeps this gated behind
-        // `state_db.is_some()`, matching both spawns' own existing guard —
-        // no model load in `MigrationOnly` mode, where neither spawn runs.
+        // only a coin flip on which task won. That second spawn is gone
+        // (D-073, below), but the single shared pool stays: it is also what
+        // keeps `MigrationOnly` from loading a model at all, matching the
+        // `state_db.is_some()` guard every spawn here already carries.
+        //
+        // D-073: there is deliberately **no** separate startup
+        // consolidation-resume spawn any more. `run_consolidation_trigger`'s
+        // `tokio::time::interval` fires its first tick immediately, and that
+        // tick's first action is the very same
+        // `resume_stale_consolidation_runs` sweep — so spec 02 §4.1 step 5's
+        // startup catch-up still happens at startup, with one owner instead
+        // of two. Two owners meant two sweeps reading `stale_runs` in the
+        // same instant, before either had written a failure, so every parked
+        // run was retried **twice** per daemon start — measured on the
+        // owner's live store, where all nine dead-letters gained exactly two
+        // attempts per restart against D-050's documented "exactly one more
+        // attempt".
         let pool = state_db
             .as_ref()
             .map(|_| Arc::new(build_best_effort_pool(&layout)));
@@ -514,17 +526,6 @@ impl DaemonHandle {
                 jobs.clone(),
                 now_ms,
                 payload_ttl_hours,
-            )));
-            tracing::info!(job = "consolidation_resume", "background job spawned");
-            resume_handles.push(tokio::spawn(spawn_consolidation_resume(
-                Arc::clone(db),
-                Arc::clone(pool.as_ref().expect("state_db present implies pool built")),
-                jobs.clone(),
-                consolidation_lease_ms,
-                consolidation_renew_interval_ms,
-                now_ms,
-                data_policy,
-                Arc::clone(&uuids),
             )));
             // D-066: planned maintenance, not crash recovery — but it rides in
             // `resume_handles` for the same reason those two do: spawned so it
@@ -722,44 +723,11 @@ async fn spawn_spool_resume(
     }
 }
 
-/// D-046/D-047: report this stale-run resume sweep's outcome via `tracing` —
-/// [`log_resume_sweep`] (shared with `consolidation_trigger.rs`'s own
-/// per-tick stale-run-recovery call, D-047's own reason for existing: before
-/// it, that second call site kept discarding this exact sweep's result on
-/// every tick, not just here at startup).
-#[allow(clippy::too_many_arguments)]
-async fn spawn_consolidation_resume(
-    db: Arc<StateDb>,
-    pool: Arc<GeneratorPool>,
-    jobs: JobRegistry,
-    lease_ms: i64,
-    renew_interval_ms: i64,
-    now_ms: i64,
-    data_policy: DataPolicy,
-    uuids: Arc<dyn UuidSource + Send + Sync>,
-) {
-    let generate =
-        |window| local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window);
-    log_resume_sweep(
-        resume_stale_consolidation_runs(
-            &db,
-            &jobs,
-            lease_ms,
-            renew_interval_ms,
-            now_ms,
-            local_rag_core::BUILD_ID,
-            generate,
-        )
-        .await,
-    );
-}
-
 /// D-024: the continuous consolidation-trigger worker (spec 07 §6).
 ///
-/// Unlike [`spawn_consolidation_resume`]'s `generate` above — which borrows
-/// `db`/`pool`/`uuids` from this function's own stack frame and is used
-/// entirely within it — this worker is `tokio::spawn`ed independently and so
-/// needs a `'static` `generate`. A `move` closure that captured `db`/`pool`/
+/// This worker is `tokio::spawn`ed independently and so needs a `'static`
+/// `generate` (unlike a plain in-frame call, which could borrow
+/// `db`/`pool`/`uuids` from its own stack). A `move` closure that captured `db`/`pool`/
 /// `uuids` directly would make each call's returned future borrow from the
 /// closure's own fields, which `Fn`'s signature cannot allow to escape
 /// (`Fut` is one fixed associated type, not tied to a per-call borrow).

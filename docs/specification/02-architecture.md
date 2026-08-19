@@ -307,6 +307,21 @@ routing.
 5. Resume: pending spool import (07 §6), crashed consolidation runs with expired leases (08 §4),
    interrupted projection switches are *not* resumed — they are detected lazily at shard open (05).
 
+As-built note (D-073, `[SPEC]`): step 5's "crashed consolidation runs with expired leases" has
+exactly **one** driver, and it is the continuous consolidation trigger's own first tick
+(`daemon::consolidation_trigger::run_consolidation_trigger`, whose `tokio::time::interval` fires
+immediately, and whose every tick begins with `resume_stale_consolidation_runs`). The startup
+catch-up still happens at startup; it is simply not a second spawned pass.
+
+It used to be two — that one-shot spawn plus the trigger's tick — and both were `tokio::spawn`ed
+together, so both read `stale_runs` in the same instant, before either had written its failures
+back, and both retried the identical set. Every parked run therefore burned **two** attempts, and
+two local-model calls, per daemon start, contradicting 08 §4's own D-050 note ("a rebuild earns it
+exactly one more attempt, never an unlimited budget"). Measured on a live store: all nine
+dead-lettered runs gained exactly two attempts across each of two consecutive restarts, with every
+`run_id` appearing twice inside one microsecond of `logs/daemon.<date>.log`. The lease does not
+defend against this — it serialises the two attempts rather than preventing the second.
+
 As-built note (T15-01, `[SPEC]`): step 1's recovery algorithm, `local_rag::daemon::lock::acquire`,
 has two independent branches, not one — the wording "on failure... retry once" describes only the
 second:
