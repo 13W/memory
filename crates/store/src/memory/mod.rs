@@ -91,6 +91,7 @@ mod candidate;
 mod consolidation;
 mod entry;
 mod evidence;
+mod normalization;
 mod op;
 mod review;
 mod runner;
@@ -125,6 +126,13 @@ pub use entry::{
     transition_memory_entry,
 };
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};
+pub(crate) use normalization::SCHEMA_V14;
+pub use normalization::{
+    CURRENT_NORMALIZER_VERSION, MAX_NORMALIZATION_ATTEMPTS, NormalizationCountRow,
+    NormalizationRow, NormalizationStatus, NormalizationWrite, PendingNormalization, UpsertOutcome,
+    delete_normalization, entries_needing_normalization, normalization_counts, normalization_for,
+    upsert_normalization,
+};
 pub use op::{
     CreateMemoryOp, EditMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome, MemoryOpResult,
     MergeLoser, MergeMemoryOp, ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp,

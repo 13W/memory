@@ -183,7 +183,14 @@ impl Migration {
 /// the durable outcome of background indexing — deliberately its own table
 /// rather than columns on `managed_worktree`, which stays the pure
 /// subscription axis T20-01 designed it to be
-/// (`registry::SCHEMA_V13`). Each checksum is frozen once shipped (see
+/// (`registry::SCHEMA_V13`); version 14 (T21-01, ADR-0010) is
+/// `memory_text_normalization`, the English-normalization axis of durable
+/// memory — one optional row per `memory_entry` holding the variant the
+/// embedder is fed, kept apart from `memory_entry` because spec 08 §3
+/// `[FIXED]` forbids rewriting a memory's own text and because `SCHEMA_V9` is
+/// frozen; inert on upgrade, since an empty table means every effective text
+/// is still the original (`memory::SCHEMA_V14`). Each checksum is frozen once
+/// shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
 pub const ALL: &[Migration] = &[
@@ -212,6 +219,7 @@ pub const ALL: &[Migration] = &[
         crate::memory::SCHEMA_V12,
     ),
     Migration::sql(13, "worktree_indexing_status", crate::registry::SCHEMA_V13),
+    Migration::sql(14, "memory_text_normalization", crate::memory::SCHEMA_V14),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.
