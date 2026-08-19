@@ -2365,3 +2365,94 @@ async fn stuck_consolidation_runs_truncates_a_long_failure_reason() {
     );
     assert!(reported.ends_with('…'), "{reported}");
 }
+
+/// D-072, found in live verification: the shrink carve-out must not depend on
+/// whether some *other* run of the same session happens to be executing right
+/// now. Keyed off the session's latest non-`applied` run, a concurrently
+/// `running` neighbour pushed the real dead-letter out of "latest" and back
+/// into the report — `doctor` and `stats`, minutes apart on an unchanged
+/// store, disagreed on how many runs were stuck.
+///
+/// The fixture is the live shape of session `4b92bfd5`: an old, permanently
+/// dead window, the newest failed one that shrink-and-retry will still halve,
+/// and a fresh run in flight.
+#[tokio::test]
+async fn stuck_consolidation_runs_does_not_flicker_while_another_run_is_in_flight() {
+    let (_home, db) = open_state();
+    seed_window_envelopes(&db, "sess-1", 1, 30).await;
+    // Older overflow dead-letter: nothing will ever act on it again.
+    seed_failed_run(
+        &db,
+        "run-abandoned",
+        "sess-1",
+        1,
+        10,
+        FailureKind::Mechanical,
+        true,
+        "build-1",
+        "deterministic context overflow for this window, retrying will not help",
+        1,
+        1_000,
+    )
+    .await;
+    // Newest failed run of the session: shrink-and-retry still has room.
+    seed_failed_run(
+        &db,
+        "run-shrinkable",
+        "sess-1",
+        11,
+        20,
+        FailureKind::Mechanical,
+        true,
+        "build-1",
+        "deterministic context overflow for this window, retrying will not help",
+        1,
+        2_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let quiet: Vec<String> =
+        stuck_consolidation_runs(&read, "build-1", STUCK_RUN_ATTEMPT_THRESHOLD)
+            .expect("stuck")
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+    assert_eq!(
+        quiet,
+        vec!["run-abandoned".to_string()],
+        "only the run nothing will ever retry"
+    );
+    drop(read);
+
+    // A newer run for the same session starts: `running`, no failure yet.
+    db.writer()
+        .transaction(|tx| {
+            create_consolidation_run(
+                tx,
+                &NewConsolidationRun {
+                    run_id: "run-in-flight",
+                    session_id: "sess-1",
+                    from_received_seq: 21,
+                    to_received_seq: 30,
+                    router_version: "v1",
+                },
+                3_000,
+            )?;
+            transition_run(tx, "run-in-flight", RunState::Running, 3_000)?.expect("legal");
+            Ok(())
+        })
+        .await
+        .expect("seed in-flight run");
+
+    let read = db.open_read().expect("read conn");
+    let busy: Vec<String> = stuck_consolidation_runs(&read, "build-1", STUCK_RUN_ATTEMPT_THRESHOLD)
+        .expect("stuck")
+        .into_iter()
+        .map(|r| r.run_id)
+        .collect();
+    assert_eq!(
+        busy, quiet,
+        "the same store, one transient run later, must give the same answer"
+    );
+}
