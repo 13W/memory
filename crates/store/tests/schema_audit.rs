@@ -252,14 +252,31 @@ async fn content_shared_tables_carry_no_path_or_context_field() {
     }
 }
 
+/// The one table whose `normalized_text` is a different axis entirely (T21-01,
+/// ADR-0010): the English variant of a **durable memory** text, not the
+/// normalized form of a **code** blob.
+///
+/// ADR-0010 rejected `cache.sqlite` for it explicitly and for the opposite of
+/// T03-04's reason: a translation is *not* locally recomputable — restoring it
+/// needs an LLM that may be unavailable — so storing it in the rebuildable
+/// cache would break the "fully rebuildable cache" invariant rather than honour
+/// it. Code normalization is a pure function of the blob and therefore belongs
+/// in the cache; a translation is not, and therefore does not.
+const MEMORY_NORMALIZATION_TABLES: &[&str] = &["memory_text_normalization"];
+
 /// Spec 03 §2.3/§4.2: a `content_blob` row carries identity + metadata only; the
-/// normalized text "lives in the cache" (`normalized_text_cache`). Assert **no**
-/// `state.sqlite` table stores a `normalized_text` column — the "no normalized
-/// text stored in path-bearing/canonical code rows" guardrail T03-04 owns. The
-/// only home for normalized text is the rebuildable cache (checked in
-/// `tests/normalized_text.rs`).
+/// normalized text "lives in the cache" (`normalized_text_cache`). Assert no
+/// `state.sqlite` **code** table stores a `normalized_text` column — the "no
+/// normalized text stored in path-bearing/canonical code rows" guardrail T03-04
+/// owns, in its own words. The only home for normalized *code* text is the
+/// rebuildable cache (checked in `tests/normalized_text.rs`).
+///
+/// The scope is code rows, not the column name: [`MEMORY_NORMALIZATION_TABLES`]
+/// carries the same word for the unrelated memory-translation axis, and its own
+/// doc says why that one may not live in the cache. Every other table — present
+/// and future — stays covered.
 #[tokio::test]
-async fn no_state_table_stores_normalized_text() {
+async fn no_code_table_stores_normalized_text() {
     let (_home, db) = open_state();
     let read = db.open_read().expect("read conn");
 
@@ -268,7 +285,17 @@ async fn no_state_table_stores_normalized_text() {
         tables.iter().any(|t| t == "content_blob"),
         "sanity: content_blob exists in the migrated schema ({tables:?})",
     );
+    for exempt in MEMORY_NORMALIZATION_TABLES {
+        assert!(
+            tables.iter().any(|t| t == exempt),
+            "sanity: exempt table `{exempt}` exists in the migrated schema ({tables:?}) — an \
+             exemption for a table that no longer exists would silently widen this lint",
+        );
+    }
     for table in &tables {
+        if MEMORY_NORMALIZATION_TABLES.contains(&table.as_str()) {
+            continue;
+        }
         for col in columns_of(&read, table) {
             assert_ne!(
                 col, "normalized_text",

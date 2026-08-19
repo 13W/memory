@@ -13,6 +13,7 @@
 //! All tests are deterministic: an isolated [`TempHome`], fixed `now_ms`
 //! literals, and ids minted from [`uuidv7_from`] with fixed entropy.
 
+use local_rag_core::hash::sha256_hex;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
@@ -31,7 +32,12 @@ use local_rag_store::memory::{
     transition_candidate, transition_memory_entry, transition_run, upsert_processing_cursor,
 };
 use local_rag_store::rusqlite::params;
-use local_rag_store::{FailureKind, LEASE_DURATION_MS, StuckRunRow, record_run_failure, retry_run};
+use local_rag_store::{
+    CURRENT_NORMALIZER_VERSION, FailureKind, LEASE_DURATION_MS, MAX_NORMALIZATION_ATTEMPTS,
+    NormalizationCountRow, NormalizationStatus, NormalizationWrite, StuckRunRow, UpsertOutcome,
+    entries_needing_normalization, normalization_counts, normalization_for, record_run_failure,
+    retry_run, upsert_normalization,
+};
 use local_rag_store::{StateDb, WriteError};
 use local_rag_test_support::TempHome;
 
@@ -2454,5 +2460,320 @@ async fn stuck_consolidation_runs_does_not_flicker_while_another_run_is_in_fligh
     assert_eq!(
         busy, quiet,
         "the same store, one transient run later, must give the same answer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T21-01: the normalization queue
+// ---------------------------------------------------------------------------
+
+/// A `memory_entry` with a caller-chosen text and `created_at` — the queue's
+/// order and its staleness check both read exactly those two.
+async fn seed_entry_with_text(db: &StateDb, memory_id: &str, text: &str, created_at: i64) {
+    let (id, text) = (memory_id.to_string(), text.to_string());
+    db.writer()
+        .transaction(move |tx| {
+            create_memory_entry(
+                tx,
+                &NewMemoryEntry {
+                    memory_id: &id,
+                    kind: MemoryKind::Fact,
+                    text: &text,
+                    canonical_key: None,
+                    scope_kind: ScopeKind::Global,
+                    scope_owner_id: GLOBAL_SCOPE_OWNER_ID,
+                    confidence: 0.5,
+                    importance: 0.5,
+                    valid_from_tree: None,
+                    last_verified_tree: None,
+                    supersedes_id: None,
+                },
+                created_at,
+            )
+        })
+        .await
+        .expect("create tx")
+        .expect("create ok");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_normalization(
+    db: &StateDb,
+    memory_id: &str,
+    status: NormalizationStatus,
+    source_text: &str,
+    normalized_text: Option<&str>,
+    normalizer_version: i64,
+    attempt_count: i64,
+    next_attempt_at: Option<i64>,
+    now_ms: i64,
+) -> UpsertOutcome {
+    let (id, sha) = (memory_id.to_string(), sha256_hex(source_text.as_bytes()));
+    let normalized = normalized_text.map(str::to_string);
+    db.writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status,
+                    source_text_sha256: &sha,
+                    normalized_text: normalized.as_deref(),
+                    source_language: Some("ru"),
+                    normalizer_model_id: Some("test-model"),
+                    prompt_version: Some(1),
+                    normalizer_version,
+                    attempt_count,
+                    last_error: None,
+                    next_attempt_at,
+                },
+                now_ms,
+            )
+        })
+        .await
+        .expect("upsert tx")
+}
+
+fn queued(db: &StateDb, now_ms: i64, limit: usize) -> Vec<String> {
+    let read = db.open_read().expect("read conn");
+    entries_needing_normalization(&read, CURRENT_NORMALIZER_VERSION, now_ms, limit)
+        .expect("queue")
+        .into_iter()
+        .map(|p| p.memory_id)
+        .collect()
+}
+
+/// An entry nobody has normalized is due; a terminal one never is, however
+/// untranslated — recall does not return it, so translating it would spend
+/// inference on text no reader will ever embed.
+#[tokio::test]
+async fn the_normalization_queue_offers_new_entries_and_never_terminal_ones() {
+    let (_home, db) = open_state();
+    seed_entry_with_text(&db, "m-live", "живой текст", 1_000).await;
+    seed_entry_with_text(&db, "m-gone", "мёртвый текст", 1_001).await;
+    assert_eq!(
+        transition_entry(&db, "m-gone", MemoryState::Retracted).await,
+        Ok(())
+    );
+
+    assert_eq!(queued(&db, 10_000, 10), vec!["m-live".to_string()]);
+}
+
+/// The staleness rule the whole table turns on: a `ready` row is current only
+/// while the entry's text still hashes to what was normalized. `reinforce`
+/// bumping `entry_version` is deliberately not part of that question.
+#[tokio::test]
+async fn a_ready_row_leaves_the_queue_until_the_text_moves_under_it() {
+    let (_home, db) = open_state();
+    seed_entry_with_text(&db, "m-1", "исходный текст", 1_000).await;
+
+    assert_eq!(queued(&db, 10_000, 10), vec!["m-1".to_string()]);
+    let outcome = write_normalization(
+        &db,
+        "m-1",
+        NormalizationStatus::Ready,
+        "исходный текст",
+        Some("source text"),
+        CURRENT_NORMALIZER_VERSION,
+        1,
+        None,
+        2_000,
+    )
+    .await;
+    assert_eq!(outcome, UpsertOutcome::Written);
+    assert!(queued(&db, 10_000, 10).is_empty(), "normalized and current");
+
+    db.writer()
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE memory_entry SET text = 'переписанный текст' WHERE memory_id = 'm-1'",
+                [],
+            )
+        })
+        .await
+        .expect("edit the text out from under the row");
+    assert_eq!(
+        queued(&db, 10_000, 10),
+        vec!["m-1".to_string()],
+        "a stale variant must come back to the queue"
+    );
+}
+
+/// `skipped` is a real answer, not an absence: an already-English entry costs
+/// zero inference and must not be offered again.
+#[tokio::test]
+async fn a_skipped_entry_stays_out_of_the_queue() {
+    let (_home, db) = open_state();
+    seed_entry_with_text(&db, "m-1", "already english", 1_000).await;
+    write_normalization(
+        &db,
+        "m-1",
+        NormalizationStatus::Skipped,
+        "already english",
+        None,
+        CURRENT_NORMALIZER_VERSION,
+        0,
+        None,
+        2_000,
+    )
+    .await;
+    assert!(queued(&db, 10_000, 10).is_empty());
+}
+
+/// A failure backs off on the clock and gives up after
+/// `MAX_NORMALIZATION_ATTEMPTS` — the entry then simply keeps using its
+/// original text, which is the pre-normalization behaviour.
+#[tokio::test]
+async fn a_failed_entry_waits_for_its_backoff_and_then_gives_up() {
+    let (_home, db) = open_state();
+    seed_entry_with_text(&db, "m-1", "исходный текст", 1_000).await;
+    write_normalization(
+        &db,
+        "m-1",
+        NormalizationStatus::Failed,
+        "исходный текст",
+        None,
+        CURRENT_NORMALIZER_VERSION,
+        1,
+        Some(5_000),
+        2_000,
+    )
+    .await;
+
+    assert!(queued(&db, 4_999, 10).is_empty(), "before next_attempt_at");
+    assert_eq!(
+        queued(&db, 5_000, 10),
+        vec!["m-1".to_string()],
+        "at next_attempt_at it is due again"
+    );
+
+    write_normalization(
+        &db,
+        "m-1",
+        NormalizationStatus::Failed,
+        "исходный текст",
+        None,
+        CURRENT_NORMALIZER_VERSION,
+        MAX_NORMALIZATION_ATTEMPTS,
+        Some(5_000),
+        6_000,
+    )
+    .await;
+    assert!(
+        queued(&db, 100_000, 10).is_empty(),
+        "past the attempt cap it stops being offered, however long we wait"
+    );
+}
+
+/// A newer normalizer re-normalizes everything — including rows that are
+/// `ready` and current, and rows that already exhausted their attempts.
+#[tokio::test]
+async fn a_newer_normalizer_version_re_queues_every_row() {
+    let (_home, db) = open_state();
+    seed_entry_with_text(&db, "m-ready", "исходный текст", 1_000).await;
+    seed_entry_with_text(&db, "m-spent", "другой текст", 1_001).await;
+    write_normalization(
+        &db,
+        "m-ready",
+        NormalizationStatus::Ready,
+        "исходный текст",
+        Some("source text"),
+        CURRENT_NORMALIZER_VERSION - 1,
+        1,
+        None,
+        2_000,
+    )
+    .await;
+    write_normalization(
+        &db,
+        "m-spent",
+        NormalizationStatus::Failed,
+        "другой текст",
+        None,
+        CURRENT_NORMALIZER_VERSION - 1,
+        MAX_NORMALIZATION_ATTEMPTS,
+        None,
+        2_000,
+    )
+    .await;
+
+    assert_eq!(
+        queued(&db, 10_000, 10),
+        vec!["m-ready".to_string(), "m-spent".to_string()],
+        "an older normalizer_version is due whatever the status says"
+    );
+}
+
+/// Oldest first, and `limit` really bounds the batch — the worker translates a
+/// bounded number of entries per tick.
+#[tokio::test]
+async fn the_queue_is_oldest_first_and_respects_its_limit() {
+    let (_home, db) = open_state();
+    seed_entry_with_text(&db, "m-3", "третий", 3_000).await;
+    seed_entry_with_text(&db, "m-1", "первый", 1_000).await;
+    seed_entry_with_text(&db, "m-2", "второй", 2_000).await;
+
+    assert_eq!(
+        queued(&db, 10_000, 10),
+        vec!["m-1".to_string(), "m-2".to_string(), "m-3".to_string()],
+    );
+    assert_eq!(
+        queued(&db, 10_000, 2),
+        vec!["m-1".to_string(), "m-2".to_string()]
+    );
+}
+
+/// The counts T21-08's `stats`/`doctor` will read, over a real store.
+#[tokio::test]
+async fn normalization_counts_group_by_status_over_a_real_store() {
+    let (_home, db) = open_state();
+    seed_entry_with_text(&db, "m-1", "исходный текст", 1_000).await;
+    seed_entry_with_text(&db, "m-2", "already english", 1_001).await;
+    write_normalization(
+        &db,
+        "m-1",
+        NormalizationStatus::Ready,
+        "исходный текст",
+        Some("source text"),
+        CURRENT_NORMALIZER_VERSION,
+        1,
+        None,
+        2_000,
+    )
+    .await;
+    write_normalization(
+        &db,
+        "m-2",
+        NormalizationStatus::Skipped,
+        "already english",
+        None,
+        CURRENT_NORMALIZER_VERSION,
+        0,
+        None,
+        2_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        normalization_counts(&read).expect("counts"),
+        vec![
+            NormalizationCountRow {
+                status: NormalizationStatus::Ready,
+                count: 1,
+            },
+            NormalizationCountRow {
+                status: NormalizationStatus::Skipped,
+                count: 1,
+            },
+        ],
+    );
+    assert_eq!(
+        normalization_for(&read, "m-1")
+            .expect("row")
+            .expect("present")
+            .normalized_text
+            .as_deref(),
+        Some("source text"),
     );
 }

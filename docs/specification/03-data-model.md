@@ -772,6 +772,25 @@ CREATE TABLE spool_import_cursor (                    -- durable import progress
   committed_offset  INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL
 );
+
+CREATE TABLE memory_text_normalization (              -- migration 14; T21-01 (ADR-0010)
+  memory_id           TEXT PRIMARY KEY REFERENCES memory_entry(memory_id) ON DELETE CASCADE,
+  status              TEXT NOT NULL CHECK (status IN ('ready','skipped','failed')),
+  source_text_sha256  TEXT NOT NULL,                  -- the text this row was derived from
+  normalized_text     TEXT,                           -- NULL unless status='ready'
+  source_language     TEXT,                           -- detector's answer, advisory
+  normalizer_model_id TEXT,                           -- provenance: which model produced it
+  prompt_version      INTEGER,                        -- provenance: which prompt
+  normalizer_version  INTEGER NOT NULL,               -- bump re-normalizes every row
+  attempt_count       INTEGER NOT NULL DEFAULT 0,
+  last_error          TEXT,
+  next_attempt_at     INTEGER,                        -- transient backoff gate, epoch ms
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL,
+  CHECK ((status = 'ready') = (normalized_text IS NOT NULL))
+);
+CREATE INDEX memory_normalization_queue
+  ON memory_text_normalization(status, next_attempt_at);
 ```
 
 As-built note (T13-04, `[SPEC]`): this section's block covers two independently-owned table
@@ -825,6 +844,41 @@ schema plus the pure transition-legality guard per machine only; the atomic
 mutation+evidence+audit+idempotency operation contract (08 §3) — including the `entry_version`
 increment 04 §5 couples to a matching `audit_event` — is T14-02's transactional memory-op engine,
 not this migration's concern.
+
+
+As-built note (T21-01, `[SPEC]`, ADR-0010): migration **14**, `memory_text_normalization`
+(`local_rag_store::memory::normalization`), adds the English-normalization axis of durable
+memory — at most one row per `memory_entry`, holding the variant fed to the embedder, the hash of
+the text it was derived from, and the provenance and retry bookkeeping of the attempt that
+produced it.
+
+**Why a table and not columns on `memory_entry`.** 08 §3 `[FIXED]` lets only `edit` change a
+memory's text, and only with a new `entry_version` in the audit ledger, while `reinforce` may not
+touch it at all — a background translator writing into that column would violate both, and would
+show the user a machine translation of their own note. The variant is a derived axis, and the
+precedent for a derived axis is a table of its own (§2.1's `worktree_indexing_status`, X-006), not
+columns on a migration frozen by checksum. The separate table also makes T21-07's purge a single
+`DELETE` through `ON DELETE CASCADE`, and gives T21-08 a countable `GROUP BY status`.
+
+**Staleness is `source_text_sha256`, never `entry_version`.** `apply_reinforce` bumps the version
+without touching the text, so a version comparison would both re-translate unchanged entries and
+let an unrelated bump make a stale variant look current. Readers therefore compare the stored hash
+against the entry's text as it stands; `upsert_normalization` refuses a write whose
+`source_text_sha256` no longer matches, which is what stops an `edit` landing mid-translation from
+committing a translation of text that is no longer there.
+
+**Why not `cache.sqlite`.** ADR-0010 rejected it: a translation is not locally recomputable —
+restoring it needs an LLM that may be unavailable — so it cannot live in a store whose defining
+invariant is that it is fully rebuildable. This is the opposite of `normalized_text_cache`'s case
+(§4.2), where normalization is a pure function of the blob; the schema lint that forbids a
+`normalized_text` column elsewhere in `state.sqlite` is scoped to those code rows and names this
+table as the one exemption, with that reasoning.
+
+**Inert on upgrade.** The migration creates an empty table, and an empty table is
+indistinguishable from the pre-T21-01 store: every effective text is still the original, every
+subject hash is unchanged, every existing vector stays valid. T21-01 ships the storage and its
+guards only — the reader that decides which text is embedded is T21-02, the detector T21-03, the
+translator T21-04, the daemon worker T21-06. Nothing consumes this table yet.
 
 ## 3. `state.sqlite` write policy `[FIXED, numbers [SPEC]]`
 
