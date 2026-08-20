@@ -108,7 +108,8 @@ true before real weights are installed.
 drift are impossible by constraint `[FIXED]`. `embedding_cache` rows reference
 `representation_id`, never inline model params.
 
-Representation kinds: `code_raw`, `code_context`, `structural_description` (post-v0),
+Representation kinds: `code_raw`, `code_context`, `structural_description` (post-v0 — its text is
+written in English, 09 §5 `[FIXED, ADR-0011]`; `code_raw` itself is never translated),
 `memory`. Subject hashing per kind: 03 §1.2. Which of the two code kinds the dense leg *searches*
 is 09 §3's decision — `code_raw`, decided by the benchmark under D-016.
 

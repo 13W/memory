@@ -31,7 +31,7 @@ Status: **v0** ships in MVP; **v0.x** additive after MVP; **post-v0** benchmark/
 | `get_file_context(path)` | v0 | file's occurrence list (ids, kinds, names, spans) + snippet from `source_blob` of the active generation |
 | `project_overview()` | v0 | 3-level tree + entry points + top imports, derived from active generation `[SPEC: computed, cached per generation]` |
 | `recall(query?, limit?)` | v0 | explicit recall; same pipeline as hook recall (08 §6) |
-| `remember(text, kind, scope?, canonical_key?, importance?, confirmed_by_user?)` | v0 | explicit durable create (08 §5); returns memory_id + entry_version |
+| `remember(text, kind, scope?, canonical_key?, importance?, confirmed_by_user?)` | v0 | explicit durable create (08 §5); returns memory_id + entry_version. `text` is accepted in any language and **stored in English** (08 §3 `[FIXED, ADR-0011]`); the author's original is kept as provenance and shown by `inspect`/`export` (12 §3) |
 | `list_memory(filters…)` / `inspect_memory_evidence(memory_id)` | v0 | review reads |
 | `list_memory_candidates()` / `approve_memory_candidate(id)` / `reject_memory_candidate(id)` / `edit_memory_candidate(id, patch)` | v0 | candidate review (04 §6) |
 | `edit_memory(id, patch, expected_version)` / `retract_memory(id, expected_version)` / `merge_memories(ids[], survivor_id)` | v0 | transactional ops (08 §3) |
@@ -278,6 +278,16 @@ table names — `remember`, `approve_memory_candidate`, `reject_memory_candidate
 file's own "every tool here is read-only" doc claim stays true). Every group-14 store primitive
 (`op::apply_*`, `review::{approve,reject,edit}_candidate`) already existed, gate-passed; this task
 is pure wiring plus five decisions the spec's own terseness left open:
+
+Amendment note (T21-12, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
+the tool's schema does not change — `remember` still takes one `text`, and a caller may write it in
+any language. What changed is what the store keeps: the boundary translates before the write
+(`T21-14`), so the entry's canon is English while the author's own words survive as provenance. The
+tool's *description* asks for English up front (T21-11's as-built note in §2 above): asking costs
+no inference and makes the translation path rare, which is the whole reason it comes first. A
+caller who ignores the ask is not refused — that is ADR-0011 §Decision 3's "eventually English".
+`actor` stays `Actor::User` for the create itself; only a later normalization rewrite is
+`Actor::System` (08 §3).
 
 - **`remember` always writes `actor=Actor::User`**, regardless of `confirmed_by_user`. The
   shipped `op.rs` doc comment on the model-claim-only-provenance backstop (T14-02, unchanged by

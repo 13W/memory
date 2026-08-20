@@ -4,6 +4,11 @@
 
 ```
 search_code(query, mode, limit, name_pattern?)
+  → query normalization: script-detect the query; translate to English if it is not
+    (ADR-0011 §Decision 2) — indexed code is never translated (§Decision 5), only the
+    query is, so a non-Latin query stops being invisible to the lexical leg;
+    free for an English or identifier-shaped query, degrades to the original text
+    plus an explicit marker when translation fails [FIXED, ADR-0011]
   → resolve worktree from request context (02 §3.3)
   → L2.read for the WHOLE pipeline
   → resolve active tuple (generation, model_space)
@@ -408,6 +413,15 @@ fitted there was no reason to move two more constants against the same 49 querie
 
 Cross-encoder reranker (`rerank`, `rerank_k`): **post-v0**, additive, only after baseline
 `[FIXED]`.
+
+**Descriptions are written in English** `[FIXED, ADR-0011]`. Whoever builds the description leg
+generates and stores them in English, and asks the generator for English in its prompt the same way
+the consolidation router now does (`crates/memory/src/prompt.rs`, T21-11). No code in group 21
+implements this — the leg is post-v0 — and that is precisely why the rule is recorded now: it is
+free to honour while the pillar is being built and expensive to retrofit afterwards, which is the
+lesson [ADR-0011](../adr/0011-english-canon-for-durable-memory.md) §Context draws from group 21
+phase 1. `code_raw` itself is never translated (§Decision 5): the lexical leg exists to match
+identifiers exactly.
 
 As-built note (T12-03, `[SPEC]`): the mode is `local_rag_protocol::SearchMode`
 (`Hybrid`/`Lexical`/`Code`/`Semantic`, default `Hybrid`), and `SearchRequest.mode` selects legs
