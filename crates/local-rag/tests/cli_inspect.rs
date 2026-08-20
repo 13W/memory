@@ -205,9 +205,10 @@ async fn inspect_memory_prints_the_translation_and_its_provenance() {
                     tx,
                     &NormalizationWrite {
                         memory_id: "mem-1",
-                        status: NormalizationStatus::Ready,
-                        source_text_sha256: &sha,
-                        normalized_text: Some("the English variant"),
+                        status: NormalizationStatus::Translated,
+                        expected_text_sha256: &sha,
+                        canon_text_sha256: &sha,
+                        source_text: Some("the English variant"),
                         source_language: Some("ru"),
                         normalizer_model_id: Some("test-normalizer"),
                         prompt_version: Some(1),
@@ -227,10 +228,10 @@ async fn inspect_memory_prints_the_translation_and_its_provenance() {
     let output = run_cli(&home, &["inspect", "memory", "mem-1"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("valid json");
-    assert_eq!(value["normalization"]["status"], "ready");
+    assert_eq!(value["normalization"]["status"], "translated");
     assert_eq!(
-        value["normalization"]["normalized_text"],
-        "the English variant"
+        value["normalization"]["source_text"], "the English variant",
+        "the row now carries what the author wrote, not the machine's rendering",
     );
     assert_eq!(value["normalization"]["source_language"], "ru");
     assert_eq!(

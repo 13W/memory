@@ -1227,9 +1227,10 @@ async fn seed_normalization(
                 &NormalizationWrite {
                     memory_id: &id,
                     status,
-                    source_text_sha256: &sha,
-                    normalized_text: match status {
-                        NormalizationStatus::Ready => Some("the English variant"),
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &sha,
+                    source_text: match status {
+                        NormalizationStatus::Translated => Some("the English variant"),
                         _ => None,
                     },
                     source_language: Some("ru"),
@@ -1293,7 +1294,7 @@ async fn stats_reports_the_normalization_axis() {
             &state,
             "mem-ru",
             "запись по-русски",
-            NormalizationStatus::Ready,
+            NormalizationStatus::Translated,
             1,
         )
         .await;
@@ -1301,7 +1302,7 @@ async fn stats_reports_the_normalization_axis() {
             &state,
             "mem-en",
             "an english note",
-            NormalizationStatus::Skipped,
+            NormalizationStatus::English,
             0,
         )
         .await;
@@ -1321,10 +1322,11 @@ async fn stats_reports_the_normalization_axis() {
 
     assert_eq!(
         block["counts_by_status"],
+        // `ORDER BY status`, alphabetical on the stored value.
         serde_json::json!([
+            {"status": "english", "count": 1},
             {"status": "failed", "count": 1},
-            {"status": "ready", "count": 1},
-            {"status": "skipped", "count": 1},
+            {"status": "translated", "count": 1},
         ]),
         "{parsed}",
     );
@@ -1364,7 +1366,7 @@ async fn the_cli_and_the_mcp_tool_report_the_same_normalization_block() {
             &state,
             "mem-ru",
             "запись по-русски",
-            NormalizationStatus::Ready,
+            NormalizationStatus::Translated,
             1,
         )
         .await;

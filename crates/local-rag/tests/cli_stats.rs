@@ -572,9 +572,10 @@ async fn seed_normalization(
                 &NormalizationWrite {
                     memory_id: &id,
                     status,
-                    source_text_sha256: &sha,
-                    normalized_text: match status {
-                        NormalizationStatus::Ready => Some("the English variant"),
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &sha,
+                    source_text: match status {
+                        NormalizationStatus::Translated => Some("the English variant"),
                         _ => None,
                     },
                     source_language: Some("ru"),
@@ -653,7 +654,7 @@ async fn stats_reports_a_partially_normalized_store() {
             &state,
             "mem-ru",
             "запись по-русски",
-            NormalizationStatus::Ready,
+            NormalizationStatus::Translated,
             1,
         )
         .await;
@@ -661,7 +662,7 @@ async fn stats_reports_a_partially_normalized_store() {
             &state,
             "mem-en",
             "an english note",
-            NormalizationStatus::Skipped,
+            NormalizationStatus::English,
             0,
         )
         .await;
@@ -708,7 +709,7 @@ async fn stats_reports_a_fully_normalized_store_as_zero_pending() {
             &state,
             "mem-ru",
             "запись по-русски",
-            NormalizationStatus::Ready,
+            NormalizationStatus::Translated,
             1,
         )
         .await;

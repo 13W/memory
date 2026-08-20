@@ -247,6 +247,15 @@ path; D-016). A `required` kind with no subject function — `memory` alone sinc
 makes the worker refuse with `UnsupportedRequiredKind` rather than report zero expected, which
 `Coverage::fully_covered` would read as "covered".
 
+As-built note (T21-13, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
+**the next two notes are superseded and kept as history.** ADR-0011 made English the canon, so a
+memory entry has exactly one text again and the `memory` kind's subject argument is plainly
+`memory_entry.text`. `EffectiveText`, the shared join fragment, the single-hasher wrapper and the
+source lint that pinned `subject_memory_entry` to two call sites are removed with the second text
+they existed to reconcile; so is the vector-then-row write order, since an entry is now born
+English and its first vector is its only one. Migration 15 rebuilds
+`memory_text_normalization` as the record of what the *author* wrote.
+
 As-built note (T21-02, `[SPEC]`, ADR-0010): the `memory` kind's subject function takes the
 entry's **effective text**, not `memory_entry.text`. Since T21-01 an entry may also carry an
 English variant (`memory_text_normalization`), and the variant — when it is `ready`, current

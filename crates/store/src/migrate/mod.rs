@@ -189,7 +189,16 @@ impl Migration {
 /// embedder is fed, kept apart from `memory_entry` because spec 08 §3
 /// `[FIXED]` forbids rewriting a memory's own text and because `SCHEMA_V9` is
 /// frozen; inert on upgrade, since an empty table means every effective text
-/// is still the original (`memory::SCHEMA_V14`). Each checksum is frozen once
+/// is still the original (`memory::SCHEMA_V14`); version 15 (T21-13, ADR-0011)
+/// inverts that same table — English became the canon, so `memory_entry.text`
+/// holds the English text and `memory_text_normalization` holds what the author
+/// wrote (`normalized_text` → `source_text`, `source_text_sha256` →
+/// `canon_text_sha256`, `ready`/`skipped` → `translated`/`english`). A rebuild
+/// rather than `ALTER`s because SQLite cannot alter a `CHECK`; deliberately
+/// **not** flagged destructive, since the one table it rebuilds is entirely
+/// derived — model output plus retry bookkeeping — and the `VACUUM INTO` copy
+/// that flag buys would protect nothing canonical (`memory::SCHEMA_V15`). Each
+/// checksum is frozen once
 /// shipped (see
 /// [`Migration::checksum`]); later schema changes are new entries here, never
 /// edits to an applied one.
@@ -220,6 +229,11 @@ pub const ALL: &[Migration] = &[
     ),
     Migration::sql(13, "worktree_indexing_status", crate::registry::SCHEMA_V13),
     Migration::sql(14, "memory_text_normalization", crate::memory::SCHEMA_V14),
+    Migration::sql(
+        15,
+        "memory_text_normalization_inverted",
+        crate::memory::SCHEMA_V15,
+    ),
 ];
 
 /// The outcome of a [`run`], for callers and tests to assert idempotency.

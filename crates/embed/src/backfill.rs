@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Mutex;
 
 use local_rag_core::config::DataPolicy;
+use local_rag_store::memory_entry_subject_keys;
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
     CacheDb, CacheOpenError, CacheWriteError, Coverage, CoverageEntry, EmbeddingKey, ExternalPins,
@@ -51,7 +52,6 @@ use local_rag_store::{
     recompute_coverage, rusqlite, source_bytes, transition_model_space, verify_cached_embedding,
     verify_cached_text, write_model_space_coverage,
 };
-use local_rag_store::{memory_entry_subject_hash, memory_entry_subject_keys};
 
 use crate::contract::{EmbedError, EmbedRequest};
 use crate::pool::ProviderPool;
@@ -804,20 +804,15 @@ fn context_index(
 /// what lets [`embed_and_write`]'s `.ok_or(MissingSource)` below catch a real
 /// disagreement between the two views rather than assuming one.
 fn memory_index(state: &Connection) -> Result<BTreeMap<String, String>, BackfillError> {
-    Ok(
-        local_rag_store::all_memory_entries_with_effective_text(state)?
-            .iter()
-            .map(|effective| {
-                // T21-02: both the hash and the text to embed come from the same
-                // `EffectiveText`, so this index cannot disagree with the expected
-                // set `memory_entry_subject_keys` built — they call one hasher.
-                (
-                    memory_entry_subject_hash(effective),
-                    effective.as_str().to_string(),
-                )
-            })
-            .collect(),
-    )
+    Ok(local_rag_store::all_memory_entries_with_text(state)?
+        .into_iter()
+        .map(|(memory_id, text)| {
+            (
+                local_rag_core::identity::domain::subject_memory_entry(&memory_id, &text),
+                text,
+            )
+        })
+        .collect())
 }
 
 fn blob_index(

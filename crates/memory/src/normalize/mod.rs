@@ -10,9 +10,13 @@
 //!   JSON string, never prompt structure) nor its output (every answer is
 //!   validated before anyone may store it).
 //!
-//! The write order (T21-05) and the daemon worker (T21-06) join them here. Nothing in this module reads or writes
-//! `state.sqlite`: the storage and its guards are
-//! `local_rag_store::memory::normalization`/`effective_text` (T21-01/T21-02).
+//! Nothing in this module reads or writes `state.sqlite`: the storage and its
+//! guards are `local_rag_store::memory::normalization` (T21-01, inverted by
+//! T21-13 — English is the canon, so that table records what the *author*
+//! wrote). Since ADR-0011 the callers are the boundaries: the write path
+//! (T21-14), the query paths (T21-15/T21-19) and the one-time backfill
+//! (T21-17). The daemon's remaining sweep only runs [`detect`], never
+//! [`translate`].
 
 pub mod detect;
 pub mod translate;

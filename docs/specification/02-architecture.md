@@ -581,6 +581,15 @@ a real window, between the lock being marked ready and the wait loop actually st
 signal kills the process ungracefully instead of draining it — caught by
 `tests/serve_subprocess.rs` flaking under concurrent test-suite load before the fix.
 
+As-built note (T21-13, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)): the
+worker the next note describes no longer translates anything, and the note is kept as history.
+ADR-0011 moved translation to the boundary — the write path (T21-14) and the query path
+(T21-15/T21-19) — so this background task holds no generator, no embedder and no `cache.sqlite`
+handle. What is left is the detector: it sweeps non-terminal entries, settles every already-English
+one as `english` in a single `state.sqlite` transaction, and spends no inference at all. That
+marker is structural rather than cosmetic — the queue excludes an entry by stored status, never by
+re-examination, so without it the `LIMIT` fills with English entries and starves the rest.
+
 As-built note (T21-06, `[SPEC]`, ADR-0010): the durable-memory English-normalization worker
 (`local_rag::daemon::normalization::run_normalization_worker`) is this section's newest
 `running_jobs` producer, `JobKind::Normalization`, and it is deliberately built to D-024's shape

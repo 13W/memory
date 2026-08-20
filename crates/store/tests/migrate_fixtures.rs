@@ -105,3 +105,110 @@ fn no_released_migration_is_destructive_or_stepped_yet() {
          test against the real ALL chain (see this test's doc comment)"
     );
 }
+
+/// T21-13: migration 15 does not merely reshape `memory_text_normalization` —
+/// it decides, row by row, what each v14 state *means* under the English canon.
+/// A migration that silently kept or silently dropped the wrong ones would leave
+/// the queue and `doctor`'s exit code reading columns that no longer say what
+/// they used to, so the mapping is pinned here rather than inferred.
+///
+/// `build_store_at_version` produces empty tables, so the three v14 states are
+/// seeded by hand against a real v14 store and asserted after the real forward
+/// chain runs.
+#[test]
+fn migration_15_carries_english_and_failed_rows_and_drops_pending_translations() {
+    let all = local_rag_store::migrate::ALL;
+    let (_home, layout) = temp_store();
+    let mut conn = build_store_at_version(&layout, 14, 1_000);
+
+    // A memory_entry per row: the table's FK is ON DELETE CASCADE, so an
+    // orphaned normalization row could never exist in the first place.
+    for id in ["m-english", "m-failed", "m-ready"] {
+        conn.execute(
+            "INSERT INTO memory_entry \
+               (memory_id, kind, state, scope_kind, scope_owner_id, text, confidence, \
+                importance, entry_version, created_at, updated_at) \
+             VALUES (?1, 'fact', 'active', 'global', 'global', ?2, 0.6, 0.5, 1, 1000, 1000)",
+            local_rag_store::rusqlite::params![id, format!("text of {id}")],
+        )
+        .expect("seed memory_entry");
+    }
+    let seed = |conn: &local_rag_store::rusqlite::Connection,
+                id: &str,
+                status: &str,
+                text: Option<&str>| {
+        conn.execute(
+            "INSERT INTO memory_text_normalization \
+               (memory_id, status, source_text_sha256, normalized_text, source_language, \
+                normalizer_model_id, prompt_version, normalizer_version, attempt_count, \
+                last_error, next_attempt_at, created_at, updated_at) \
+             VALUES (?1, ?2, 'sha-of-the-text', ?3, 'ru', 'a-model', 1, 1, 5, \
+                     'the envelope tore', 4242, 1000, 1000)",
+            local_rag_store::rusqlite::params![id, status, text],
+        )
+        .expect("seed normalization row");
+    };
+    seed(&conn, "m-english", "skipped", None);
+    seed(&conn, "m-failed", "failed", None);
+    seed(&conn, "m-ready", "ready", Some("the English variant"));
+
+    run(&mut conn, all, &layout.migration_lock(), 2_000).expect("migrate v14 fixture to head");
+
+    let mut stmt = conn
+        .prepare("SELECT memory_id, status, source_text FROM memory_text_normalization ORDER BY memory_id")
+        .expect("prepare");
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("collect");
+
+    assert_eq!(
+        rows,
+        vec![
+            // `skipped` meant "already English"; it still does, under the name
+            // the canon made accurate. Dropping it would make the detector
+            // re-examine the entry on every tick forever.
+            ("m-english".to_string(), "english".to_string(), None),
+            // The retry bookkeeping survives intact — T21-16 releases these by
+            // bumping the normalizer version, which is the owner's decision.
+            ("m-failed".to_string(), "failed".to_string(), None),
+        ],
+        "`ready` rows are dropped on purpose: their English text was never \
+         installed as canon, v15 has no state for a translation waiting to be \
+         installed, and T21-16 replaces the translator that produced them",
+    );
+
+    let (attempts, last_error, next_attempt): (i64, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT attempt_count, last_error, next_attempt_at \
+             FROM memory_text_normalization WHERE memory_id = 'm-failed'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("read the carried-over failure");
+    assert_eq!(attempts, 5, "the dead-letter's attempt count must survive");
+    assert_eq!(last_error.as_deref(), Some("the envelope tore"));
+    assert_eq!(next_attempt, Some(4242));
+
+    // The staleness basis is carried across under its new name, not lost.
+    let canon_sha: String = conn
+        .query_row(
+            "SELECT canon_text_sha256 FROM memory_text_normalization WHERE memory_id = 'm-english'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read canon_text_sha256");
+    assert_eq!(canon_sha, "sha-of-the-text");
+
+    // The rebuild must leave the FK intact, or a later purge would orphan rows.
+    let violations: i64 = conn
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .expect("foreign_key_check");
+    assert_eq!(
+        violations, 0,
+        "the rebuilt table kept its FK to memory_entry"
+    );
+}

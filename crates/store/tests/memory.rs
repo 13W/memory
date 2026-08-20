@@ -2501,15 +2501,15 @@ async fn write_normalization(
     db: &StateDb,
     memory_id: &str,
     status: NormalizationStatus,
-    source_text: &str,
-    normalized_text: Option<&str>,
+    entry_text: &str,
+    source_text: Option<&str>,
     normalizer_version: i64,
     attempt_count: i64,
     next_attempt_at: Option<i64>,
     now_ms: i64,
 ) -> UpsertOutcome {
-    let (id, sha) = (memory_id.to_string(), sha256_hex(source_text.as_bytes()));
-    let normalized = normalized_text.map(str::to_string);
+    let (id, sha) = (memory_id.to_string(), sha256_hex(entry_text.as_bytes()));
+    let source = source_text.map(str::to_string);
     db.writer()
         .transaction(move |tx| {
             upsert_normalization(
@@ -2517,8 +2517,9 @@ async fn write_normalization(
                 &NormalizationWrite {
                     memory_id: &id,
                     status,
-                    source_text_sha256: &sha,
-                    normalized_text: normalized.as_deref(),
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &sha,
+                    source_text: source.as_deref(),
                     source_language: Some("ru"),
                     normalizer_model_id: Some("test-model"),
                     prompt_version: Some(1),
@@ -2571,7 +2572,7 @@ async fn a_ready_row_leaves_the_queue_until_the_text_moves_under_it() {
     let outcome = write_normalization(
         &db,
         "m-1",
-        NormalizationStatus::Ready,
+        NormalizationStatus::Translated,
         "исходный текст",
         Some("source text"),
         CURRENT_NORMALIZER_VERSION,
@@ -2608,7 +2609,7 @@ async fn a_skipped_entry_stays_out_of_the_queue() {
     write_normalization(
         &db,
         "m-1",
-        NormalizationStatus::Skipped,
+        NormalizationStatus::English,
         "already english",
         None,
         CURRENT_NORMALIZER_VERSION,
@@ -2675,7 +2676,7 @@ async fn a_newer_normalizer_version_re_queues_every_row() {
     write_normalization(
         &db,
         "m-ready",
-        NormalizationStatus::Ready,
+        NormalizationStatus::Translated,
         "исходный текст",
         Some("source text"),
         CURRENT_NORMALIZER_VERSION - 1,
@@ -2732,7 +2733,7 @@ async fn normalization_counts_group_by_status_over_a_real_store() {
     write_normalization(
         &db,
         "m-1",
-        NormalizationStatus::Ready,
+        NormalizationStatus::Translated,
         "исходный текст",
         Some("source text"),
         CURRENT_NORMALIZER_VERSION,
@@ -2744,7 +2745,7 @@ async fn normalization_counts_group_by_status_over_a_real_store() {
     write_normalization(
         &db,
         "m-2",
-        NormalizationStatus::Skipped,
+        NormalizationStatus::English,
         "already english",
         None,
         CURRENT_NORMALIZER_VERSION,
@@ -2757,13 +2758,15 @@ async fn normalization_counts_group_by_status_over_a_real_store() {
     let read = db.open_read().expect("read conn");
     assert_eq!(
         normalization_counts(&read).expect("counts"),
+        // `ORDER BY status` is the reader's own contract, so the expected
+        // order is alphabetical on the stored value: english < translated.
         vec![
             NormalizationCountRow {
-                status: NormalizationStatus::Ready,
+                status: NormalizationStatus::English,
                 count: 1,
             },
             NormalizationCountRow {
-                status: NormalizationStatus::Skipped,
+                status: NormalizationStatus::Translated,
                 count: 1,
             },
         ],
@@ -2772,7 +2775,7 @@ async fn normalization_counts_group_by_status_over_a_real_store() {
         normalization_for(&read, "m-1")
             .expect("row")
             .expect("present")
-            .normalized_text
+            .source_text
             .as_deref(),
         Some("source text"),
     );

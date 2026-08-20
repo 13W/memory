@@ -386,13 +386,10 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         // (8,"observation_redaction_version"), (9,"memory"),
         // (10,"managed_worktree"), (11,"consolidation_run_failure_tracking"),
         // (12,"consolidation_run_context_overflow_tracking"),
-        // (13,"worktree_indexing_status"), (14,"memory_text_normalization").
+        // (13,"worktree_indexing_status"), (14,"memory_text_normalization"),
+        // (15,"memory_text_normalization_inverted").
         let rows = migration_rows(&read);
-        assert_eq!(
-            rows.len(),
-            14,
-            "the production set is [v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14] at T21-01"
-        );
+        assert_eq!(rows.len(), 15, "the production set is [v1..v15] at T21-13");
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[0].1, "registry");
         assert_eq!(rows[1].0, 2);
@@ -421,6 +418,8 @@ fn state_db_open_bootstraps_and_is_idempotent() {
         assert_eq!(rows[12].1, "worktree_indexing_status");
         assert_eq!(rows[13].0, 14);
         assert_eq!(rows[13].1, "memory_text_normalization");
+        assert_eq!(rows[14].0, 15);
+        assert_eq!(rows[14].1, "memory_text_normalization_inverted");
     }
     drop(db);
 
@@ -430,7 +429,7 @@ fn state_db_open_bootstraps_and_is_idempotent() {
     let applied: i64 = read
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(applied, 14, "reopen adds no new migration rows");
+    assert_eq!(applied, 15, "reopen adds no new migration rows");
 }
 
 /// D-007: migration 5 adds `worktree.state_changed_at` and backfills every

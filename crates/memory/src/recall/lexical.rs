@@ -148,7 +148,6 @@ mod tests {
             text: text.to_string(),
             // T21-02: no normalization row, so the effective text is the
             // entry's own — the only way to build one is to ask `decide`.
-            embed_text: local_rag_store::decide_effective_text(memory_id, text, None),
             confidence: 0.5,
             created_at: 1000,
         }

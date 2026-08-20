@@ -1156,9 +1156,10 @@ async fn seed_entry_with_normalization(
                 &NormalizationWrite {
                     memory_id: &id,
                     status,
-                    source_text_sha256: &sha,
-                    normalized_text: match status {
-                        NormalizationStatus::Ready => Some("the English variant"),
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &sha,
+                    source_text: match status {
+                        NormalizationStatus::Translated => Some("the English variant"),
                         _ => None,
                     },
                     source_language: Some("ru"),
@@ -1216,7 +1217,7 @@ async fn normalization_section_is_clean_when_on_with_nothing_wrong() {
         &layout,
         "mem-ru",
         "запись по-русски",
-        Some((NormalizationStatus::Ready, 1)),
+        Some((NormalizationStatus::Translated, 1)),
     )
     .await;
     // T21-11 flipped the default to `false`, so "on" is now stated rather than
@@ -1230,7 +1231,7 @@ async fn normalization_section_is_clean_when_on_with_nothing_wrong() {
     let text = stdout(&output);
     assert!(text.contains("normalization: on"), "{text}");
     assert!(text.contains("0 pending"), "{text}");
-    assert!(text.contains("ready: 1"), "{text}");
+    assert!(text.contains("translated: 1"), "{text}");
     assert!(!text.contains("DEAD-LETTERED"), "{text}");
 }
 
