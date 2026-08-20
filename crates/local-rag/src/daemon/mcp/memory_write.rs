@@ -20,10 +20,14 @@ use local_rag_store::{
     GLOBAL_SCOPE_OWNER_ID, MemoryKind, MemoryOpError, MemoryOpOutcome, MergeLoser, MergeMemoryOp,
     NewObservationEnvelope, ProposedOperation, RequestRoot, Resolution, RetractMemoryOp,
     ReviewError, ScopeKind, TrustLevel, apply_create, apply_edit, apply_merge, apply_retract,
-    approve_candidate, edit_candidate, insert_envelope, reject_candidate, resolve,
+    approve_candidate, edit_candidate, find_by_idempotency_key, insert_envelope, reject_candidate,
+    resolve, upsert_normalization,
 };
 
 use crate::daemon::memory::MemoryContext;
+use crate::daemon::normalization::boundary::{
+    Normalized, OwnedNormalizationRow, normalize_for_write,
+};
 
 use super::content::{self, CallToolResult};
 use super::memory::{infra_err, optional_enum};
@@ -388,16 +392,39 @@ pub async fn remember(
         request_id_string(request_id)
     );
 
+    // T21-14, ADR-0011 §Decision 2: the canon is decided **before** the store
+    // sees the text. A replay is checked first and skips translation entirely —
+    // `apply_create` would recognise the idempotency key anyway and return the
+    // original result, so translating again would spend a second of local GPU
+    // to reproduce an answer nobody will store.
+    let already_applied = match ctx.state.open_read() {
+        Ok(read) => find_by_idempotency_key(&read, &idempotency_key)
+            .ok()
+            .flatten()
+            .is_some(),
+        Err(e) => return Ok(infra_err(e)),
+    };
+    let decided = if already_applied {
+        None
+    } else {
+        Some(normalize_on_blocking(ctx, &memory_id, &text).await)
+    };
+    let canon = decided
+        .as_ref()
+        .map(|d| d.canon(&text).to_string())
+        .unwrap_or_else(|| text.clone());
+    let row = decided.map(|d| OwnedNormalizationRow::for_canon(&memory_id, &canon, d));
+
     let outcome = ctx
         .state
         .writer()
         .transaction(move |tx| {
-            apply_create(
+            let applied = apply_create(
                 tx,
                 &CreateMemoryOp {
                     memory_id: &memory_id,
                     kind,
-                    text: &text,
+                    text: &canon,
                     canonical_key: canonical_key.as_deref(),
                     scope_kind,
                     scope_owner_id: &scope_owner_id,
@@ -410,7 +437,15 @@ pub async fn remember(
                     idempotency_key: Some(&idempotency_key),
                 },
                 now_ms,
-            )
+            )?;
+            // Same transaction as the create, so an entry can never exist with
+            // an English canon and no record of what the author wrote.
+            if applied.is_ok()
+                && let Some(row) = &row
+            {
+                upsert_normalization(tx, &row.as_write(), now_ms)?;
+            }
+            Ok(applied)
         })
         .await;
 
@@ -419,6 +454,33 @@ pub async fn remember(
         Ok(Err(e)) => Ok(content::err(&memory_op_error_envelope(&e))),
         Err(e) => Ok(infra_err(e)),
     }
+}
+
+/// Decide the canon for one incoming text, off the async worker.
+///
+/// `GeneratorPool::generate` is synchronous and a local translation takes about
+/// a second. The consolidation router calls it inline because a background tick
+/// owns its own time; an MCP handler does not — blocking a tokio worker here
+/// would delay every other request the daemon is serving, so this one hop
+/// through `spawn_blocking` is the difference between a slow `remember` and a
+/// slow daemon.
+///
+/// A panicked blocking task degrades to a refusal rather than an error: the
+/// caller still has the author's text, and losing a note to an executor mishap
+/// would be exactly the failure ADR-0011 §Decision 3 exists to prevent.
+async fn normalize_on_blocking(ctx: &MemoryContext, memory_id: &str, text: &str) -> Normalized {
+    let generators = ctx.generators.clone();
+    let policy = ctx.data_policy;
+    let model_id = ctx.generator_model_id.clone();
+    let (id, text) = (memory_id.to_string(), text.to_string());
+    tokio::task::spawn_blocking(move || {
+        normalize_for_write(generators.as_deref(), policy, &model_id, &id, &text)
+    })
+    .await
+    .unwrap_or_else(|e| Normalized::Refused {
+        reason: format!("the translation task did not finish: {e}"),
+        kind: local_rag_memory::normalize::translate::TranslateFailureKind::Transient,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -576,22 +638,47 @@ pub async fn edit_memory(
         return Err("patch must set at least one of text/importance".to_string());
     }
 
+    // T21-14: an edit that supplies new text is the same boundary as a create,
+    // so it gets the same treatment. An importance-only edit decides nothing —
+    // the canon is untouched, and `apply_edit` leaves the existing row alone.
+    let decided = match text.as_deref() {
+        Some(incoming) => Some(normalize_on_blocking(ctx, &id, incoming).await),
+        None => None,
+    };
+    let canon = decided
+        .as_ref()
+        .zip(text.as_deref())
+        .map(|(d, incoming)| d.canon(incoming).to_string());
+    let row = decided
+        .zip(canon.as_deref())
+        .map(|(d, canon)| OwnedNormalizationRow::for_canon(&id, canon, d));
+
     let outcome = ctx
         .state
         .writer()
         .transaction(move |tx| {
-            apply_edit(
+            let applied = apply_edit(
                 tx,
                 &EditMemoryOp {
                     memory_id: &id,
                     expected_version,
-                    text: text.as_deref(),
+                    text: canon.as_deref(),
                     importance,
                     actor: Actor::User,
                     idempotency_key: None,
                 },
                 now_ms,
-            )
+            )?;
+            // `apply_edit` drops the old row when the text moves (T21-07); this
+            // writes the new one in the same transaction, so the window where
+            // an entry has a fresh canon and no record of its origin does not
+            // exist.
+            if applied.is_ok()
+                && let Some(row) = &row
+            {
+                upsert_normalization(tx, &row.as_write(), now_ms)?;
+            }
+            Ok(applied)
         })
         .await;
     match outcome {
@@ -788,6 +875,316 @@ pub async fn give_feedback(
             deduplicated: inner.is_none(),
         })),
         Err(e) => Ok(infra_err(e)),
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    //! The write boundary end to end through the real handlers (T21-14).
+    //!
+    //! These live inside the module because `mcp::memory_write` is private to
+    //! `mcp` — widening it to `pub` so an integration test could reach in would
+    //! trade a real encapsulation boundary for test convenience. Everything
+    //! here builds a `MemoryContext` by hand with a scripted generator, which
+    //! is the one thing the live-daemon harness in
+    //! `tests/mcp_memory_write_tools.rs` cannot do.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use local_rag_core::config::DataPolicy;
+    use local_rag_core::identity::SystemUuidV7;
+    use local_rag_core::paths::StoreLayout;
+    use local_rag_embed::{
+        FinishReason, GenError, GenRequest, GenResponse, Generator, GeneratorEntry, GeneratorPool,
+    };
+    use local_rag_memory::recall::{BruteForceCosine, UnavailableEmbedder};
+    use local_rag_store::{
+        CacheDb, NormalizationStatus, StateDb, memory_entry_by_id, normalization_for,
+    };
+    use local_rag_test_support::TempHome;
+    use serde_json::json;
+
+    use super::*;
+    use crate::daemon::memory::MemoryContext;
+
+    const RU: &str = "мы решили всегда запускать тесты перед коммитом";
+    const EN: &str = "we always run the tests before committing";
+    const STORE_UUID: &str = "01a00000-0000-7000-8000-00000000fffd";
+
+    /// A generator that counts calls and answers from a script, so "the
+    /// detector short-circuited" is provable rather than assumed.
+    #[derive(Clone)]
+    struct ScriptedGenerator {
+        calls: Arc<AtomicUsize>,
+        answer: Option<String>,
+    }
+
+    impl ScriptedGenerator {
+        fn translating(english: &str) -> Self {
+            ScriptedGenerator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: Some(english.to_string()),
+            }
+        }
+
+        fn refusing() -> Self {
+            ScriptedGenerator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: None,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn pool(&self) -> Arc<GeneratorPool> {
+            Arc::new(GeneratorPool::new(vec![GeneratorEntry::local(
+                "scripted",
+                Arc::new(self.clone()),
+            )]))
+        }
+    }
+
+    impl Generator for ScriptedGenerator {
+        fn generate(&self, _req: GenRequest) -> Result<GenResponse, GenError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.answer {
+                Some(english) => Ok(GenResponse {
+                    text: json!({ "en": english }).to_string(),
+                    finish_reason: FinishReason::Stop,
+                    tokens_generated: None,
+                }),
+                None => Ok(GenResponse {
+                    text: "I cannot do that".to_string(),
+                    finish_reason: FinishReason::Stop,
+                    tokens_generated: None,
+                }),
+            }
+        }
+    }
+
+    struct Fixture {
+        _home: TempHome,
+        ctx: MemoryContext,
+        state: Arc<StateDb>,
+    }
+
+    fn fixture(generators: Option<Arc<GeneratorPool>>) -> Fixture {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let state = Arc::new(StateDb::open(layout.state_db()).expect("open state.sqlite"));
+        let cache = Arc::new(CacheDb::open(layout.cache_db(), STORE_UUID).expect("open cache"));
+        let ctx = MemoryContext {
+            state: Arc::clone(&state),
+            cache,
+            embedder: Arc::new(UnavailableEmbedder),
+            dense_backend: Arc::new(BruteForceCosine),
+            recall_token_budget: 1500,
+            uuids: Arc::new(SystemUuidV7),
+            generators,
+            generator_model_id: "scripted-model".to_string(),
+            data_policy: DataPolicy::LocalOnly,
+        };
+        Fixture {
+            _home: home,
+            ctx,
+            state,
+        }
+    }
+
+    fn remember_args(text: &str) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("text".to_string(), json!(text));
+        args.insert("kind".to_string(), json!("fact"));
+        args.insert("scope".to_string(), json!("global"));
+        args
+    }
+
+    async fn call_remember(fx: &Fixture, text: &str, request_id: &str) -> Value {
+        let args = remember_args(text);
+        let raw = remember(
+            &fx.ctx,
+            RequestRoot::default(),
+            &args,
+            "sess-1",
+            &json!(request_id),
+            1_000,
+        )
+        .await
+        .expect("handler ran");
+        serde_json::to_value(&raw).expect("serializable")
+    }
+
+    fn stored_text(fx: &Fixture, memory_id: &str) -> String {
+        let read = fx.state.open_read().expect("read");
+        memory_entry_by_id(&read, memory_id)
+            .expect("read entry")
+            .expect("entry exists")
+            .text
+    }
+
+    /// ADR-0010 Decision 8, still in force and now on the request path: an
+    /// English note must not reach the generator at all.
+    #[tokio::test]
+    async fn english_text_costs_zero_inference() {
+        let generator = ScriptedGenerator::translating("SHOULD NOT BE USED");
+        let fx = fixture(Some(generator.pool()));
+
+        call_remember(&fx, EN, "req-1").await;
+
+        assert_eq!(generator.calls(), 0, "the detector answered on its own");
+        let read = fx.state.open_read().expect("read");
+        let id: String = read
+            .query_row("SELECT memory_id FROM memory_entry", [], |r| r.get(0))
+            .expect("one entry");
+        assert_eq!(stored_text(&fx, &id), EN);
+        let row = normalization_for(&read, &id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(row.status, NormalizationStatus::English);
+        assert_eq!(row.source_text, None, "there is no other text to keep");
+    }
+
+    /// The canon is English and the author's own words survive beside it.
+    #[tokio::test]
+    async fn russian_text_is_stored_english_with_the_original_as_provenance() {
+        let generator = ScriptedGenerator::translating(EN);
+        let fx = fixture(Some(generator.pool()));
+
+        call_remember(&fx, RU, "req-1").await;
+
+        assert_eq!(generator.calls(), 1);
+        let read = fx.state.open_read().expect("read");
+        let id: String = read
+            .query_row("SELECT memory_id FROM memory_entry", [], |r| r.get(0))
+            .expect("one entry");
+        assert_eq!(stored_text(&fx, &id), EN, "the canon is English");
+        let row = normalization_for(&read, &id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(row.status, NormalizationStatus::Translated);
+        assert_eq!(
+            row.source_text.as_deref(),
+            Some(RU),
+            "the owner must still be able to read what they wrote",
+        );
+        assert_eq!(row.normalizer_model_id.as_deref(), Some("scripted-model"));
+    }
+
+    /// ADR-0011 §Decision 3: a refusal costs the author nothing.
+    #[tokio::test]
+    async fn a_refused_translation_keeps_the_note_and_records_why() {
+        let generator = ScriptedGenerator::refusing();
+        let fx = fixture(Some(generator.pool()));
+
+        call_remember(&fx, RU, "req-1").await;
+
+        assert_eq!(generator.calls(), 1);
+        let read = fx.state.open_read().expect("read");
+        let id: String = read
+            .query_row("SELECT memory_id FROM memory_entry", [], |r| r.get(0))
+            .expect("the note was stored anyway");
+        assert_eq!(
+            stored_text(&fx, &id),
+            RU,
+            "no half-translation, no lost note — the author's text stands",
+        );
+        let row = normalization_for(&read, &id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(row.status, NormalizationStatus::Failed);
+        assert!(row.last_error.is_some(), "the refusal is recorded");
+        assert_eq!(row.attempt_count, 1, "a real refusal spends an attempt");
+    }
+
+    /// A daemon whose model is not installed keeps accepting notes, and the
+    /// missing model does not cost the entry one of its attempts.
+    #[tokio::test]
+    async fn no_installed_model_is_a_refusal_not_a_failure_of_the_entry() {
+        let fx = fixture(None);
+
+        call_remember(&fx, RU, "req-1").await;
+
+        let read = fx.state.open_read().expect("read");
+        let id: String = read
+            .query_row("SELECT memory_id FROM memory_entry", [], |r| r.get(0))
+            .expect("the note was stored anyway");
+        assert_eq!(stored_text(&fx, &id), RU);
+        let row = normalization_for(&read, &id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(row.status, NormalizationStatus::Failed);
+        assert_eq!(
+            row.attempt_count, 0,
+            "a missing model is the environment's fault, not the entry's, so the sweep \
+             must retry it the moment one appears",
+        );
+    }
+
+    /// An edit is the same boundary as a create: new text becomes an English
+    /// canon, and the row that described the *old* text is replaced rather than
+    /// left behind.
+    #[tokio::test]
+    async fn editing_with_russian_text_installs_an_english_canon_and_replaces_the_row() {
+        let generator = ScriptedGenerator::translating(EN);
+        let fx = fixture(Some(generator.pool()));
+
+        // Start from an English entry, so there is an `english` row to replace.
+        call_remember(&fx, "the first version of this note", "req-1").await;
+        let read = fx.state.open_read().expect("read");
+        let (id, version): (String, i64) = read
+            .query_row(
+                "SELECT memory_id, entry_version FROM memory_entry",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("one entry");
+        drop(read);
+        assert_eq!(generator.calls(), 0);
+
+        let mut args = Map::new();
+        args.insert("id".to_string(), json!(id));
+        args.insert("expected_version".to_string(), json!(version));
+        args.insert("patch".to_string(), json!({ "text": RU }));
+        edit_memory(&fx.ctx, &args, 2_000)
+            .await
+            .expect("handler ran");
+
+        assert_eq!(generator.calls(), 1);
+        assert_eq!(stored_text(&fx, &id), EN, "the new canon is English");
+        let read = fx.state.open_read().expect("read");
+        let row = normalization_for(&read, &id)
+            .expect("read row")
+            .expect("the row was replaced, not dropped");
+        assert_eq!(row.status, NormalizationStatus::Translated);
+        assert_eq!(row.source_text.as_deref(), Some(RU));
+    }
+
+    /// A replayed `remember` is recognised before the translator is asked, so a
+    /// retry does not spend a second of local GPU reproducing an answer that
+    /// will be discarded.
+    #[tokio::test]
+    async fn a_replay_does_not_translate_twice() {
+        let generator = ScriptedGenerator::translating(EN);
+        let fx = fixture(Some(generator.pool()));
+
+        call_remember(&fx, RU, "req-1").await;
+        assert_eq!(generator.calls(), 1);
+
+        call_remember(&fx, RU, "req-1").await;
+        assert_eq!(
+            generator.calls(),
+            1,
+            "the idempotency key was checked before the translator",
+        );
+        let read = fx.state.open_read().expect("read");
+        let entries: i64 = read
+            .query_row("SELECT COUNT(*) FROM memory_entry", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(entries, 1);
     }
 }
 

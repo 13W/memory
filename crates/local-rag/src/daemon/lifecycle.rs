@@ -381,6 +381,18 @@ impl DaemonHandle {
                 Err(other) => return Err(DaemonStartupError::State(other)),
             };
 
+        // D-054, now for a second consumer: built exactly **once**, here, and
+        // shared by `Arc` with the consolidation trigger *and* — since T21-14 —
+        // the MCP write boundary. `LlamaBackend` is a process-wide singleton; a
+        // second `build_best_effort_pool` returns `BackendAlreadyInitialized`
+        // and degrades silently to an empty pool for the daemon's whole uptime.
+        // It sits above the context construction only because that context now
+        // needs it; the `state_db.is_some()` guard is unchanged, so
+        // `MigrationOnly` still loads no model.
+        let pool = state_db
+            .as_ref()
+            .map(|_| Arc::new(build_best_effort_pool(&layout)));
+
         // The MCP code-query tools' `SearchEngine` and the MCP status/
         // memory-read tools' `MemoryContext` — both `None` exactly in
         // `MigrationOnly` (no usable `state.sqlite`/`cache.sqlite` to build
@@ -405,6 +417,9 @@ impl DaemonHandle {
                     memory_query_embedder,
                     recall_token_budget,
                     Arc::clone(&uuids),
+                    pool.clone(),
+                    local_rag_generate::DEFAULT_MODEL_ID.to_string(),
+                    data_policy,
                 )),
             ),
             _ => (None, None),
@@ -527,9 +542,11 @@ impl DaemonHandle {
         // owner's live store, where all nine dead-letters gained exactly two
         // attempts per restart against D-050's documented "exactly one more
         // attempt".
-        let pool = state_db
-            .as_ref()
-            .map(|_| Arc::new(build_best_effort_pool(&layout)));
+        //
+        // T21-14: the pool itself is now built earlier — above the MCP context
+        // construction, which needs the same `Arc` for the write boundary. The
+        // "exactly once" property D-054 is about is unchanged and pinned by
+        // `tests/memory_normalization_worker.rs::the_generator_pool_is_built_once_per_process`.
         let mut resume_handles = Vec::new();
         if let Some(ref db) = state_db {
             tracing::info!(job = "spool_resume", "background job spawned");
@@ -815,7 +832,21 @@ async fn spawn_consolidation_trigger(
             let pool = Arc::clone(&pool);
             let uuids = Arc::clone(&uuids);
             async move {
-                local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window).await
+                let ops = local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window)
+                    .await?;
+                // T21-14: the router's own output crosses the same write
+                // boundary. Since T21-11 its prompt asks for English, so the
+                // detector answers for free and this is a safety net — but it
+                // is the net that keeps the canon's invariant true even when a
+                // small local model ignores the ask. Called inline, not under
+                // `spawn_blocking`: unlike an MCP handler, a consolidation tick
+                // owns its own time and blocks nobody else's request.
+                Ok(super::normalization::boundary::normalize_generated_ops(
+                    Some(&pool),
+                    data_policy,
+                    local_rag_generate::DEFAULT_MODEL_ID,
+                    ops,
+                ))
             }
         }
     };

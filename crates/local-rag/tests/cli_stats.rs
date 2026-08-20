@@ -675,8 +675,8 @@ async fn stats_reports_a_partially_normalized_store() {
     assert_eq!(
         block["counts_by_status"],
         serde_json::json!([
-            {"status": "ready", "count": 1},
-            {"status": "skipped", "count": 1},
+            {"status": "english", "count": 1},
+            {"status": "translated", "count": 1},
         ]),
         "empty buckets are omitted, not reported as zero",
     );
@@ -684,9 +684,12 @@ async fn stats_reports_a_partially_normalized_store() {
     assert_eq!(block["dead_letter"], 0);
 
     let human = stdout(&run_cli(&home, home.path(), &["stats"]));
-    assert!(human.contains("memory normalization  ready: 1"), "{human}");
     assert!(
-        human.contains("memory normalization  skipped: 1"),
+        human.contains("memory normalization  translated: 1"),
+        "{human}"
+    );
+    assert!(
+        human.contains("memory normalization  english: 1"),
         "{human}"
     );
     assert!(human.contains("memory normalization pending: 1"), "{human}");
@@ -718,7 +721,7 @@ async fn stats_reports_a_fully_normalized_store_as_zero_pending() {
     let block = normalization_block(&stdout(&run_cli(&home, home.path(), &["stats", "--json"])));
     assert_eq!(
         block["counts_by_status"],
-        serde_json::json!([{"status": "ready", "count": 1}]),
+        serde_json::json!([{"status": "translated", "count": 1}]),
     );
     assert_eq!(block["pending"], 0, "nothing left to translate");
     assert_eq!(block["dead_letter"], 0);
