@@ -1219,6 +1219,11 @@ async fn normalization_section_is_clean_when_on_with_nothing_wrong() {
         Some((NormalizationStatus::Ready, 1)),
     )
     .await;
+    // T21-11 flipped the default to `false`, so "on" is now stated rather than
+    // inherited — this test is about how the section *renders* when the worker
+    // is on, and must not silently become the off-case if the default moves
+    // again.
+    write_config(&home, "[memory]\nnormalize_to_english = true\n");
 
     let output = run_cli(&home, &["doctor"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");

@@ -422,6 +422,33 @@ Out of scope for T19-01 (deferred to the rest of group 19's queue, `19-mcp-adopt
 tool-routing trailer (§5, T19-02), hook/`.mcp.json` cold-start reliability (T19-03), and the
 plugin skill channel (T19-04).
 
+As-built note (T21-11, `[SPEC]`, group 21 phase 2 — `docs/implementation-plan/groups/
+21-memory-english-normalization.md`). The catalog and the server instructions now state the
+language durable memory is kept in. Until this task nothing in the product did: `SERVER_INSTRUCTIONS`
+described the whole working loop without naming a language, and `remember.text` — the one field
+whose content *becomes* the memory — carried no `description` at all. A background translator was
+built to repair the consequence (`T21-01`…`T21-08`) before the source was ever addressed, and
+`T21-09` then measured that translator at `Δ MRR = +0.0000` (`D-075`).
+
+- `SERVER_INSTRUCTIONS` gains one paragraph: durable memory is kept in English, `remember` and
+  memory edits are written in English, `recall` queries are phrased in English, and identifiers,
+  file paths, commit hashes, URLs, numbers and quoted code stay verbatim. The reason given to the
+  model is the operative one — one language across the store is what lets the lexical and vector
+  legs agree on the same entry.
+- Three `inputSchema` field descriptions say the same thing in one clause each: `remember.text`
+  (new — it had none), `recall.query`, `edit_memory.patch.text`. Tool names, schemas and
+  `annotations` are unchanged; the field descriptions are prose, like T19-01's.
+- Serialized catalog: **12 805 bytes** (was 12 252 before this task), against the unchanged
+  15 000-byte `MAX_CATALOG_BYTES` budget. The +553 bytes are deliberate and bounded: the rule is
+  stated once per field that needs it and once in the instructions, which are not part of the
+  catalog's deferred-loading weight.
+- The consolidation router's system prompt (`crates/memory/src/prompt.rs`) gains the matching
+  output rule and loses the one few-shot example that demonstrated the opposite (a Russian
+  observation answered with a Russian `text`). Spec 14 §1 item 4's `[FIXED]` RU/EN bar is
+  untouched: it constrains the *transcripts the router must cope with* and the `op_kinds` it must
+  emit, and all 42 `memory.router.op.*` fixtures assert `op_kinds` and never the language of
+  `text`. Router inputs stay multilingual on purpose.
+
 ## 3. Hooks
 
 ### 3.1 Ingestion hooks `[FIXED]`

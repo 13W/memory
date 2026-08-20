@@ -51,6 +51,12 @@ remember before moving on to the next thing; deferring it to \"later\" is how it
 RECALL \u{2192} SEARCH_CODE \u{2192} THINK \u{2192} ACT \u{2192} REMEMBER: each arrow is a tool \
 call, not narration.
 
+Language: durable memory is kept in English. Write remember (and any memory edit) in English, and \
+phrase recall queries in English, whatever language the session itself is in \u{2014} one language \
+across the store is what lets recall's lexical and vector legs agree on the same entry. Keep \
+identifiers, file paths, commit hashes, URLs, numbers and quoted code verbatim; those are never \
+translated.
+
 Which tool, once recall has run: search_code finds code by name or by meaning. \
 get_file_context, once you have a path, lists that file's indexed units (ids, kinds, names, \
 byte spans) with excerpts; cheaper and more complete than re-searching for a file you already \
@@ -123,6 +129,25 @@ mod tests {
     #[test]
     fn no_requested_version_gets_the_preferred_one() {
         assert_eq!(negotiate_protocol_version(None), PREFERRED_MCP_PROTOCOL);
+    }
+
+    /// T21-11: the cheapest lever in the system. The instructions are the one
+    /// text a client model reads before it ever calls a tool, and until this
+    /// task they said nothing about language while a background worker spent
+    /// local GPU translating the consequences.
+    #[test]
+    fn server_instructions_ask_for_english_and_exempt_identifiers() {
+        assert!(
+            SERVER_INSTRUCTIONS.contains("durable memory is kept in English"),
+            "the language contract must be stated, not implied"
+        );
+        assert!(
+            SERVER_INSTRUCTIONS.contains(
+                "Keep identifiers, file paths, commit hashes, URLs, \
+                 numbers and quoted code verbatim"
+            ),
+            "asking for English without exempting identifiers would corrupt them"
+        );
     }
 
     #[test]
