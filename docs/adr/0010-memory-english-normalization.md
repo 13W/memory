@@ -193,6 +193,25 @@ already normalized keep being recalled through their English variant, whose vect
 cached. `local-rag doctor` reports the switch's state, the backlog, and any dead-lettered entry;
 `local-rag stats` reports the counts on both the CLI and the MCP surface.
 
+*Amended (T21-11, 2026-08-20) — the default is now `false`.* Decision 11's argument was that the
+only case where the worker does work is the case where it was measured to help. `T21-09` measured
+the **shipped** component end to end and that premise did not hold: `pipeline_en` equals `baseline`
+query for query (`Δ MRR = +0.0000`), because the translation feeds the *dense* leg and the dense leg
+already ranked the expected entry #1 in 24/24 queries in every configuration, `baseline` included
+(`D-075`). A default that spends ≈ 1 s of local GPU per entry for a measured zero is not a default,
+so the switch ships off while the successor design lands.
+
+Decision 3's "background, after the mutation commits" and Decision 1's "the stored record is never
+rewritten" are superseded by ADR-0011 (English canon), on the owner's decision of 2026-08-20. The
+first move of that design is the one this ADR never considered: **ask for English at the source.**
+Nothing in the product ever told an agent which language durable memory is kept in —
+`SERVER_INSTRUCTIONS` did not mention language, `remember.text` carried no description at all, and
+the router's own few-shot set demonstrated mirroring the observation's language back into `text`.
+Asking costs zero inference and acts on the source; translating costs a second of GPU per entry and
+acts on the consequence. T21-11 changes all three, and translation stays only as a safety net for
+what instructions cannot reach (verbatim quotes, other clients, small local models that do not
+follow instructions reliably) and for entries written before it.
+
 ## Consequences
 
 - Cross-lingual memory recall goes from MRR 0.25–0.56 to a measured 1.0 on the benchmark corpus;

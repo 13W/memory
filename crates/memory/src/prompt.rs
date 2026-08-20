@@ -8,11 +8,19 @@
 //! trivially golden-testable. RU/EN is not a prompt-language switch — the
 //! system prompt and few-shot examples are fixed (mostly English, since
 //! that's the model's strongest instruction-following register at this
-//! size), and the model is asked to read/write `text` in *whichever*
-//! language the observations themselves are in, which is exactly spec 14 §1
-//! item 4's "RU/EN, including code-switched within one transcript" quality
-//! bar — the fixture corpus (Phase 4) is what actually exercises that, not
-//! the prompt template.
+//! size), and the model *reads* observations in whichever language they
+//! arrive in, which is exactly spec 14 §1 item 4's "RU/EN, including
+//! code-switched within one transcript" quality bar — the fixture corpus
+//! (Phase 4) is what actually exercises that, not the prompt template.
+//!
+//! What it *writes* is English, always (T21-11). That is a change from this
+//! module's original behaviour, which mirrored the observation's language
+//! into `text`. The `[FIXED]` bar in 14 §1 item 4 is about the input the
+//! router must cope with and the `op_kinds` it must emit — the 42
+//! `memory.router.op.*` fixtures assert `op_kinds` and never the language of
+//! `text` — so requiring English on the way out leaves it intact. Asking
+//! here costs nothing; translating afterwards costs a second of local GPU per
+//! entry, which is the whole reason to ask in the prompt instead.
 
 use serde::Serialize;
 
@@ -43,6 +51,8 @@ Output rules (must follow exactly):
   ids that actually appear in the input.
 - To act on an EXISTING entry (reinforce/resolve/retract/supersede), use its exact
   "memory_id" from the existing_entries list. Never invent one.
+- Write "text" and "reason" in English whatever language the observations use; keep
+  identifiers, paths, hashes, URLs and code verbatim.
 
 Placement rules (must follow):
 - Auto-save ("create" of kind fact/decision/convention/procedure/task) is ONLY for an
@@ -61,7 +71,7 @@ Input observation: {"id":"o1","event_type":"UserPromptSubmit","evidence_kind":"u
 Output: {"op":"create","kind":"decision","text":"Use pnpm instead of npm for this repo.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}
 
 Input observation: {"id":"o2","event_type":"UserPromptSubmit","evidence_kind":"user_statement","trust":"normal","text":"мы решили всегда запускать тесты перед коммитом"}
-Output: {"op":"create","kind":"convention","text":"Всегда запускать тесты перед коммитом.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o2"]}
+Output: {"op":"create","kind":"convention","text":"Always run the tests before committing.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o2"]}
 
 Input observation: {"id":"o3","event_type":"UserPromptSubmit","evidence_kind":"user_statement","trust":"normal","text":"what if we cached the embeddings?"}
 Output: {"op":"create","kind":"hypothesis","text":"Caching embeddings might help.","scope_kind":"repository","confidence_signal":"low","importance_signal":"low","cites":["o3"]}
@@ -188,6 +198,59 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Auto-save"));
         assert!(prompt.contains("propose_candidate"));
+    }
+
+    /// T21-11: the router writes English whatever the observations are in.
+    #[test]
+    fn system_prompt_requires_english_output_and_verbatim_identifiers() {
+        // The prompt is hard-wrapped, so match on whitespace-normalized text:
+        // a test that fails when a line is rewrapped guards formatting, not
+        // meaning.
+        let prompt = system_prompt();
+        let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(r#"Write "text" and "reason" in English"#),
+            "the language rule must be stated as an output rule, not implied: {flat}",
+        );
+        assert!(
+            flat.contains("keep identifiers, paths, hashes, URLs and code verbatim"),
+            "asking for English without exempting identifiers would corrupt them: {flat}",
+        );
+    }
+
+    /// The few-shot set is the strongest instruction a small model reads, so a
+    /// non-Latin `"text"` in any example would teach the opposite of the rule
+    /// above — which is exactly what the pre-T21-11 prompt did (a Russian
+    /// observation with a Russian `text` in its output).
+    ///
+    /// Inputs stay multilingual on purpose: spec 14 §1 item 4 `[FIXED]` is a
+    /// bar on the transcripts the router must cope with, and this test must not
+    /// be read as licence to make them English too.
+    #[test]
+    fn no_few_shot_output_text_is_written_in_a_non_latin_script() {
+        let prompt = system_prompt();
+        let examples = prompt
+            .split_once("Examples:")
+            .expect("the prompt carries a few-shot section")
+            .1;
+
+        for line in examples
+            .lines()
+            .filter(|l| l.starts_with("Output:") || l.starts_with('{'))
+        {
+            for field in ["\"text\":\"", "\"reason\":\""] {
+                let mut rest = line;
+                while let Some((_, after)) = rest.split_once(field) {
+                    let value = after.split('"').next().unwrap_or_default();
+                    assert!(
+                        !value.chars().any(|c| c.is_alphabetic() && !c.is_ascii()),
+                        "few-shot output {field}{value}\" is not English, which teaches the \
+                         model to mirror the observation's language",
+                    );
+                    rest = after;
+                }
+            }
+        }
     }
 
     #[test]

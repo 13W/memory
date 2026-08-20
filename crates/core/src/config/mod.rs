@@ -285,8 +285,7 @@ pub struct MemoryConfig {
     /// `[SPEC]`-chosen value, not derived from any normative text.
     pub consolidation_idle_checkpoint_hours: u64,
     /// Whether the daemon translates non-English memory entries into English
-    /// in the background (ADR-0010 Decision 11, T21-06's worker; default
-    /// `true`).
+    /// in the background (T21-06's worker; default `false` since T21-11).
     ///
     /// This switches off the **work**, not the reading: entries already
     /// normalized keep being recalled through their English variant, because
@@ -295,6 +294,16 @@ pub struct MemoryConfig {
     /// the store where it stands rather than reverting it — the honest
     /// behaviour for a switch a user flips to stop spending GPU, not to undo
     /// work already paid for.
+    ///
+    /// The default was `true` when the worker shipped (ADR-0010 Decision 11).
+    /// T21-09 then measured the shipped component end to end and found it moves
+    /// no metric at all — it translates the text the *dense* leg reads, and the
+    /// dense leg already ranked the expected entry #1 in 24/24 queries without
+    /// it (`D-075`). A default that spends a second of local GPU per entry for
+    /// a measured `Δ MRR` of `+0.0000` is not a default. The successor design
+    /// asks for English at the source instead (server instructions, tool
+    /// descriptions, router prompt — T21-11) and keeps translation only as a
+    /// safety net, which is what the rest of the group's phase 2 wires up.
     pub normalize_to_english: bool,
     /// How many entries the normalization worker translates per tick — its
     /// inference bound (`NormalizationParams.translate_batch`, T21-06).
@@ -316,7 +325,7 @@ impl Default for MemoryConfig {
             consolidation_batch_size: 20,
             consolidation_queue_threshold: 50,
             consolidation_idle_checkpoint_hours: 24,
-            normalize_to_english: true,
+            normalize_to_english: false,
             normalization_batch: 4,
         }
     }
@@ -607,7 +616,7 @@ recall_token_budget = 1500
 consolidation_batch_size = 20
 consolidation_queue_threshold = 50
 consolidation_idle_checkpoint_hours = 24
-normalize_to_english = true
+normalize_to_english = false
 normalization_batch = 4
 ";
 
@@ -814,32 +823,40 @@ normalization_batch = 4
         assert_eq!(cfg.memory.recall_token_budget, 1500);
     }
 
-    // ---- `[memory]` English normalization (T21-08, ADR-0010) ----------------
+    // ---- `[memory]` English normalization (T21-08; default flipped T21-11) --
 
+    /// T21-11: the background translator ships **off**. T21-09 measured the
+    /// shipped component end to end at `Δ MRR = +0.0000` (`D-075`), so the
+    /// default may not spend a second of local GPU per entry; English is asked
+    /// for at the source instead (server instructions, tool descriptions,
+    /// router prompt).
     #[test]
-    fn normalization_defaults_to_on_with_a_batch_of_four() {
+    fn normalization_defaults_to_off_with_a_batch_of_four() {
         let cfg = MemoryConfig::default();
         assert!(
-            cfg.normalize_to_english,
-            "ADR-0010 Decision 11: on by default"
+            !cfg.normalize_to_english,
+            "T21-11: off by default until the English-canon design lands"
         );
-        assert_eq!(cfg.normalization_batch, 4);
+        assert_eq!(
+            cfg.normalization_batch, 4,
+            "the batch bound stays meaningful for whoever switches the worker on"
+        );
     }
 
     #[test]
     fn a_memory_section_without_the_normalization_keys_still_defaults_them() {
         let cfg = Config::parse_toml("[memory]\nrecall_token_budget = 3000\n").unwrap();
         assert_eq!(cfg.memory.recall_token_budget, 3000);
-        assert!(cfg.memory.normalize_to_english);
+        assert!(!cfg.memory.normalize_to_english);
         assert_eq!(cfg.memory.normalization_batch, 4);
     }
 
     #[test]
-    fn normalization_can_be_switched_off_and_its_batch_retuned() {
+    fn normalization_can_be_switched_on_and_its_batch_retuned() {
         let cfg =
-            Config::parse_toml("[memory]\nnormalize_to_english = false\nnormalization_batch = 0\n")
+            Config::parse_toml("[memory]\nnormalize_to_english = true\nnormalization_batch = 0\n")
                 .unwrap();
-        assert!(!cfg.memory.normalize_to_english);
+        assert!(cfg.memory.normalize_to_english);
         assert_eq!(
             cfg.memory.normalization_batch, 0,
             "zero is a supported mode — detect and record, spend no inference",

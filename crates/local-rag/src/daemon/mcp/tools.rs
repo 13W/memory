@@ -163,8 +163,9 @@ pub fn catalog() -> Value {
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Free-text relevance query. Omit or leave empty for \
-                                a termless recall (most recent eligible memories)."
+                            "description": "Free-text relevance query, in English \u{2014} the \
+                                store is kept in English. Omit or leave empty for a termless \
+                                recall (most recent eligible memories)."
                         },
                         "limit": {
                             "type": "integer",
@@ -310,7 +311,10 @@ pub fn catalog() -> Value {
                     "properties": {
                         "text": {
                             "type": "string",
-                            "minLength": 1
+                            "minLength": 1,
+                            "description": "The entry's text, in English \u{2014} durable memory \
+                                is kept in one language so both recall legs agree. Keep \
+                                identifiers, paths, commit hashes and quoted code verbatim."
                         },
                         "kind": {
                             "type": "string",
@@ -401,7 +405,8 @@ pub fn catalog() -> Value {
                                     "description": "Full replacement for the candidate's \
                                         proposed_operation: a tagged object {\"op\": \
                                         \"create\"|\"reinforce\"|\"resolve\"|\"retract\"|\
-                                        \"supersede\", ...op-specific fields}."
+                                        \"supersede\", ...op-specific fields}. Any \"text\" \
+                                        it carries is written in English."
                                 },
                                 "conflicts": {
                                     "type": "array",
@@ -435,7 +440,10 @@ pub fn catalog() -> Value {
                         "patch": {
                             "type": "object",
                             "properties": {
-                                "text": {"type": "string"},
+                                "text": {
+                                    "type": "string",
+                                    "description": "Replacement text, in English."
+                                },
                                 "importance": {
                                     "type": "number",
                                     "minimum": 0,
@@ -600,6 +608,55 @@ mod tests {
                 budget (T19-01) — deferred loading in MCP clients keys off total tool-definition \
                 size, so catalog growth must be a deliberate choice, not an accident"
         );
+    }
+
+    /// T21-11: every field whose value becomes durable memory text, or the
+    /// query matched against it, says which language it is written in. Before
+    /// this task `remember.text` carried no description at all — the one field
+    /// whose content *is* the memory.
+    #[test]
+    fn every_memory_text_field_asks_for_english() {
+        let catalog = catalog();
+        let tools = catalog["tools"].as_array().expect("tools array");
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is in the catalog"))
+                .clone()
+        };
+
+        let cases = [
+            (
+                "remember",
+                tool("remember")["inputSchema"]["properties"]["text"].clone(),
+            ),
+            (
+                "recall",
+                tool("recall")["inputSchema"]["properties"]["query"].clone(),
+            ),
+            (
+                "edit_memory",
+                tool("edit_memory")["inputSchema"]["properties"]["patch"]["properties"]["text"]
+                    .clone(),
+            ),
+            (
+                "edit_memory_candidate",
+                tool("edit_memory_candidate")["inputSchema"]["properties"]["patch"]["properties"]
+                    ["proposed_operation"]
+                    .clone(),
+            ),
+        ];
+
+        for (name, field) in cases {
+            let description = field["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}'s text/query field has a description"));
+            assert!(
+                description.contains("English"),
+                "{name}'s field description does not name the language: {description}"
+            );
+        }
     }
 
     #[test]
