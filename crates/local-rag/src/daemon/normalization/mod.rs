@@ -45,6 +45,8 @@
 //!
 //! [ADR-0011]: ../../../../../docs/adr/0011-english-canon-for-durable-memory.md
 
+pub mod boundary;
+
 use std::sync::Arc;
 use std::time::Duration;
 

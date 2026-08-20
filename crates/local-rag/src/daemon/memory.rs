@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
+use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::UuidSource;
+use local_rag_embed::GeneratorPool;
 use local_rag_memory::recall::{BruteForceCosine, MemoryDenseBackend, QueryEmbedder};
 use local_rag_store::{CacheDb, StateDb};
 
@@ -29,6 +31,24 @@ pub struct MemoryContext {
     pub dense_backend: Arc<dyn MemoryDenseBackend>,
     pub recall_token_budget: u32,
     pub uuids: Arc<dyn UuidSource + Send + Sync>,
+    /// The write boundary's translator (T21-14, ADR-0011 §Decision 2).
+    ///
+    /// `None` when the generative model is not installed — the memory tools
+    /// keep working and record the refusal, because a store that stops
+    /// accepting notes when an optional model is missing would be a worse
+    /// product than one whose canon is English only eventually.
+    ///
+    /// It is the **same** `Arc` the consolidation router holds: `LlamaBackend`
+    /// is a process-wide singleton (D-054), so a second pool built here would
+    /// fail with `BackendAlreadyInitialized` and degrade silently to an empty
+    /// pool for the daemon's whole uptime.
+    pub generators: Option<Arc<GeneratorPool>>,
+    /// Which weights `generators` runs, for the provenance row. A pool names
+    /// its providers, not the model behind them.
+    pub generator_model_id: String,
+    /// The effective policy the translator passes to the pool; the pool itself
+    /// enforces it before selecting a provider (ADR-0010 Decision 7).
+    pub data_policy: DataPolicy,
 }
 
 /// Build the [`MemoryContext`] the MCP memory tools call.
@@ -46,12 +66,16 @@ pub struct MemoryContext {
 /// whatever vectors the embedder did or didn't produce), so it is hardcoded
 /// here rather than threaded through `StartOptions`, mirroring
 /// [`super::search::NoRebuildVectorSource`]'s own unconditional construction.
+#[allow(clippy::too_many_arguments)]
 pub fn build_memory_context(
     state: Arc<StateDb>,
     cache: Arc<CacheDb>,
     embedder: Arc<dyn QueryEmbedder>,
     recall_token_budget: u32,
     uuids: Arc<dyn UuidSource + Send + Sync>,
+    generators: Option<Arc<GeneratorPool>>,
+    generator_model_id: String,
+    data_policy: DataPolicy,
 ) -> Arc<MemoryContext> {
     Arc::new(MemoryContext {
         state,
@@ -60,5 +84,8 @@ pub fn build_memory_context(
         dense_backend: Arc::new(BruteForceCosine),
         recall_token_budget,
         uuids,
+        generators,
+        generator_model_id,
+        data_policy,
     })
 }

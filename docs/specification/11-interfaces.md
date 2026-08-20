@@ -289,6 +289,29 @@ caller who ignores the ask is not refused — that is ADR-0011 §Decision 3's "e
 `actor` stays `Actor::User` for the create itself; only a later normalization rewrite is
 `Actor::System` (08 §3).
 
+As-built note (T21-14, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
+the write boundary is wired. `remember` and `edit_memory` decide the canon **before** the store
+sees the text — script-detect, translate only when needed — and commit the canon and the
+provenance row in **one** transaction, so an entry can never exist with an English canon and no
+record of what its author wrote. Three properties worth stating because they are easy to get
+wrong:
+
+- **the English path spends no inference and barely any time.** The detector is pure; measured at
+  ~25 µs against a ~709 µs `remember` on this machine. That is what makes a translation step
+  tolerable on a request path at all.
+- **`remember` translates under `spawn_blocking`; the consolidation router does not.**
+  `GeneratorPool::generate` is synchronous and a local translation takes about a second. A
+  background tick owns its own time; an MCP handler does not, and blocking a tokio worker there
+  would delay every other request the daemon is serving.
+- **a replay is recognised before the translator is asked.** `remember`'s idempotency key is
+  looked up first, so a retried call does not spend a second of GPU reproducing an answer
+  `apply_create` would discard.
+
+A refusal — no installed model, a policy-blocked pool, an answer the validator rejects — stores
+the author's text unchanged and records why (`failed`). An `Unavailable` refusal deliberately does
+**not** consume one of the entry's attempts: a missing model is the environment's fault, not the
+entry's. The sweep that installs the canon for anything left queued is `T21-17`'s.
+
 - **`remember` always writes `actor=Actor::User`**, regardless of `confirmed_by_user`. The
   shipped `op.rs` doc comment on the model-claim-only-provenance backstop (T14-02, unchanged by
   this task) already says `actor == User` is exempt "by construction" because "spec 08 §5's
