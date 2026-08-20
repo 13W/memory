@@ -4,12 +4,20 @@
 
 | Field | Value |
 | --- | --- |
-| v2 commit | `2bcac29` |
+| v2 commit | `eb4c6c9` |
 | Corpus | `/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json` @ `1.0.0` |
 | Model | `embeddinggemma-300m` |
 | Config | `both_en` |
 | Corpus size | 24 entries, 24 queries |
 | Host | aarch64-macos |
+
+## Legs
+
+| Signal | Value |
+| --- | --- |
+| dense leg ranked the expected entry #1 | 24/24 |
+| dense leg surfaced it at all (top 5) | 24/24 |
+| dense leg degraded | 0/24 |
 
 ## Metrics
 
@@ -26,9 +34,9 @@
 | Stage | ms |
 | --- | --- |
 | install | 0 |
-| embed | 270 |
-| warm recall p50 | 43.096 |
-| warm recall p95 | 50.556 |
+| embed | 302 |
+| warm recall p50 | 47.120 |
+| warm recall p95 | 53.475 |
 
 ## Per-query
 

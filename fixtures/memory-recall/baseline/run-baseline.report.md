@@ -4,12 +4,20 @@
 
 | Field | Value |
 | --- | --- |
-| v2 commit | `2bcac29` |
+| v2 commit | `eb4c6c9` |
 | Corpus | `/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json` @ `1.0.0` |
 | Model | `embeddinggemma-300m` |
 | Config | `baseline` |
 | Corpus size | 24 entries, 24 queries |
 | Host | aarch64-macos |
+
+## Legs
+
+| Signal | Value |
+| --- | --- |
+| dense leg ranked the expected entry #1 | 24/24 |
+| dense leg surfaced it at all (top 5) | 24/24 |
+| dense leg degraded | 0/24 |
 
 ## Metrics
 
@@ -26,9 +34,9 @@
 | Stage | ms |
 | --- | --- |
 | install | 0 |
-| embed | 1104 |
-| warm recall p50 | 40.699 |
-| warm recall p95 | 42.593 |
+| embed | 887 |
+| warm recall p50 | 39.883 |
+| warm recall p95 | 45.672 |
 
 ## Per-query
 
@@ -53,7 +61,7 @@
 | mrq-17 | ru-en | 1 | mr-17 |
 | mrq-18 | ru-en | 1 | mr-18 |
 | mrq-19 | ru-en | 4 | mr-10 |
-| mrq-20 | ru-en | — | mr-11 |
+| mrq-20 | ru-en | — | mr-12 |
 | mrq-21 | en-ru | 1 | mr-21 |
 | mrq-22 | en-ru | — | mr-05 |
 | mrq-23 | en-ru | — | mr-06 |

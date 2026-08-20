@@ -354,7 +354,7 @@ fn run_memory_recall_bench() -> ExitCode {
                         Some(c) => configs.push(c),
                         None => {
                             eprintln!(
-                                "--config takes baseline|store_en|query_en|both_en|all, got {piece:?}"
+                                "--config takes baseline|store_en|query_en|both_en|pipeline_en|all, got {piece:?}"
                             );
                             return ExitCode::from(2);
                         }

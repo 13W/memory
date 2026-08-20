@@ -510,6 +510,55 @@ against a Russian store. The harness now seeds its `UuidSource` and gives each e
 for query. The recorded artifacts above predate that fix and are kept as-is (evidence is never
 rewritten); the numbers a comparison may be drawn from are the ones a re-run produces.
 
+As-built note (T21-09, `[SPEC]`, ADR-0010): the two notes above measured **hand-authored** English —
+`store_en`/`query_en`/`both_en` read `text_english`/`query_english` straight out of the fixture. A
+fifth configuration, `pipeline_en`, measures **what is actually shipped**: the original text in
+`memory_entry`, the real detector and translator (`local_rag_memory::normalize::translate` against
+the installed `gemma-4-e2b-it-gguf-q4-0`) writing real `memory_text_normalization` rows, and the
+backfill embedding each entry's *effective* text. The corpus, model, and queries are unchanged; the
+query side stays original (translating it is `T21-10`).
+
+The translator did its job — **12 translated, 12 passthrough, 0 failed** over the 24 entries — and
+the result is that the metric does not move at all:
+
+| Group | `baseline` | `store_en` | `query_en` | `both_en` | **`pipeline_en`** |
+| --- | --- | --- | --- | --- | --- |
+| overall (n=24) | 0.8021 | 1.0000 | 0.9062 | 1.0000 | **0.8021** |
+| `en-en` (n=8) | 1.0000 | 1.0000 | 1.0000 | 1.0000 | **1.0000** |
+| `ru-ru` (n=8) | 1.0000 | 1.0000 | 0.9375 | 1.0000 | **1.0000** |
+| `ru-en` (n=4) | 0.5625 | 1.0000 | 0.5625 | 1.0000 | **0.5625** |
+| `en-ru` (n=4) | 0.2500 | 1.0000 | 1.0000 | 1.0000 | **0.2500** |
+
+`pipeline_en` is `baseline` query for query. The card predicted that such a divergence would mean
+"the embedder is being fed the wrong text"; the run proves it is not. This task added the
+instrumentation that settles it — every run now records, per query, whether the dense leg degraded
+and at what rank **that leg alone** placed the expected entry (`## Legs` in each report):
+
+> dense leg ranked the expected entry #1 — **24/24**, in *every one* of the five configurations,
+> `baseline` included; dense leg degraded — 0/24.
+
+So the multilingual embedder already solves this corpus's cross-lingual problem on its own, with no
+normalization whatsoever, and all 24 vectors are found by hash. The cross-lingual gap the earlier
+notes measured is created **at fusion**: RRF ranks an entry that both legs surfaced above an entry
+only the dense leg found, so a dense-rank-1 answer that BM25 never saw lands outside the top 5.
+`store_en`/`both_en` close that gap by changing what the **lexical** leg reads (English stored text
+matching an English query), not by improving retrieval quality. The shipped design deliberately does
+the opposite — `memory_entry.text` stays canonical (§3 `[FIXED]`) and BM25 stays raw-against-raw
+(ADR-0010) — so it moves only the leg that was already perfect.
+
+This is registered as **`D-075`, status `blocked`**: whether to change fusion, to feed the lexical
+leg normalized text (a revision of ADR-0010), to pursue the query side (`T21-10`), or to accept the
+current state is an owner decision, not something this measurement may settle on its own. Full run
+artifacts: `fixtures/memory-recall/baseline/run-{baseline,store_en,query_en,both_en,pipeline_en,
+comparison}.json` and `.report.md`, all five regenerated together on the D-068-fixed harness (the
+older recorded numbers predate that fix, as the note above says).
+
+A harness defect found and fixed in the same task: every configuration used **one** reused temp
+directory, deleted and recreated per configuration while the previous one's `StateDb`/`CacheDb`
+writer threads could still hold its files. On this five-configuration sweep that raced and killed
+the run outright with a bare SQLite `disk I/O error` on the second configuration. Each configuration
+now gets its own directory and the cache is closed explicitly before the next one starts.
+
 ## 7. Memory-quality benchmark `[FIXED, new in rev 6]`
 
 A labeled fixture set of observation streams → expected memory ops

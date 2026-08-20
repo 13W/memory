@@ -5,17 +5,25 @@
     "corpus_path": "/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json",
     "corpus_version": "1.0.0",
     "model_id": "embeddinggemma-300m",
-    "config": "both_en",
+    "config": "pipeline_en",
     "entry_count": 24,
     "query_count": 24,
     "host": "aarch64-macos",
-    "normalizer": null
+    "normalizer": {
+      "model_id": "gemma-4-e2b-it-gguf-q4-0",
+      "prompt_version": 1,
+      "normalizer_version": 1,
+      "translated": 12,
+      "passthrough": 12,
+      "failed": 0,
+      "failures": []
+    }
   },
   "metrics": {
-    "hit_at_1": 1.0,
-    "hit_at_3": 1.0,
-    "hit_at_5": 1.0,
-    "mrr": 1.0,
+    "hit_at_1": 0.7916666666666666,
+    "hit_at_3": 0.7916666666666666,
+    "hit_at_5": 0.8333333333333334,
+    "mrr": 0.8020833333333334,
     "query_count": 24
   },
   "metrics_by_lang_pair": {
@@ -27,17 +35,17 @@
       "query_count": 8
     },
     "en-ru": {
-      "hit_at_1": 1.0,
-      "hit_at_3": 1.0,
-      "hit_at_5": 1.0,
-      "mrr": 1.0,
+      "hit_at_1": 0.25,
+      "hit_at_3": 0.25,
+      "hit_at_5": 0.25,
+      "mrr": 0.25,
       "query_count": 4
     },
     "ru-en": {
-      "hit_at_1": 1.0,
-      "hit_at_3": 1.0,
-      "hit_at_5": 1.0,
-      "mrr": 1.0,
+      "hit_at_1": 0.5,
+      "hit_at_3": 0.5,
+      "hit_at_5": 0.75,
+      "mrr": 0.5625,
       "query_count": 4
     },
     "ru-ru": {
@@ -254,8 +262,8 @@
       "dense_hits": 5,
       "lang_pair": "ru-en",
       "expected_entry_id": "mr-19",
-      "rank": 1,
-      "top_result_id": "mr-19",
+      "rank": 4,
+      "top_result_id": "mr-10",
       "returned": 24
     },
     {
@@ -265,8 +273,8 @@
       "dense_hits": 5,
       "lang_pair": "ru-en",
       "expected_entry_id": "mr-20",
-      "rank": 1,
-      "top_result_id": "mr-20",
+      "rank": null,
+      "top_result_id": "mr-11",
       "returned": 24
     },
     {
@@ -287,8 +295,8 @@
       "dense_hits": 5,
       "lang_pair": "en-ru",
       "expected_entry_id": "mr-22",
-      "rank": 1,
-      "top_result_id": "mr-22",
+      "rank": null,
+      "top_result_id": "mr-02",
       "returned": 24
     },
     {
@@ -298,8 +306,8 @@
       "dense_hits": 5,
       "lang_pair": "en-ru",
       "expected_entry_id": "mr-23",
-      "rank": 1,
-      "top_result_id": "mr-23",
+      "rank": null,
+      "top_result_id": "mr-06",
       "returned": 24
     },
     {
@@ -309,15 +317,15 @@
       "dense_hits": 5,
       "lang_pair": "en-ru",
       "expected_entry_id": "mr-24",
-      "rank": 1,
-      "top_result_id": "mr-24",
+      "rank": null,
+      "top_result_id": "mr-05",
       "returned": 24
     }
   ],
   "latency": {
     "install_ms": 0,
-    "embed_ms": 302,
-    "recall_p50_ms": 47.120166,
-    "recall_p95_ms": 53.475167
+    "embed_ms": 501,
+    "recall_p50_ms": 38.602,
+    "recall_p95_ms": 41.779416
   }
 }
