@@ -49,11 +49,31 @@ Operations: `create | reinforce | resolve | supersede | retract | noop`
 - **Retry is idempotent**: same `idempotency_key` ⇒ recognized as already applied, returns the
   original result.
 - `reinforce`: adds evidence, may raise confidence, never changes text `[FIXED]`.
-- `edit`: new `entry_version` via audit; `actor` distinguishes user-edit vs router-edit `[FIXED]`.
+- `edit`: new `entry_version` via audit; `actor` distinguishes user-edit vs router-edit vs
+  **system-edit** `[FIXED]` (the third actor added by ADR-0011 — a normalization rewrite is an
+  audited `edit` like any other, see the amendment note below).
+- **Durable memory text is stored in English** `[FIXED, ADR-0011]`. Non-English input is
+  translated at the boundary before it is written (08 §5, 11 §2); the author's original is kept as
+  provenance and is what `inspect`/`export` show (12 §3). The invariant is **eventually** English:
+  when translation fails the entry is written with the author's text and its canon is rewritten
+  later by `Actor::System`, because losing a note to a model failure is not an acceptable
+  degradation.
 - `retract` ≠ delete: entry survives for audit; hard removal exists only as an explicit privacy
   `purge` (12 §5) which also rewrites audit references to tombstones `[SPEC]`.
 - `merge_memories`: one tx — survivor absorbs evidence, losers → `superseded` with
   `supersedes_id` → survivor; audit records the merge set.
+
+Amendment note (T21-12, `[FIXED]` change under
+[ADR-0011](../adr/0011-english-canon-for-durable-memory.md)): the two `[FIXED]` bullets above about
+`actor` and about language are this ADR's, and they are deliberately narrow. This section already
+said an entry's text may change **only** through `edit`, with a new `entry_version` and an audit
+row; English canon does not weaken that contract, it uses it. `Actor::System` already existed in
+code (`crates/store/src/memory/audit.rs`) and was simply unnamed here. What is genuinely new is the
+language invariant, and it is stated as *eventually* English on purpose — ADR-0011 §Decision 3
+explains why refusing a write whose translation failed would be the worse failure. The write path
+that performs the boundary translation is `T21-14`'s and lives **above** `crates/store`: a
+generative model must not run inside the write transaction (the precedent D-063 set for
+subprocesses).
 
 As-built note (T14-02, `[SPEC]`): `local_rag_store::memory::op` ships exactly `create`/
 `reinforce`/`noop` — the shared transactional engine `resolve`/`supersede`/`retract`/`edit`
@@ -318,7 +338,10 @@ model_claim` `[SPEC]`. It passes through the same transactional path as router o
 ## 6. Recall v0 `[FIXED pipeline]`
 
 ```
-scope resolution: global ∪ repository(worktree→repo) ∪ worktree
+query normalization: script-detect the query; translate to English if it is not
+   (ADR-0011 §Decision 2) — free for an English query, degrades to the original
+   text plus an explicit marker when translation fails [FIXED, ADR-0011]
+→ scope resolution: global ∪ repository(worktree→repo) ∪ worktree
 → candidate set: entries in recall-eligible states
    (active; hypothesis/confirmed flagged as hypothesis-confirmed;
     terminal states excluded)

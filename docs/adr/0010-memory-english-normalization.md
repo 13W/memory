@@ -30,6 +30,14 @@ therefore chose the heavier path `TRACEABILITY.md` reserves for this case: a new
 `21`, gated by `G21`, outside the closed `T00–T17` v0 queue — the third instance of the
 precedent ADR-0008 established. Group 21 reopens no gate `G00–G20`.
 
+**Partially superseded by [ADR-0011](0011-english-canon-for-durable-memory.md) — 2026-08-20.**
+Decisions 1, 3 and 6 are replaced (English becomes the stored canon, normalization moves to the
+write and query boundaries, and an entry born English needs no vector-then-row ordering);
+Decisions 4 and 5 become moot with them; 2, 7, 8 and 10 remain in force; 11 was already amended
+above. The text below is left exactly as accepted, including the reasoning that turned out to be
+wrong: `T21-09` measured this design at `Δ MRR = +0.0000` (`D-075`), and an ADR is evidence of
+what was decided and why, not a record edited to look correct in hindsight.
+
 ## Context
 
 ### What was measured

@@ -148,6 +148,16 @@ deferral every sweep in this crate carries (triggering it periodically is the da
 15).
 - `inspect / export / purge` exist as first-class CLI operations (11 §6). `purge` is the only
   hard-delete path and tombstones audit references `[SPEC]`.
+- **The author's original text stays visible** `[FIXED, ADR-0011]`. Durable memory is stored in
+  English (08 §3), so `inspect` and `export` must show the text as it was written alongside the
+  stored canon: an owner reading their own store has to see their own words, not only a machine's
+  rendering of them. `purge` removes both — both are the same person's data.
+- **Observations and evidence are never translated** `[FIXED, ADR-0011]`. What hooks capture and
+  what `give_feedback` records is a record of what was actually said; translating it would turn
+  evidence into paraphrase and hollow out `inspect_memory_evidence`. This does not weaken the
+  language invariant: the consolidation router writes entry text in English regardless of the
+  language of the observations it read, so the durable entry is English anyway
+  ([ADR-0011](../adr/0011-english-canon-for-durable-memory.md) §Decision 7).
 
 As-built note (T16-02, `[SPEC]`): implemented as `local_rag_store::privacy::{inspect,export,
 purge}` (11 §6's own as-built note has the CLI wiring and flag shape). `purge_memory` deletes the
