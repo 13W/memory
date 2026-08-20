@@ -51,22 +51,29 @@ use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::{Uuid, UuidSource, uuidv7_from};
 use local_rag_core::paths::StoreLayout;
 use local_rag_embed::{
-    BackfillParams, EmbedRequest, Embedder, InFlight, ProviderEntry, ProviderPool, run_backfill,
+    BackfillParams, EmbedRequest, Embedder, GeneratorEntry, GeneratorPool, InFlight, ProviderEntry,
+    ProviderPool, run_backfill,
+};
+use local_rag_memory::normalize::translate::{
+    TRANSLATOR_VERSION, TranslateRequest, Translation, translate,
 };
 use local_rag_memory::recall;
 use local_rag_models::{
     DEFAULT_MODEL_ID, HttpFetcher, ModelCatalogEntry, OnnxEmbedder, find, install_model,
 };
 use local_rag_store::{
-    CacheDb, CreateMemoryEntryError, DEFAULT_MODEL_SPACE_ID, GLOBAL_SCOPE_OWNER_ID, MemoryKind,
-    NewMemoryEntry, RepresentationKey, RequestRoot, RetentionParams, ScopeKind, StateDb,
-    create_memory_entry, register_representation, set_model_space_representation,
+    CURRENT_NORMALIZER_VERSION, CacheDb, CreateMemoryEntryError, DEFAULT_MODEL_SPACE_ID,
+    GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, NormalizationStatus, NormalizationWrite,
+    RepresentationKey, RepresentationKind, RequestRoot, RetentionParams, ScopeKind, StateDb,
+    UpsertOutcome, create_memory_entry, model_space_required_representation_ids,
+    recall_candidates_for_scope, register_representation, representation_key,
+    set_model_space_representation, upsert_normalization,
 };
 
 use crate::git::git_short_head;
 use crate::memory_recall_bench::corpus::{Corpus, Entry, Query};
 use crate::memory_recall_bench::report::{
-    Latency, MemoryRecallBenchReport, Provenance, QueryResult,
+    Latency, MemoryRecallBenchReport, NormalizerRun, Provenance, QueryResult,
 };
 use crate::memory_recall_bench::score::{aggregate, aggregate_by_lang_pair, rank_of_match};
 use crate::stats::percentile;
@@ -132,17 +139,34 @@ pub enum Config {
     /// Store and query both use `*_english` — the v1-style shape (English-only
     /// storage, translated query).
     BothEn,
+    /// **The shipped component** (T21-09). The store is seeded with
+    /// `*_original`, exactly as `Baseline` is, and then the real
+    /// `local_rag_memory::normalize::translate` runs over each entry against a
+    /// real generator; whatever it produces is written as a
+    /// `memory_text_normalization` row. Nothing else changes — the backfill
+    /// already embeds each entry's *effective* text (T21-02), and recall
+    /// searches that same text.
+    ///
+    /// The query stays `*_original`: translating the query is `T21-10`, an
+    /// owner-decision card gated on the numbers this configuration produces.
+    ///
+    /// Unlike the four above, this configuration measures a *pipeline* rather
+    /// than a hand-authored ceiling: the fixture's `text_english` is never read
+    /// at all here, and the detector decides on its own which entries are worth
+    /// translating.
+    PipelineEn,
 }
 
 impl Config {
     /// Every configuration, `Baseline` first — `report::compare` looks for
     /// `Baseline` by name, so any caller sweeping "all" gets a comparable
     /// baseline in the set by construction.
-    pub const ALL: [Config; 4] = [
+    pub const ALL: [Config; 5] = [
         Config::Baseline,
         Config::StoreEn,
         Config::QueryEn,
         Config::BothEn,
+        Config::PipelineEn,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -151,6 +175,7 @@ impl Config {
             Config::StoreEn => "store_en",
             Config::QueryEn => "query_en",
             Config::BothEn => "both_en",
+            Config::PipelineEn => "pipeline_en",
         }
     }
 
@@ -160,6 +185,7 @@ impl Config {
             "store_en" => Some(Config::StoreEn),
             "query_en" => Some(Config::QueryEn),
             "both_en" => Some(Config::BothEn),
+            "pipeline_en" => Some(Config::PipelineEn),
             _ => None,
         }
     }
@@ -168,7 +194,7 @@ impl Config {
     /// with.
     fn store_text(self, entry: &Entry) -> &str {
         match self {
-            Config::Baseline | Config::QueryEn => &entry.text_original,
+            Config::Baseline | Config::QueryEn | Config::PipelineEn => &entry.text_original,
             Config::StoreEn | Config::BothEn => &entry.text_english,
         }
     }
@@ -176,9 +202,20 @@ impl Config {
     /// Which of `query`'s two text fields this configuration searches with.
     fn query_text(self, query: &Query) -> &str {
         match self {
-            Config::Baseline | Config::StoreEn => &query.query_original,
+            Config::Baseline | Config::StoreEn | Config::PipelineEn => &query.query_original,
             Config::QueryEn | Config::BothEn => &query.query_english,
         }
+    }
+
+    /// Whether this configuration runs the real translator over each seeded
+    /// entry. The **only** difference between [`Config::PipelineEn`] and
+    /// [`Config::Baseline`]: same stored text, same query text, one extra
+    /// component in the middle.
+    ///
+    /// A run whose set contains no such configuration never opens a generator
+    /// at all, so the four fixture-driven configurations stay model-free.
+    pub fn normalizes(self) -> bool {
+        matches!(self, Config::PipelineEn)
     }
 }
 
@@ -270,6 +307,15 @@ pub async fn run(options: &Options) -> Result<Vec<MemoryRecallBenchReport>, Stri
         options.configs.clone()
     };
 
+    // T21-09: the GGUF is opened once, and **only** when some configuration in
+    // this run actually translates. A `--config baseline` run stays exactly as
+    // model-free as it was before this task.
+    let generator = if configs.iter().any(|c| c.normalizes()) {
+        Some(open_generator(&model_layout)?)
+    } else {
+        None
+    };
+
     let mut reports = Vec::with_capacity(configs.len());
     for config in configs {
         eprintln!("[memory-recall-bench] running config={}", config.as_str());
@@ -278,6 +324,7 @@ pub async fn run(options: &Options) -> Result<Vec<MemoryRecallBenchReport>, Stri
                 &corpus,
                 entry,
                 embedder.clone(),
+                generator.as_ref(),
                 config,
                 install_ms,
                 &options.corpus_path,
@@ -288,17 +335,59 @@ pub async fn run(options: &Options) -> Result<Vec<MemoryRecallBenchReport>, Stri
     Ok(reports)
 }
 
+/// The real local generative model `pipeline_en` translates with — installed
+/// and opened exactly the way `crate::memory_bench::run` already does it, into
+/// the same benchmark model home (`StoreLayout::model_dir` namespaces by
+/// `model_id`, so the GGUF and the ONNX weights coexist without either
+/// re-downloading).
+fn open_generator(model_layout: &StoreLayout) -> Result<GeneratorSession, String> {
+    let entry =
+        local_rag_generate::find(local_rag_generate::DEFAULT_MODEL_ID).ok_or_else(|| {
+            format!(
+                "{:?} is not in the generator catalog",
+                local_rag_generate::DEFAULT_MODEL_ID
+            )
+        })?;
+    eprintln!(
+        "[memory-recall-bench] translator {} in {}",
+        entry.model_id,
+        model_layout.model_dir(entry.model_id).display()
+    );
+    local_rag_generate::install_model(
+        model_layout,
+        entry,
+        &local_rag_generate::HttpFetcher::default(),
+        &mut std::io::stderr(),
+    )
+    .map_err(|e| format!("install {}: {e}", entry.model_id))?;
+    let generator = local_rag_generate::LlamaGenerator::open(model_layout, entry)
+        .map_err(|e| format!("open {}: {e}", entry.model_id))?;
+    Ok(GeneratorSession {
+        model_id: entry.model_id.to_string(),
+        pool: GeneratorPool::new(vec![GeneratorEntry::local("llama", Arc::new(generator))]),
+    })
+}
+
+/// A generator plus the id it answers under — the id belongs in the report's
+/// provenance, and `GeneratorPool` does not surface it.
+pub struct GeneratorSession {
+    pub model_id: String,
+    pub pool: GeneratorPool,
+}
+
 /// One configuration's full run: fresh store, seed with `config`'s chosen
 /// store text, embed, then every query against `config`'s chosen query text.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_config(
     corpus: &Corpus,
     entry: &'static ModelCatalogEntry,
     embedder: Arc<dyn Embedder>,
+    generator: Option<&GeneratorSession>,
     config: Config,
     install_ms: u64,
     corpus_path: &std::path::Path,
 ) -> Result<MemoryRecallBenchReport, String> {
-    let home = tempdir()?;
+    let home = tempdir(config)?;
     let layout = StoreLayout::new(home.join("local-rag"));
     layout.ensure().map_err(|e| format!("store layout: {e}"))?;
 
@@ -309,6 +398,22 @@ async fn run_one_config(
     let now_ms = 1_000;
 
     register_memory_representation(&state, embedder.as_ref(), now_ms).await?;
+
+    // T21-09: `pipeline_en` seeds the original text and then runs the real
+    // component over it. Every other configuration leaves this `None`, and its
+    // provenance says so.
+    let mut normalizer = config.normalizes().then(|| {
+        let session = generator.expect("a normalizing config always gets a generator");
+        NormalizerRun {
+            model_id: session.model_id.clone(),
+            prompt_version: TRANSLATOR_VERSION,
+            normalizer_version: CURRENT_NORMALIZER_VERSION,
+            translated: 0,
+            passthrough: 0,
+            failed: 0,
+            failures: Vec::new(),
+        }
+    });
 
     let mut memory_id_by_corpus_id: BTreeMap<String, String> = BTreeMap::new();
     for (i, corpus_entry) in corpus.entries.iter().enumerate() {
@@ -329,6 +434,21 @@ async fn run_one_config(
             created_at,
         )
         .await?;
+        if let Some(run) = normalizer.as_mut() {
+            let pool = &generator
+                .expect("a normalizing config always gets a generator")
+                .pool;
+            normalize_entry(
+                &state,
+                pool,
+                &memory_id,
+                corpus_entry,
+                config.store_text(corpus_entry),
+                run,
+                created_at,
+            )
+            .await?;
+        }
         memory_id_by_corpus_id.insert(corpus_entry.id.clone(), memory_id);
     }
     let corpus_id_by_memory_id: BTreeMap<String, String> = memory_id_by_corpus_id
@@ -366,6 +486,17 @@ async fn run_one_config(
         embedder: embedder.clone(),
     };
 
+    // T21-09: the dense leg, called directly with exactly what the pipeline
+    // hands it, so each query can be scored on that leg alone as well as after
+    // fusion. Without this the benchmark cannot tell "the embedder never saw
+    // the English text" from "the embedder saw it and RRF still ranked the
+    // lexical leg's answer higher" — and those two conclusions point at
+    // opposite fixes.
+    let dense_context = memory_representation(&state_read)?;
+    let candidates =
+        recall_candidates_for_scope(&state_read, ScopeKind::Global, GLOBAL_SCOPE_OWNER_ID)
+            .map_err(|e| format!("candidates: {e}"))?;
+
     let mut per_query = Vec::with_capacity(corpus.queries.len());
     let mut ranks: Vec<Option<usize>> = Vec::with_capacity(corpus.queries.len());
     let mut ranks_by_pair: Vec<(String, Option<usize>)> = Vec::with_capacity(corpus.queries.len());
@@ -385,6 +516,7 @@ async fn run_one_config(
 
         let mut ranked_ids: Vec<String> = Vec::new();
         let mut returned = 0usize;
+        let mut dense_degraded: Option<String> = None;
         for pass in 0..(WARMUP_PASSES + TIMED_PASSES) {
             let started = Instant::now();
             let outcome = recall::recall(
@@ -401,6 +533,7 @@ async fn run_one_config(
                 timings_ms.push(elapsed);
             }
             returned = outcome.entries.len();
+            dense_degraded = outcome.dense_degraded.as_ref().map(|d| format!("{d:?}"));
             ranked_ids = outcome
                 .entries
                 .iter()
@@ -410,6 +543,27 @@ async fn run_one_config(
         }
 
         let rank = rank_of_match(expected_memory_id, &ranked_ids);
+        let dense_hits_list = dense_context
+            .as_ref()
+            .and_then(|(key, representation_id)| {
+                recall::dense_leg(
+                    &cache_read,
+                    config.query_text(query),
+                    key,
+                    representation_id,
+                    &query_embedder,
+                    &recall::BruteForceCosine,
+                    &candidates,
+                    QUERY_LIMIT,
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let dense_hits = dense_hits_list.len();
+        let dense_rank = dense_hits_list
+            .iter()
+            .find(|h| h.memory_id == *expected_memory_id)
+            .map(|h| h.rank);
         let top_result_id = ranked_ids
             .first()
             .and_then(|id| corpus_id_by_memory_id.get(id))
@@ -422,6 +576,9 @@ async fn run_one_config(
             rank,
             top_result_id,
             returned,
+            dense_degraded,
+            dense_rank,
+            dense_hits,
         });
         ranks.push(rank);
         ranks_by_pair.push((query.lang_pair.clone(), rank));
@@ -446,7 +603,15 @@ async fn run_one_config(
         entry_count: corpus.entries.len(),
         query_count: corpus.queries.len(),
         host: std::env::consts::ARCH.to_string() + "-" + std::env::consts::OS,
+        normalizer,
     };
+
+    // Let this configuration's writer threads finish before the next one
+    // starts: `CacheDb::close` joins its own, and dropping the read handles
+    // first keeps SQLite from holding the files open behind them.
+    drop(state_read);
+    drop(cache_read);
+    cache.close();
 
     Ok(MemoryRecallBenchReport::new(
         provenance,
@@ -455,6 +620,30 @@ async fn run_one_config(
         per_query,
         latency,
     ))
+}
+
+/// The active `memory` representation for the benchmark's own model space —
+/// the same pair `recall`'s own `resolve_memory_representation` resolves for a
+/// `GlobalOnly` request, read here so the dense leg can be scored on its own
+/// (T21-09).
+fn memory_representation(
+    state_read: &local_rag_store::rusqlite::Connection,
+) -> Result<Option<(RepresentationKey, String)>, String> {
+    let representations =
+        model_space_required_representation_ids(state_read, DEFAULT_MODEL_SPACE_ID)
+            .map_err(|e| format!("representations: {e}"))?;
+    let Some((_, representation_id)) = representations
+        .into_iter()
+        .find(|(kind, _)| *kind == RepresentationKind::Memory)
+    else {
+        return Ok(None);
+    };
+    let Some(key) =
+        representation_key(state_read, &representation_id).map_err(|e| format!("key: {e}"))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((key, representation_id)))
 }
 
 async fn register_memory_representation(
@@ -514,6 +703,99 @@ async fn seed_entry(
     Ok(())
 }
 
+/// Run the **real** translator over one seeded entry and record whatever it
+/// produced, exactly as `local_rag::daemon::normalization` does in the daemon
+/// (T21-09).
+///
+/// Three outcomes, all of them normal:
+///
+/// - a validated English variant → a `ready` row, and from here on the backfill
+///   embeds *that* text (`all_memory_entries_with_effective_text`, T21-02) —
+///   this benchmark never re-implements "which text is embedded";
+/// - the detector found nothing non-Latin → a `skipped` row, written without a
+///   single generator call (ADR-0010 Decision 8);
+/// - the validator refused the answer → a `failed` row. The entry keeps its
+///   original text and the run continues: a benchmark that aborted here would
+///   go blind precisely when the shipped component did something interesting,
+///   and the metric is supposed to include that outcome, not hide it.
+///
+/// `memory_entry.text` is never touched — it is the original in every branch,
+/// which is the whole point of measuring the pipeline rather than the fixture.
+async fn normalize_entry(
+    state: &StateDb,
+    pool: &GeneratorPool,
+    memory_id: &str,
+    corpus_entry: &Entry,
+    text: &str,
+    run: &mut NormalizerRun,
+    now_ms: i64,
+) -> Result<(), String> {
+    let outcome = translate(
+        pool,
+        DataPolicy::LocalOnly,
+        TranslateRequest { memory_id, text },
+    );
+
+    let sha = local_rag_core::hash::sha256_hex(text.as_bytes());
+    let (status, english, language, last_error) = match outcome {
+        Ok(Translation::Translated { english }) => {
+            run.translated += 1;
+            (NormalizationStatus::Ready, Some(english), None, None)
+        }
+        Ok(Translation::Passthrough { class }) => {
+            run.passthrough += 1;
+            (
+                NormalizationStatus::Skipped,
+                None,
+                Some(format!("{class:?}")),
+                None,
+            )
+        }
+        Err(e) => {
+            run.failed += 1;
+            run.failures.push((corpus_entry.id.clone(), e.to_string()));
+            eprintln!(
+                "[memory-recall-bench]   {} not translated: {e}",
+                corpus_entry.id
+            );
+            (NormalizationStatus::Failed, None, None, Some(e.to_string()))
+        }
+    };
+
+    let (id, model_id) = (memory_id.to_string(), run.model_id.clone());
+    let normalizer_version = run.normalizer_version;
+    let outcome = state
+        .writer()
+        .transaction(move |tx| {
+            upsert_normalization(
+                tx,
+                &NormalizationWrite {
+                    memory_id: &id,
+                    status,
+                    source_text_sha256: &sha,
+                    normalized_text: english.as_deref(),
+                    source_language: language.as_deref(),
+                    normalizer_model_id: Some(&model_id),
+                    prompt_version: Some(TRANSLATOR_VERSION),
+                    normalizer_version,
+                    attempt_count: 1,
+                    last_error: last_error.as_deref(),
+                    next_attempt_at: None,
+                },
+                now_ms,
+            )
+        })
+        .await
+        .map_err(|e| format!("{}: normalization tx: {e}", corpus_entry.id))?;
+    match outcome {
+        UpsertOutcome::Written => Ok(()),
+        other => Err(format!(
+            "{}: normalization refused: {other:?}",
+            corpus_entry.id
+        )),
+    }
+}
+
 fn default_entry(model_id: Option<&str>) -> Result<&'static ModelCatalogEntry, String> {
     let model_id = model_id.unwrap_or(DEFAULT_MODEL_ID);
     find(model_id).ok_or_else(|| format!("{model_id:?} is not in the embedding catalog"))
@@ -533,17 +815,26 @@ fn model_home() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".local/share/local-rag-bench"))
 }
 
-/// Recreated fresh on every call (`remove_dir_all` then `create_dir_all`),
-/// so [`run`]'s sequential per-[`Config`] loop never leaks state between
-/// configurations despite reusing one directory name across calls.
-fn tempdir() -> Result<PathBuf, String> {
+/// A store directory of this configuration's own — `…-<pid>/<config>`.
+///
+/// It used to be one directory reused across configurations, deleted and
+/// recreated per call. That raced: `StateDb`'s writer thread is detached and
+/// `CacheDb`'s is joined only on an explicit `close`, so the next
+/// configuration could delete files the previous one's threads still held, and
+/// the following `run_backfill` failed with a bare SQLite `disk I/O error`
+/// (observed at T21-09, on the second configuration of a five-configuration
+/// sweep, killing the whole run). Per-configuration directories remove the
+/// shared resource instead of trying to time the cleanup; the parent is
+/// removed once, up front, so a rerun of the same pid still starts clean.
+fn tempdir(config: Config) -> Result<PathBuf, String> {
     let base = std::env::temp_dir().join(format!(
         "local-rag-memory-recall-bench-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).map_err(|e| format!("temp dir: {e}"))?;
-    Ok(base)
+    let dir = base.join(config.as_str());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
+    Ok(dir)
 }
 
 #[cfg(test)]
@@ -595,6 +886,24 @@ mod tests {
 
         assert_eq!(Config::BothEn.store_text(&e), "EN_STORE");
         assert_eq!(Config::BothEn.query_text(&q), "EN_QUERY");
+
+        // T21-09: the shipped pipeline reads neither English field of the
+        // fixture — it produces its own, at run time.
+        assert_eq!(Config::PipelineEn.store_text(&e), "RU_STORE");
+        assert_eq!(Config::PipelineEn.query_text(&q), "RU_QUERY");
+        assert!(Config::PipelineEn.normalizes());
+        for config in [
+            Config::Baseline,
+            Config::StoreEn,
+            Config::QueryEn,
+            Config::BothEn,
+        ] {
+            assert!(
+                !config.normalizes(),
+                "{} is fixture-driven and must never open a generator",
+                config.as_str(),
+            );
+        }
     }
 
     #[test]
@@ -699,6 +1008,250 @@ mod tests {
             .await
             .expect_err("an unknown kind must be refused, not silently dropped");
         assert!(err.contains("unknown kind"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // T21-09: the shipped pipeline's own plumbing, with no model at all
+    // -----------------------------------------------------------------
+
+    /// A generator that answers with a scripted translation and counts its
+    /// calls — the point of several tests below is that it is **not** called.
+    #[derive(Debug, Clone)]
+    struct ScriptedTranslator {
+        answer: Result<String, local_rag_embed::GenError>,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl ScriptedTranslator {
+        fn translating(english: &str) -> Self {
+            Self {
+                answer: Ok(serde_json::json!({ "en": english }).to_string()),
+                calls: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn refusing() -> Self {
+            Self {
+                answer: Ok("not json at all".to_string()),
+                calls: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn pool(&self) -> GeneratorPool {
+            GeneratorPool::new(vec![GeneratorEntry::local(
+                "scripted",
+                Arc::new(self.clone()),
+            )])
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl local_rag_embed::Generator for ScriptedTranslator {
+        fn generate(
+            &self,
+            _req: local_rag_embed::GenRequest,
+        ) -> Result<local_rag_embed::GenResponse, local_rag_embed::GenError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.answer
+                .clone()
+                .map(|text| local_rag_embed::GenResponse {
+                    text,
+                    finish_reason: local_rag_embed::FinishReason::Stop,
+                    tokens_generated: None,
+                })
+        }
+    }
+
+    fn empty_run(model_id: &str) -> NormalizerRun {
+        NormalizerRun {
+            model_id: model_id.to_string(),
+            prompt_version: TRANSLATOR_VERSION,
+            normalizer_version: CURRENT_NORMALIZER_VERSION,
+            translated: 0,
+            passthrough: 0,
+            failed: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    /// The seeding contract of `pipeline_en`: the **original** text stays in
+    /// `memory_entry`, the English variant goes into
+    /// `memory_text_normalization`, and the effective text — the one thing that
+    /// decides what gets embedded — is the English one.
+    #[tokio::test]
+    async fn pipeline_en_seeds_the_original_and_normalizes_beside_it() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let uuids = SeqUuidV7::new();
+
+        let russian = "команда перевела очередь уведомлений с rabbitmq на nats jetstream";
+        let english = "the team moved the notification queue off rabbitmq onto nats jetstream";
+        let bilingual = entry("mr-b", "decision", russian, "IGNORED FIXTURE ENGLISH");
+        let memory_id = uuids.next_uuid().to_string();
+        let text = Config::PipelineEn.store_text(&bilingual);
+        assert_eq!(text, russian, "the store gets the original, like baseline");
+        seed_entry(&state, &memory_id, &bilingual, text, 1_000)
+            .await
+            .expect("seed");
+
+        let translator = ScriptedTranslator::translating(english);
+        let mut run = empty_run("scripted-model");
+        normalize_entry(
+            &state,
+            &translator.pool(),
+            &memory_id,
+            &bilingual,
+            text,
+            &mut run,
+            2_000,
+        )
+        .await
+        .expect("normalize");
+
+        assert_eq!(run.translated, 1);
+        assert_eq!(run.passthrough, 0);
+        assert_eq!(run.failed, 0);
+        assert_eq!(translator.calls(), 1);
+
+        let read = state.open_read().expect("state read");
+        let stored = local_rag_store::memory_entry_by_id(&read, &memory_id)
+            .expect("read entry")
+            .expect("entry exists");
+        assert_eq!(
+            stored.text, russian,
+            "memory_entry.text is canonical and must never be rewritten (08 §3)",
+        );
+        let row = local_rag_store::normalization_for(&read, &memory_id)
+            .expect("read normalization")
+            .expect("row exists");
+        assert_eq!(row.status, NormalizationStatus::Ready);
+        assert_eq!(row.normalized_text.as_deref(), Some(english));
+        assert_eq!(row.normalizer_model_id.as_deref(), Some("scripted-model"));
+
+        let effective = local_rag_store::all_memory_entries_with_effective_text(&read)
+            .expect("effective texts")
+            .into_iter()
+            .find(|e| e.memory_id() == memory_id)
+            .expect("entry present");
+        assert_eq!(
+            effective.as_str(),
+            english,
+            "the backfill embeds the effective text — that is what makes this configuration \
+             measure the pipeline rather than the fixture",
+        );
+    }
+
+    /// ADR-0010 Decision 8, measured: an already-English entry costs the
+    /// benchmark exactly zero inference, same as it costs the daemon.
+    #[tokio::test]
+    async fn pipeline_en_never_calls_the_generator_for_english_text() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let uuids = SeqUuidV7::new();
+
+        let text = "the team moved the notification queue off rabbitmq onto nats jetstream";
+        let english_entry = entry("mr-e", "decision", text, text);
+        let memory_id = uuids.next_uuid().to_string();
+        seed_entry(&state, &memory_id, &english_entry, text, 1_000)
+            .await
+            .expect("seed");
+
+        let translator = ScriptedTranslator::translating("SHOULD NOT BE USED");
+        let mut run = empty_run("scripted-model");
+        normalize_entry(
+            &state,
+            &translator.pool(),
+            &memory_id,
+            &english_entry,
+            text,
+            &mut run,
+            2_000,
+        )
+        .await
+        .expect("normalize");
+
+        assert_eq!(translator.calls(), 0, "the detector answered on its own");
+        assert_eq!(run.passthrough, 1);
+        assert_eq!(run.translated, 0);
+
+        let read = state.open_read().expect("state read");
+        let row = local_rag_store::normalization_for(&read, &memory_id)
+            .expect("read normalization")
+            .expect("row exists");
+        assert_eq!(row.status, NormalizationStatus::Skipped);
+        assert_eq!(row.normalized_text, None);
+        let effective = local_rag_store::all_memory_entries_with_effective_text(&read)
+            .expect("effective texts")
+            .into_iter()
+            .find(|e| e.memory_id() == memory_id)
+            .expect("entry present");
+        assert_eq!(effective.as_str(), text, "still the original, untouched");
+    }
+
+    /// A refused translation is a normal outcome, not an abort: the entry keeps
+    /// its original text and the run goes on, so the metric includes the
+    /// failure instead of the failure erasing the metric.
+    #[tokio::test]
+    async fn a_refused_translation_is_recorded_and_the_run_continues() {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let uuids = SeqUuidV7::new();
+
+        let russian = "команда перевела очередь уведомлений с rabbitmq на nats jetstream";
+        let bilingual = entry("mr-b", "decision", russian, "IGNORED FIXTURE ENGLISH");
+        let memory_id = uuids.next_uuid().to_string();
+        seed_entry(&state, &memory_id, &bilingual, russian, 1_000)
+            .await
+            .expect("seed");
+
+        let translator = ScriptedTranslator::refusing();
+        let mut run = empty_run("scripted-model");
+        normalize_entry(
+            &state,
+            &translator.pool(),
+            &memory_id,
+            &bilingual,
+            russian,
+            &mut run,
+            2_000,
+        )
+        .await
+        .expect("a refusal is not an error for the caller");
+
+        assert_eq!(run.failed, 1);
+        assert_eq!(run.translated, 0);
+        assert_eq!(run.failures.len(), 1);
+        assert_eq!(run.failures[0].0, "mr-b");
+        assert!(
+            run.failures[0].1.contains("rejected"),
+            "the reason travels into the report: {:?}",
+            run.failures[0].1,
+        );
+
+        let read = state.open_read().expect("state read");
+        let row = local_rag_store::normalization_for(&read, &memory_id)
+            .expect("read normalization")
+            .expect("row exists");
+        assert_eq!(row.status, NormalizationStatus::Failed);
+        let effective = local_rag_store::all_memory_entries_with_effective_text(&read)
+            .expect("effective texts")
+            .into_iter()
+            .find(|e| e.memory_id() == memory_id)
+            .expect("entry present");
+        assert_eq!(
+            effective.as_str(),
+            russian,
+            "a failed entry degrades to today's behaviour — the original text",
+        );
     }
 
     /// X-011's actual point: seeding under [`Config::StoreEn`] must persist
@@ -831,9 +1384,17 @@ mod tests {
                 local_rag_store::registry::RepresentationKind::Memory,
             ));
             runs.push(
-                run_one_config(&corpus, model, embedder, Config::Baseline, 0, corpus_path)
-                    .await
-                    .expect("run"),
+                run_one_config(
+                    &corpus,
+                    model,
+                    embedder,
+                    None,
+                    Config::Baseline,
+                    0,
+                    corpus_path,
+                )
+                .await
+                .expect("run"),
             );
         }
 

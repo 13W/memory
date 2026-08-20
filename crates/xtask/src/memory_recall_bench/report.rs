@@ -36,6 +36,40 @@ pub struct Provenance {
     pub query_count: usize,
     /// Host triple.
     pub host: String,
+    /// T21-09: present only for a configuration that actually ran the
+    /// translator ([`Config::normalizes`](super::run::Config::normalizes)).
+    /// `#[serde(default)]` so the four fixture-driven runs recorded before this
+    /// task still deserialize unchanged.
+    #[serde(default)]
+    pub normalizer: Option<NormalizerRun>,
+}
+
+/// T21-09: what the real translator did over the corpus, and with what.
+///
+/// A `pipeline_en` number is only meaningful next to the model that produced
+/// it: a different generator, prompt version or normalizer version is a
+/// different measurement, not a better or worse one. The three counters are the
+/// component's own outcome classes — translated, skipped by the detector at
+/// zero inference cost, and refused by the validator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizerRun {
+    /// The generative model that produced the translations.
+    pub model_id: String,
+    /// `local_rag_memory::normalize::translate::TRANSLATOR_VERSION`.
+    pub prompt_version: i64,
+    /// `local_rag_store::CURRENT_NORMALIZER_VERSION`.
+    pub normalizer_version: i64,
+    /// Entries the translator produced a validated English variant for.
+    pub translated: usize,
+    /// Entries the detector judged already-Latin — no generator call at all.
+    pub passthrough: usize,
+    /// Entries whose translation was refused; each one stayed on its original
+    /// text, exactly as the shipped worker leaves it.
+    pub failed: usize,
+    /// `(corpus entry id, reason)` for every refusal — the report exists to
+    /// let a reader tell "the machine translation is worse than the
+    /// hand-authored one" from "the embedder is being fed the wrong text".
+    pub failures: Vec<(String, String)>,
 }
 
 /// How one query fared.
@@ -43,6 +77,29 @@ pub struct Provenance {
 pub struct QueryResult {
     /// The corpus query id.
     pub id: String,
+    /// T21-09: why the dense leg produced nothing for this query, if it
+    /// didn't. `None` means the leg ran (whether or not it found hits).
+    ///
+    /// The benchmark ignored this before, which meant a run could silently
+    /// score a **lexical-only** pipeline and report it as recall quality.
+    #[serde(default)]
+    pub dense_degraded: Option<String>,
+    /// T21-09: the expected entry's 1-based rank among the **dense leg's own**
+    /// hits, ignoring fusion — `None` if that leg did not surface it.
+    ///
+    /// `rank` above is what a user gets: RRF over the lexical and dense legs.
+    /// This column is what makes the two separable, which a configuration that
+    /// changes only the embedded text (and deliberately leaves the lexical
+    /// leg's input alone — ADR-0010 keeps BM25 raw-against-raw) cannot be read
+    /// without.
+    #[serde(default)]
+    pub dense_rank: Option<usize>,
+    /// T21-09: how many hits that leg produced at all. Zero across a whole run
+    /// means the dense half of the hybrid was contributing nothing — a fact the
+    /// aggregate metrics cannot show, because RRF over an empty leg is just the
+    /// lexical leg.
+    #[serde(default)]
+    pub dense_hits: usize,
     /// `(entry_language, query_language)` — see `corpus::Query::lang_pair`.
     pub lang_pair: String,
     /// The corpus entry id this query's ground truth is.
@@ -70,6 +127,11 @@ pub struct Latency {
 
 /// This report's schema version.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// The depth the dense-leg diagnostics above are taken at — mirrors
+/// `super::run::QUERY_LIMIT`, named here so the rendered table says what it
+/// means without importing the runner into this module.
+const QUERY_LIMIT_HINT: usize = 5;
 
 /// One benchmark run, one [`super::run::Config`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,7 +182,69 @@ impl MemoryRecallBenchReport {
             "| Corpus size | {} entries, {} queries |\n",
             p.entry_count, p.query_count
         ));
-        out.push_str(&format!("| Host | {} |\n\n", p.host));
+        out.push_str(&format!("| Host | {} |\n", p.host));
+        // T21-09: a `pipeline_en` number belongs to the model that produced it.
+        if let Some(n) = &p.normalizer {
+            out.push_str(&format!(
+                "| Translator | `{}` (prompt v{}, normalizer v{}) |\n",
+                n.model_id, n.prompt_version, n.normalizer_version
+            ));
+            out.push_str(&format!(
+                "| Normalization | {} translated, {} passthrough, {} failed |\n",
+                n.translated, n.passthrough, n.failed
+            ));
+        }
+        out.push('\n');
+
+        // Every refusal, by name: a reader comparing this configuration against
+        // `store_en`'s hand-authored ceiling has to be able to tell a worse
+        // machine translation from an entry that was never translated at all.
+        if let Some(n) = &p.normalizer
+            && !n.failures.is_empty()
+        {
+            out.push_str("## Translations refused\n\n");
+            out.push_str(
+                "Each entry below stayed on its original text, exactly as the shipped worker\n\
+                 leaves it — the metrics above include that outcome rather than hiding it.\n\n",
+            );
+            out.push_str("| Entry | Reason |\n| --- | --- |\n");
+            for (id, reason) in &n.failures {
+                out.push_str(&format!("| `{id}` | {reason} |\n"));
+            }
+            out.push('\n');
+        }
+
+        // T21-09: which leg actually found the answer. Without this, a
+        // configuration that changes only what the dense leg embeds is
+        // unreadable — a flat metric could mean "the embedder never saw the
+        // new text" or "it saw it, ranked it first, and fusion overruled it",
+        // and those point at opposite fixes.
+        let scored = self.per_query.len();
+        if scored > 0 {
+            let dense_first = self
+                .per_query
+                .iter()
+                .filter(|q| q.dense_rank == Some(1))
+                .count();
+            let dense_found = self
+                .per_query
+                .iter()
+                .filter(|q| q.dense_rank.is_some())
+                .count();
+            let degraded = self
+                .per_query
+                .iter()
+                .filter(|q| q.dense_degraded.is_some())
+                .count();
+            out.push_str("## Legs\n\n| Signal | Value |\n| --- | --- |\n");
+            out.push_str(&format!(
+                "| dense leg ranked the expected entry #1 | {dense_first}/{scored} |\n"
+            ));
+            out.push_str(&format!(
+                "| dense leg surfaced it at all (top {QUERY_LIMIT_HINT}) | {dense_found}/{scored} |\n"
+            ));
+            out.push_str(&format!("| dense leg degraded | {degraded}/{scored} |\n\n"));
+        }
 
         out.push_str("## Metrics\n\n");
         out.push_str(metrics_table_header());
@@ -326,6 +450,20 @@ impl ComparisonReport {
         );
         out.push_str("the cross-lingual effect this table exists to show — read `ru-en`/`en-ru`\n");
         out.push_str("rows, not just `overall`, before drawing a conclusion.\n\n");
+        // T21-09: the one configuration here that is not a hand-authored
+        // ceiling needs its own reading instruction, or it will be compared
+        // against the wrong column.
+        if self
+            .configs
+            .iter()
+            .any(|c| c.report.provenance.normalizer.is_some())
+        {
+            out.push_str(
+                "`pipeline_en` is the **shipped** component — the real detector and translator\n\
+                 over the original text — so read it against `store_en`, the hand-authored\n\
+                 ceiling for the same store-side idea, not only against `baseline`.\n\n",
+            );
+        }
         let mut pairs: Vec<&String> = self.baseline.metrics_by_lang_pair.keys().collect();
         pairs.sort();
         out.push_str("| lang_pair | baseline MRR | ");
@@ -368,6 +506,26 @@ mod tests {
             entry_count: 24,
             query_count: 24,
             host: "aarch64-apple-darwin".to_string(),
+            normalizer: None,
+        }
+    }
+
+    fn normalizer_run(translated: usize, passthrough: usize, failed: usize) -> NormalizerRun {
+        NormalizerRun {
+            model_id: "gemma-4-e2b-it-gguf-q4-0".to_string(),
+            prompt_version: 1,
+            normalizer_version: 1,
+            translated,
+            passthrough,
+            failed,
+            failures: if failed > 0 {
+                vec![(
+                    "mr-07".to_string(),
+                    "translation rejected: refused".to_string(),
+                )]
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -379,6 +537,9 @@ mod tests {
             rank,
             top_result_id: rank.map(|_| "mr-01".to_string()),
             returned: 5,
+            dense_degraded: None,
+            dense_rank: rank,
+            dense_hits: 5,
         }
     }
 
@@ -454,6 +615,80 @@ mod tests {
         assert!((both_en.delta_overall.mrr - 0.25).abs() < 1e-12);
         assert!((both_en.delta_by_lang_pair["ru-en"].mrr - 0.65).abs() < 1e-12);
         assert!((both_en.delta_by_lang_pair["en-en"].mrr - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compare_diffs_the_shipped_pipeline_like_any_other_config() {
+        let mut pipeline = report("pipeline_en", 1.0, &[("ru-en", 1.0), ("en-en", 1.0)]);
+        pipeline.provenance.normalizer = Some(normalizer_run(12, 12, 0));
+        let reports = vec![
+            report("baseline", 0.80, &[("ru-en", 0.56), ("en-en", 1.0)]),
+            report("store_en", 0.98, &[("ru-en", 1.0), ("en-en", 0.9375)]),
+            pipeline,
+        ];
+        let cmp = compare(reports).expect("compare");
+        assert_eq!(cmp.configs.len(), 2);
+        let shipped = cmp
+            .configs
+            .iter()
+            .find(|c| c.report.provenance.config == "pipeline_en")
+            .expect("the new configuration is diffed like the rest");
+        assert!((shipped.delta_overall.mrr - 0.20).abs() < 1e-12);
+        assert!((shipped.delta_by_lang_pair["ru-en"].mrr - 0.44).abs() < 1e-12);
+        assert!(
+            (shipped.delta_by_lang_pair["en-en"].mrr - 0.0).abs() < 1e-12,
+            "the detector leaves already-English entries alone, so this row must not move",
+        );
+
+        let md = cmp.to_markdown();
+        assert!(md.contains("| pipeline_en |"), "{md}");
+        assert!(
+            md.contains("read it against `store_en`"),
+            "the comparison must say how to read the shipped column: {md}",
+        );
+    }
+
+    #[test]
+    fn a_normalizing_run_records_its_translator_and_every_refusal() {
+        let mut r = report("pipeline_en", 0.9, &[("ru-en", 0.9)]);
+        r.provenance.normalizer = Some(normalizer_run(11, 12, 1));
+        let md = r.to_markdown();
+        assert!(
+            md.contains("| Translator | `gemma-4-e2b-it-gguf-q4-0` (prompt v1, normalizer v1) |"),
+            "{md}",
+        );
+        assert!(
+            md.contains("| Normalization | 11 translated, 12 passthrough, 1 failed |"),
+            "{md}",
+        );
+        assert!(md.contains("## Translations refused"), "{md}");
+        assert!(md.contains("| `mr-07` |"), "{md}");
+    }
+
+    #[test]
+    fn the_report_says_which_leg_found_the_answer() {
+        let mut r = report("baseline", 0.80, &[("ru-en", 0.56)]);
+        r.per_query = vec![
+            result("mrq-01", "ru-en", Some(1)),
+            QueryResult {
+                dense_rank: Some(1),
+                rank: None,
+                ..result("mrq-02", "ru-en", None)
+            },
+        ];
+        let md = r.to_markdown();
+        assert!(
+            md.contains("| dense leg ranked the expected entry #1 | 2/2 |"),
+            "a query the fusion missed but the dense leg ranked first must still be visible: {md}",
+        );
+        assert!(md.contains("| dense leg degraded | 0/2 |"), "{md}");
+    }
+
+    #[test]
+    fn a_fixture_driven_run_says_nothing_about_a_translator() {
+        let md = report("store_en", 0.98, &[("ru-en", 1.0)]).to_markdown();
+        assert!(!md.contains("Translator"), "{md}");
+        assert!(!md.contains("Translations refused"), "{md}");
     }
 
     #[test]
