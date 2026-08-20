@@ -261,9 +261,10 @@ async fn export_carries_the_translation_and_leaves_unnormalized_entries_as_none(
                 tx,
                 &NormalizationWrite {
                     memory_id: &id,
-                    status: NormalizationStatus::Ready,
-                    source_text_sha256: &sha,
-                    normalized_text: Some("the English variant"),
+                    status: NormalizationStatus::Translated,
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &sha,
+                    source_text: Some("the English variant"),
                     source_language: Some("ru"),
                     normalizer_model_id: Some("test-normalizer"),
                     prompt_version: Some(1),
@@ -291,7 +292,7 @@ async fn export_carries_the_translation_and_leaves_unnormalized_entries_as_none(
         .as_ref()
         .expect("export is never poorer than inspect");
     assert_eq!(
-        row.normalized_text.as_deref(),
+        row.source_text.as_deref(),
         Some("the English variant"),
         "an export exists to show everything the store holds about the user",
     );

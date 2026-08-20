@@ -173,19 +173,20 @@ pub(crate) fn memory_inspection_json(found: &MemoryInspection) -> serde_json::Va
     })
 }
 
-/// The entry's English variant and where it came from (T21-07, ADR-0010).
+/// What the author wrote, and how the canon came to be English (T21-13,
+/// ADR-0011).
 ///
-/// `normalized_text` is included, not elided: `export` reuses this renderer and
-/// exists to show everything the store holds about the user, whose original
-/// text is printed two keys above. Provenance travels with it so a reader can
-/// tell a translation by a known model under a known prompt version from one
-/// left behind by an older normalizer — and, on a `failed` row, why there is no
-/// translation at all.
+/// `source_text` is printed, not elided: durable memory is stored in English
+/// (08 §3), so this row *is* the owner's own words, and `export` exists to show
+/// everything the store holds about them (12 §3 `[FIXED, ADR-0011]`).
+/// Provenance travels with it so a reader can tell a translation by a known
+/// model under a known prompt version from one left behind by an older
+/// normalizer — and, on a `failed` row, why the canon is not English at all.
 fn normalization_json(row: &NormalizationRow) -> serde_json::Value {
     serde_json::json!({
         "status": row.status.as_str(),
-        "source_text_sha256": row.source_text_sha256,
-        "normalized_text": row.normalized_text,
+        "canon_text_sha256": row.canon_text_sha256,
+        "source_text": row.source_text,
         "source_language": row.source_language,
         "normalizer_model_id": row.normalizer_model_id,
         "prompt_version": row.prompt_version,

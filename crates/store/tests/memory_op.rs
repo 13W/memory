@@ -2335,9 +2335,10 @@ async fn seed_normalization(db: &StateDb, memory_id: &str) {
                 tx,
                 &NormalizationWrite {
                     memory_id: &id,
-                    status: NormalizationStatus::Ready,
-                    source_text_sha256: &sha,
-                    normalized_text: Some("the English variant"),
+                    status: NormalizationStatus::Translated,
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &sha,
+                    source_text: Some("the English variant"),
                     source_language: Some("ru"),
                     normalizer_model_id: Some("test-normalizer"),
                     prompt_version: Some(1),

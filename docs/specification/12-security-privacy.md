@@ -180,6 +180,13 @@ partially-completed purge is a worse outcome than a slow one for an all-or-nothi
 operation. `local_rag_store::retention::ExternalPins.referenced_generations` (06 §5) is not wired
 by this task: no column on `memory_entry`/`observation_envelope` carries an actual `generation_id`
 reference today, so there is nothing yet for that pin to name.
+As-built note (T21-13, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)): the
+next note is kept as history, with its polarity inverted. The row `inspect`/`export` print now
+carries `source_text` — what the **author** wrote — beside the English canon, which is what §3's
+`[FIXED, ADR-0011]` bullet above requires. `purge` still removes both, and the `ON DELETE CASCADE`
+survives the migration-15 table rebuild (asserted by `pragma_foreign_key_check` in
+`crates/store/tests/migrate_fixtures.rs`).
+
 As-built note (T21-07, `[SPEC]`, ADR-0010): since migration 14 an entry may carry a second copy of
 the user's own writing — `memory_text_normalization.normalized_text`, the English variant a local
 model produced from it (03 §2.5) — and all three operations above now account for it.

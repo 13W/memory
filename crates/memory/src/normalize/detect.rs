@@ -396,7 +396,7 @@ mod tests {
         ),
         (
             "path only",
-            "crates/store/src/memory/effective_text.rs",
+            "crates/store/src/memory/normalization.rs",
             ScriptClass::Undetermined,
         ),
         (
@@ -572,8 +572,8 @@ mod tests {
     /// it, an identifier dump would drag Russian prose toward English.
     #[test]
     fn identifiers_and_paths_do_not_vote() {
-        let with_machinery = "Правил apply_run и memory_entry_subject_hash в \
-             crates/store/src/memory/effective_text.rs";
+        let with_machinery = "Правил apply_run и upsert_normalization в \
+             crates/store/src/memory/normalization.rs";
         let prose_only = "Правил и в";
         assert_eq!(
             script_stats(with_machinery).latin,

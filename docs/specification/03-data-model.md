@@ -846,6 +846,21 @@ increment 04 §5 couples to a matching `audit_event` — is T14-02's transaction
 not this migration's concern.
 
 
+As-built note (T21-13, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
+migration **15** inverts the table the next note describes, which is kept as history. English is
+the canon (08 §3), so `memory_entry.text` holds the English text and this table holds the author's
+own words: `normalized_text` → `source_text`, `source_text_sha256` → `canon_text_sha256` (the hash
+of `memory_entry.text` as the row last saw it), `ready`/`skipped`/`failed` →
+`translated`/`english`/`failed`. A table rebuild rather than `ALTER`s, because SQLite cannot alter a
+`CHECK`; deliberately **not** flagged destructive, because the one table it rebuilds is entirely
+derived — model output plus retry bookkeeping — and the `VACUUM INTO` copy that flag buys would
+protect nothing canonical (spec 13 §3). Data carried across by meaning: `skipped` rows become
+`english` (the entry is English and unchanged), `failed` rows keep their retry bookkeeping, and
+`ready` rows are **dropped** — their English text was never installed as canon and v15 has no state
+for a translation waiting to be installed. `english` is not tidiness: the queue predicate is SQL
+with a `LIMIT` and cannot run the detector, so without a stored marker every English entry would be
+re-offered on every tick and starve the entries that need work.
+
 As-built note (T21-01, `[SPEC]`, ADR-0010): migration **14**, `memory_text_normalization`
 (`local_rag_store::memory::normalization`), adds the English-normalization axis of durable
 memory — at most one row per `memory_entry`, holding the variant fed to the embedder, the hash of

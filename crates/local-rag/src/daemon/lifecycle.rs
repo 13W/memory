@@ -597,31 +597,22 @@ impl DaemonHandle {
         // fourth ONNX session would be pure cost, and the laziness picks up a
         // model installed after startup for free (D-037).
         //
-        // Shipped **off**: the switch that turns it off
-        // (`MemoryConfig.normalize_to_english`) is T21-08's, and a worker that
-        // spends GPU before its own switch exists is not something to hand a
-        // user.
+        // T21-13: no generator, no embedder, no `cache.sqlite`. Since ADR-0011
+        // made English the canon this worker only detects and settles — the
+        // translation it used to drive moved to the boundary (T21-14/T21-15).
         let (normalization_stop, normalization_join) = match state_db.as_ref() {
             Some(db) => {
                 tracing::info!(job = "normalization", "background job spawned");
                 let (stop_tx, stop_rx) = oneshot::channel();
-                let provider = Arc::clone(&embedder_provider);
-                let cache = cache_db.clone();
-                let join = cache.map(|cache| {
-                    tokio::spawn(super::normalization::run_normalization_worker(
-                        Arc::clone(db),
-                        cache,
-                        Arc::clone(pool.as_ref().expect("state_db present implies pool built")),
-                        move || provider.memory(),
-                        jobs.clone(),
-                        normalization,
-                        data_policy,
-                        normalization_poll_interval,
-                        system_now_ms,
-                        stop_rx,
-                    ))
-                });
-                (Some(stop_tx), join)
+                let join = tokio::spawn(super::normalization::run_normalization_worker(
+                    Arc::clone(db),
+                    jobs.clone(),
+                    normalization,
+                    normalization_poll_interval,
+                    system_now_ms,
+                    stop_rx,
+                ));
+                (Some(stop_tx), Some(join))
             }
             None => (None, None),
         };

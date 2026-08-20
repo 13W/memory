@@ -23,7 +23,7 @@
 //! not columns on the frozen original. A separate table also buys
 //! `ON DELETE CASCADE` and a countable, explicit purge (T21-07) for free.
 //!
-//! ## Staleness is `source_text_sha256`, never `entry_version`
+//! ## Staleness is `canon_text_sha256`, never `entry_version`
 //!
 //! `apply_reinforce` bumps `entry_version` without touching the text
 //! ([`super::op::apply_reinforce`]), so a version comparison would re-translate
@@ -91,6 +91,89 @@ CREATE INDEX memory_normalization_queue
 -- version without touching the text).
 ";
 
+/// Migration 15 (T21-13, ADR-0011): the same table, inverted.
+///
+/// English became the canon, so `memory_entry.text` now holds the English text
+/// and this table holds what the **author** wrote. Every column that existed to
+/// reconcile two texts is gone with the second text; what stays is the queue's
+/// own bookkeeping, which ADR-0011 §Decision 3's "eventually English" invariant
+/// still needs.
+///
+/// Column by column against [`SCHEMA_V14`]:
+///
+/// - `normalized_text` (the English variant) → `source_text` (the author's own
+///   words). The CHECK mirrors: present exactly when `status = 'translated'`.
+/// - `source_text_sha256` → `canon_text_sha256`. Same mechanism, inverted
+///   subject: it is the hash of `memory_entry.text` **as this row last observed
+///   it**, so the queue can tell a row that is still true from one whose entry
+///   has since been edited. It is deliberately *not* dropped — see
+///   [`NormalizationWrite`] for why the write-race guard it also serves splits
+///   into two values rather than disappearing.
+/// - `status`: `ready`/`skipped`/`failed` → `translated`/`english`/`failed`.
+///   `english` is the old `skipped` and exists for one structural reason:
+///   [`scan_pending`] is SQL with a `LIMIT`, and the detector cannot run inside
+///   it. Without a stored "this canon is already English" marker the predicate
+///   would return every English entry, fill the limit with them, and starve the
+///   entries that actually need work.
+///
+/// **Data carried across, and the one loss, stated rather than implied.**
+/// `skipped` rows become `english` (the entry is English and unchanged —
+/// discarding them would make the detector re-examine them forever) and
+/// `failed` rows keep their retry bookkeeping (T21-16 releases them by bumping
+/// [`CURRENT_NORMALIZER_VERSION`]). `ready` rows are **dropped**: their English
+/// text was never installed as canon and v15 has no state for "a translation
+/// waiting to be installed". T21-16 replaces the translator that produced them
+/// — the single-line JSON envelope that tore on long text — so preserving its
+/// output would preserve the product of a component being declared defective.
+/// T21-17 re-translates them.
+///
+/// **Not marked `destructive`, deliberately.** That flag's cost and meaning is a
+/// `VACUUM INTO` copy of the whole `state.sqlite` before any mutation
+/// (spec 13 §3, "rollback = restore + old binary") — on a real store that is a
+/// multi-gigabyte copy, and here it would buy nothing. The one table rebuilt is
+/// entirely **derived**: model output plus retry bookkeeping, reproducible by
+/// re-running the translator. `memory_entry`, `memory_evidence` and
+/// `audit_event` are not touched. The tripwire in
+/// `crates/store/tests/migrate_fixtures.rs` therefore stays intact, and the
+/// crash-at-checkpoint test it demands belongs to the first migration that is
+/// destructive in the sense spec 13 §3 means.
+///
+/// **Frozen once shipped**, like every entry in [`crate::migrate::ALL`].
+pub(crate) const SCHEMA_V15: &str = "CREATE TABLE memory_text_normalization_v15 (          -- migration 15; T21-13 (ADR-0011)
+  memory_id           TEXT PRIMARY KEY REFERENCES memory_entry(memory_id) ON DELETE CASCADE,
+  status              TEXT NOT NULL CHECK (status IN ('translated','english','failed')),
+  canon_text_sha256   TEXT NOT NULL,                  -- memory_entry.text as this row saw it
+  source_text         TEXT,                           -- the author's words; NULL unless 'translated'
+  source_language     TEXT,                           -- detector's answer, advisory
+  normalizer_model_id TEXT,                           -- provenance: which model produced the canon
+  prompt_version      INTEGER,                        -- provenance: which prompt
+  normalizer_version  INTEGER NOT NULL,               -- bump re-examines every row
+  attempt_count       INTEGER NOT NULL DEFAULT 0,
+  last_error          TEXT,
+  next_attempt_at     INTEGER,                        -- transient backoff gate, epoch ms
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL,
+  CHECK ((status = 'translated') = (source_text IS NOT NULL))
+);
+INSERT INTO memory_text_normalization_v15
+  (memory_id, status, canon_text_sha256, source_text, source_language,
+   normalizer_model_id, prompt_version, normalizer_version, attempt_count,
+   last_error, next_attempt_at, created_at, updated_at)
+SELECT memory_id,
+       CASE status WHEN 'skipped' THEN 'english' ELSE 'failed' END,
+       source_text_sha256, NULL, source_language,
+       normalizer_model_id, prompt_version, normalizer_version, attempt_count,
+       last_error, next_attempt_at, created_at, updated_at
+  FROM memory_text_normalization
+ WHERE status IN ('skipped', 'failed');
+DROP TABLE memory_text_normalization;
+ALTER TABLE memory_text_normalization_v15 RENAME TO memory_text_normalization;
+CREATE INDEX memory_normalization_queue
+  ON memory_text_normalization(status, next_attempt_at);
+-- memory_entry.text is the English canon (08 §3 [FIXED, ADR-0011]); this table
+-- keeps the author's own words, and a text change deletes the row (T21-07).
+";
+
 /// The normalizer generation this binary produces (ADR-0010).
 ///
 /// Bumping it re-normalizes every stored row: [`entries_needing_normalization`]
@@ -118,25 +201,34 @@ pub const MAX_NORMALIZATION_ATTEMPTS: i64 = 5;
 /// translating it would spend inference on text no reader will embed.
 const TERMINAL_STATES: &str = "'resolved', 'retracted', 'rejected', 'superseded'";
 
-/// What a normalization row says about its entry's English variant.
+/// What a normalization row says about its entry's canonical text.
+///
+/// Inverted by ADR-0011: the canon is English, so these describe **how the
+/// entry's own text came to be English**, not which of two texts to prefer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NormalizationStatus {
-    /// An English variant exists and may be used (`normalized_text` is
-    /// non-`NULL`, enforced by the table's own CHECK).
-    Ready,
-    /// Deliberately not normalized — the detector found the text already in
-    /// the target script, so the effective text is the original and no
-    /// inference was spent (ADR-0010 Decision 8).
-    Skipped,
-    /// Normalization was attempted and did not produce a usable variant.
+    /// The canon is a translation; `source_text` holds what the author wrote
+    /// (non-`NULL`, enforced by the table's own CHECK).
+    Translated,
+    /// The canon was already English, so no inference was spent (ADR-0010
+    /// Decision 8, still in force). There is no provenance to keep — the
+    /// author's words *are* the canon.
+    ///
+    /// This state is not bookkeeping for its own sake: [`scan_pending`] is SQL
+    /// with a `LIMIT` and cannot run the detector, so without a stored marker
+    /// every English entry would be offered on every tick, fill the limit, and
+    /// starve the entries that actually need work.
+    English,
+    /// Translation was attempted and produced nothing usable. The canon is
+    /// still the author's text — ADR-0011 §Decision 3's "eventually English".
     Failed,
 }
 
 impl NormalizationStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            NormalizationStatus::Ready => "ready",
-            NormalizationStatus::Skipped => "skipped",
+            NormalizationStatus::Translated => "translated",
+            NormalizationStatus::English => "english",
             NormalizationStatus::Failed => "failed",
         }
     }
@@ -144,11 +236,21 @@ impl NormalizationStatus {
     /// Parse a stored value; `None` for anything the CHECK constraint forbids.
     pub fn from_db(value: &str) -> Option<Self> {
         match value {
-            "ready" => Some(NormalizationStatus::Ready),
-            "skipped" => Some(NormalizationStatus::Skipped),
+            "translated" => Some(NormalizationStatus::Translated),
+            "english" => Some(NormalizationStatus::English),
             "failed" => Some(NormalizationStatus::Failed),
             _ => None,
         }
+    }
+
+    /// Whether this state means the entry's canon needs no further work at the
+    /// current normalizer version. `failed` does not — it is retried until the
+    /// attempt ceiling.
+    pub fn is_settled(self) -> bool {
+        matches!(
+            self,
+            NormalizationStatus::Translated | NormalizationStatus::English
+        )
     }
 }
 
@@ -157,11 +259,12 @@ impl NormalizationStatus {
 pub struct NormalizationRow {
     pub memory_id: String,
     pub status: NormalizationStatus,
-    /// SHA-256 of the `memory_entry.text` this row was derived from — the
+    /// SHA-256 of `memory_entry.text` **as this row last observed it** — the
     /// staleness basis, compared against the entry's current text.
-    pub source_text_sha256: String,
-    /// The English variant; `Some` exactly when `status == Ready`.
-    pub normalized_text: Option<String>,
+    pub canon_text_sha256: String,
+    /// What the author wrote, before the canon became English; `Some` exactly
+    /// when `status == Translated`.
+    pub source_text: Option<String>,
     /// The detector's answer for the source text, advisory only.
     pub source_language: Option<String>,
     pub normalizer_model_id: Option<String>,
@@ -184,12 +287,24 @@ pub struct NormalizationRow {
 pub struct NormalizationWrite<'a> {
     pub memory_id: &'a str,
     pub status: NormalizationStatus,
-    /// SHA-256 of the text the caller actually normalized. The write is
-    /// refused unless the entry's text still hashes to this.
-    pub source_text_sha256: &'a str,
-    /// Required for [`NormalizationStatus::Ready`], forbidden otherwise — the
-    /// table's CHECK rejects any other combination.
-    pub normalized_text: Option<&'a str>,
+    /// The **guard**: SHA-256 of the text the caller read before it started
+    /// working. The write is refused unless `memory_entry.text` still hashes to
+    /// this, so a translation of text an `edit` has since replaced can never be
+    /// installed.
+    ///
+    /// This is separate from [`canon_text_sha256`](Self::canon_text_sha256)
+    /// because installing a translation *changes* the canon in the same
+    /// transaction: the guard describes what was there before, the stored hash
+    /// what is there after. A writer that does not move the canon
+    /// (`english`/`failed`) passes the same value for both.
+    pub expected_text_sha256: &'a str,
+    /// What to store as the row's staleness basis: SHA-256 of
+    /// `memory_entry.text` as it stands once this write's transaction commits.
+    pub canon_text_sha256: &'a str,
+    /// The author's own text, kept as provenance. Required for
+    /// [`NormalizationStatus::Translated`], forbidden otherwise — the table's
+    /// CHECK rejects any other combination.
+    pub source_text: Option<&'a str>,
     pub source_language: Option<&'a str>,
     pub normalizer_model_id: Option<&'a str>,
     pub prompt_version: Option<i64>,
@@ -204,7 +319,7 @@ pub struct NormalizationWrite<'a> {
 pub enum UpsertOutcome {
     /// The row was inserted or updated.
     Written,
-    /// The entry's text no longer hashes to the write's `source_text_sha256`:
+    /// The entry's text no longer hashes to the write's `expected_text_sha256`:
     /// it changed while the caller was normalizing. **Nothing was written** —
     /// storing a translation of text that is no longer there would put the
     /// store in a state no reader can detect, since staleness is judged by
@@ -222,7 +337,7 @@ pub enum UpsertOutcome {
 ///
 /// The guard is the point of this function: it re-reads the entry's text **in
 /// the caller's transaction**, hashes it, and refuses the write unless it still
-/// matches `write.source_text_sha256`. Normalization runs outside any
+/// matches `write.expected_text_sha256`. Normalization runs outside any
 /// transaction and takes on the order of a second (ADR-0010 Decision 3), so an
 /// `edit` landing in between is an ordinary race rather than an exotic one, and
 /// the loser must be the stale translation.
@@ -247,7 +362,7 @@ pub fn upsert_normalization(
         return Ok(UpsertOutcome::UnknownEntry);
     };
     let current_text_sha256 = sha256_hex(current_text.as_bytes());
-    if current_text_sha256 != write.source_text_sha256 {
+    if current_text_sha256 != write.expected_text_sha256 {
         return Ok(UpsertOutcome::TextMoved {
             current_text_sha256,
         });
@@ -255,14 +370,14 @@ pub fn upsert_normalization(
 
     tx.execute(
         "INSERT INTO memory_text_normalization \
-           (memory_id, status, source_text_sha256, normalized_text, source_language, \
+           (memory_id, status, canon_text_sha256, source_text, source_language, \
             normalizer_model_id, prompt_version, normalizer_version, attempt_count, \
             last_error, next_attempt_at, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12) \
          ON CONFLICT(memory_id) DO UPDATE SET \
            status              = ?2, \
-           source_text_sha256  = ?3, \
-           normalized_text     = ?4, \
+           canon_text_sha256   = ?3, \
+           source_text         = ?4, \
            source_language     = ?5, \
            normalizer_model_id = ?6, \
            prompt_version      = ?7, \
@@ -274,8 +389,8 @@ pub fn upsert_normalization(
         params![
             write.memory_id,
             write.status.as_str(),
-            write.source_text_sha256,
-            write.normalized_text,
+            write.canon_text_sha256,
+            write.source_text,
             write.source_language,
             write.normalizer_model_id,
             write.prompt_version,
@@ -295,7 +410,7 @@ pub fn normalization_for(
     memory_id: &str,
 ) -> rusqlite::Result<Option<NormalizationRow>> {
     conn.query_row(
-        "SELECT memory_id, status, source_text_sha256, normalized_text, source_language, \
+        "SELECT memory_id, status, canon_text_sha256, source_text, source_language, \
                 normalizer_model_id, prompt_version, normalizer_version, attempt_count, \
                 last_error, next_attempt_at, created_at, updated_at \
          FROM memory_text_normalization WHERE memory_id = ?1",
@@ -310,7 +425,7 @@ pub fn normalization_for(
 pub struct PendingNormalization {
     pub memory_id: String,
     /// The entry's current text — the exact bytes whose SHA-256 the caller
-    /// must pass back as `source_text_sha256`.
+    /// must pass back as `expected_text_sha256`.
     pub text: String,
     /// Attempts already recorded under this entry's existing row (`0` when
     /// there is none).
@@ -326,7 +441,7 @@ pub struct PendingNormalization {
 /// - `normalizer_version` below `normalizer_version` (a normalizer change
 ///   re-normalizes everything, whatever the previous status was);
 /// - `failed`, under [`MAX_NORMALIZATION_ATTEMPTS`], and past `next_attempt_at`;
-/// - `ready`/`skipped` whose `source_text_sha256` no longer matches the entry's
+/// - a settled row (`translated`/`english`) whose `canon_text_sha256` no longer matches the entry's
 ///   text.
 ///
 /// Terminal entries are excluded ([`TERMINAL_STATES`]) — recall never returns
@@ -360,7 +475,7 @@ fn scan_pending(
 ) -> rusqlite::Result<Vec<PendingNormalization>> {
     let sql = format!(
         "SELECT e.memory_id, e.text, COALESCE(n.attempt_count, 0), n.status, \
-                n.source_text_sha256, n.normalizer_version \
+                n.canon_text_sha256, n.normalizer_version \
          FROM memory_entry e \
          LEFT JOIN memory_text_normalization n ON n.memory_id = e.memory_id \
          WHERE e.state NOT IN ({TERMINAL_STATES}) \
@@ -372,7 +487,7 @@ fn scan_pending(
                       AND n.attempt_count < ?2 \
                       AND (n.next_attempt_at IS NULL OR n.next_attempt_at <= ?3) \
                     ) \
-                 OR n.status IN ('ready', 'skipped') \
+                 OR n.status IN ('translated', 'english') \
                ) \
          ORDER BY e.created_at, e.memory_id"
     );
@@ -384,7 +499,7 @@ fn scan_pending(
             let text: String = r.get(1)?;
             let attempt_count: i64 = r.get(2)?;
             let status: Option<String> = r.get(3)?;
-            let source_text_sha256: Option<String> = r.get(4)?;
+            let canon_text_sha256: Option<String> = r.get(4)?;
             let row_version: Option<i64> = r.get(5)?;
             Ok((
                 PendingNormalization {
@@ -393,7 +508,7 @@ fn scan_pending(
                     attempt_count,
                 },
                 status,
-                source_text_sha256,
+                canon_text_sha256,
                 row_version,
             ))
         },
@@ -401,13 +516,16 @@ fn scan_pending(
 
     let mut out = Vec::new();
     for row in rows {
-        let (pending, status, source_text_sha256, row_version) = row?;
-        // A row that SQL could not judge alone: `ready`/`skipped` at the
-        // current normalizer version is due only if the text moved under it.
-        let up_to_date_variant = matches!(status.as_deref(), Some("ready") | Some("skipped"))
+        let (pending, status, canon_text_sha256, row_version) = row?;
+        // A row that SQL could not judge alone: a settled row at the current
+        // normalizer version is due only if the canon moved under it.
+        let settled = status
+            .as_deref()
+            .and_then(NormalizationStatus::from_db)
+            .is_some_and(NormalizationStatus::is_settled)
             && row_version.is_some_and(|v| v >= normalizer_version);
-        if up_to_date_variant
-            && source_text_sha256.as_deref() == Some(sha256_hex(pending.text.as_bytes()).as_str())
+        if settled
+            && canon_text_sha256.as_deref() == Some(sha256_hex(pending.text.as_bytes()).as_str())
         {
             continue;
         }
@@ -587,8 +705,8 @@ fn row_to_normalization(r: &rusqlite::Row<'_>) -> rusqlite::Result<Normalization
     Ok(NormalizationRow {
         memory_id: r.get(0)?,
         status,
-        source_text_sha256: r.get(2)?,
-        normalized_text: r.get(3)?,
+        canon_text_sha256: r.get(2)?,
+        source_text: r.get(3)?,
         source_language: r.get(4)?,
         normalizer_model_id: r.get(5)?,
         prompt_version: r.get(6)?,
@@ -640,9 +758,10 @@ mod tests {
     ) -> NormalizationWrite<'a> {
         NormalizationWrite {
             memory_id,
-            status: NormalizationStatus::Ready,
-            source_text_sha256: source_sha,
-            normalized_text: Some(english),
+            status: NormalizationStatus::Translated,
+            expected_text_sha256: source_sha,
+            canon_text_sha256: source_sha,
+            source_text: Some(english),
             source_language: Some("ru"),
             normalizer_model_id: Some("gemma-4-e2b-it-gguf-q4-0"),
             prompt_version: Some(1),
@@ -663,8 +782,8 @@ mod tests {
     #[test]
     fn status_round_trips_and_rejects_an_unknown_value() {
         for status in [
-            NormalizationStatus::Ready,
-            NormalizationStatus::Skipped,
+            NormalizationStatus::Translated,
+            NormalizationStatus::English,
             NormalizationStatus::Failed,
         ] {
             assert_eq!(NormalizationStatus::from_db(status.as_str()), Some(status));
@@ -682,7 +801,7 @@ mod tests {
 
         let ready_without_text = conn.execute(
             "INSERT INTO memory_text_normalization \
-               (memory_id, status, source_text_sha256, normalized_text, normalizer_version, \
+               (memory_id, status, canon_text_sha256, source_text, normalizer_version, \
                 created_at, updated_at) \
              VALUES ('m-1', 'ready', 'abc', NULL, 1, 1000, 1000)",
             [],
@@ -695,7 +814,7 @@ mod tests {
 
         let failed_with_text = conn.execute(
             "INSERT INTO memory_text_normalization \
-               (memory_id, status, source_text_sha256, normalized_text, normalizer_version, \
+               (memory_id, status, canon_text_sha256, source_text, normalizer_version, \
                 created_at, updated_at) \
              VALUES ('m-1', 'failed', 'abc', 'some english', 1, 1000, 1000)",
             [],
@@ -708,7 +827,7 @@ mod tests {
 
         let unknown_status = conn.execute(
             "INSERT INTO memory_text_normalization \
-               (memory_id, status, source_text_sha256, normalized_text, normalizer_version, \
+               (memory_id, status, canon_text_sha256, source_text, normalizer_version, \
                 created_at, updated_at) \
              VALUES ('m-1', 'translated', 'abc', 'some english', 1, 1000, 1000)",
             [],
@@ -725,7 +844,7 @@ mod tests {
         let err = conn
             .execute(
                 "INSERT INTO memory_text_normalization \
-                   (memory_id, status, source_text_sha256, normalized_text, normalizer_version, \
+                   (memory_id, status, canon_text_sha256, source_text, normalizer_version, \
                     created_at, updated_at) \
                  VALUES ('ghost', 'ready', 'abc', 'english', 1, 1000, 1000)",
                 [],
@@ -772,8 +891,8 @@ mod tests {
         );
         assert_eq!(second.updated_at, 3_000);
         assert_eq!(second.attempt_count, first.attempt_count, "no x = x + 1");
-        assert_eq!(second.normalized_text.as_deref(), Some("source text"));
-        assert_eq!(second.status, NormalizationStatus::Ready);
+        assert_eq!(second.source_text.as_deref(), Some("source text"));
+        assert_eq!(second.status, NormalizationStatus::Translated);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM memory_text_normalization", [], |r| {
                 r.get::<_, i64>(0)
@@ -842,9 +961,10 @@ mod tests {
             &mut conn,
             &NormalizationWrite {
                 memory_id: "m-2",
-                status: NormalizationStatus::Skipped,
-                source_text_sha256: &sha256_hex(b"two"),
-                normalized_text: None,
+                status: NormalizationStatus::English,
+                expected_text_sha256: &sha256_hex(b"two"),
+                canon_text_sha256: &sha256_hex(b"two"),
+                source_text: None,
                 source_language: Some("en"),
                 normalizer_model_id: None,
                 prompt_version: None,
@@ -860,11 +980,11 @@ mod tests {
             normalization_counts(&conn).unwrap(),
             vec![
                 NormalizationCountRow {
-                    status: NormalizationStatus::Ready,
+                    status: NormalizationStatus::Translated,
                     count: 1,
                 },
                 NormalizationCountRow {
-                    status: NormalizationStatus::Skipped,
+                    status: NormalizationStatus::English,
                     count: 1,
                 },
             ],
@@ -942,8 +1062,9 @@ mod tests {
             &NormalizationWrite {
                 memory_id: "m-1",
                 status: NormalizationStatus::Failed,
-                source_text_sha256: &sha,
-                normalized_text: None,
+                expected_text_sha256: &sha,
+                canon_text_sha256: &sha,
+                source_text: None,
                 source_language: Some("ru"),
                 normalizer_model_id: Some("gemma-4-e2b-it-gguf-q4-0"),
                 prompt_version: Some(1),
@@ -981,8 +1102,9 @@ mod tests {
             &NormalizationWrite {
                 memory_id: "m-1",
                 status: NormalizationStatus::Failed,
-                source_text_sha256: &sha,
-                normalized_text: None,
+                expected_text_sha256: &sha,
+                canon_text_sha256: &sha,
+                source_text: None,
                 source_language: Some("ru"),
                 normalizer_model_id: Some("gemma-4-e2b-it-gguf-q4-0"),
                 prompt_version: Some(1),

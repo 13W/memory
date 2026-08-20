@@ -703,24 +703,33 @@ async fn seed_entry(
     Ok(())
 }
 
-/// Run the **real** translator over one seeded entry and record whatever it
-/// produced, exactly as `local_rag::daemon::normalization` does in the daemon
-/// (T21-09).
+/// Run the **real** translator over one seeded entry and install what it
+/// produced as that entry's canon (T21-13, ADR-0011).
 ///
 /// Three outcomes, all of them normal:
 ///
-/// - a validated English variant → a `ready` row, and from here on the backfill
-///   embeds *that* text (`all_memory_entries_with_effective_text`, T21-02) —
-///   this benchmark never re-implements "which text is embedded";
-/// - the detector found nothing non-Latin → a `skipped` row, written without a
-///   single generator call (ADR-0010 Decision 8);
-/// - the validator refused the answer → a `failed` row. The entry keeps its
-///   original text and the run continues: a benchmark that aborted here would
-///   go blind precisely when the shipped component did something interesting,
-///   and the metric is supposed to include that outcome, not hide it.
+/// - a validated English variant → the entry's `text` **becomes** it and a
+///   `translated` row keeps the author's original as provenance. From here on
+///   every leg reads that one text, which is the whole point of the English
+///   canon;
+/// - the detector found nothing non-Latin → an `english` row, written without a
+///   single generator call (ADR-0010 Decision 8, still in force);
+/// - the validator refused the answer → a `failed` row. The canon stays the
+///   original and the run continues: a benchmark that aborted here would go
+///   blind precisely when the shipped component did something interesting, and
+///   the metric is supposed to include that outcome, not hide it.
 ///
-/// `memory_entry.text` is never touched — it is the original in every branch,
-/// which is the whole point of measuring the pipeline rather than the fixture.
+/// Order inside the transaction is load-bearing. `upsert_normalization` guards
+/// by re-reading `memory_entry.text` and comparing it to `expected_text_sha256`,
+/// so the provenance row is written **before** the canon moves — the reverse
+/// order would have the guard compare the new English text against the original
+/// hash and refuse its own write.
+///
+/// Installing the canon with a bare `UPDATE` is a harness liberty, stated
+/// rather than hidden: the production path (T21-14/T21-17) goes through
+/// `apply_edit` so the rewrite earns an `audit_event`. This store is synthetic,
+/// built and thrown away per configuration, and has no audit trail to keep
+/// honest.
 async fn normalize_entry(
     state: &StateDb,
     pool: &GeneratorPool,
@@ -740,12 +749,12 @@ async fn normalize_entry(
     let (status, english, language, last_error) = match outcome {
         Ok(Translation::Translated { english }) => {
             run.translated += 1;
-            (NormalizationStatus::Ready, Some(english), None, None)
+            (NormalizationStatus::Translated, Some(english), None, None)
         }
         Ok(Translation::Passthrough { class }) => {
             run.passthrough += 1;
             (
-                NormalizationStatus::Skipped,
+                NormalizationStatus::English,
                 None,
                 Some(format!("{class:?}")),
                 None,
@@ -764,16 +773,22 @@ async fn normalize_entry(
 
     let (id, model_id) = (memory_id.to_string(), run.model_id.clone());
     let normalizer_version = run.normalizer_version;
+    let original = text.to_string();
     let outcome = state
         .writer()
         .transaction(move |tx| {
-            upsert_normalization(
+            // The canon after this write: the translation when there is one,
+            // otherwise the text that is already there.
+            let canon = english.as_deref().unwrap_or(original.as_str());
+            let canon_sha = local_rag_core::hash::sha256_hex(canon.as_bytes());
+            let outcome = upsert_normalization(
                 tx,
                 &NormalizationWrite {
                     memory_id: &id,
                     status,
-                    source_text_sha256: &sha,
-                    normalized_text: english.as_deref(),
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &canon_sha,
+                    source_text: english.as_ref().map(|_| original.as_str()),
                     source_language: language.as_deref(),
                     normalizer_model_id: Some(&model_id),
                     prompt_version: Some(TRANSLATOR_VERSION),
@@ -783,7 +798,14 @@ async fn normalize_entry(
                     next_attempt_at: None,
                 },
                 now_ms,
-            )
+            )?;
+            if matches!(outcome, UpsertOutcome::Written) && english.is_some() {
+                tx.execute(
+                    "UPDATE memory_entry SET text = ?2 WHERE memory_id = ?1",
+                    local_rag_store::rusqlite::params![&id, canon],
+                )?;
+            }
+            Ok(outcome)
         })
         .await
         .map_err(|e| format!("{}: normalization tx: {e}", corpus_entry.id))?;
@@ -1123,25 +1145,28 @@ mod tests {
             .expect("read entry")
             .expect("entry exists");
         assert_eq!(
-            stored.text, russian,
-            "memory_entry.text is canonical and must never be rewritten (08 §3)",
+            stored.text, english,
+            "the canon is English now (ADR-0011 §Decision 1) — that is what every leg reads",
         );
         let row = local_rag_store::normalization_for(&read, &memory_id)
             .expect("read normalization")
             .expect("row exists");
-        assert_eq!(row.status, NormalizationStatus::Ready);
-        assert_eq!(row.normalized_text.as_deref(), Some(english));
+        assert_eq!(row.status, NormalizationStatus::Translated);
+        assert_eq!(
+            row.source_text.as_deref(),
+            Some(russian),
+            "the author's own words survive as provenance",
+        );
         assert_eq!(row.normalizer_model_id.as_deref(), Some("scripted-model"));
 
-        let effective = local_rag_store::all_memory_entries_with_effective_text(&read)
-            .expect("effective texts")
+        let texts = local_rag_store::all_memory_entries_with_text(&read).expect("entry texts");
+        let (_, embedded) = texts
             .into_iter()
-            .find(|e| e.memory_id() == memory_id)
+            .find(|(id, _)| *id == memory_id)
             .expect("entry present");
         assert_eq!(
-            effective.as_str(),
-            english,
-            "the backfill embeds the effective text — that is what makes this configuration \
+            embedded, english,
+            "one text, and the backfill embeds it — which is what makes this configuration \
              measure the pipeline rather than the fixture",
         );
     }
@@ -1185,14 +1210,14 @@ mod tests {
         let row = local_rag_store::normalization_for(&read, &memory_id)
             .expect("read normalization")
             .expect("row exists");
-        assert_eq!(row.status, NormalizationStatus::Skipped);
-        assert_eq!(row.normalized_text, None);
-        let effective = local_rag_store::all_memory_entries_with_effective_text(&read)
-            .expect("effective texts")
+        assert_eq!(row.status, NormalizationStatus::English);
+        assert_eq!(row.source_text, None);
+        let texts = local_rag_store::all_memory_entries_with_text(&read).expect("entry texts");
+        let (_, canon) = texts
             .into_iter()
-            .find(|e| e.memory_id() == memory_id)
+            .find(|(id, _)| *id == memory_id)
             .expect("entry present");
-        assert_eq!(effective.as_str(), text, "still the original, untouched");
+        assert_eq!(canon, text, "already English: the canon is untouched");
     }
 
     /// A refused translation is a normal outcome, not an abort: the entry keeps
@@ -1242,15 +1267,15 @@ mod tests {
             .expect("read normalization")
             .expect("row exists");
         assert_eq!(row.status, NormalizationStatus::Failed);
-        let effective = local_rag_store::all_memory_entries_with_effective_text(&read)
-            .expect("effective texts")
+        let texts = local_rag_store::all_memory_entries_with_text(&read).expect("entry texts");
+        let (_, canon) = texts
             .into_iter()
-            .find(|e| e.memory_id() == memory_id)
+            .find(|(id, _)| *id == memory_id)
             .expect("entry present");
         assert_eq!(
-            effective.as_str(),
-            russian,
-            "a failed entry degrades to today's behaviour — the original text",
+            canon, russian,
+            "a failed translation degrades to today's behaviour — the author's own text stays \
+             the canon, which is ADR-0011 §Decision 3's \"eventually English\"",
         );
     }
 

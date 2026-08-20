@@ -340,7 +340,7 @@ async fn seed_normalization(
     db: &StateDb,
     memory_id: &str,
     status: NormalizationStatus,
-    normalized_text: Option<&'static str>,
+    source_text: Option<&'static str>,
     last_error: Option<&'static str>,
 ) {
     let id = memory_id.to_string();
@@ -353,8 +353,9 @@ async fn seed_normalization(
                 &NormalizationWrite {
                     memory_id: &id,
                     status,
-                    source_text_sha256: &sha,
-                    normalized_text,
+                    expected_text_sha256: &sha,
+                    canon_text_sha256: &sha,
+                    source_text,
                     source_language: Some("ru"),
                     normalizer_model_id: Some("test-normalizer"),
                     prompt_version: Some(1),
@@ -384,7 +385,7 @@ async fn inspect_memory_carries_the_translation_and_its_provenance() {
     seed_normalization(
         &db,
         &id,
-        NormalizationStatus::Ready,
+        NormalizationStatus::Translated,
         Some("the English variant"),
         None,
     )
@@ -396,14 +397,14 @@ async fn inspect_memory_carries_the_translation_and_its_provenance() {
         .expect("entry exists");
     let normalization = found.normalization.expect("the row is part of inspect");
 
-    assert_eq!(normalization.status, NormalizationStatus::Ready);
+    assert_eq!(normalization.status, NormalizationStatus::Translated);
     assert_eq!(
-        normalization.normalized_text.as_deref(),
+        normalization.source_text.as_deref(),
         Some("the English variant"),
         "an export of everything the store holds must include the stored translation",
     );
     assert_eq!(
-        normalization.source_text_sha256,
+        normalization.canon_text_sha256,
         local_rag_core::hash::sha256_hex(CREATED_TEXT.as_bytes()),
         "the hash says which text this translation belongs to",
     );
@@ -443,7 +444,7 @@ async fn inspect_memory_reports_a_failed_normalization_with_its_reason() {
         .expect("a failed row is still a row");
 
     assert_eq!(normalization.status, NormalizationStatus::Failed);
-    assert_eq!(normalization.normalized_text, None);
+    assert_eq!(normalization.source_text, None);
     assert_eq!(
         normalization.last_error.as_deref(),
         Some("answer was not one {\"en\": …} object"),

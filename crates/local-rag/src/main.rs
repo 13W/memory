@@ -153,14 +153,13 @@ async fn serve() -> ExitCode {
         consolidation_idle_checkpoint_hours: config.memory.consolidation_idle_checkpoint_hours,
         consolidation_poll_interval: CONSOLIDATION_POLL_INTERVAL,
         normalization_poll_interval: NORMALIZATION_POLL_INTERVAL,
-        // T21-08: the worker's switch and its inference bound, straight from
-        // `[memory]`. A negative `normalization_batch` is read as zero rather
-        // than rejected — the config layer validates no other numeric field
-        // either, and "detect but translate nothing" is a coherent state, not
-        // a reason to refuse to start a daemon.
+        // T21-13: only the switch. The worker spends no inference since
+        // ADR-0011 moved translation to the boundary, so its former per-tick
+        // bound has no consumer here; `MemoryConfig.normalization_batch` stays
+        // in the config and gets one back in T21-14, where the inference it
+        // bounds actually happens.
         normalization: local_rag::daemon::normalization::NormalizationParams {
             enabled: config.memory.normalize_to_english,
-            translate_batch: config.memory.normalization_batch.max(0) as usize,
             ..local_rag::daemon::normalization::NormalizationParams::default()
         },
         retention: local_rag_store::RetentionParams::from_storage_config(&config.storage),

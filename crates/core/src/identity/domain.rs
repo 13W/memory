@@ -228,17 +228,16 @@ pub fn subject_occurrence_context(context_version: u32, serialization: &[u8]) ->
 /// content-identity domain (no domain exists for raw memory text, and the memory
 /// tables this would back do not exist before group 14).
 ///
-/// **For a stored entry, do not call this — call
-/// `local_rag_store::memory_entry_subject_hash`** (T21-02, ADR-0010
-/// Decision 4). Since T21-01 an entry's text and the text it is *embedded*
-/// under can differ (an English variant), and three readers derive this hash
-/// independently; a caller passing whichever text it happens to hold produces
-/// a hash no vector was written under, which fails silently — the dense leg
-/// simply finds nothing. `memory_entry_subject_hash` takes an
-/// `EffectiveText`, which only the store can produce, and a source lint
-/// (`crates/store/tests/memory_subject_lint.rs`) keeps this function's call
-/// sites at exactly two: here and there. This entry point remains for the
-/// known-answer tests below, which pin the hash framing itself.
+/// Call it with the entry's own `memory_entry.text` — there is only one.
+///
+/// T21-02 briefly wrapped this in a store-side `memory_entry_subject_hash`
+/// taking an `EffectiveText`, because ADR-0010 gave an entry two texts (its own
+/// and an English variant) that three readers derived this hash from
+/// independently: disagree about which text, and the dense leg silently finds
+/// no vector. ADR-0011 removed the second text instead of policing it —
+/// `T21-13` — so the wrapper, its private-field type and the source lint that
+/// pinned this function to two call sites are all gone, and the plain form is
+/// correct again by construction rather than by discipline.
 pub fn subject_memory_entry(memory_id: &str, text: &str) -> String {
     let text_hash = crate::hash::sha256_hex(text.as_bytes());
     hash(
