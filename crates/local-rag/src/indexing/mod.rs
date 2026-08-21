@@ -50,10 +50,11 @@ use local_rag_projection::{
 };
 use local_rag_store::{
     CacheDb, DEFAULT_MODEL_SPACE_ID, FtsMaterializeError, FtsMaterializeOutcome, RequestRoot,
-    Resolution, RetentionParams, StateDb, WorktreeLockRegistry, WorktreeRootFacts, WriteError,
-    create_repository, create_worktree, effective_data_policy, ensure_store_instance_uuid,
-    insert_projection_state, materialize_fts, observe_repository_path, observe_worktree_path,
-    register_managed_worktree, resolve, worktree_summary,
+    Resolution, RetentionParams, SUPERSEDED_BATCH, StateDb, WorktreeLockRegistry,
+    WorktreeRootFacts, WriteError, create_repository, create_worktree, effective_data_policy,
+    ensure_store_instance_uuid, fail_superseded_generations, insert_projection_state,
+    materialize_fts, observe_repository_path, observe_worktree_path, register_managed_worktree,
+    resolve, worktree_summary,
 };
 
 /// Everything the pipeline needs, built once per invocation and threaded
@@ -88,6 +89,8 @@ pub enum IndexError {
     Switch(SwitchError),
     Fts(FtsMaterializeError),
     EffectivePolicy(rusqlite::Error),
+    /// Retiring the generations this one supersedes failed (D-088).
+    RetireSuperseded(WriteError),
 }
 
 impl std::fmt::Display for IndexError {
@@ -110,6 +113,9 @@ impl std::fmt::Display for IndexError {
             }
             IndexError::ModelSpaceParams(e) => write!(f, "{e}"),
             IndexError::Backfill(e) => write!(f, "embedding backfill failed: {e}"),
+            IndexError::RetireSuperseded(e) => {
+                write!(f, "could not retire superseded generations: {e}")
+            }
             IndexError::VectorSource(e) => write!(f, "could not read cached vectors: {e}"),
             IndexError::Switch(e) => write!(f, "activating the new generation failed: {e}"),
             IndexError::Fts(e) => write!(f, "FTS materialization failed: {e}"),
@@ -172,6 +178,41 @@ pub async fn project_generation(
             effective_data_policy_for_worktree(&read, ctx.data_policy, &worktree_id.to_string())?;
         (params, policy)
     };
+
+    // D-088: retire what this generation supersedes *before* the backfill, not
+    // after the switch. `retention::mark_pins` pins every `building`/
+    // `projection_ready` generation unconditionally, and the backfill walks every
+    // pin root, so a generation left behind by an abandoned cycle makes every
+    // future cycle slower — a ratchet that ends with cycles that never finish and
+    // therefore abandon more of them. Doing it first means the very first cycle
+    // after this change already sees a small pin set, instead of having to
+    // survive the expensive one to earn the cheap ones. It is under this
+    // worktree's `L2.write` (the caller took it), so no concurrent cycle for this
+    // worktree can be mid-flight on the rows being retired.
+    let mut retired_superseded = 0usize;
+    loop {
+        let (w, g) = (worktree_id.to_string(), generation_id.to_string());
+        let moved = ctx
+            .state
+            .writer()
+            .transaction(move |tx| fail_superseded_generations(tx, &w, &g, SUPERSEDED_BATCH))
+            .await
+            .map_err(IndexError::RetireSuperseded)?;
+        retired_superseded += moved;
+        // Zero, not "less than a full batch": a batch that moves nothing must end
+        // the loop rather than invite another identical one.
+        if moved == 0 {
+            break;
+        }
+    }
+    if retired_superseded > 0 {
+        tracing::info!(
+            worktree_id = %worktree_id,
+            generation_id = %generation_id,
+            retired_superseded,
+            "retired generations superseded by this cycle"
+        );
+    }
 
     let pool = ProviderPool::new(vec![
         ProviderEntry::local("cli", ctx.embedder.clone()),

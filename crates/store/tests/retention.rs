@@ -24,10 +24,11 @@ use local_rag_store::registry::{
 use local_rag_store::{
     EdgeResolution, ExternalPins, JobLease, NewContentBlob, NewFileRevision, NewOccurrence,
     NewParsedUnit, NewResolvedEdge, NewUnresolvedReference, NewlineStyle, RetentionParams,
-    SkipReason, SourceCompression, StateDb, SweepReport, UnitKind, generation_meta_for_worktree,
-    insert_content_blob, insert_file_revision, insert_generation_file, insert_occurrence,
-    insert_parsed_unit, insert_resolved_edge, insert_skipped_file, insert_unresolved_reference,
-    mark_pins, pinned_generation_roots, plan_sweep, run_sweep, run_sweep_with_batch,
+    SkipReason, SourceCompression, StateDb, SweepReport, UnitKind, fail_superseded_generations,
+    generation_meta_for_worktree, insert_content_blob, insert_file_revision,
+    insert_generation_file, insert_occurrence, insert_parsed_unit, insert_resolved_edge,
+    insert_skipped_file, insert_unresolved_reference, mark_pins, pinned_generation_roots,
+    plan_sweep, run_sweep, run_sweep_with_batch,
 };
 use local_rag_test_support::TempHome;
 
@@ -98,6 +99,152 @@ async fn drive_to(db: &StateDb, generation_id: &str, target: GenerationState) {
             .await
             .expect("transition tx (infrastructure)")
             .expect("legal transition");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D-088: a generation a newer one left behind must stop being a pin root.
+// `mark_pins` pins every `building`/`projection_ready` generation
+// unconditionally, and nothing ever retries an abandoned one — so without this
+// they accumulate forever, and the embedding backfill walks every one of them on
+// every cycle. Measured on the owner's store: 3086 of them.
+// ---------------------------------------------------------------------------
+
+/// Retire everything superseded by `keep`, looping the way a caller must:
+/// until a call moves nothing. Looping on "was the batch full?" instead spins
+/// forever against an implementation that selects rows but moves none.
+async fn fail_superseded(db: &StateDb, worktree_id: &str, keep: &str, limit: usize) -> usize {
+    let mut total = 0;
+    loop {
+        let (w, k) = (worktree_id.to_string(), keep.to_string());
+        let n = db
+            .writer()
+            .transaction(move |tx| fail_superseded_generations(tx, &w, &k, limit))
+            .await
+            .expect("fail superseded tx");
+        total += n;
+        if n == 0 {
+            return total;
+        }
+    }
+}
+
+async fn state_of(db: &StateDb, worktree_id: &str, generation_id: &str) -> GenerationState {
+    generation_meta_for_worktree(&db.open_read().expect("read conn"), worktree_id)
+        .expect("meta")
+        .into_iter()
+        .find(|g| g.generation_id == generation_id)
+        .expect("generation exists")
+        .state
+}
+
+#[tokio::test]
+async fn a_superseded_projection_ready_generation_stops_being_a_pin_root() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 40).await;
+
+    let older = allocate_at(&db, &wt, 41, 1000).await;
+    drive_to(&db, &older, GenerationState::ProjectionReady).await;
+    let newer = allocate_at(&db, &wt, 42, 2000).await;
+    drive_to(&db, &newer, GenerationState::ProjectionReady).await;
+
+    // Before: both are pin roots, which is the ratchet itself.
+    let params = RetentionParams {
+        keep_last_k: 2,
+        window_ms: 7 * 24 * 60 * 60 * 1000,
+    };
+    let before = pinned_generation_roots(
+        &db.open_read().expect("read conn"),
+        &wt,
+        &params,
+        &ExternalPins::default(),
+        3000,
+    )
+    .expect("pins")
+    .generations;
+    assert!(before.contains(&older) && before.contains(&newer));
+
+    assert_eq!(fail_superseded(&db, &wt, &newer, 500).await, 1);
+
+    assert_eq!(state_of(&db, &wt, &older).await, GenerationState::Failed);
+    assert_eq!(
+        state_of(&db, &wt, &newer).await,
+        GenerationState::ProjectionReady,
+        "the generation the cycle is about to activate must be untouched"
+    );
+
+    let after = pinned_generation_roots(
+        &db.open_read().expect("read conn"),
+        &wt,
+        &params,
+        &ExternalPins::default(),
+        3000,
+    )
+    .expect("pins")
+    .generations;
+    assert!(
+        !after.contains(&older),
+        "a retired generation must leave the pin set — otherwise the backfill still walks it"
+    );
+    assert!(after.contains(&newer));
+}
+
+#[tokio::test]
+async fn nothing_newer_than_the_kept_generation_is_touched() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 50).await;
+
+    let older = allocate_at(&db, &wt, 51, 1000).await;
+    drive_to(&db, &older, GenerationState::ProjectionReady).await;
+    let keep = allocate_at(&db, &wt, 52, 2000).await;
+    drive_to(&db, &keep, GenerationState::ProjectionReady).await;
+    // A concurrent build that started after the one we are activating.
+    let newer = allocate_at(&db, &wt, 53, 3000).await;
+
+    assert_eq!(fail_superseded(&db, &wt, &keep, 500).await, 1);
+
+    assert_eq!(state_of(&db, &wt, &older).await, GenerationState::Failed);
+    assert_eq!(
+        state_of(&db, &wt, &newer).await,
+        GenerationState::Building,
+        "a build newer than the kept generation is still live work"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_keep_generation_retires_nothing() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 60).await;
+    let ready = allocate_at(&db, &wt, 61, 1000).await;
+    drive_to(&db, &ready, GenerationState::ProjectionReady).await;
+
+    // "Older than a generation that does not exist" must not read as "older
+    // than everything" — that would be a silent purge.
+    assert_eq!(fail_superseded(&db, &wt, &uuid(200), 500).await, 0);
+    assert_eq!(
+        state_of(&db, &wt, &ready).await,
+        GenerationState::ProjectionReady
+    );
+}
+
+#[tokio::test]
+async fn a_full_batch_reports_itself_so_the_caller_comes_back() {
+    let (_home, db) = open_state();
+    let wt = worktree(&db, 70).await;
+
+    let mut older = Vec::new();
+    for seed in 71..=73u8 {
+        let g = allocate_at(&db, &wt, seed, 1000 + i64::from(seed)).await;
+        drive_to(&db, &g, GenerationState::ProjectionReady).await;
+        older.push(g);
+    }
+    let keep = allocate_at(&db, &wt, 80, 5000).await;
+    drive_to(&db, &keep, GenerationState::ProjectionReady).await;
+
+    // Batch of one: the loop must run three times, not stop after the first.
+    assert_eq!(fail_superseded(&db, &wt, &keep, 1).await, 3);
+    for g in &older {
+        assert_eq!(state_of(&db, &wt, g).await, GenerationState::Failed);
     }
 }
 

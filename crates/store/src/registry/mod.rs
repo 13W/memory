@@ -84,8 +84,8 @@ pub mod worktree;
 
 pub use generation::{
     GenerationRow, GenerationState, GenerationTransitionError, IllegalGenerationTransition,
-    active_generations, allocate_generation, generation_number, generation_row, generation_state,
-    transition_generation,
+    SUPERSEDED_BATCH, active_generations, allocate_generation, fail_superseded_generations,
+    generation_number, generation_row, generation_state, transition_generation,
 };
 
 pub(crate) use indexing_status::SCHEMA_V13;

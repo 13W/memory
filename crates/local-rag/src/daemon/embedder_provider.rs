@@ -160,6 +160,14 @@ fn probe_onnx(
     leg: &'static str,
 ) -> ProviderProbe<dyn Embedder> {
     let Some(entry) = find(DEFAULT_MODEL_ID) else {
+        // D-088: the only branch here that latched `Unusable` for the whole
+        // process without saying anything. Its sibling below already explains
+        // itself; this one left the daemon permanently unable to index with no
+        // record of why.
+        tracing::warn!(
+            "local-rag: {DEFAULT_MODEL_ID} is not in this binary's model catalog; the {leg} \
+             representation will stay unavailable for the lifetime of this process"
+        );
         return ProviderProbe::Unusable;
     };
     if !is_installed(layout, entry.model_id) {

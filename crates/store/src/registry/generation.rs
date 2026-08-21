@@ -253,6 +253,92 @@ pub fn transition_generation(
     Ok(Ok(()))
 }
 
+/// How many generations one [`fail_superseded_generations`] call may retire.
+///
+/// Matches `retention::SWEEP_BATCH_ROWS`'s reasoning rather than its number's
+/// origin: the point is that one transaction on the single write queue stays
+/// bounded, not that these are the same rows. The caller loops.
+pub const SUPERSEDED_BATCH: usize = 500;
+
+/// Move generations a newer one has left behind out of the pin set (D-088).
+///
+/// A generation that reached `projection_ready` and was then overtaken — the
+/// cycle was abandoned, the daemon restarted, the switch failed, or the
+/// reconciler simply published a newer id while this one waited — is never
+/// looked at again. Nothing retries it: every retry path builds a *fresh*
+/// generation with a fresh id. But `retention::mark_pins` pins every
+/// `building`/`projection_ready` generation **unconditionally**, so each one
+/// left behind stays a pin root forever, and the embedding backfill walks every
+/// pin root on every cycle. That is a ratchet: each abandoned generation makes
+/// every future cycle slower, until cycles stop finishing at all — which
+/// abandons more of them. Measured on the owner's store: 3086 `projection_ready`
+/// generations, a backfill walking ~32 million occurrence rows per cycle, and no
+/// cycle completing for ten hours.
+///
+/// `failed` is the exit the state machine allows (`projection_ready → retiring`
+/// is illegal, [`GenerationState::check_transition`]) and the one retention
+/// already understands: this module's own docs call `retiring` and `failed` GC
+/// targets rather than pin roots, so retiring them here both shrinks the pin set
+/// immediately and hands the rows to the existing sweep.
+///
+/// Only generations *strictly older* than `keep_generation_id` are touched, so
+/// the generation this cycle is about to activate — and anything newer that a
+/// concurrent build has produced — is left alone.
+///
+/// Returns how many rows this call **actually moved**, not how many it looked
+/// at, and the caller loops until that is zero. The difference is load-bearing:
+/// counting rows examined lets a batch that transitions nothing still report a
+/// full batch, and a caller looping on "was the batch full?" then spins forever.
+/// That is not hypothetical — it is what a mutation test of this function did to
+/// its own caller. Zero-means-stop needs no argument about which transitions the
+/// state machine happens to allow.
+pub fn fail_superseded_generations(
+    tx: &Transaction<'_>,
+    worktree_id: &str,
+    keep_generation_id: &str,
+    limit: usize,
+) -> rusqlite::Result<usize> {
+    let keep_number: Option<i64> = tx
+        .query_row(
+            "SELECT generation_number FROM generation WHERE generation_id = ?1",
+            params![keep_generation_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    // No row means the caller named a generation this store does not have.
+    // Retiring "everything older than nothing" would be a silent purge, so do
+    // nothing at all instead.
+    let Some(keep_number) = keep_number else {
+        return Ok(0);
+    };
+
+    let superseded: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT generation_id FROM generation \
+             WHERE worktree_id = ?1 AND generation_number < ?2 \
+               AND state IN ('building', 'projection_ready') \
+             ORDER BY generation_number \
+             LIMIT ?3",
+        )?;
+        stmt.query_map(params![worktree_id, keep_number, limit as i64], |r| {
+            r.get(0)
+        })?
+        .collect::<rusqlite::Result<Vec<String>>>()?
+    };
+
+    let mut retired = 0;
+    for generation_id in &superseded {
+        // Through `transition_generation`, not a bare UPDATE: the state machine
+        // is the authority on what may follow `building`/`projection_ready`, and
+        // a row that raced into `active` between the SELECT and here must be
+        // refused rather than overwritten.
+        if transition_generation(tx, generation_id, GenerationState::Failed)?.is_ok() {
+            retired += 1;
+        }
+    }
+    Ok(retired)
+}
+
 /// The generation's current lifecycle state, if it exists (spec 03 §2.1).
 ///
 /// A stored value outside the CHECK domain (corruption) surfaces as
