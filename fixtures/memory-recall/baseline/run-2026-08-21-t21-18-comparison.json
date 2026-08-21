@@ -1,0 +1,3744 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "schema_version": 1,
+    "provenance": {
+      "v2_commit": "d8360dc",
+      "corpus_path": "/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json",
+      "corpus_version": "2.0.0",
+      "model_id": "embeddinggemma-300m",
+      "config": "baseline",
+      "entry_count": 200,
+      "query_count": 60,
+      "host": "aarch64-macos",
+      "normalizer": null
+    },
+    "metrics": {
+      "hit_at_1": 0.5,
+      "hit_at_3": 0.5833333333333334,
+      "hit_at_5": 0.6166666666666667,
+      "mrr": 0.5472222222222222,
+      "query_count": 60
+    },
+    "metrics_by_lang_pair": {
+      "en-en": {
+        "hit_at_1": 1.0,
+        "hit_at_3": 1.0,
+        "hit_at_5": 1.0,
+        "mrr": 1.0,
+        "query_count": 15
+      },
+      "en-ru": {
+        "hit_at_1": 0.0,
+        "hit_at_3": 0.13333333333333333,
+        "hit_at_5": 0.2,
+        "mrr": 0.07222222222222222,
+        "query_count": 15
+      },
+      "ru-en": {
+        "hit_at_1": 0.13333333333333333,
+        "hit_at_3": 0.26666666666666666,
+        "hit_at_5": 0.26666666666666666,
+        "mrr": 0.2,
+        "query_count": 15
+      },
+      "ru-ru": {
+        "hit_at_1": 0.8666666666666667,
+        "hit_at_3": 0.9333333333333333,
+        "hit_at_5": 1.0,
+        "mrr": 0.9166666666666666,
+        "query_count": 15
+      }
+    },
+    "per_query": [
+      {
+        "id": "mrq-01",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-01",
+        "rank": 1,
+        "top_result_id": "mr-01",
+        "returned": 200
+      },
+      {
+        "id": "mrq-02",
+        "dense_degraded": null,
+        "dense_rank": 3,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-02",
+        "rank": 4,
+        "top_result_id": "md-086",
+        "returned": 200
+      },
+      {
+        "id": "mrq-03",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-03",
+        "rank": 1,
+        "top_result_id": "mr-03",
+        "returned": 200
+      },
+      {
+        "id": "mrq-04",
+        "dense_degraded": null,
+        "dense_rank": 2,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-04",
+        "rank": 1,
+        "top_result_id": "mr-04",
+        "returned": 200
+      },
+      {
+        "id": "mrq-05",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-05",
+        "rank": 1,
+        "top_result_id": "mr-05",
+        "returned": 200
+      },
+      {
+        "id": "mrq-06",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-06",
+        "rank": 1,
+        "top_result_id": "mr-06",
+        "returned": 200
+      },
+      {
+        "id": "mrq-07",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-07",
+        "rank": 1,
+        "top_result_id": "mr-07",
+        "returned": 200
+      },
+      {
+        "id": "mrq-08",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-08",
+        "rank": 1,
+        "top_result_id": "mr-08",
+        "returned": 200
+      },
+      {
+        "id": "mrq-09",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-17",
+        "rank": 2,
+        "top_result_id": "md-055",
+        "returned": 200
+      },
+      {
+        "id": "mrq-10",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-18",
+        "rank": 1,
+        "top_result_id": "mr-18",
+        "returned": 200
+      },
+      {
+        "id": "mrq-11",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-19",
+        "rank": null,
+        "top_result_id": "md-039",
+        "returned": 200
+      },
+      {
+        "id": "mrq-12",
+        "dense_degraded": null,
+        "dense_rank": 3,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-20",
+        "rank": null,
+        "top_result_id": "md-026",
+        "returned": 200
+      },
+      {
+        "id": "mrq-13",
+        "dense_degraded": null,
+        "dense_rank": 5,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-25",
+        "rank": 1,
+        "top_result_id": "mr-25",
+        "returned": 200
+      },
+      {
+        "id": "mrq-14",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-26",
+        "rank": 1,
+        "top_result_id": "mr-26",
+        "returned": 200
+      },
+      {
+        "id": "mrq-15",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-27",
+        "rank": 1,
+        "top_result_id": "mr-27",
+        "returned": 200
+      },
+      {
+        "id": "mrq-16",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-28",
+        "rank": 1,
+        "top_result_id": "mr-28",
+        "returned": 200
+      },
+      {
+        "id": "mrq-17",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-29",
+        "rank": 1,
+        "top_result_id": "mr-29",
+        "returned": 200
+      },
+      {
+        "id": "mrq-18",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-30",
+        "rank": 1,
+        "top_result_id": "mr-30",
+        "returned": 200
+      },
+      {
+        "id": "mrq-19",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-ru",
+        "expected_entry_id": "mr-31",
+        "rank": 2,
+        "top_result_id": "md-091",
+        "returned": 200
+      },
+      {
+        "id": "mrq-20",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-32",
+        "rank": null,
+        "top_result_id": "md-024",
+        "returned": 200
+      },
+      {
+        "id": "mrq-21",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-33",
+        "rank": null,
+        "top_result_id": "md-057",
+        "returned": 200
+      },
+      {
+        "id": "mrq-22",
+        "dense_degraded": null,
+        "dense_rank": 3,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-34",
+        "rank": null,
+        "top_result_id": "mr-45",
+        "returned": 200
+      },
+      {
+        "id": "mrq-23",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-35",
+        "rank": null,
+        "top_result_id": "md-042",
+        "returned": 200
+      },
+      {
+        "id": "mrq-24",
+        "dense_degraded": null,
+        "dense_rank": 2,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-36",
+        "rank": null,
+        "top_result_id": "mr-16",
+        "returned": 200
+      },
+      {
+        "id": "mrq-25",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-37",
+        "rank": 2,
+        "top_result_id": "md-051",
+        "returned": 200
+      },
+      {
+        "id": "mrq-26",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-38",
+        "rank": null,
+        "top_result_id": "md-048",
+        "returned": 200
+      },
+      {
+        "id": "mrq-27",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-39",
+        "rank": null,
+        "top_result_id": "md-055",
+        "returned": 200
+      },
+      {
+        "id": "mrq-28",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-40",
+        "rank": null,
+        "top_result_id": "md-053",
+        "returned": 200
+      },
+      {
+        "id": "mrq-29",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-41",
+        "rank": null,
+        "top_result_id": "md-055",
+        "returned": 200
+      },
+      {
+        "id": "mrq-30",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "ru-en",
+        "expected_entry_id": "mr-42",
+        "rank": 1,
+        "top_result_id": "mr-42",
+        "returned": 200
+      },
+      {
+        "id": "mrq-31",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-09",
+        "rank": 1,
+        "top_result_id": "mr-09",
+        "returned": 200
+      },
+      {
+        "id": "mrq-32",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-10",
+        "rank": 1,
+        "top_result_id": "mr-10",
+        "returned": 200
+      },
+      {
+        "id": "mrq-33",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-11",
+        "rank": 1,
+        "top_result_id": "mr-11",
+        "returned": 200
+      },
+      {
+        "id": "mrq-34",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-12",
+        "rank": 1,
+        "top_result_id": "mr-12",
+        "returned": 200
+      },
+      {
+        "id": "mrq-35",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-13",
+        "rank": 1,
+        "top_result_id": "mr-13",
+        "returned": 200
+      },
+      {
+        "id": "mrq-36",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-14",
+        "rank": 1,
+        "top_result_id": "mr-14",
+        "returned": 200
+      },
+      {
+        "id": "mrq-37",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-15",
+        "rank": 1,
+        "top_result_id": "mr-15",
+        "returned": 200
+      },
+      {
+        "id": "mrq-38",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-16",
+        "rank": 1,
+        "top_result_id": "mr-16",
+        "returned": 200
+      },
+      {
+        "id": "mrq-39",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-21",
+        "rank": 3,
+        "top_result_id": "md-078",
+        "returned": 200
+      },
+      {
+        "id": "mrq-40",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-22",
+        "rank": null,
+        "top_result_id": "mr-26",
+        "returned": 200
+      },
+      {
+        "id": "mrq-41",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-23",
+        "rank": null,
+        "top_result_id": "md-088",
+        "returned": 200
+      },
+      {
+        "id": "mrq-42",
+        "dense_degraded": null,
+        "dense_rank": 2,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-24",
+        "rank": null,
+        "top_result_id": "md-090",
+        "returned": 200
+      },
+      {
+        "id": "mrq-43",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-43",
+        "rank": 1,
+        "top_result_id": "mr-43",
+        "returned": 200
+      },
+      {
+        "id": "mrq-44",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-44",
+        "rank": 1,
+        "top_result_id": "mr-44",
+        "returned": 200
+      },
+      {
+        "id": "mrq-45",
+        "dense_degraded": null,
+        "dense_rank": 2,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-45",
+        "rank": 1,
+        "top_result_id": "mr-45",
+        "returned": 200
+      },
+      {
+        "id": "mrq-46",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-46",
+        "rank": 1,
+        "top_result_id": "mr-46",
+        "returned": 200
+      },
+      {
+        "id": "mrq-47",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-47",
+        "rank": 1,
+        "top_result_id": "mr-47",
+        "returned": 200
+      },
+      {
+        "id": "mrq-48",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-48",
+        "rank": 1,
+        "top_result_id": "mr-48",
+        "returned": 200
+      },
+      {
+        "id": "mrq-49",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-en",
+        "expected_entry_id": "mr-49",
+        "rank": 1,
+        "top_result_id": "mr-49",
+        "returned": 200
+      },
+      {
+        "id": "mrq-50",
+        "dense_degraded": null,
+        "dense_rank": 4,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-50",
+        "rank": null,
+        "top_result_id": "md-107",
+        "returned": 200
+      },
+      {
+        "id": "mrq-51",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-51",
+        "rank": 2,
+        "top_result_id": "md-113",
+        "returned": 200
+      },
+      {
+        "id": "mrq-52",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-52",
+        "rank": null,
+        "top_result_id": "md-097",
+        "returned": 200
+      },
+      {
+        "id": "mrq-53",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-53",
+        "rank": null,
+        "top_result_id": "md-132",
+        "returned": 200
+      },
+      {
+        "id": "mrq-54",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-54",
+        "rank": null,
+        "top_result_id": "mr-01",
+        "returned": 200
+      },
+      {
+        "id": "mrq-55",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-55",
+        "rank": null,
+        "top_result_id": "mr-36",
+        "returned": 200
+      },
+      {
+        "id": "mrq-56",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-56",
+        "rank": null,
+        "top_result_id": "md-133",
+        "returned": 200
+      },
+      {
+        "id": "mrq-57",
+        "dense_degraded": null,
+        "dense_rank": 4,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-57",
+        "rank": null,
+        "top_result_id": "md-094",
+        "returned": 200
+      },
+      {
+        "id": "mrq-58",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-58",
+        "rank": null,
+        "top_result_id": "md-074",
+        "returned": 200
+      },
+      {
+        "id": "mrq-59",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-59",
+        "rank": null,
+        "top_result_id": "md-104",
+        "returned": 200
+      },
+      {
+        "id": "mrq-60",
+        "dense_degraded": null,
+        "dense_rank": 1,
+        "dense_hits": 5,
+        "lang_pair": "en-ru",
+        "expected_entry_id": "mr-60",
+        "rank": 4,
+        "top_result_id": "mr-06",
+        "returned": 200
+      }
+    ],
+    "latency": {
+      "install_ms": 0,
+      "embed_ms": 9777,
+      "recall_p50_ms": 65.300125,
+      "recall_p95_ms": 71.723042
+    }
+  },
+  "configs": [
+    {
+      "report": {
+        "schema_version": 1,
+        "provenance": {
+          "v2_commit": "d8360dc",
+          "corpus_path": "/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json",
+          "corpus_version": "2.0.0",
+          "model_id": "embeddinggemma-300m",
+          "config": "store_en",
+          "entry_count": 200,
+          "query_count": 60,
+          "host": "aarch64-macos",
+          "normalizer": null
+        },
+        "metrics": {
+          "hit_at_1": 0.8333333333333334,
+          "hit_at_3": 0.9333333333333333,
+          "hit_at_5": 0.95,
+          "mrr": 0.8847222222222223,
+          "query_count": 60
+        },
+        "metrics_by_lang_pair": {
+          "en-en": {
+            "hit_at_1": 1.0,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 1.0,
+            "query_count": 15
+          },
+          "en-ru": {
+            "hit_at_1": 0.7333333333333333,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 0.8666666666666667,
+            "query_count": 15
+          },
+          "ru-en": {
+            "hit_at_1": 0.9333333333333333,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 0.9666666666666667,
+            "query_count": 15
+          },
+          "ru-ru": {
+            "hit_at_1": 0.6666666666666666,
+            "hit_at_3": 0.7333333333333333,
+            "hit_at_5": 0.8,
+            "mrr": 0.7055555555555556,
+            "query_count": 15
+          }
+        },
+        "per_query": [
+          {
+            "id": "mrq-01",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-01",
+            "rank": 1,
+            "top_result_id": "mr-01",
+            "returned": 200
+          },
+          {
+            "id": "mrq-02",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-02",
+            "rank": 4,
+            "top_result_id": "md-131",
+            "returned": 200
+          },
+          {
+            "id": "mrq-03",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-03",
+            "rank": null,
+            "top_result_id": "md-132",
+            "returned": 200
+          },
+          {
+            "id": "mrq-04",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-04",
+            "rank": 1,
+            "top_result_id": "mr-04",
+            "returned": 200
+          },
+          {
+            "id": "mrq-05",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-05",
+            "rank": 1,
+            "top_result_id": "mr-05",
+            "returned": 200
+          },
+          {
+            "id": "mrq-06",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-06",
+            "rank": 3,
+            "top_result_id": "md-050",
+            "returned": 200
+          },
+          {
+            "id": "mrq-07",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-07",
+            "rank": 1,
+            "top_result_id": "mr-07",
+            "returned": 200
+          },
+          {
+            "id": "mrq-08",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-08",
+            "rank": 1,
+            "top_result_id": "mr-08",
+            "returned": 200
+          },
+          {
+            "id": "mrq-09",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-17",
+            "rank": 1,
+            "top_result_id": "mr-17",
+            "returned": 200
+          },
+          {
+            "id": "mrq-10",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-18",
+            "rank": 1,
+            "top_result_id": "mr-18",
+            "returned": 200
+          },
+          {
+            "id": "mrq-11",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-19",
+            "rank": 1,
+            "top_result_id": "mr-19",
+            "returned": 200
+          },
+          {
+            "id": "mrq-12",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-20",
+            "rank": 1,
+            "top_result_id": "mr-20",
+            "returned": 200
+          },
+          {
+            "id": "mrq-13",
+            "dense_degraded": null,
+            "dense_rank": 5,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-25",
+            "rank": null,
+            "top_result_id": "md-016",
+            "returned": 200
+          },
+          {
+            "id": "mrq-14",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-26",
+            "rank": 1,
+            "top_result_id": "mr-26",
+            "returned": 200
+          },
+          {
+            "id": "mrq-15",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-27",
+            "rank": null,
+            "top_result_id": "md-132",
+            "returned": 200
+          },
+          {
+            "id": "mrq-16",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-28",
+            "rank": 1,
+            "top_result_id": "mr-28",
+            "returned": 200
+          },
+          {
+            "id": "mrq-17",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-29",
+            "rank": 1,
+            "top_result_id": "mr-29",
+            "returned": 200
+          },
+          {
+            "id": "mrq-18",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-30",
+            "rank": 1,
+            "top_result_id": "mr-30",
+            "returned": 200
+          },
+          {
+            "id": "mrq-19",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-31",
+            "rank": 1,
+            "top_result_id": "mr-31",
+            "returned": 200
+          },
+          {
+            "id": "mrq-20",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-32",
+            "rank": 1,
+            "top_result_id": "mr-32",
+            "returned": 200
+          },
+          {
+            "id": "mrq-21",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-33",
+            "rank": 1,
+            "top_result_id": "mr-33",
+            "returned": 200
+          },
+          {
+            "id": "mrq-22",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-34",
+            "rank": 1,
+            "top_result_id": "mr-34",
+            "returned": 200
+          },
+          {
+            "id": "mrq-23",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-35",
+            "rank": 1,
+            "top_result_id": "mr-35",
+            "returned": 200
+          },
+          {
+            "id": "mrq-24",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-36",
+            "rank": 2,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-25",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-37",
+            "rank": 1,
+            "top_result_id": "mr-37",
+            "returned": 200
+          },
+          {
+            "id": "mrq-26",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-38",
+            "rank": 1,
+            "top_result_id": "mr-38",
+            "returned": 200
+          },
+          {
+            "id": "mrq-27",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-39",
+            "rank": 1,
+            "top_result_id": "mr-39",
+            "returned": 200
+          },
+          {
+            "id": "mrq-28",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-40",
+            "rank": 1,
+            "top_result_id": "mr-40",
+            "returned": 200
+          },
+          {
+            "id": "mrq-29",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-41",
+            "rank": 1,
+            "top_result_id": "mr-41",
+            "returned": 200
+          },
+          {
+            "id": "mrq-30",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-42",
+            "rank": 1,
+            "top_result_id": "mr-42",
+            "returned": 200
+          },
+          {
+            "id": "mrq-31",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-09",
+            "rank": 1,
+            "top_result_id": "mr-09",
+            "returned": 200
+          },
+          {
+            "id": "mrq-32",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-10",
+            "rank": 1,
+            "top_result_id": "mr-10",
+            "returned": 200
+          },
+          {
+            "id": "mrq-33",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-11",
+            "rank": 1,
+            "top_result_id": "mr-11",
+            "returned": 200
+          },
+          {
+            "id": "mrq-34",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-12",
+            "rank": 1,
+            "top_result_id": "mr-12",
+            "returned": 200
+          },
+          {
+            "id": "mrq-35",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-13",
+            "rank": 1,
+            "top_result_id": "mr-13",
+            "returned": 200
+          },
+          {
+            "id": "mrq-36",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-14",
+            "rank": 1,
+            "top_result_id": "mr-14",
+            "returned": 200
+          },
+          {
+            "id": "mrq-37",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-15",
+            "rank": 1,
+            "top_result_id": "mr-15",
+            "returned": 200
+          },
+          {
+            "id": "mrq-38",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-16",
+            "rank": 1,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-39",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-21",
+            "rank": 1,
+            "top_result_id": "mr-21",
+            "returned": 200
+          },
+          {
+            "id": "mrq-40",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-22",
+            "rank": 1,
+            "top_result_id": "mr-22",
+            "returned": 200
+          },
+          {
+            "id": "mrq-41",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-23",
+            "rank": 1,
+            "top_result_id": "mr-23",
+            "returned": 200
+          },
+          {
+            "id": "mrq-42",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-24",
+            "rank": 2,
+            "top_result_id": "md-014",
+            "returned": 200
+          },
+          {
+            "id": "mrq-43",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-43",
+            "rank": 1,
+            "top_result_id": "mr-43",
+            "returned": 200
+          },
+          {
+            "id": "mrq-44",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-44",
+            "rank": 1,
+            "top_result_id": "mr-44",
+            "returned": 200
+          },
+          {
+            "id": "mrq-45",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-45",
+            "rank": 1,
+            "top_result_id": "mr-45",
+            "returned": 200
+          },
+          {
+            "id": "mrq-46",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-46",
+            "rank": 1,
+            "top_result_id": "mr-46",
+            "returned": 200
+          },
+          {
+            "id": "mrq-47",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-47",
+            "rank": 1,
+            "top_result_id": "mr-47",
+            "returned": 200
+          },
+          {
+            "id": "mrq-48",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-48",
+            "rank": 1,
+            "top_result_id": "mr-48",
+            "returned": 200
+          },
+          {
+            "id": "mrq-49",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-49",
+            "rank": 1,
+            "top_result_id": "mr-49",
+            "returned": 200
+          },
+          {
+            "id": "mrq-50",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-50",
+            "rank": 1,
+            "top_result_id": "mr-50",
+            "returned": 200
+          },
+          {
+            "id": "mrq-51",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-51",
+            "rank": 1,
+            "top_result_id": "mr-51",
+            "returned": 200
+          },
+          {
+            "id": "mrq-52",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-52",
+            "rank": 1,
+            "top_result_id": "mr-52",
+            "returned": 200
+          },
+          {
+            "id": "mrq-53",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-53",
+            "rank": 2,
+            "top_result_id": "md-132",
+            "returned": 200
+          },
+          {
+            "id": "mrq-54",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-54",
+            "rank": 1,
+            "top_result_id": "mr-54",
+            "returned": 200
+          },
+          {
+            "id": "mrq-55",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-55",
+            "rank": 1,
+            "top_result_id": "mr-55",
+            "returned": 200
+          },
+          {
+            "id": "mrq-56",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-56",
+            "rank": 1,
+            "top_result_id": "mr-56",
+            "returned": 200
+          },
+          {
+            "id": "mrq-57",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-57",
+            "rank": 2,
+            "top_result_id": "md-076",
+            "returned": 200
+          },
+          {
+            "id": "mrq-58",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-58",
+            "rank": 1,
+            "top_result_id": "mr-58",
+            "returned": 200
+          },
+          {
+            "id": "mrq-59",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-59",
+            "rank": 1,
+            "top_result_id": "mr-59",
+            "returned": 200
+          },
+          {
+            "id": "mrq-60",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-60",
+            "rank": 2,
+            "top_result_id": "md-050",
+            "returned": 200
+          }
+        ],
+        "latency": {
+          "install_ms": 0,
+          "embed_ms": 7080,
+          "recall_p50_ms": 63.437999999999995,
+          "recall_p95_ms": 68.639875
+        }
+      },
+      "delta_overall": {
+        "hit_at_1": 0.33333333333333337,
+        "hit_at_3": 0.35,
+        "hit_at_5": 0.33333333333333326,
+        "mrr": 0.33750000000000013
+      },
+      "delta_by_lang_pair": {
+        "en-en": {
+          "hit_at_1": 0.0,
+          "hit_at_3": 0.0,
+          "hit_at_5": 0.0,
+          "mrr": 0.0
+        },
+        "en-ru": {
+          "hit_at_1": 0.7333333333333333,
+          "hit_at_3": 0.8666666666666667,
+          "hit_at_5": 0.8,
+          "mrr": 0.7944444444444445
+        },
+        "ru-en": {
+          "hit_at_1": 0.8,
+          "hit_at_3": 0.7333333333333334,
+          "hit_at_5": 0.7333333333333334,
+          "mrr": 0.7666666666666666
+        },
+        "ru-ru": {
+          "hit_at_1": -0.20000000000000007,
+          "hit_at_3": -0.20000000000000007,
+          "hit_at_5": -0.19999999999999996,
+          "mrr": -0.21111111111111103
+        }
+      }
+    },
+    {
+      "report": {
+        "schema_version": 1,
+        "provenance": {
+          "v2_commit": "d8360dc",
+          "corpus_path": "/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json",
+          "corpus_version": "2.0.0",
+          "model_id": "embeddinggemma-300m",
+          "config": "query_en",
+          "entry_count": 200,
+          "query_count": 60,
+          "host": "aarch64-macos",
+          "normalizer": null
+        },
+        "metrics": {
+          "hit_at_1": 0.5833333333333334,
+          "hit_at_3": 0.6666666666666666,
+          "hit_at_5": 0.6666666666666666,
+          "mrr": 0.6166666666666667,
+          "query_count": 60
+        },
+        "metrics_by_lang_pair": {
+          "en-en": {
+            "hit_at_1": 1.0,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 1.0,
+            "query_count": 15
+          },
+          "en-ru": {
+            "hit_at_1": 1.0,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 1.0,
+            "query_count": 15
+          },
+          "ru-en": {
+            "hit_at_1": 0.13333333333333333,
+            "hit_at_3": 0.26666666666666666,
+            "hit_at_5": 0.26666666666666666,
+            "mrr": 0.2,
+            "query_count": 15
+          },
+          "ru-ru": {
+            "hit_at_1": 0.2,
+            "hit_at_3": 0.4,
+            "hit_at_5": 0.4,
+            "mrr": 0.26666666666666666,
+            "query_count": 15
+          }
+        },
+        "per_query": [
+          {
+            "id": "mrq-01",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-01",
+            "rank": 1,
+            "top_result_id": "mr-01",
+            "returned": 200
+          },
+          {
+            "id": "mrq-02",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-02",
+            "rank": null,
+            "top_result_id": "md-054",
+            "returned": 200
+          },
+          {
+            "id": "mrq-03",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-03",
+            "rank": 3,
+            "top_result_id": "md-003",
+            "returned": 200
+          },
+          {
+            "id": "mrq-04",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-04",
+            "rank": 3,
+            "top_result_id": "md-007",
+            "returned": 200
+          },
+          {
+            "id": "mrq-05",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-05",
+            "rank": 3,
+            "top_result_id": "md-048",
+            "returned": 200
+          },
+          {
+            "id": "mrq-06",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-06",
+            "rank": null,
+            "top_result_id": "mr-60",
+            "returned": 200
+          },
+          {
+            "id": "mrq-07",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-07",
+            "rank": 1,
+            "top_result_id": "mr-07",
+            "returned": 200
+          },
+          {
+            "id": "mrq-08",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-08",
+            "rank": 1,
+            "top_result_id": "mr-08",
+            "returned": 200
+          },
+          {
+            "id": "mrq-09",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-17",
+            "rank": 2,
+            "top_result_id": "md-055",
+            "returned": 200
+          },
+          {
+            "id": "mrq-10",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-18",
+            "rank": 1,
+            "top_result_id": "mr-18",
+            "returned": 200
+          },
+          {
+            "id": "mrq-11",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-19",
+            "rank": null,
+            "top_result_id": "md-039",
+            "returned": 200
+          },
+          {
+            "id": "mrq-12",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-20",
+            "rank": null,
+            "top_result_id": "md-026",
+            "returned": 200
+          },
+          {
+            "id": "mrq-13",
+            "dense_degraded": null,
+            "dense_rank": 5,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-25",
+            "rank": null,
+            "top_result_id": "mr-48",
+            "returned": 200
+          },
+          {
+            "id": "mrq-14",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-26",
+            "rank": null,
+            "top_result_id": "md-011",
+            "returned": 200
+          },
+          {
+            "id": "mrq-15",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-27",
+            "rank": null,
+            "top_result_id": "mr-52",
+            "returned": 200
+          },
+          {
+            "id": "mrq-16",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-28",
+            "rank": null,
+            "top_result_id": "md-028",
+            "returned": 200
+          },
+          {
+            "id": "mrq-17",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-29",
+            "rank": null,
+            "top_result_id": "md-021",
+            "returned": 200
+          },
+          {
+            "id": "mrq-18",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-30",
+            "rank": null,
+            "top_result_id": "md-002",
+            "returned": 200
+          },
+          {
+            "id": "mrq-19",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-31",
+            "rank": null,
+            "top_result_id": "md-045",
+            "returned": 200
+          },
+          {
+            "id": "mrq-20",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-32",
+            "rank": null,
+            "top_result_id": "md-024",
+            "returned": 200
+          },
+          {
+            "id": "mrq-21",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-33",
+            "rank": null,
+            "top_result_id": "md-057",
+            "returned": 200
+          },
+          {
+            "id": "mrq-22",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-34",
+            "rank": null,
+            "top_result_id": "mr-45",
+            "returned": 200
+          },
+          {
+            "id": "mrq-23",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-35",
+            "rank": null,
+            "top_result_id": "md-042",
+            "returned": 200
+          },
+          {
+            "id": "mrq-24",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-36",
+            "rank": null,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-25",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-37",
+            "rank": 2,
+            "top_result_id": "md-051",
+            "returned": 200
+          },
+          {
+            "id": "mrq-26",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-38",
+            "rank": null,
+            "top_result_id": "md-048",
+            "returned": 200
+          },
+          {
+            "id": "mrq-27",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-39",
+            "rank": null,
+            "top_result_id": "md-055",
+            "returned": 200
+          },
+          {
+            "id": "mrq-28",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-40",
+            "rank": null,
+            "top_result_id": "md-053",
+            "returned": 200
+          },
+          {
+            "id": "mrq-29",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-41",
+            "rank": null,
+            "top_result_id": "md-055",
+            "returned": 200
+          },
+          {
+            "id": "mrq-30",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-42",
+            "rank": 1,
+            "top_result_id": "mr-42",
+            "returned": 200
+          },
+          {
+            "id": "mrq-31",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-09",
+            "rank": 1,
+            "top_result_id": "mr-09",
+            "returned": 200
+          },
+          {
+            "id": "mrq-32",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-10",
+            "rank": 1,
+            "top_result_id": "mr-10",
+            "returned": 200
+          },
+          {
+            "id": "mrq-33",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-11",
+            "rank": 1,
+            "top_result_id": "mr-11",
+            "returned": 200
+          },
+          {
+            "id": "mrq-34",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-12",
+            "rank": 1,
+            "top_result_id": "mr-12",
+            "returned": 200
+          },
+          {
+            "id": "mrq-35",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-13",
+            "rank": 1,
+            "top_result_id": "mr-13",
+            "returned": 200
+          },
+          {
+            "id": "mrq-36",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-14",
+            "rank": 1,
+            "top_result_id": "mr-14",
+            "returned": 200
+          },
+          {
+            "id": "mrq-37",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-15",
+            "rank": 1,
+            "top_result_id": "mr-15",
+            "returned": 200
+          },
+          {
+            "id": "mrq-38",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-16",
+            "rank": 1,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-39",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-21",
+            "rank": 1,
+            "top_result_id": "mr-21",
+            "returned": 200
+          },
+          {
+            "id": "mrq-40",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-22",
+            "rank": 1,
+            "top_result_id": "mr-22",
+            "returned": 200
+          },
+          {
+            "id": "mrq-41",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-23",
+            "rank": 1,
+            "top_result_id": "mr-23",
+            "returned": 200
+          },
+          {
+            "id": "mrq-42",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-24",
+            "rank": 1,
+            "top_result_id": "mr-24",
+            "returned": 200
+          },
+          {
+            "id": "mrq-43",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-43",
+            "rank": 1,
+            "top_result_id": "mr-43",
+            "returned": 200
+          },
+          {
+            "id": "mrq-44",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-44",
+            "rank": 1,
+            "top_result_id": "mr-44",
+            "returned": 200
+          },
+          {
+            "id": "mrq-45",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-45",
+            "rank": 1,
+            "top_result_id": "mr-45",
+            "returned": 200
+          },
+          {
+            "id": "mrq-46",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-46",
+            "rank": 1,
+            "top_result_id": "mr-46",
+            "returned": 200
+          },
+          {
+            "id": "mrq-47",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-47",
+            "rank": 1,
+            "top_result_id": "mr-47",
+            "returned": 200
+          },
+          {
+            "id": "mrq-48",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-48",
+            "rank": 1,
+            "top_result_id": "mr-48",
+            "returned": 200
+          },
+          {
+            "id": "mrq-49",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-49",
+            "rank": 1,
+            "top_result_id": "mr-49",
+            "returned": 200
+          },
+          {
+            "id": "mrq-50",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-50",
+            "rank": 1,
+            "top_result_id": "mr-50",
+            "returned": 200
+          },
+          {
+            "id": "mrq-51",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-51",
+            "rank": 1,
+            "top_result_id": "mr-51",
+            "returned": 200
+          },
+          {
+            "id": "mrq-52",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-52",
+            "rank": 1,
+            "top_result_id": "mr-52",
+            "returned": 200
+          },
+          {
+            "id": "mrq-53",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-53",
+            "rank": 1,
+            "top_result_id": "mr-53",
+            "returned": 200
+          },
+          {
+            "id": "mrq-54",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-54",
+            "rank": 1,
+            "top_result_id": "mr-54",
+            "returned": 200
+          },
+          {
+            "id": "mrq-55",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-55",
+            "rank": 1,
+            "top_result_id": "mr-55",
+            "returned": 200
+          },
+          {
+            "id": "mrq-56",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-56",
+            "rank": 1,
+            "top_result_id": "mr-56",
+            "returned": 200
+          },
+          {
+            "id": "mrq-57",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-57",
+            "rank": 1,
+            "top_result_id": "mr-57",
+            "returned": 200
+          },
+          {
+            "id": "mrq-58",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-58",
+            "rank": 1,
+            "top_result_id": "mr-58",
+            "returned": 200
+          },
+          {
+            "id": "mrq-59",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-59",
+            "rank": 1,
+            "top_result_id": "mr-59",
+            "returned": 200
+          },
+          {
+            "id": "mrq-60",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-60",
+            "rank": 1,
+            "top_result_id": "mr-60",
+            "returned": 200
+          }
+        ],
+        "latency": {
+          "install_ms": 0,
+          "embed_ms": 9183,
+          "recall_p50_ms": 62.061291999999995,
+          "recall_p95_ms": 68.2305
+        }
+      },
+      "delta_overall": {
+        "hit_at_1": 0.08333333333333337,
+        "hit_at_3": 0.08333333333333326,
+        "hit_at_5": 0.04999999999999993,
+        "mrr": 0.06944444444444453
+      },
+      "delta_by_lang_pair": {
+        "en-en": {
+          "hit_at_1": 0.0,
+          "hit_at_3": 0.0,
+          "hit_at_5": 0.0,
+          "mrr": 0.0
+        },
+        "en-ru": {
+          "hit_at_1": 1.0,
+          "hit_at_3": 0.8666666666666667,
+          "hit_at_5": 0.8,
+          "mrr": 0.9277777777777778
+        },
+        "ru-en": {
+          "hit_at_1": 0.0,
+          "hit_at_3": 0.0,
+          "hit_at_5": 0.0,
+          "mrr": 0.0
+        },
+        "ru-ru": {
+          "hit_at_1": -0.6666666666666667,
+          "hit_at_3": -0.5333333333333333,
+          "hit_at_5": -0.6,
+          "mrr": -0.6499999999999999
+        }
+      }
+    },
+    {
+      "report": {
+        "schema_version": 1,
+        "provenance": {
+          "v2_commit": "d8360dc",
+          "corpus_path": "/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json",
+          "corpus_version": "2.0.0",
+          "model_id": "embeddinggemma-300m",
+          "config": "both_en",
+          "entry_count": 200,
+          "query_count": 60,
+          "host": "aarch64-macos",
+          "normalizer": null
+        },
+        "metrics": {
+          "hit_at_1": 0.9166666666666666,
+          "hit_at_3": 0.9666666666666667,
+          "hit_at_5": 0.9833333333333333,
+          "mrr": 0.9450000000000001,
+          "query_count": 60
+        },
+        "metrics_by_lang_pair": {
+          "en-en": {
+            "hit_at_1": 1.0,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 1.0,
+            "query_count": 15
+          },
+          "en-ru": {
+            "hit_at_1": 1.0,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 1.0,
+            "query_count": 15
+          },
+          "ru-en": {
+            "hit_at_1": 0.9333333333333333,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 0.9666666666666667,
+            "query_count": 15
+          },
+          "ru-ru": {
+            "hit_at_1": 0.7333333333333333,
+            "hit_at_3": 0.8666666666666667,
+            "hit_at_5": 0.9333333333333333,
+            "mrr": 0.8133333333333332,
+            "query_count": 15
+          }
+        },
+        "per_query": [
+          {
+            "id": "mrq-01",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-01",
+            "rank": 1,
+            "top_result_id": "mr-01",
+            "returned": 200
+          },
+          {
+            "id": "mrq-02",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-02",
+            "rank": null,
+            "top_result_id": "md-086",
+            "returned": 200
+          },
+          {
+            "id": "mrq-03",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-03",
+            "rank": 2,
+            "top_result_id": "md-003",
+            "returned": 200
+          },
+          {
+            "id": "mrq-04",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-04",
+            "rank": 1,
+            "top_result_id": "mr-04",
+            "returned": 200
+          },
+          {
+            "id": "mrq-05",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-05",
+            "rank": 1,
+            "top_result_id": "mr-05",
+            "returned": 200
+          },
+          {
+            "id": "mrq-06",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-06",
+            "rank": 1,
+            "top_result_id": "mr-06",
+            "returned": 200
+          },
+          {
+            "id": "mrq-07",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-07",
+            "rank": 1,
+            "top_result_id": "mr-07",
+            "returned": 200
+          },
+          {
+            "id": "mrq-08",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-08",
+            "rank": 1,
+            "top_result_id": "mr-08",
+            "returned": 200
+          },
+          {
+            "id": "mrq-09",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-17",
+            "rank": 1,
+            "top_result_id": "mr-17",
+            "returned": 200
+          },
+          {
+            "id": "mrq-10",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-18",
+            "rank": 1,
+            "top_result_id": "mr-18",
+            "returned": 200
+          },
+          {
+            "id": "mrq-11",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-19",
+            "rank": 1,
+            "top_result_id": "mr-19",
+            "returned": 200
+          },
+          {
+            "id": "mrq-12",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-20",
+            "rank": 1,
+            "top_result_id": "mr-20",
+            "returned": 200
+          },
+          {
+            "id": "mrq-13",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-25",
+            "rank": 2,
+            "top_result_id": "md-127",
+            "returned": 200
+          },
+          {
+            "id": "mrq-14",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-26",
+            "rank": 1,
+            "top_result_id": "mr-26",
+            "returned": 200
+          },
+          {
+            "id": "mrq-15",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-27",
+            "rank": 1,
+            "top_result_id": "mr-27",
+            "returned": 200
+          },
+          {
+            "id": "mrq-16",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-28",
+            "rank": 1,
+            "top_result_id": "mr-28",
+            "returned": 200
+          },
+          {
+            "id": "mrq-17",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-29",
+            "rank": 5,
+            "top_result_id": "mr-42",
+            "returned": 200
+          },
+          {
+            "id": "mrq-18",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-30",
+            "rank": 1,
+            "top_result_id": "mr-30",
+            "returned": 200
+          },
+          {
+            "id": "mrq-19",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-31",
+            "rank": 1,
+            "top_result_id": "mr-31",
+            "returned": 200
+          },
+          {
+            "id": "mrq-20",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-32",
+            "rank": 1,
+            "top_result_id": "mr-32",
+            "returned": 200
+          },
+          {
+            "id": "mrq-21",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-33",
+            "rank": 1,
+            "top_result_id": "mr-33",
+            "returned": 200
+          },
+          {
+            "id": "mrq-22",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-34",
+            "rank": 1,
+            "top_result_id": "mr-34",
+            "returned": 200
+          },
+          {
+            "id": "mrq-23",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-35",
+            "rank": 1,
+            "top_result_id": "mr-35",
+            "returned": 200
+          },
+          {
+            "id": "mrq-24",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-36",
+            "rank": 2,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-25",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-37",
+            "rank": 1,
+            "top_result_id": "mr-37",
+            "returned": 200
+          },
+          {
+            "id": "mrq-26",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-38",
+            "rank": 1,
+            "top_result_id": "mr-38",
+            "returned": 200
+          },
+          {
+            "id": "mrq-27",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-39",
+            "rank": 1,
+            "top_result_id": "mr-39",
+            "returned": 200
+          },
+          {
+            "id": "mrq-28",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-40",
+            "rank": 1,
+            "top_result_id": "mr-40",
+            "returned": 200
+          },
+          {
+            "id": "mrq-29",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-41",
+            "rank": 1,
+            "top_result_id": "mr-41",
+            "returned": 200
+          },
+          {
+            "id": "mrq-30",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-42",
+            "rank": 1,
+            "top_result_id": "mr-42",
+            "returned": 200
+          },
+          {
+            "id": "mrq-31",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-09",
+            "rank": 1,
+            "top_result_id": "mr-09",
+            "returned": 200
+          },
+          {
+            "id": "mrq-32",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-10",
+            "rank": 1,
+            "top_result_id": "mr-10",
+            "returned": 200
+          },
+          {
+            "id": "mrq-33",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-11",
+            "rank": 1,
+            "top_result_id": "mr-11",
+            "returned": 200
+          },
+          {
+            "id": "mrq-34",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-12",
+            "rank": 1,
+            "top_result_id": "mr-12",
+            "returned": 200
+          },
+          {
+            "id": "mrq-35",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-13",
+            "rank": 1,
+            "top_result_id": "mr-13",
+            "returned": 200
+          },
+          {
+            "id": "mrq-36",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-14",
+            "rank": 1,
+            "top_result_id": "mr-14",
+            "returned": 200
+          },
+          {
+            "id": "mrq-37",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-15",
+            "rank": 1,
+            "top_result_id": "mr-15",
+            "returned": 200
+          },
+          {
+            "id": "mrq-38",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-16",
+            "rank": 1,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-39",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-21",
+            "rank": 1,
+            "top_result_id": "mr-21",
+            "returned": 200
+          },
+          {
+            "id": "mrq-40",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-22",
+            "rank": 1,
+            "top_result_id": "mr-22",
+            "returned": 200
+          },
+          {
+            "id": "mrq-41",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-23",
+            "rank": 1,
+            "top_result_id": "mr-23",
+            "returned": 200
+          },
+          {
+            "id": "mrq-42",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-24",
+            "rank": 1,
+            "top_result_id": "mr-24",
+            "returned": 200
+          },
+          {
+            "id": "mrq-43",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-43",
+            "rank": 1,
+            "top_result_id": "mr-43",
+            "returned": 200
+          },
+          {
+            "id": "mrq-44",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-44",
+            "rank": 1,
+            "top_result_id": "mr-44",
+            "returned": 200
+          },
+          {
+            "id": "mrq-45",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-45",
+            "rank": 1,
+            "top_result_id": "mr-45",
+            "returned": 200
+          },
+          {
+            "id": "mrq-46",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-46",
+            "rank": 1,
+            "top_result_id": "mr-46",
+            "returned": 200
+          },
+          {
+            "id": "mrq-47",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-47",
+            "rank": 1,
+            "top_result_id": "mr-47",
+            "returned": 200
+          },
+          {
+            "id": "mrq-48",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-48",
+            "rank": 1,
+            "top_result_id": "mr-48",
+            "returned": 200
+          },
+          {
+            "id": "mrq-49",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-49",
+            "rank": 1,
+            "top_result_id": "mr-49",
+            "returned": 200
+          },
+          {
+            "id": "mrq-50",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-50",
+            "rank": 1,
+            "top_result_id": "mr-50",
+            "returned": 200
+          },
+          {
+            "id": "mrq-51",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-51",
+            "rank": 1,
+            "top_result_id": "mr-51",
+            "returned": 200
+          },
+          {
+            "id": "mrq-52",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-52",
+            "rank": 1,
+            "top_result_id": "mr-52",
+            "returned": 200
+          },
+          {
+            "id": "mrq-53",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-53",
+            "rank": 1,
+            "top_result_id": "mr-53",
+            "returned": 200
+          },
+          {
+            "id": "mrq-54",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-54",
+            "rank": 1,
+            "top_result_id": "mr-54",
+            "returned": 200
+          },
+          {
+            "id": "mrq-55",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-55",
+            "rank": 1,
+            "top_result_id": "mr-55",
+            "returned": 200
+          },
+          {
+            "id": "mrq-56",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-56",
+            "rank": 1,
+            "top_result_id": "mr-56",
+            "returned": 200
+          },
+          {
+            "id": "mrq-57",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-57",
+            "rank": 1,
+            "top_result_id": "mr-57",
+            "returned": 200
+          },
+          {
+            "id": "mrq-58",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-58",
+            "rank": 1,
+            "top_result_id": "mr-58",
+            "returned": 200
+          },
+          {
+            "id": "mrq-59",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-59",
+            "rank": 1,
+            "top_result_id": "mr-59",
+            "returned": 200
+          },
+          {
+            "id": "mrq-60",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-60",
+            "rank": 1,
+            "top_result_id": "mr-60",
+            "returned": 200
+          }
+        ],
+        "latency": {
+          "install_ms": 0,
+          "embed_ms": 7451,
+          "recall_p50_ms": 62.018833,
+          "recall_p95_ms": 67.327584
+        }
+      },
+      "delta_overall": {
+        "hit_at_1": 0.41666666666666663,
+        "hit_at_3": 0.3833333333333333,
+        "hit_at_5": 0.3666666666666666,
+        "mrr": 0.3977777777777779
+      },
+      "delta_by_lang_pair": {
+        "en-en": {
+          "hit_at_1": 0.0,
+          "hit_at_3": 0.0,
+          "hit_at_5": 0.0,
+          "mrr": 0.0
+        },
+        "en-ru": {
+          "hit_at_1": 1.0,
+          "hit_at_3": 0.8666666666666667,
+          "hit_at_5": 0.8,
+          "mrr": 0.9277777777777778
+        },
+        "ru-en": {
+          "hit_at_1": 0.8,
+          "hit_at_3": 0.7333333333333334,
+          "hit_at_5": 0.7333333333333334,
+          "mrr": 0.7666666666666666
+        },
+        "ru-ru": {
+          "hit_at_1": -0.13333333333333341,
+          "hit_at_3": -0.06666666666666665,
+          "hit_at_5": -0.06666666666666665,
+          "mrr": -0.10333333333333339
+        }
+      }
+    },
+    {
+      "report": {
+        "schema_version": 1,
+        "provenance": {
+          "v2_commit": "d8360dc",
+          "corpus_path": "/opt/soft/local-rag-v2/crates/xtask/../../fixtures/memory-recall/corpus.json",
+          "corpus_version": "2.0.0",
+          "model_id": "embeddinggemma-300m",
+          "config": "pipeline_en",
+          "entry_count": 200,
+          "query_count": 60,
+          "host": "aarch64-macos",
+          "normalizer": {
+            "model_id": "gemma-4-e2b-it-gguf-q4-0",
+            "prompt_version": 2,
+            "normalizer_version": 2,
+            "translated": 100,
+            "passthrough": 100,
+            "failed": 0,
+            "failures": []
+          }
+        },
+        "metrics": {
+          "hit_at_1": 0.8166666666666667,
+          "hit_at_3": 0.9333333333333333,
+          "hit_at_5": 0.95,
+          "mrr": 0.87,
+          "query_count": 60
+        },
+        "metrics_by_lang_pair": {
+          "en-en": {
+            "hit_at_1": 1.0,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 1.0,
+            "query_count": 15
+          },
+          "en-ru": {
+            "hit_at_1": 0.6666666666666666,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 0.8111111111111112,
+            "query_count": 15
+          },
+          "ru-en": {
+            "hit_at_1": 0.9333333333333333,
+            "hit_at_3": 1.0,
+            "hit_at_5": 1.0,
+            "mrr": 0.9666666666666667,
+            "query_count": 15
+          },
+          "ru-ru": {
+            "hit_at_1": 0.6666666666666666,
+            "hit_at_3": 0.7333333333333333,
+            "hit_at_5": 0.8,
+            "mrr": 0.7022222222222222,
+            "query_count": 15
+          }
+        },
+        "per_query": [
+          {
+            "id": "mrq-01",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-01",
+            "rank": 1,
+            "top_result_id": "mr-01",
+            "returned": 200
+          },
+          {
+            "id": "mrq-02",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-02",
+            "rank": 5,
+            "top_result_id": "md-131",
+            "returned": 200
+          },
+          {
+            "id": "mrq-03",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-03",
+            "rank": null,
+            "top_result_id": "md-003",
+            "returned": 200
+          },
+          {
+            "id": "mrq-04",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-04",
+            "rank": 1,
+            "top_result_id": "mr-04",
+            "returned": 200
+          },
+          {
+            "id": "mrq-05",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-05",
+            "rank": 1,
+            "top_result_id": "mr-05",
+            "returned": 200
+          },
+          {
+            "id": "mrq-06",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-06",
+            "rank": 3,
+            "top_result_id": "md-050",
+            "returned": 200
+          },
+          {
+            "id": "mrq-07",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-07",
+            "rank": 1,
+            "top_result_id": "mr-07",
+            "returned": 200
+          },
+          {
+            "id": "mrq-08",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-08",
+            "rank": 1,
+            "top_result_id": "mr-08",
+            "returned": 200
+          },
+          {
+            "id": "mrq-09",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-17",
+            "rank": 1,
+            "top_result_id": "mr-17",
+            "returned": 200
+          },
+          {
+            "id": "mrq-10",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-18",
+            "rank": 1,
+            "top_result_id": "mr-18",
+            "returned": 200
+          },
+          {
+            "id": "mrq-11",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-19",
+            "rank": 1,
+            "top_result_id": "mr-19",
+            "returned": 200
+          },
+          {
+            "id": "mrq-12",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-20",
+            "rank": 1,
+            "top_result_id": "mr-20",
+            "returned": 200
+          },
+          {
+            "id": "mrq-13",
+            "dense_degraded": null,
+            "dense_rank": 5,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-25",
+            "rank": null,
+            "top_result_id": "md-016",
+            "returned": 200
+          },
+          {
+            "id": "mrq-14",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-26",
+            "rank": 1,
+            "top_result_id": "mr-26",
+            "returned": 200
+          },
+          {
+            "id": "mrq-15",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-27",
+            "rank": null,
+            "top_result_id": "md-132",
+            "returned": 200
+          },
+          {
+            "id": "mrq-16",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-28",
+            "rank": 1,
+            "top_result_id": "mr-28",
+            "returned": 200
+          },
+          {
+            "id": "mrq-17",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-29",
+            "rank": 1,
+            "top_result_id": "mr-29",
+            "returned": 200
+          },
+          {
+            "id": "mrq-18",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-30",
+            "rank": 1,
+            "top_result_id": "mr-30",
+            "returned": 200
+          },
+          {
+            "id": "mrq-19",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-ru",
+            "expected_entry_id": "mr-31",
+            "rank": 1,
+            "top_result_id": "mr-31",
+            "returned": 200
+          },
+          {
+            "id": "mrq-20",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-32",
+            "rank": 1,
+            "top_result_id": "mr-32",
+            "returned": 200
+          },
+          {
+            "id": "mrq-21",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-33",
+            "rank": 1,
+            "top_result_id": "mr-33",
+            "returned": 200
+          },
+          {
+            "id": "mrq-22",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-34",
+            "rank": 1,
+            "top_result_id": "mr-34",
+            "returned": 200
+          },
+          {
+            "id": "mrq-23",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-35",
+            "rank": 1,
+            "top_result_id": "mr-35",
+            "returned": 200
+          },
+          {
+            "id": "mrq-24",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-36",
+            "rank": 2,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-25",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-37",
+            "rank": 1,
+            "top_result_id": "mr-37",
+            "returned": 200
+          },
+          {
+            "id": "mrq-26",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-38",
+            "rank": 1,
+            "top_result_id": "mr-38",
+            "returned": 200
+          },
+          {
+            "id": "mrq-27",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-39",
+            "rank": 1,
+            "top_result_id": "mr-39",
+            "returned": 200
+          },
+          {
+            "id": "mrq-28",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-40",
+            "rank": 1,
+            "top_result_id": "mr-40",
+            "returned": 200
+          },
+          {
+            "id": "mrq-29",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-41",
+            "rank": 1,
+            "top_result_id": "mr-41",
+            "returned": 200
+          },
+          {
+            "id": "mrq-30",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "ru-en",
+            "expected_entry_id": "mr-42",
+            "rank": 1,
+            "top_result_id": "mr-42",
+            "returned": 200
+          },
+          {
+            "id": "mrq-31",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-09",
+            "rank": 1,
+            "top_result_id": "mr-09",
+            "returned": 200
+          },
+          {
+            "id": "mrq-32",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-10",
+            "rank": 1,
+            "top_result_id": "mr-10",
+            "returned": 200
+          },
+          {
+            "id": "mrq-33",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-11",
+            "rank": 1,
+            "top_result_id": "mr-11",
+            "returned": 200
+          },
+          {
+            "id": "mrq-34",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-12",
+            "rank": 1,
+            "top_result_id": "mr-12",
+            "returned": 200
+          },
+          {
+            "id": "mrq-35",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-13",
+            "rank": 1,
+            "top_result_id": "mr-13",
+            "returned": 200
+          },
+          {
+            "id": "mrq-36",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-14",
+            "rank": 1,
+            "top_result_id": "mr-14",
+            "returned": 200
+          },
+          {
+            "id": "mrq-37",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-15",
+            "rank": 1,
+            "top_result_id": "mr-15",
+            "returned": 200
+          },
+          {
+            "id": "mrq-38",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-16",
+            "rank": 1,
+            "top_result_id": "mr-16",
+            "returned": 200
+          },
+          {
+            "id": "mrq-39",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-21",
+            "rank": 1,
+            "top_result_id": "mr-21",
+            "returned": 200
+          },
+          {
+            "id": "mrq-40",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-22",
+            "rank": 1,
+            "top_result_id": "mr-22",
+            "returned": 200
+          },
+          {
+            "id": "mrq-41",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-23",
+            "rank": 1,
+            "top_result_id": "mr-23",
+            "returned": 200
+          },
+          {
+            "id": "mrq-42",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-24",
+            "rank": 3,
+            "top_result_id": "md-076",
+            "returned": 200
+          },
+          {
+            "id": "mrq-43",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-43",
+            "rank": 1,
+            "top_result_id": "mr-43",
+            "returned": 200
+          },
+          {
+            "id": "mrq-44",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-44",
+            "rank": 1,
+            "top_result_id": "mr-44",
+            "returned": 200
+          },
+          {
+            "id": "mrq-45",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-45",
+            "rank": 1,
+            "top_result_id": "mr-45",
+            "returned": 200
+          },
+          {
+            "id": "mrq-46",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-46",
+            "rank": 1,
+            "top_result_id": "mr-46",
+            "returned": 200
+          },
+          {
+            "id": "mrq-47",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-47",
+            "rank": 1,
+            "top_result_id": "mr-47",
+            "returned": 200
+          },
+          {
+            "id": "mrq-48",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-48",
+            "rank": 1,
+            "top_result_id": "mr-48",
+            "returned": 200
+          },
+          {
+            "id": "mrq-49",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-en",
+            "expected_entry_id": "mr-49",
+            "rank": 1,
+            "top_result_id": "mr-49",
+            "returned": 200
+          },
+          {
+            "id": "mrq-50",
+            "dense_degraded": null,
+            "dense_rank": 2,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-50",
+            "rank": 2,
+            "top_result_id": "md-128",
+            "returned": 200
+          },
+          {
+            "id": "mrq-51",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-51",
+            "rank": 1,
+            "top_result_id": "mr-51",
+            "returned": 200
+          },
+          {
+            "id": "mrq-52",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-52",
+            "rank": 1,
+            "top_result_id": "mr-52",
+            "returned": 200
+          },
+          {
+            "id": "mrq-53",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-53",
+            "rank": 2,
+            "top_result_id": "md-132",
+            "returned": 200
+          },
+          {
+            "id": "mrq-54",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-54",
+            "rank": 1,
+            "top_result_id": "mr-54",
+            "returned": 200
+          },
+          {
+            "id": "mrq-55",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-55",
+            "rank": 1,
+            "top_result_id": "mr-55",
+            "returned": 200
+          },
+          {
+            "id": "mrq-56",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-56",
+            "rank": 1,
+            "top_result_id": "mr-56",
+            "returned": 200
+          },
+          {
+            "id": "mrq-57",
+            "dense_degraded": null,
+            "dense_rank": 3,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-57",
+            "rank": 3,
+            "top_result_id": "md-076",
+            "returned": 200
+          },
+          {
+            "id": "mrq-58",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-58",
+            "rank": 1,
+            "top_result_id": "mr-58",
+            "returned": 200
+          },
+          {
+            "id": "mrq-59",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-59",
+            "rank": 1,
+            "top_result_id": "mr-59",
+            "returned": 200
+          },
+          {
+            "id": "mrq-60",
+            "dense_degraded": null,
+            "dense_rank": 1,
+            "dense_hits": 5,
+            "lang_pair": "en-ru",
+            "expected_entry_id": "mr-60",
+            "rank": 2,
+            "top_result_id": "md-050",
+            "returned": 200
+          }
+        ],
+        "latency": {
+          "install_ms": 0,
+          "embed_ms": 6422,
+          "recall_p50_ms": 43.1005,
+          "recall_p95_ms": 46.047875000000005
+        }
+      },
+      "delta_overall": {
+        "hit_at_1": 0.31666666666666665,
+        "hit_at_3": 0.35,
+        "hit_at_5": 0.33333333333333326,
+        "mrr": 0.32277777777777783
+      },
+      "delta_by_lang_pair": {
+        "en-en": {
+          "hit_at_1": 0.0,
+          "hit_at_3": 0.0,
+          "hit_at_5": 0.0,
+          "mrr": 0.0
+        },
+        "en-ru": {
+          "hit_at_1": 0.6666666666666666,
+          "hit_at_3": 0.8666666666666667,
+          "hit_at_5": 0.8,
+          "mrr": 0.738888888888889
+        },
+        "ru-en": {
+          "hit_at_1": 0.8,
+          "hit_at_3": 0.7333333333333334,
+          "hit_at_5": 0.7333333333333334,
+          "mrr": 0.7666666666666666
+        },
+        "ru-ru": {
+          "hit_at_1": -0.20000000000000007,
+          "hit_at_3": -0.20000000000000007,
+          "hit_at_5": -0.19999999999999996,
+          "mrr": -0.21444444444444444
+        }
+      }
+    }
+  ]
+}
