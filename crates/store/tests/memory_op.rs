@@ -1,6 +1,7 @@
 //! T14-02/T14-03 acceptance tests for the transactional memory-op engine
 //! (spec 08 §3): the operation contracts (`create`/`reinforce`/`noop`/
-//! `resolve`/`retract`/`supersede`/`edit`), optimistic conflict, illegal
+//! `resolve`/`retract`/`supersede`/`edit`, plus D-079's `confirm`/`reject`),
+//! optimistic conflict, illegal
 //! kind/state transitions, idempotency-key replay ("same key returns the
 //! original result"), rollback-under-failpoint, audit-version contiguity,
 //! and user/router actor recording.
@@ -19,12 +20,13 @@
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
-    Actor, CreateMemoryOp, EditMemoryOp, EvidenceInput, IllegalMemoryTransition, MemoryOpError,
-    MemoryOpOutcome, MergeLoser, MergeMemoryOp, NormalizationStatus, NormalizationWrite,
-    ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp, ScopeKind, SupersedeMemoryOp,
-    UpsertOutcome, apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce,
-    apply_resolve, apply_retract, apply_supersede, memory_entry_state, memory_evidence_for,
-    normalization_for, read_audit_events_for_entity, upsert_normalization,
+    Actor, ConfirmMemoryOp, CreateMemoryOp, EditMemoryOp, EvidenceInput, IllegalMemoryTransition,
+    MemoryOpError, MemoryOpOutcome, MergeLoser, MergeMemoryOp, NormalizationStatus,
+    NormalizationWrite, ReinforceMemoryOp, RejectMemoryOp, ResolveMemoryOp, RetractMemoryOp,
+    ScopeKind, SupersedeMemoryOp, UpsertOutcome, apply_confirm, apply_create, apply_edit,
+    apply_merge, apply_noop, apply_reinforce, apply_reject, apply_resolve, apply_retract,
+    apply_supersede, memory_entry_state, memory_evidence_for, normalization_for,
+    read_audit_events_for_entity, upsert_normalization,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{MemoryKind, MemoryState, StateDb};
@@ -241,6 +243,58 @@ async fn retract(
         })
         .await
         .expect("retract tx (infrastructure)")
+}
+
+async fn confirm(
+    db: &StateDb,
+    memory_id: &str,
+    expected_version: i64,
+    actor: Actor,
+    idempotency_key: Option<&str>,
+) -> Result<MemoryOpOutcome, MemoryOpError> {
+    let (id, idem) = (memory_id.to_string(), idempotency_key.map(str::to_string));
+    db.writer()
+        .transaction(move |tx| {
+            apply_confirm(
+                tx,
+                &ConfirmMemoryOp {
+                    memory_id: &id,
+                    expected_version,
+                    evidence: &[],
+                    actor,
+                    idempotency_key: idem.as_deref(),
+                },
+                3000,
+            )
+        })
+        .await
+        .expect("confirm tx (infrastructure)")
+}
+
+async fn reject(
+    db: &StateDb,
+    memory_id: &str,
+    expected_version: i64,
+    actor: Actor,
+    idempotency_key: Option<&str>,
+) -> Result<MemoryOpOutcome, MemoryOpError> {
+    let (id, idem) = (memory_id.to_string(), idempotency_key.map(str::to_string));
+    db.writer()
+        .transaction(move |tx| {
+            apply_reject(
+                tx,
+                &RejectMemoryOp {
+                    memory_id: &id,
+                    expected_version,
+                    evidence: &[],
+                    actor,
+                    idempotency_key: idem.as_deref(),
+                },
+                3000,
+            )
+        })
+        .await
+        .expect("reject tx (infrastructure)")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2455,5 +2509,293 @@ async fn reinforce_keeps_the_translation() {
     assert!(
         has_normalization(&db, &id).await,
         "reinforce may not touch the text, so it may not invalidate its translation",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// confirm / reject (D-079)
+//
+// Spec 04 §5 has declared `hypothesis: active → confirmed | rejected |
+// superseded` since idea.md rev 6, and `check_transition` has accepted those
+// edges since T14-01 — but until D-079 no operation could reach them, so a
+// hypothesis could only be born and then absorbed by a merge. These tests
+// pin the two verbs that close that gap, and the two edges deliberately left
+// closed (a non-hypothesis kind; `confirmed → rejected`, D-020).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn confirm_moves_a_hypothesis_to_confirmed_and_audits_it() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(238);
+    let id = uuid(239);
+    create(&db, &id, MemoryKind::Hypothesis, &owner, None, vec![], None)
+        .await
+        .expect("create");
+
+    let outcome = confirm(&db, &id, 1, Actor::User, None)
+        .await
+        .expect("confirm applies");
+    let MemoryOpOutcome::Applied(result) = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(result.entry_version, 2);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &id).expect("state"),
+        Some((MemoryKind::Hypothesis, MemoryState::Confirmed)),
+        "a confirmed hypothesis keeps kind=hypothesis (spec 04 §5's common rule)",
+    );
+    let audit = read_audit_events_for_entity(&read, "memory_entry", &id).expect("audit");
+    assert_eq!(audit.len(), 2, "create + confirm");
+    assert_eq!(audit[1].op, "confirm");
+    assert_eq!(audit[1].actor, Actor::User);
+    assert_eq!(audit[1].entity_version, 2);
+    assert_eq!(audit[1].audit_id, result.audit_id);
+}
+
+#[tokio::test]
+async fn reject_moves_a_hypothesis_to_rejected_without_deleting_it() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(240);
+    let id = uuid(241);
+    create(&db, &id, MemoryKind::Hypothesis, &owner, None, vec![], None)
+        .await
+        .expect("create");
+
+    let outcome = reject(&db, &id, 1, Actor::User, None)
+        .await
+        .expect("reject applies");
+    let MemoryOpOutcome::Applied(result) = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(result.entry_version, 2);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &id).expect("state"),
+        Some((MemoryKind::Hypothesis, MemoryState::Rejected)),
+        "reject is terminal but not a delete — the row stays for review",
+    );
+    let audit = read_audit_events_for_entity(&read, "memory_entry", &id).expect("audit");
+    assert_eq!(audit.len(), 2, "create + reject");
+    assert_eq!(audit[1].op, "reject");
+}
+
+#[tokio::test]
+async fn confirm_is_illegal_for_a_fact() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(242);
+    let id = uuid(243);
+    create(&db, &id, MemoryKind::Fact, &owner, None, vec![], None)
+        .await
+        .expect("create");
+
+    let error = confirm(&db, &id, 1, Actor::User, None)
+        .await
+        .expect_err("confirmed is not in a fact's state set");
+    assert_eq!(
+        error,
+        MemoryOpError::IllegalTransition(IllegalMemoryTransition {
+            kind: MemoryKind::Fact,
+            from: MemoryState::Active,
+            to: MemoryState::Confirmed,
+        }),
+    );
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &id).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+        "a rejected precondition mutates nothing",
+    );
+    assert_eq!(
+        read_audit_events_for_entity(&read, "memory_entry", &id)
+            .expect("audit")
+            .len(),
+        1,
+        "create only",
+    );
+}
+
+/// D-020 deliberately left `confirmed → rejected` out of the machine: spec 04
+/// §5's table gives `reject` no role once a hypothesis is confirmed. Without
+/// this test the missing edge reads like an oversight and gets "fixed".
+#[tokio::test]
+async fn reject_is_illegal_once_a_hypothesis_is_confirmed() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(244);
+    let id = uuid(245);
+    create(&db, &id, MemoryKind::Hypothesis, &owner, None, vec![], None)
+        .await
+        .expect("create");
+    confirm(&db, &id, 1, Actor::User, None)
+        .await
+        .expect("confirm applies");
+
+    let error = reject(&db, &id, 2, Actor::User, None)
+        .await
+        .expect_err("confirmed -> rejected has no textual basis (D-020)");
+    assert_eq!(
+        error,
+        MemoryOpError::IllegalTransition(IllegalMemoryTransition {
+            kind: MemoryKind::Hypothesis,
+            from: MemoryState::Confirmed,
+            to: MemoryState::Rejected,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn confirm_with_a_stale_expected_version_is_an_optimistic_conflict() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(246);
+    let id = uuid(247);
+    create(&db, &id, MemoryKind::Hypothesis, &owner, None, vec![], None)
+        .await
+        .expect("create");
+    confirm(&db, &id, 1, Actor::User, None)
+        .await
+        .expect("first confirm applies");
+
+    let error = confirm(&db, &id, 1, Actor::User, None)
+        .await
+        .expect_err("version 1 is stale after the first confirm");
+    assert_eq!(
+        error,
+        MemoryOpError::OptimisticConflict {
+            expected: 1,
+            actual: 2,
+        },
+    );
+}
+
+/// A self-transition is legal (`check_transition`'s own rule) and, as with
+/// every other op in this engine, still bumps the version and writes an audit
+/// row — `apply_reinforce`'s T14-02 precedent, not a claim that the state
+/// changed.
+#[tokio::test]
+async fn confirming_an_already_confirmed_entry_still_bumps_the_version() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(248);
+    let id = uuid(249);
+    create(&db, &id, MemoryKind::Hypothesis, &owner, None, vec![], None)
+        .await
+        .expect("create");
+    confirm(&db, &id, 1, Actor::User, None)
+        .await
+        .expect("first confirm");
+
+    let outcome = confirm(&db, &id, 2, Actor::User, None)
+        .await
+        .expect("second confirm is a legal self-transition");
+    let MemoryOpOutcome::Applied(result) = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(result.entry_version, 3);
+
+    let read = db.open_read().expect("read conn");
+    let audit = read_audit_events_for_entity(&read, "memory_entry", &id).expect("audit");
+    assert_eq!(audit.len(), 3, "create + confirm + confirm");
+    assert_eq!(audit[2].op, "confirm");
+}
+
+/// The card's own acceptance criterion: a `hypothesis` can be walked through
+/// the whole lifecycle spec 04 §5 declares for it — confirmed on evidence,
+/// then promoted to a `fact` by an explicit `supersede` — without reaching for
+/// `merge`, which was the only legal exit before D-079.
+#[tokio::test]
+async fn a_hypothesis_walks_its_declared_lifecycle_without_merge() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(250);
+    let hypothesis = uuid(251);
+    let promoted = uuid(252);
+    create(
+        &db,
+        &hypothesis,
+        MemoryKind::Hypothesis,
+        &owner,
+        None,
+        vec![],
+        None,
+    )
+    .await
+    .expect("create");
+
+    confirm(&db, &hypothesis, 1, Actor::User, None)
+        .await
+        .expect("confirm on strong evidence");
+    supersede(
+        &db,
+        &hypothesis,
+        2,
+        &promoted,
+        MemoryKind::Fact,
+        &owner,
+        Actor::User,
+        None,
+    )
+    .await
+    .expect("promotion acts on an already-confirmed hypothesis (D-020)");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        memory_entry_state(&read, &hypothesis).expect("state"),
+        Some((MemoryKind::Hypothesis, MemoryState::Superseded)),
+    );
+    assert_eq!(
+        memory_entry_state(&read, &promoted).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+    );
+    let audit = read_audit_events_for_entity(&read, "memory_entry", &hypothesis).expect("audit");
+    let ops: Vec<&str> = audit.iter().map(|e| e.op.as_str()).collect();
+    assert_eq!(ops, ["create", "confirm", "supersede"]);
+}
+
+/// The card's other test bullet, at the layer where it is actually observable:
+/// an entry the op engine confirmed is still a recall candidate (high trust,
+/// not terminal), while one it rejected is gone from recall — the same
+/// `!state.is_terminal()` filter every reader shares (spec 04 §5, 08 §6).
+#[tokio::test]
+async fn recall_keeps_a_confirmed_hypothesis_and_drops_a_rejected_one() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let owner = uuid(253);
+    let confirmed = uuid(254);
+    let rejected = uuid(255);
+    for id in [&confirmed, &rejected] {
+        create(&db, id, MemoryKind::Hypothesis, &owner, None, vec![], None)
+            .await
+            .expect("create");
+    }
+
+    confirm(&db, &confirmed, 1, Actor::User, None)
+        .await
+        .expect("confirm applies");
+    reject(&db, &rejected, 1, Actor::User, None)
+        .await
+        .expect("reject applies");
+
+    let read = db.open_read().expect("read conn");
+    let visible: Vec<String> =
+        local_rag_store::memory::recall_candidates_for_scope(&read, ScopeKind::Worktree, &owner)
+            .expect("recall candidates")
+            .into_iter()
+            .map(|c| c.memory_id)
+            .collect();
+    assert!(
+        visible.contains(&confirmed),
+        "a confirmed hypothesis stays recall-eligible: {visible:?}",
+    );
+    assert!(
+        !visible.contains(&rejected),
+        "a rejected hypothesis is terminal and excluded: {visible:?}",
     );
 }

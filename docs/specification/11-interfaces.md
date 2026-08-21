@@ -34,7 +34,7 @@ Status: **v0** ships in MVP; **v0.x** additive after MVP; **post-v0** benchmark/
 | `remember(text, kind, scope?, canonical_key?, importance?, confirmed_by_user?)` | v0 | explicit durable create (08 §5); returns memory_id + entry_version. `text` is accepted in any language and **stored in English** (08 §3 `[FIXED, ADR-0011]`); the author's original is kept as provenance and shown by `inspect`/`export` (12 §3) |
 | `list_memory(filters…)` / `inspect_memory_evidence(memory_id)` | v0 | review reads |
 | `list_memory_candidates()` / `approve_memory_candidate(id)` / `reject_memory_candidate(id)` / `edit_memory_candidate(id, patch)` | v0 | candidate review (04 §6) |
-| `edit_memory(id, patch, expected_version)` / `retract_memory(id, expected_version)` / `merge_memories(ids[], survivor_id)` | v0 | transactional ops (08 §3) |
+| `edit_memory(id, patch, expected_version)` / `retract_memory(id, expected_version)` / `confirm_memory(id, expected_version)` / `reject_memory(id, expected_version)` / `merge_memories(ids[], survivor_id)` | v0 | transactional ops (08 §3); `confirm_memory`/`reject_memory` move a **hypothesis entry** through 04 §5's own machine and are not `approve`/`reject_memory_candidate`, which move a pending candidate (04 §6) |
 | `stats()` | v0 | counts per pillar, index/generation info, degraded states |
 | `health()` | v0 | daemon/version/store status |
 | `give_feedback(text)` | v0 | writes an observation envelope directly (daemon-side; source identity `mcp:<session>:<request_id>`) `[SPEC]` — spool-only constraint applies to hooks, not to daemon-internal writes |
@@ -433,10 +433,11 @@ that competition by construction. Two caller-facing changes to `mcp::tools::cata
   workflow-timing trigger ("Call before your first file read, grep, or search …" /
   "Call the moment something durable surfaces … not later"). Tool names, `inputSchema`, and
   `annotations` are unchanged (spec-fixed); only prose changed.
-- The twelve administrative/review tools (`list_memory`, `list_memory_candidates`,
+- The administrative/review tools (twelve at T19-01; fourteen since D-079 added
+  `confirm_memory`/`reject_memory` — `list_memory`, `list_memory_candidates`,
   `inspect_memory_evidence`, `stats`, `health`, `approve_memory_candidate`,
   `reject_memory_candidate`, `edit_memory_candidate`, `edit_memory`, `retract_memory`,
-  `merge_memories`, `give_feedback`) are held to 1–2 sentences — they are not part of the
+  `confirm_memory`, `reject_memory`, `merge_memories`, `give_feedback`) are held to 1–2 sentences — they are not part of the
   recall/search/remember working loop, but their token weight still counts toward the client-side
   deferred-loading threshold that decides whether the whole catalog is inlined into context at
   all (MCP Tool Search / deferred loading, Claude Code ≥ 2.1.7: tool definitions past ~10% of the
@@ -481,6 +482,20 @@ built to repair the consequence (`T21-01`…`T21-08`) before the source was ever
   untouched: it constrains the *transcripts the router must cope with* and the `op_kinds` it must
   emit, and all 42 `memory.router.op.*` fixtures assert `op_kinds` and never the language of
   `text`. Router inputs stay multilingual on purpose.
+
+As-built note (D-079, `[SPEC]`): the catalog gains `confirm_memory` and `reject_memory`, the two
+verbs 04 §5 declared for `hypothesis` and nothing implemented (that section's own D-079 note has
+the account). `confirm_memory` is `destructiveHint: false` — `confirmed` is non-terminal and
+raises trust — while `reject_memory` is `destructiveHint: true`, making it the **second**
+entry-terminating tool after `retract_memory`; the "exactly one destructive tool" assertions in
+`mcp_contract.rs`, `local-rag-proxy`'s subprocess test and `tools.rs` become a two-element set, and
+the TUI's confirm-modal gate needs no change at all because it reads `destructiveHint` from this
+same catalog rather than keeping its own list (T18-05's whole point).
+
+Serialized catalog: **14 138 bytes** (measured 12 852 immediately before this change), against the
+unchanged 15 000-byte `MAX_CATALOG_BYTES` budget. That is 94% of the budget and only ~860 bytes of
+headroom — worth stating plainly, because the next tool of this size will not fit and the honest
+response then is to trim descriptions, not to raise the constant.
 
 ## 3. Hooks
 
@@ -703,7 +718,7 @@ local-rag index <path> | reindex | watch          # watch: standalone process, s
 local-rag project add|remove|enable|disable|list|status|reindex <path>   # daemon-managed, see §8
 local-rag repo list | repo attach <repo_id> [--path P] [--worktree <id>] | worktree list
 local-rag rebuild --worktree <id> [--fts] [--dense]
-local-rag memory list|approve|reject|edit|retract|merge|rescope|evidence …
+local-rag memory list|approve|reject|edit|retract|confirm|refute|merge|rescope|evidence …
 local-rag inspect <observation|memory|generation> <id>
 local-rag export [--scope …] | purge [--memory <id>|--session <id>|--all]
 local-rag gc [--dry-run]

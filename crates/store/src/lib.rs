@@ -255,7 +255,9 @@
 //! (T14-04) are later tasks composing the same primitives.
 //!
 //! T14-03 adds the **lifecycle/edit ops** in the same module:
-//! [`apply_resolve`]/[`apply_retract`] are thin wrappers over a shared
+//! [`apply_resolve`]/[`apply_retract`] — and [`apply_confirm`]/
+//! [`apply_reject`], added by D-079 for the `hypothesis` machine — are thin
+//! wrappers over a shared
 //! private helper that reads `(kind, state, entry_version)` once and reuses
 //! [`memory::MemoryState::check_transition`] directly (not
 //! `transition_memory_entry`, which has no notion of `entry_version`).
@@ -433,38 +435,38 @@ pub use lock::{LockLevel, OrderViolation, WorktreeLockRegistry, check_order, hel
 pub use memory::{
     Actor, ApplyReport, ApproveCandidateOutcome, AuditEventRow, CURRENT_NORMALIZER_VERSION,
     CandidateCountRow, CandidateRow, CandidateState, CandidateTransitionError, ClassifiedFailure,
-    ConsolidationWindow, CreateMemoryEntryError, CreateMemoryOp, DeadLetteredNormalization,
-    EditMemoryOp, EvidenceInput, FailureKind, GLOBAL_SCOPE_OWNER_ID, GeneratedOp,
-    IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition, LEASE_DURATION_MS,
-    LEASE_RENEW_INTERVAL_MS, MAX_NORMALIZATION_ATTEMPTS, MemoryCountRow, MemoryEntryRow,
-    MemoryEntrySummary, MemoryKind, MemoryOpError, MemoryOpOutcome, MemoryOpResult, MemoryState,
-    MemoryTransitionError, MergeLoser, MergeMemoryOp, NewAuditEvent, NewCandidate,
+    ConfirmMemoryOp, ConsolidationWindow, CreateMemoryEntryError, CreateMemoryOp,
+    DeadLetteredNormalization, EditMemoryOp, EvidenceInput, FailureKind, GLOBAL_SCOPE_OWNER_ID,
+    GeneratedOp, IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition,
+    LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, MAX_NORMALIZATION_ATTEMPTS, MemoryCountRow,
+    MemoryEntryRow, MemoryEntrySummary, MemoryKind, MemoryOpError, MemoryOpOutcome, MemoryOpResult,
+    MemoryState, MemoryTransitionError, MergeLoser, MergeMemoryOp, NewAuditEvent, NewCandidate,
     NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, NormalizationBacklog,
     NormalizationCountRow, NormalizationRow, NormalizationStatus, NormalizationWrite,
-    PendingNormalization, ProposedOperation, RecallCandidate, ReinforceMemoryOp, RenewError,
-    ResolveMemoryOp, RetractMemoryOp, ReviewError, RunCountRow, RunOutcome, RunOutcomeError,
-    RunState, RunTransitionError, RunWindow, RunnerApplyError, RunnerError,
+    PendingNormalization, ProposedOperation, RecallCandidate, ReinforceMemoryOp, RejectMemoryOp,
+    RenewError, ResolveMemoryOp, RetractMemoryOp, ReviewError, RunCountRow, RunOutcome,
+    RunOutcomeError, RunState, RunTransitionError, RunWindow, RunnerApplyError, RunnerError,
     STUCK_RUN_ATTEMPT_THRESHOLD, STUCK_RUN_REASON_MAX_CHARS, ScopeKind, SnapshotOutcome, StaleRun,
     StuckRunRow, SupersedeMemoryOp, TRANSIENT_BACKOFF_BASE_MS, TRANSIENT_BACKOFF_CAP_MS,
     UnconsolidatableSession, UpsertOutcome, WindowObservation, acquire_lease,
-    active_entries_for_scope, active_entry_with_text, all_memory_entries_with_text, apply_create,
-    apply_edit, apply_merge, apply_noop, apply_reinforce, apply_resolve, apply_retract,
-    apply_supersede, approve_candidate, candidate_evidence_for, candidate_state,
-    canonical_key_owner, commit_apply_run, consolidation_run_counts, consolidation_run_state,
-    create_candidate, create_consolidation_run, create_memory_entry, dead_lettered_normalizations,
-    delete_normalization, edit_candidate, entries_needing_normalization, find_by_idempotency_key,
-    has_unconsolidated_checkpoint, insert_audit_event, insert_candidate_evidence,
-    insert_memory_evidence, lease_expired, list_candidates, list_memory_entries_for_scope,
-    memory_entry_by_id, memory_entry_counts, memory_entry_state, memory_entry_summary,
-    memory_evidence_for, normalization_backlog, normalization_counts, normalization_for,
-    observation_evidence_source, observations_applied_since, oldest_open_run_created_at,
-    open_next_run, pending_backlog, pending_candidate_ages, pending_candidate_counts,
-    processing_cursor, propose_candidate, read_audit_events_for_entity, recall_candidate_by_id,
-    recall_candidates_for_scope, record_run_failure, reject_candidate, renew_lease, retry_run,
-    run_once, session_idle_since, sessions_with_pending_backlog, stale_runs,
-    stuck_consolidation_runs, total_pending_backlog, transient_backoff_delay_ms,
-    transition_candidate, transition_memory_entry, transition_run, unconsolidatable_sessions,
-    upsert_normalization, upsert_processing_cursor,
+    active_entries_for_scope, active_entry_with_text, all_memory_entries_with_text, apply_confirm,
+    apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce, apply_reject,
+    apply_resolve, apply_retract, apply_supersede, approve_candidate, candidate_evidence_for,
+    candidate_state, canonical_key_owner, commit_apply_run, consolidation_run_counts,
+    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
+    dead_lettered_normalizations, delete_normalization, edit_candidate,
+    entries_needing_normalization, find_by_idempotency_key, has_unconsolidated_checkpoint,
+    insert_audit_event, insert_candidate_evidence, insert_memory_evidence, lease_expired,
+    list_candidates, list_memory_entries_for_scope, memory_entry_by_id, memory_entry_counts,
+    memory_entry_state, memory_entry_summary, memory_evidence_for, normalization_backlog,
+    normalization_counts, normalization_for, observation_evidence_source,
+    observations_applied_since, oldest_open_run_created_at, open_next_run, pending_backlog,
+    pending_candidate_ages, pending_candidate_counts, processing_cursor, propose_candidate,
+    read_audit_events_for_entity, recall_candidate_by_id, recall_candidates_for_scope,
+    record_run_failure, reject_candidate, renew_lease, retry_run, run_once, session_idle_since,
+    sessions_with_pending_backlog, stale_runs, stuck_consolidation_runs, total_pending_backlog,
+    transient_backoff_delay_ms, transition_candidate, transition_memory_entry, transition_run,
+    unconsolidatable_sessions, upsert_normalization, upsert_processing_cursor,
 };
 pub use migrate::{
     ALL, Migration, MigrationError, MigrationReport, MigrationStep, StepFn, VersionDiagnosis,

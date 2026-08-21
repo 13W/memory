@@ -215,6 +215,24 @@ first, then retires the old one to `superseded` second (matching this section's 
 order), pre-validating both sides before either write; only the new entry's `audit_event` carries
 a router-supplied `idempotency_key`, so a retry never risks two rows colliding on the same key.
 
+As-built note (D-079, `[SPEC]`, found while clearing the duplicates of D-078): this table has
+declared `hypothesis: active → confirmed | rejected` since idea.md rev 6, and T14-01's
+`check_transition` has accepted both edges since — but until D-079 **no operation could reach
+them**. The op surface was `create`/`reinforce`/`resolve`/`retract`/`supersede`/`edit`/`merge`/
+`noop`; the generic `transition_memory_entry` primitive was only ever called with `Resolved` in
+production, and the sole place anything reached `confirmed` at all was a raw-primitive helper
+inside one test. A hypothesis could therefore only be born and then absorbed by a `merge` —
+"confirm on strong evidence", the whole reason the `hypothesis` kind exists, belonged to nobody.
+Closed by `local_rag_store::memory::op::apply_confirm`/`apply_reject`, thin wrappers over the same
+`apply_state_transition` `apply_resolve`/`apply_retract` use, so version bump and `audit_event`
+commit together exactly as this section requires; surfaced as MCP `confirm_memory`/`reject_memory`
+and CLI `local-rag memory confirm`/`refute` (11 §6 — `memory reject` was already taken by
+candidate review, a different table). The two edges D-020 deliberately left out stay out:
+`confirmed → rejected` is still illegal, so `reject` is not an "undo confirm" and the only exit
+from `confirmed` remains `supersede`. The router's op vocabulary is **unchanged** — these are
+review-tool verbs like `edit`/`merge`, and "when is evidence strong" is a product decision this
+deviation did not settle.
+
 ## 6. Pending memory candidate
 
 ```

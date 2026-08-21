@@ -481,6 +481,53 @@ pub fn catalog() -> Value {
                 }
             },
             {
+                "name": "confirm_memory",
+                "description": "Confirm a hypothesis on strong evidence: it stays \
+                    kind=hypothesis, state=confirmed, and remains recall-eligible as high trust. \
+                    Only a hypothesis can be confirmed; promotion to a fact is a separate \
+                    supersede.",
+                "annotations": annotations("Confirm hypothesis", false, false, false),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "expected_version": {
+                            "type": "integer",
+                            "description": "Optimistic-concurrency precondition; a mismatch is \
+                                OPTIMISTIC_CONFLICT."
+                        }
+                    },
+                    "required": ["id", "expected_version"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "reject_memory",
+                "description": "Reject a hypothesis the evidence disproves: terminal, dropped \
+                    from recall, kept for review. Legal only from active — an already-confirmed \
+                    hypothesis can only be superseded.",
+                "annotations": annotations("Reject hypothesis", false, true, false),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "expected_version": {
+                            "type": "integer",
+                            "description": "Optimistic-concurrency precondition; a mismatch is \
+                                OPTIMISTIC_CONFLICT."
+                        }
+                    },
+                    "required": ["id", "expected_version"],
+                    "additionalProperties": false
+                }
+            },
+            {
                 "name": "merge_memories",
                 "description": "Merge two or more memory entries (v1 'consolidate'): the \
                     survivor absorbs the losers' evidence; losers become superseded, pointing at \
@@ -660,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_advertises_all_seventeen_v0_tools_with_the_spec_fixed_names() {
+    fn catalog_advertises_all_nineteen_v0_tools_with_the_spec_fixed_names() {
         let catalog = catalog();
         let names: Vec<&str> = catalog["tools"]
             .as_array()
@@ -686,6 +733,8 @@ mod tests {
                 "edit_memory_candidate",
                 "edit_memory",
                 "retract_memory",
+                "confirm_memory",
+                "reject_memory",
                 "merge_memories",
                 "give_feedback",
             ]
@@ -742,8 +791,13 @@ mod tests {
         }
     }
 
+    /// D-079 added `reject_memory`, the second entry-terminating tool: it puts
+    /// a hypothesis into `rejected`, which recall stops showing — the same
+    /// shape `retract_memory` has for the kinds that own a `retracted` state.
+    /// `confirm_memory` is deliberately **not** destructive: `confirmed` is
+    /// non-terminal and raises trust.
     #[test]
-    fn catalog_destructive_hint_is_true_only_for_retract_memory() {
+    fn catalog_destructive_hint_is_true_only_for_the_entry_terminating_tools() {
         let catalog = catalog();
         let destructive: Vec<&str> = catalog["tools"]
             .as_array()
@@ -752,7 +806,7 @@ mod tests {
             .filter(|t| t["annotations"]["destructiveHint"] == Value::Bool(true))
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(destructive, ["retract_memory"]);
+        assert_eq!(destructive, ["retract_memory", "reject_memory"]);
     }
 
     #[test]

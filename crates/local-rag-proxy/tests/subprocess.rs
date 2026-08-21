@@ -262,12 +262,15 @@ fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
             "edit_memory_candidate",
             "edit_memory",
             "retract_memory",
+            "confirm_memory",
+            "reject_memory",
             "merge_memories",
             "give_feedback",
         ]
     );
     // X-003: every advertised tool carries annotations, and destructiveHint
-    // is true for exactly one of them (retract_memory) -- the acceptance
+    // is true for exactly the two entry-terminating tools (retract_memory
+    // and, since D-079, reject_memory) -- the acceptance
     // check this task card names explicitly (a real `local-rag-proxy` +
     // `local-rag serve` round trip, not just the in-process daemon test).
     let destructive: Vec<&str> = response["result"]["tools"]
@@ -284,7 +287,7 @@ fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
                 .then(|| t["name"].as_str().unwrap())
         })
         .collect();
-    assert_eq!(destructive, ["retract_memory"]);
+    assert_eq!(destructive, ["retract_memory", "reject_memory"]);
     let _ = stdout;
 
     wait_until_daemon_ready(&layout, Duration::from_secs(5)); // must already be true by now

@@ -1,7 +1,8 @@
 //! The shared transactional memory-op engine (spec 08 §3): `create`,
 //! `reinforce`, `noop` (T14-02); `resolve`/`supersede`/`retract`/`edit`
-//! (T14-03); `merge` (T14-04) — the atomic mutation+evidence+audit+idempotency
-//! contract every memory operation follows.
+//! (T14-03); `merge` (T14-04); `confirm`/`reject` (D-079) — the atomic
+//! mutation+evidence+audit+idempotency contract every memory operation
+//! follows.
 //!
 //! Mirrors [`crate::observation::import::import_batch`]'s shape: each `apply_*`
 //! is a **sync** `fn(&Transaction<'_>, ...)` that composes several sibling
@@ -11,8 +12,10 @@
 //!
 //! # Lifecycle ops (T14-03)
 //!
-//! `apply_resolve`/`apply_retract` are thin wrappers over a shared private
-//! `apply_state_transition` helper: read `(kind, state, entry_version)` once,
+//! `apply_resolve`/`apply_retract` — and, since D-079, `apply_confirm`/
+//! `apply_reject`, which give spec 04 §5's `hypothesis` machine the verbs it
+//! had declared but nothing implemented — are thin wrappers over a shared
+//! private `apply_state_transition` helper: read `(kind, state, entry_version)` once,
 //! check `expected_version` then [`entry::MemoryState::check_transition`]
 //! (spec 04 §5's kind-specific guard — reused directly rather than calling
 //! [`entry::transition_memory_entry`], which has no notion of
@@ -198,6 +201,36 @@ pub struct ResolveMemoryOp<'a> {
 /// set). Retract ≠ delete: the row survives for audit (spec 08 §3).
 #[derive(Debug, Clone, Copy)]
 pub struct RetractMemoryOp<'a> {
+    pub memory_id: &'a str,
+    pub expected_version: i64,
+    pub evidence: &'a [EvidenceInput<'a>],
+    pub actor: Actor,
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// A `confirm` request (spec 04 §5, D-079: `hypothesis` only, `active →
+/// confirmed`). A confirmed hypothesis keeps `kind=hypothesis` and stays
+/// recall-eligible as high trust — promotion to `fact` is a separate,
+/// explicit `supersede`. `evidence` is the "strong evidence" the section's
+/// own transition column names: it attaches to the entry like any other op's,
+/// so the justification for confirming survives next to the state change.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfirmMemoryOp<'a> {
+    pub memory_id: &'a str,
+    pub expected_version: i64,
+    pub evidence: &'a [EvidenceInput<'a>],
+    pub actor: Actor,
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// A `reject` request (spec 04 §5, D-079: `hypothesis` only, `active →
+/// rejected`). Terminal — recall stops showing the entry (08 §6) while the
+/// row survives for review, the same audit-preserving shape `retract` has for
+/// the kinds that own a `retracted` state. Not legal from `confirmed`: D-020
+/// deliberately left that edge out (the table gives `reject` no role once a
+/// hypothesis is confirmed), so this is not the verb for un-confirming one.
+#[derive(Debug, Clone, Copy)]
+pub struct RejectMemoryOp<'a> {
     pub memory_id: &'a str,
     pub expected_version: i64,
     pub evidence: &'a [EvidenceInput<'a>],
@@ -732,8 +765,8 @@ pub fn apply_reinforce(
     })))
 }
 
-/// Shared by `apply_resolve`/`apply_retract`/`apply_supersede`'s old-entry
-/// half: idempotency-key replay, `expected_version`, the kind-specific
+/// Shared by `apply_resolve`/`apply_retract`/`apply_confirm`/`apply_reject`
+/// and `apply_supersede`'s old-entry half: idempotency-key replay, `expected_version`, the kind-specific
 /// [`MemoryState::check_transition`] guard, then one combined
 /// `UPDATE ... SET state=?, entry_version=?, updated_at=?` — see the module
 /// doc for why `transition_memory_entry` isn't reused here.
@@ -834,6 +867,54 @@ pub fn apply_retract(
         request.expected_version,
         MemoryState::Retracted,
         "retract",
+        request.actor,
+        request.idempotency_key,
+        request.evidence,
+        now_ms,
+    )
+}
+
+/// Apply a `confirm` (spec 04 §5, D-079): `hypothesis` `active → confirmed`.
+/// Illegal for every other kind — the three machines are disjoint, so a
+/// `fact` asking for `confirmed` is [`MemoryOpError::IllegalTransition`], not
+/// "not yet reached". Confirming an already-`confirmed` entry is a legal
+/// self-transition that still bumps `entry_version` and writes an
+/// `audit_event`, matching `apply_reinforce`'s T14-02 precedent that every
+/// applied op returns a real `audit_id`.
+pub fn apply_confirm(
+    tx: &Transaction<'_>,
+    request: &ConfirmMemoryOp<'_>,
+    now_ms: i64,
+) -> rusqlite::Result<Result<MemoryOpOutcome, MemoryOpError>> {
+    apply_state_transition(
+        tx,
+        request.memory_id,
+        request.expected_version,
+        MemoryState::Confirmed,
+        "confirm",
+        request.actor,
+        request.idempotency_key,
+        request.evidence,
+        now_ms,
+    )
+}
+
+/// Apply a `reject` (spec 04 §5, D-079): `hypothesis` `active → rejected`.
+/// Terminal like `retract`, and like `retract` it is not a delete — the row
+/// stays queryable for review. `confirmed → rejected` is **not** legal
+/// (D-020), so rejecting an already-confirmed hypothesis surfaces the same
+/// typed [`MemoryOpError::IllegalTransition`] any other illegal edge does.
+pub fn apply_reject(
+    tx: &Transaction<'_>,
+    request: &RejectMemoryOp<'_>,
+    now_ms: i64,
+) -> rusqlite::Result<Result<MemoryOpOutcome, MemoryOpError>> {
+    apply_state_transition(
+        tx,
+        request.memory_id,
+        request.expected_version,
+        MemoryState::Rejected,
+        "reject",
         request.actor,
         request.idempotency_key,
         request.evidence,

@@ -1,6 +1,7 @@
 //! The eight MCP memory-write tool adapters: `remember`/
 //! `approve_memory_candidate`/`reject_memory_candidate`/
-//! `edit_memory_candidate`/`edit_memory`/`retract_memory`/`merge_memories`/
+//! `edit_memory_candidate`/`edit_memory`/`retract_memory`/`confirm_memory`/
+//! `reject_memory`/`merge_memories`/
 //! `give_feedback` — T15-05. Same shape as [`super::memory`]'s read
 //! adapters: parse args, call a domain function against [`MemoryContext`]'s
 //! already-open `state.sqlite`, map the outcome into a [`CallToolResult`].
@@ -16,12 +17,12 @@ use local_rag_core::hash::sha256_hex;
 use local_rag_memory::schema::Signal;
 use local_rag_protocol::ErrorEnvelope;
 use local_rag_store::{
-    Actor, ApproveCandidateOutcome, CreateMemoryOp, EditMemoryOp, EvidenceKind,
+    Actor, ApproveCandidateOutcome, ConfirmMemoryOp, CreateMemoryOp, EditMemoryOp, EvidenceKind,
     GLOBAL_SCOPE_OWNER_ID, MemoryKind, MemoryOpError, MemoryOpOutcome, MergeLoser, MergeMemoryOp,
-    NewObservationEnvelope, ProposedOperation, RequestRoot, Resolution, RetractMemoryOp,
-    ReviewError, ScopeKind, TrustLevel, apply_create, apply_edit, apply_merge, apply_retract,
-    approve_candidate, edit_candidate, find_by_idempotency_key, insert_envelope, reject_candidate,
-    resolve, upsert_normalization,
+    NewObservationEnvelope, ProposedOperation, RejectMemoryOp, RequestRoot, Resolution,
+    RetractMemoryOp, ReviewError, ScopeKind, TrustLevel, apply_confirm, apply_create, apply_edit,
+    apply_merge, apply_reject, apply_retract, approve_candidate, edit_candidate,
+    find_by_idempotency_key, insert_envelope, reject_candidate, resolve, upsert_normalization,
 };
 
 use crate::daemon::memory::MemoryContext;
@@ -569,7 +570,7 @@ pub async fn edit_memory_candidate(
 }
 
 // ---------------------------------------------------------------------------
-// edit_memory / retract_memory / merge_memories
+// edit_memory / retract_memory / confirm_memory / reject_memory / merge_memories
 // ---------------------------------------------------------------------------
 
 pub async fn edit_memory(
@@ -675,6 +676,79 @@ pub async fn retract_memory(
             apply_retract(
                 tx,
                 &RetractMemoryOp {
+                    memory_id: &id,
+                    expected_version,
+                    evidence: &[],
+                    actor: Actor::User,
+                    idempotency_key: None,
+                },
+                now_ms,
+            )
+        })
+        .await;
+    match outcome {
+        Ok(Ok(outcome)) => Ok(content::ok(&MemoryOpResultWire::from(outcome))),
+        Ok(Err(e)) => Ok(content::err(&memory_op_error_envelope(&e))),
+        Err(e) => Ok(infra_err(e)),
+    }
+}
+
+/// `confirm_memory` (D-079): spec 04 §5's `hypothesis` `active → confirmed`.
+/// Same argument shape and same optimistic guard as `retract_memory` — the
+/// two differ only in the state they reach and in whether recall keeps
+/// showing the entry afterwards.
+pub async fn confirm_memory(
+    ctx: &MemoryContext,
+    args: &Map<String, Value>,
+    now_ms: i64,
+) -> Result<CallToolResult, String> {
+    reject_unknown_keys(args, &["id", "expected_version"])?;
+    let id = require_string(args, "id")?;
+    let expected_version = require_i64(args, "expected_version")?;
+
+    let outcome = ctx
+        .state
+        .writer()
+        .transaction(move |tx| {
+            apply_confirm(
+                tx,
+                &ConfirmMemoryOp {
+                    memory_id: &id,
+                    expected_version,
+                    evidence: &[],
+                    actor: Actor::User,
+                    idempotency_key: None,
+                },
+                now_ms,
+            )
+        })
+        .await;
+    match outcome {
+        Ok(Ok(outcome)) => Ok(content::ok(&MemoryOpResultWire::from(outcome))),
+        Ok(Err(e)) => Ok(content::err(&memory_op_error_envelope(&e))),
+        Err(e) => Ok(infra_err(e)),
+    }
+}
+
+/// `reject_memory` (D-079): spec 04 §5's `hypothesis` `active → rejected`.
+/// Not to be confused with `reject_memory_candidate`, which moves a *pending
+/// candidate* (04 §6) and never touches a durable entry.
+pub async fn reject_memory(
+    ctx: &MemoryContext,
+    args: &Map<String, Value>,
+    now_ms: i64,
+) -> Result<CallToolResult, String> {
+    reject_unknown_keys(args, &["id", "expected_version"])?;
+    let id = require_string(args, "id")?;
+    let expected_version = require_i64(args, "expected_version")?;
+
+    let outcome = ctx
+        .state
+        .writer()
+        .transaction(move |tx| {
+            apply_reject(
+                tx,
+                &RejectMemoryOp {
                     memory_id: &id,
                     expected_version,
                     evidence: &[],

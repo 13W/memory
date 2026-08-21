@@ -70,7 +70,7 @@ async fn a_notification_produces_no_response_line() {
 }
 
 #[tokio::test]
-async fn tools_list_advertises_all_seventeen_v0_tools() {
+async fn tools_list_advertises_all_nineteen_v0_tools() {
     let (_home, layout) = open_layout();
     let socket_path = layout.socket_path();
     let handle = start(&layout).await;
@@ -106,12 +106,16 @@ async fn tools_list_advertises_all_seventeen_v0_tools() {
             "edit_memory_candidate",
             "edit_memory",
             "retract_memory",
+            "confirm_memory",
+            "reject_memory",
             "merge_memories",
             "give_feedback",
         ]
     );
     // X-003: every advertised tool carries annotations, and destructiveHint
-    // is true for exactly one of them (retract_memory).
+    // is true for exactly the two entry-terminating ones (retract_memory and,
+    // since D-079, reject_memory -- `rejected` drops a hypothesis out of
+    // recall the same way `retracted` does for the other kinds).
     let destructive: Vec<&str> = body["result"]["tools"]
         .as_array()
         .unwrap()
@@ -126,7 +130,7 @@ async fn tools_list_advertises_all_seventeen_v0_tools() {
                 .then(|| t["name"].as_str().unwrap())
         })
         .collect();
-    assert_eq!(destructive, ["retract_memory"]);
+    assert_eq!(destructive, ["retract_memory", "reject_memory"]);
 
     // v1 name mapping (spec 11 §2): forget -> retract_memory,
     // consolidate(src,tgt) -> merge_memories -- neither v1 name is ever
