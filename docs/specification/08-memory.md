@@ -91,6 +91,25 @@ section states less precisely than the code fixes:
   insert, rather than letting `create_memory_entry`'s raw `UNIQUE` constraint violation bubble up
   unwrapped (that primitive's own doc comment explicitly defers this typed wrapping to this
   task).
+- **A `create` of text that already exists in the scope is a `reinforce`** (as-built, `D-078`).
+  `local_rag_memory::guard::materialize` looks the text up
+  (`local_rag_store::active_entry_with_text`: same scope, exact text, non-terminal) and, when it
+  finds one, emits `reinforce` on that entry instead of a second copy — carrying the window's
+  evidence, and leaving `confidence` untouched, because one window's opinion of a *new* entry is
+  no basis for rewriting an accumulated one.
+
+  This is a mechanical guard rather than a prompt rule for a measured reason: the router cannot
+  see the duplicate. §4 step 3's candidate set is capped, and past the cap the model is blind to
+  its own recent output (`D-080`), so it re-derives the same claim every window. On the owner's
+  store that produced **136** copies of one sentence — over half of the durable memory. The
+  `canonical_key` uniqueness above cannot catch it either: that index is partial on non-null keys
+  and the router leaves the key null.
+
+  Exact text, not similarity, and deliberately: "is this the same claim?" asked loosely is a
+  judgement that belongs to the model and to review; asked as byte equality it is a fact, and a
+  fact is what a guard may act on silently. Near-duplicates are left alone. `propose_candidate`
+  is left alone too — it creates no entry, so it cannot duplicate one, and turning a request for
+  human review into an automatic write is not a guard's decision to make.
 - **`noop` writes nothing at all** — no `memory_entry` mutation, no `memory_evidence`, no
   `audit_event`. The op envelope in §4 below lists `target/kind/text/scope/canonical_key/
   confidence inputs` for the op list generally; `noop` needs none of them, unlike every other

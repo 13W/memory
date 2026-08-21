@@ -64,7 +64,7 @@ use local_rag_store::rusqlite;
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{
     EvidenceKind, MemoryKind, MemoryState, ProposedOperation, ScopeKind, WindowObservation,
-    canonical_key_owner, observation_evidence_source,
+    active_entry_with_text, canonical_key_owner, observation_evidence_source,
 };
 
 use crate::recall::resolve_target;
@@ -248,6 +248,47 @@ fn handle_create(
             evidence_observation_ids,
         });
     }
+
+    // D-078: the claim is already in the store, so re-observing it is a
+    // `reinforce`, not a second copy. Checked here rather than hoped for from
+    // the prompt, because the router *cannot* see the duplicate: the candidate
+    // set it is shown is capped at the oldest `MAX_PROMPT_CANDIDATES` entries,
+    // so past that cap it is structurally blind to its own recent output. On
+    // the owner's store that produced 136 identical entries — over half of the
+    // durable memory, and still climbing.
+    //
+    // Deliberately below the review gate, not above it: `propose_candidate`
+    // creates no entry, so it cannot duplicate one, and turning a request for
+    // human review into an automatic write would be a policy change this
+    // guard has no business making.
+    //
+    // `confidence: None` leaves the stored value alone. The signal the model
+    // produced was its opinion of a *new* entry; letting one window's opinion
+    // overwrite an accumulated confidence would be a judgement this guard has
+    // no basis for. What the op does carry is the evidence link — the whole
+    // gain over dropping the op as a `noop`.
+    let ProposedOperation::Create {
+        text,
+        scope_kind: op_scope_kind,
+        scope_owner_id: op_scope_owner_id,
+        ..
+    } = &operation
+    else {
+        unreachable!("handle_create builds a Create")
+    };
+    if let Some(scope) = ScopeKind::from_db(op_scope_kind)
+        && let Some(existing) = active_entry_with_text(conn, scope, op_scope_owner_id, text)?
+    {
+        return Ok(GeneratedOp::Materialize {
+            operation: ProposedOperation::Reinforce {
+                memory_id: existing.memory_id,
+                expected_version: existing.entry_version,
+                confidence: None,
+            },
+            evidence_observation_ids,
+        });
+    }
+
     Ok(GeneratedOp::Materialize {
         operation,
         evidence_observation_ids,
@@ -633,10 +674,35 @@ mod tests {
         scope_owner_id: &str,
         canonical_key: Option<&str>,
     ) {
-        let (id, owner, key) = (
+        create_memory_with_text(
+            db,
+            memory_id,
+            kind,
+            scope_kind,
+            scope_owner_id,
+            canonical_key,
+            "existing entry",
+        )
+        .await;
+    }
+
+    /// `D-078`'s tests need the text to matter, which the fixed-text helper
+    /// above deliberately does not expose.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_memory_with_text(
+        db: &StateDb,
+        memory_id: &str,
+        kind: StoreMemoryKind,
+        scope_kind: ScopeKind,
+        scope_owner_id: &str,
+        canonical_key: Option<&str>,
+        text: &str,
+    ) {
+        let (id, owner, key, text) = (
             memory_id.to_string(),
             scope_owner_id.to_string(),
             canonical_key.map(str::to_string),
+            text.to_string(),
         );
         db.writer()
             .transaction(move |tx| {
@@ -645,7 +711,7 @@ mod tests {
                     &NewMemoryEntry {
                         memory_id: &id,
                         kind,
-                        text: "existing entry",
+                        text: &text,
                         canonical_key: key.as_deref(),
                         scope_kind,
                         scope_owner_id: &owner,
@@ -686,6 +752,263 @@ mod tests {
         assert!(
             matches!(outcome, GeneratedOp::Materialize { .. }),
             "explicit user statement satisfies the durable gate, got {outcome:?}"
+        );
+    }
+
+    /// The text `create_raw` proposes, so a seeded entry can collide with it.
+    const PROPOSED_TEXT: &str = "we decided to use pnpm";
+
+    /// Set up the window a `create` needs to clear the durable gate, and hand
+    /// back everything `materialize` wants.
+    async fn user_statement_window(db: &StateDb, obs_id: &str) -> Vec<WindowObservation> {
+        seed_observation(db, obs_id, EvidenceKind::UserStatement).await;
+        vec![window_observation(
+            obs_id,
+            EvidenceKind::UserStatement,
+            None,
+            None,
+        )]
+    }
+
+    /// `D-078`: the headline. A `create` whose text already exists in the same
+    /// scope is re-observation, not a second copy, so it becomes a
+    /// `reinforce` on the entry that is already there — and it keeps the
+    /// evidence, which is the whole gain over dropping the op.
+    ///
+    /// The version is read fresh (7 below, not 1), for the same reason
+    /// `reinforce_a_known_entry_uses_its_fresh_version_never_a_model_echoed_one`
+    /// checks it: a stale `expected_version` would abort the whole
+    /// consolidation batch on the optimistic guard.
+    #[tokio::test]
+    async fn a_create_whose_text_already_exists_becomes_a_reinforce() {
+        let (_home, db) = open_state();
+        let existing_id = uuid(40);
+        create_memory_with_text(
+            &db,
+            &existing_id,
+            StoreMemoryKind::Fact,
+            ScopeKind::Global,
+            local_rag_store::GLOBAL_SCOPE_OWNER_ID,
+            None,
+            PROPOSED_TEXT,
+        )
+        .await;
+        let bump = existing_id.clone();
+        db.writer()
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE memory_entry SET entry_version = 7 WHERE memory_id = ?1",
+                    params![bump],
+                )
+            })
+            .await
+            .expect("bump version");
+
+        let obs_id = uuid(41);
+        let window = user_statement_window(&db, &obs_id).await;
+        let by_id: HashMap<&str, &WindowObservation> = window
+            .iter()
+            .map(|o| (o.observation_id.as_str(), o))
+            .collect();
+
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = create_raw("fact", "global", None, vec![obs_id.clone()]);
+        let outcome = materialize(&read, &by_id, &window, &uuids, raw).expect("materialize");
+        match outcome {
+            GeneratedOp::Materialize {
+                operation:
+                    ProposedOperation::Reinforce {
+                        memory_id,
+                        expected_version,
+                        confidence,
+                    },
+                evidence_observation_ids,
+            } => {
+                assert_eq!(memory_id, existing_id, "reinforce the entry already there");
+                assert_eq!(expected_version, 7, "the version is read fresh");
+                assert_eq!(
+                    confidence, None,
+                    "one window's opinion must not overwrite an accumulated confidence",
+                );
+                assert_eq!(
+                    evidence_observation_ids,
+                    vec![obs_id],
+                    "the evidence is what makes this better than a noop",
+                );
+            }
+            other => panic!("expected Materialize(Reinforce), got {other:?}"),
+        }
+    }
+
+    /// The boundary the check is drawn at, and the reason it is drawn there:
+    /// byte equality is a fact, "the same claim" asked loosely is a judgement.
+    /// A near-duplicate is exactly the case where a wrong answer silently
+    /// destroys information, so it stays a `create`.
+    #[tokio::test]
+    async fn a_near_duplicate_is_still_created() {
+        let (_home, db) = open_state();
+        create_memory_with_text(
+            &db,
+            &uuid(42),
+            StoreMemoryKind::Fact,
+            ScopeKind::Global,
+            local_rag_store::GLOBAL_SCOPE_OWNER_ID,
+            None,
+            "we decided to use pnpm for this repository",
+        )
+        .await;
+
+        let obs_id = uuid(43);
+        let window = user_statement_window(&db, &obs_id).await;
+        let by_id: HashMap<&str, &WindowObservation> = window
+            .iter()
+            .map(|o| (o.observation_id.as_str(), o))
+            .collect();
+
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = create_raw("fact", "global", None, vec![obs_id]);
+        let outcome = materialize(&read, &by_id, &window, &uuids, raw).expect("materialize");
+        assert!(
+            matches!(
+                outcome,
+                GeneratedOp::Materialize {
+                    operation: ProposedOperation::Create { .. },
+                    ..
+                }
+            ),
+            "a near-duplicate is a judgement call, not a fact — got {outcome:?}",
+        );
+    }
+
+    /// A terminal entry does not block a new one: an author who retracted a
+    /// claim and then stated it again means the new one.
+    #[tokio::test]
+    async fn a_retracted_duplicate_does_not_block_a_new_entry() {
+        let (_home, db) = open_state();
+        let retracted_id = uuid(44);
+        create_memory_with_text(
+            &db,
+            &retracted_id,
+            StoreMemoryKind::Fact,
+            ScopeKind::Global,
+            local_rag_store::GLOBAL_SCOPE_OWNER_ID,
+            None,
+            PROPOSED_TEXT,
+        )
+        .await;
+        let gone = retracted_id.clone();
+        db.writer()
+            .transaction(move |tx| {
+                local_rag_store::transition_memory_entry(tx, &gone, MemoryState::Retracted)
+            })
+            .await
+            .expect("transition tx")
+            .expect("retract ok");
+
+        let obs_id = uuid(45);
+        let window = user_statement_window(&db, &obs_id).await;
+        let by_id: HashMap<&str, &WindowObservation> = window
+            .iter()
+            .map(|o| (o.observation_id.as_str(), o))
+            .collect();
+
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = create_raw("fact", "global", None, vec![obs_id]);
+        let outcome = materialize(&read, &by_id, &window, &uuids, raw).expect("materialize");
+        assert!(
+            matches!(
+                outcome,
+                GeneratedOp::Materialize {
+                    operation: ProposedOperation::Create { .. },
+                    ..
+                }
+            ),
+            "a retracted claim restated is a new entry — got {outcome:?}",
+        );
+    }
+
+    /// The check is scoped, because the same sentence in two scopes is two
+    /// facts about two projects (spec 08 §1: uniqueness is per scope).
+    #[tokio::test]
+    async fn an_identical_entry_in_another_scope_does_not_deduplicate() {
+        let (_home, db) = open_state();
+        create_memory_with_text(
+            &db,
+            &uuid(46),
+            StoreMemoryKind::Fact,
+            ScopeKind::Repository,
+            "repo-elsewhere",
+            None,
+            PROPOSED_TEXT,
+        )
+        .await;
+
+        let obs_id = uuid(47);
+        let window = user_statement_window(&db, &obs_id).await;
+        let by_id: HashMap<&str, &WindowObservation> = window
+            .iter()
+            .map(|o| (o.observation_id.as_str(), o))
+            .collect();
+
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = create_raw("fact", "global", None, vec![obs_id]);
+        let outcome = materialize(&read, &by_id, &window, &uuids, raw).expect("materialize");
+        assert!(
+            matches!(
+                outcome,
+                GeneratedOp::Materialize {
+                    operation: ProposedOperation::Create { .. },
+                    ..
+                }
+            ),
+            "another scope's identical text is a different fact — got {outcome:?}",
+        );
+    }
+
+    /// The review gate is not bypassed. `propose_candidate` creates no entry,
+    /// so it cannot duplicate one; turning a request for human review into an
+    /// automatic write would be a policy change this guard has no business
+    /// making.
+    #[tokio::test]
+    async fn a_candidate_proposal_is_never_turned_into_a_reinforce() {
+        let (_home, db) = open_state();
+        create_memory_with_text(
+            &db,
+            &uuid(48),
+            StoreMemoryKind::Fact,
+            ScopeKind::Global,
+            local_rag_store::GLOBAL_SCOPE_OWNER_ID,
+            None,
+            PROPOSED_TEXT,
+        )
+        .await;
+
+        let obs_id = uuid(49);
+        let window = user_statement_window(&db, &obs_id).await;
+        let by_id: HashMap<&str, &WindowObservation> = window
+            .iter()
+            .map(|o| (o.observation_id.as_str(), o))
+            .collect();
+
+        let read = db.open_read().expect("read conn");
+        let uuids = SeqUuidV7::new();
+        let raw = RawRouterOp::ProposeCandidate {
+            kind: "fact".to_string(),
+            text: PROPOSED_TEXT.to_string(),
+            canonical_key: None,
+            scope_kind: "global".to_string(),
+            confidence_signal: Some(Signal::High),
+            importance_signal: Some(Signal::Medium),
+            cites: vec![obs_id],
+        };
+        let outcome = materialize(&read, &by_id, &window, &uuids, raw).expect("materialize");
+        assert!(
+            matches!(outcome, GeneratedOp::ProposeCandidate { .. }),
+            "a review request stays a review request — got {outcome:?}",
         );
     }
 

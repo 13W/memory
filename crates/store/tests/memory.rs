@@ -22,9 +22,9 @@ use local_rag_store::memory::{
     MemoryKind, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
     NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunCountRow, RunState,
     RunTransitionError, STUCK_RUN_ATTEMPT_THRESHOLD, STUCK_RUN_REASON_MAX_CHARS, ScopeKind,
-    active_entries_for_scope, candidate_state, canonical_key_owner, consolidation_run_counts,
-    consolidation_run_state, create_candidate, create_consolidation_run, create_memory_entry,
-    insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
+    active_entries_for_scope, active_entry_with_text, candidate_state, canonical_key_owner,
+    consolidation_run_counts, consolidation_run_state, create_candidate, create_consolidation_run,
+    create_memory_entry, insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
     list_memory_entries_for_scope, memory_entry_by_id, memory_entry_counts, memory_entry_state,
     memory_entry_summary, memory_evidence_for, observations_applied_since,
     oldest_open_run_created_at, processing_cursor, read_audit_events_for_entity,
@@ -1331,6 +1331,100 @@ async fn active_entries_for_scope_excludes_terminal_states_and_other_scopes() {
     );
     assert_eq!(found[0].kind, MemoryKind::Fact);
     assert_eq!(found[0].entry_version, 1);
+}
+
+/// `D-078`: the deduplication lookup. Same scope + exact text + non-terminal
+/// is the whole predicate, and each of those three words is load-bearing —
+/// asserted here rather than left to the caller, because the caller
+/// (`local_rag_memory::guard`) uses the answer to *silently* turn a `create`
+/// into a `reinforce`, and a lookup that over-matched would drop a claim the
+/// author meant to keep.
+#[tokio::test]
+async fn active_entry_with_text_matches_only_an_exact_live_same_scope_entry() {
+    let (_home, db) = open_state();
+    let owner = uuid(190);
+    let other_owner = uuid(191);
+    const TEXT: &str = "some durable text";
+
+    // Terminal: retracted, and therefore not a match — a claim restated after
+    // a retraction is a new entry, not a reinforcement of the dead one.
+    let retracted_id = uuid(192);
+    create_memory(
+        &db,
+        &retracted_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create");
+    transition_entry(&db, &retracted_id, MemoryState::Retracted)
+        .await
+        .expect("retract");
+
+    // Another scope: same sentence, different project, different fact.
+    create_memory(
+        &db,
+        &uuid(193),
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &other_owner,
+        None,
+    )
+    .await
+    .expect("create elsewhere");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        active_entry_with_text(&read, ScopeKind::Worktree, &owner, TEXT).expect("query"),
+        None,
+        "a retracted entry and another scope's entry are both non-matches",
+    );
+
+    // Now a live one in this scope.
+    let live_id = uuid(194);
+    create_memory(
+        &db,
+        &live_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create live");
+    // …and a second one, so the tie-break has something to break. A store that
+    // already accumulated duplicates (which is how this deviation was found)
+    // must still give one stable answer.
+    let newer_id = uuid(195);
+    create_memory(
+        &db,
+        &newer_id,
+        MemoryKind::Fact,
+        ScopeKind::Worktree,
+        &owner,
+        None,
+    )
+    .await
+    .expect("create a duplicate");
+
+    let read = db.open_read().expect("read conn");
+    let found = active_entry_with_text(&read, ScopeKind::Worktree, &owner, TEXT)
+        .expect("query")
+        .expect("the live entry matches");
+    assert_eq!(
+        found.memory_id, live_id,
+        "the oldest wins, deterministically"
+    );
+    assert_eq!(found.entry_version, 1);
+
+    assert_eq!(
+        active_entry_with_text(&read, ScopeKind::Worktree, &owner, "some durable text!")
+            .expect("query"),
+        None,
+        "one byte of difference is a different claim — the guard must not judge similarity",
+    );
 }
 
 #[tokio::test]

@@ -120,9 +120,9 @@ pub(crate) use entry::all_memory_entry_ids;
 pub use entry::{
     CreateMemoryEntryError, IllegalMemoryTransition, MemoryEntryRow, MemoryEntrySummary,
     MemoryKind, MemoryState, MemoryTransitionError, NewMemoryEntry, RecallCandidate, ScopeKind,
-    active_entries_for_scope, all_memory_entries_with_text, canonical_key_owner,
-    create_memory_entry, list_memory_entries_for_scope, memory_entry_by_id, memory_entry_state,
-    memory_entry_summary, recall_candidate_by_id, recall_candidates_for_scope,
+    active_entries_for_scope, active_entry_with_text, all_memory_entries_with_text,
+    canonical_key_owner, create_memory_entry, list_memory_entries_for_scope, memory_entry_by_id,
+    memory_entry_state, memory_entry_summary, recall_candidate_by_id, recall_candidates_for_scope,
     transition_memory_entry,
 };
 pub use evidence::{NewMemoryEvidence, insert_memory_evidence, memory_evidence_for};
