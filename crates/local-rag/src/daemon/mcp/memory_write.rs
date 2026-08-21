@@ -25,9 +25,7 @@ use local_rag_store::{
 };
 
 use crate::daemon::memory::MemoryContext;
-use crate::daemon::normalization::boundary::{
-    Normalized, OwnedNormalizationRow, normalize_for_write,
-};
+use crate::daemon::normalization::boundary::OwnedNormalizationRow;
 
 use super::content::{self, CallToolResult};
 use super::memory::{infra_err, optional_enum};
@@ -407,7 +405,7 @@ pub async fn remember(
     let decided = if already_applied {
         None
     } else {
-        Some(normalize_on_blocking(ctx, &memory_id, &text).await)
+        Some(ctx.translator().decide(&memory_id, &text).await)
     };
     let canon = decided
         .as_ref()
@@ -454,33 +452,6 @@ pub async fn remember(
         Ok(Err(e)) => Ok(content::err(&memory_op_error_envelope(&e))),
         Err(e) => Ok(infra_err(e)),
     }
-}
-
-/// Decide the canon for one incoming text, off the async worker.
-///
-/// `GeneratorPool::generate` is synchronous and a local translation takes about
-/// a second. The consolidation router calls it inline because a background tick
-/// owns its own time; an MCP handler does not — blocking a tokio worker here
-/// would delay every other request the daemon is serving, so this one hop
-/// through `spawn_blocking` is the difference between a slow `remember` and a
-/// slow daemon.
-///
-/// A panicked blocking task degrades to a refusal rather than an error: the
-/// caller still has the author's text, and losing a note to an executor mishap
-/// would be exactly the failure ADR-0011 §Decision 3 exists to prevent.
-async fn normalize_on_blocking(ctx: &MemoryContext, memory_id: &str, text: &str) -> Normalized {
-    let generators = ctx.generators.clone();
-    let policy = ctx.data_policy;
-    let model_id = ctx.generator_model_id.clone();
-    let (id, text) = (memory_id.to_string(), text.to_string());
-    tokio::task::spawn_blocking(move || {
-        normalize_for_write(generators.as_deref(), policy, &model_id, &id, &text)
-    })
-    .await
-    .unwrap_or_else(|e| Normalized::Refused {
-        reason: format!("the translation task did not finish: {e}"),
-        kind: local_rag_memory::normalize::translate::TranslateFailureKind::Transient,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -642,7 +613,7 @@ pub async fn edit_memory(
     // so it gets the same treatment. An importance-only edit decides nothing —
     // the canon is untouched, and `apply_edit` leaves the existing row alone.
     let decided = match text.as_deref() {
-        Some(incoming) => Some(normalize_on_blocking(ctx, &id, incoming).await),
+        Some(incoming) => Some(ctx.translator().decide(&id, incoming).await),
         None => None,
     };
     let canon = decided

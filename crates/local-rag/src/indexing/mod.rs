@@ -694,6 +694,8 @@ mod tests {
         let response = engine
             .search_code(
                 SearchRequest {
+                    // An indexing self-check, not a user query — nothing to translate.
+                    query_degraded: None,
                     root: RequestRoot {
                         worktree_root: Some(facts),
                         repo_hint: None,
@@ -881,6 +883,8 @@ mod tests {
             .expect("join entered-wait");
 
         let request = SearchRequest {
+            // An indexing self-check, not a user query — nothing to translate.
+            query_degraded: None,
             root: RequestRoot {
                 worktree_root: Some(facts),
                 repo_hint: None,

@@ -51,6 +51,21 @@ pub struct MemoryContext {
     pub data_policy: DataPolicy,
 }
 
+impl MemoryContext {
+    /// The write/query boundary's translator, as one value.
+    ///
+    /// Handed out rather than reached into so a caller in the *code* pillar can
+    /// translate a query without being given a memory context it has no
+    /// business holding (`T21-19`).
+    pub fn translator(&self) -> crate::daemon::normalization::boundary::Translator {
+        crate::daemon::normalization::boundary::Translator {
+            generators: self.generators.clone(),
+            model_id: self.generator_model_id.clone(),
+            policy: self.data_policy,
+        }
+    }
+}
+
 /// Build the [`MemoryContext`] the MCP memory tools call.
 ///
 /// `embedder` is `main.rs::build_memory_query_embedder`'s result (D-036) — a

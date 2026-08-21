@@ -421,6 +421,7 @@ fn engine_with(
 
 fn request(path: &str, limit: usize) -> SearchRequest {
     SearchRequest {
+        query_degraded: None,
         root: request_root(path),
         query: "searchable".to_string(),
         limit,

@@ -135,6 +135,19 @@ fn dense_degraded_label(d: &recall_pipeline::DenseLegUnavailable) -> String {
     }
 }
 
+impl From<boundary::QueryNotTranslated> for recall_pipeline::QueryNotNormalized {
+    fn from(why: boundary::QueryNotTranslated) -> Self {
+        match why {
+            boundary::QueryNotTranslated::NoGenerator => {
+                recall_pipeline::QueryNotNormalized::NoGenerator
+            }
+            boundary::QueryNotTranslated::Refused(reason) => {
+                recall_pipeline::QueryNotNormalized::TranslationRefused(reason)
+            }
+        }
+    }
+}
+
 fn query_degraded_label(q: &recall_pipeline::QueryNotNormalized) -> String {
     match q {
         recall_pipeline::QueryNotNormalized::NoGenerator => {
@@ -142,53 +155,6 @@ fn query_degraded_label(q: &recall_pipeline::QueryNotNormalized) -> String {
         }
         recall_pipeline::QueryNotNormalized::TranslationRefused(reason) => {
             format!("translation_refused: {reason}")
-        }
-    }
-}
-
-/// Decide the query both legs will read.
-///
-/// Reuses the write boundary's own decision function (`T21-14`): "what should
-/// this text be in the canon's language" is one question, and answering it
-/// twice would be two chances to answer it differently.
-///
-/// Measured on the real model, a query-sized translation is ~324 ms (median of
-/// three prompt-shaped samples, `tests/memory_translate_real_model.rs`) — not
-/// the ~800 ms ADR-0010 recorded, which was the *router*'s much larger prompt.
-/// That number is what `local_rag_hook::recall::RECALL_BUDGET` was re-derived
-/// from.
-async fn normalize_query(
-    ctx: &MemoryContext,
-    query: &str,
-) -> (String, Option<recall_pipeline::QueryNotNormalized>) {
-    let generators = ctx.generators.clone();
-    let policy = ctx.data_policy;
-    let model_id = ctx.generator_model_id.clone();
-    let owned = query.to_string();
-    let decided = tokio::task::spawn_blocking(move || {
-        boundary::normalize_for_write(generators.as_deref(), policy, &model_id, "recall", &owned)
-    })
-    .await
-    .unwrap_or_else(|e| boundary::Normalized::Refused {
-        reason: format!("the translation task did not finish: {e}"),
-        kind: local_rag_memory::normalize::translate::TranslateFailureKind::Transient,
-    });
-
-    match decided {
-        boundary::Normalized::AlreadyEnglish { .. } => (query.to_string(), None),
-        boundary::Normalized::Translated { english, .. } => (english, None),
-        // The recall still runs, on the author's own words: the dense leg is
-        // multilingual and does most of the work. What the caller must not get
-        // is silence about why the lexical leg found nothing (02 §6).
-        boundary::Normalized::Refused { reason, kind } => {
-            let marker = if kind
-                == local_rag_memory::normalize::translate::TranslateFailureKind::Unavailable
-            {
-                recall_pipeline::QueryNotNormalized::NoGenerator
-            } else {
-                recall_pipeline::QueryNotNormalized::TranslationRefused(reason)
-            };
-            (query.to_string(), Some(marker))
         }
     }
 }
@@ -222,10 +188,9 @@ pub async fn recall(
     // can only rank coherently if the query is in that language too. An empty
     // (termless) query has nothing to decide, so it never reaches the
     // translator.
-    let (query, query_degraded) = if query.trim().is_empty() {
-        (query, None)
-    } else {
-        normalize_query(ctx, &query).await
+    let (query, query_degraded) = {
+        let (decided, why) = ctx.translator().decide_query(&query).await;
+        (decided, why.map(Into::into))
     };
     let request = recall_pipeline::RecallRequest {
         root,

@@ -526,6 +526,7 @@ async fn lock_is_held_in_every_leg_of_a_successful_hybrid_search() {
 
     let observer = RecordingObserver::new();
     let request = SearchRequest {
+        query_degraded: None,
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
@@ -590,6 +591,7 @@ async fn unknown_root_yields_worktree_not_indexed() {
     );
 
     let request = SearchRequest {
+        query_degraded: None,
         root: RequestRoot::default(),
         query: "search".to_string(),
         limit: 5,
@@ -638,6 +640,7 @@ async fn fts_diverged_above_threshold_degrades_dense_only() {
     );
 
     let request = SearchRequest {
+        query_degraded: None,
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
@@ -695,6 +698,7 @@ async fn dense_unavailable_degrades_lexical_only() {
     );
 
     let request = SearchRequest {
+        query_degraded: None,
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
@@ -745,6 +749,7 @@ async fn both_legs_unavailable_yields_index_unavailable() {
     );
 
     let request = SearchRequest {
+        query_degraded: None,
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,
@@ -851,6 +856,7 @@ async fn writer_holding_l2_write_delays_search_past_bound_yields_busy_retry() {
         .expect("join entered-wait");
 
     let request = SearchRequest {
+        query_degraded: None,
         root: request_root(&path),
         query: "search".to_string(),
         limit: 5,

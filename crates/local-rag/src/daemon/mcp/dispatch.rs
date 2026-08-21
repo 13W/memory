@@ -170,7 +170,19 @@ async fn route_tools_call(
 
     let root = gitroot::request_root(ctx.request_context);
     let result = match call.name.as_str() {
-        "search_code" => super::code::search_code(engine, root, &call.arguments, ctx.now_ms).await,
+        "search_code" => {
+            // The translator comes from the memory context because that is
+            // where the daemon's single `GeneratorPool` already lives (D-054);
+            // the code pillar gets the translator, not the context.
+            super::code::search_code(
+                engine,
+                &memory.translator(),
+                root,
+                &call.arguments,
+                ctx.now_ms,
+            )
+            .await
+        }
         "get_file_context" => super::code::get_file_context(engine, root, &call.arguments).await,
         "project_overview" => super::code::project_overview(engine, root, &call.arguments).await,
         "recall" => super::memory::recall(memory, root, &call.arguments).await,

@@ -433,6 +433,7 @@ fn engine_over(state: &Arc<StateDb>, cache: &Arc<CacheDb>, layout: StoreLayout) 
 
 fn request(path: &str, query: &str, name_pattern: Option<&str>, limit: usize) -> SearchRequest {
     SearchRequest {
+        query_degraded: None,
         root: request_root(path),
         query: query.to_string(),
         limit,
