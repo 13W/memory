@@ -285,6 +285,7 @@ async fn do_one_search(
         limit: 5,
         mode: SearchMode::Hybrid,
         name_pattern: None,
+        query_degraded: None,
     };
     for attempt in 0..20 {
         match engine
