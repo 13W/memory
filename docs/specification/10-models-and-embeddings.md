@@ -108,6 +108,16 @@ true before real weights are installed.
 drift are impossible by constraint `[FIXED]`. `embedding_cache` rows reference
 `representation_id`, never inline model params.
 
+As-built note (T21-16, `[SPEC]`): `GenRequest::json_schema` stays **ignored** by the shipped
+runtime, and now for a measured reason rather than a scope decision. Grammar-constrained decoding
+was built for the translator's one fixed shape and aborts the process: llama.cpp's
+`llama_grammar_reject_candidates` calls `ggml_abort` when the grammar leaves no legal token, which
+is a `SIGABRT` no caller can classify or recover from. Reproduced on `gemma-4-e2b-it-gguf-q4-0`
+with two different string rules. `crates/generate/src/llama.rs`'s module doc carries the stack and
+the reproduction, and replaces the advice it previously gave. The field therefore remains advisory
+exactly as §1 says, and output reliability comes from a tolerant reader on the consumer side
+(`local_rag_memory::normalize::translate`), not from constrained sampling.
+
 Representation kinds: `code_raw`, `code_context`, `structural_description` (post-v0 — its text is
 written in English, 09 §5 `[FIXED, ADR-0011]`; `code_raw` itself is never translated),
 `memory`. Subject hashing per kind: 03 §1.2. Which of the two code kinds the dense leg *searches*

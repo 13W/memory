@@ -16,6 +16,41 @@
 //! `crates/embed/src/contract.rs`'s module doc), so implementing it here would
 //! be unexercised code.
 //!
+//! # Grammar-constrained decoding aborts the process here — do not add it
+//!
+//! The note below closes with *"a future revision can add a hand-authored GBNF
+//! grammar for this task's own fixed op schema without changing the `Generator`
+//! contract at all."* `T21-16` tried exactly that, and the advice turns out to
+//! be **wrong on this stack**: it does not degrade, it kills the process.
+//!
+//! What was built and measured: a GBNF for the translator's one fixed shape
+//! (`{"en": "<string>"}`), compiled from its JSON Schema, installed as
+//! `LlamaSampler::grammar` ahead of greedy, with `accept` added to the sampling
+//! loop so the parse state advances (`sample` only picks; a stateful sampler
+//! needs the acceptance, which greedy alone never did). `LlamaSampler::grammar`
+//! accepted the grammar — construction returned `Ok` — and then sampling
+//! aborted the process:
+//!
+//! ```text
+//! ggml_abort
+//! llama_grammar_reject_candidates
+//! llama_grammar_apply_impl
+//! llama_sampler_chain_apply
+//! llama_sampler_sample
+//! ```
+//!
+//! That is the vendored llama.cpp asserting when the grammar leaves **no**
+//! candidate token legal — `SIGABRT`, not an error a caller can classify or
+//! recover from. Reproduced on `gemma-4-e2b-it-gguf-q4-0` with two different
+//! string rules (the `json.gbnf` idiom with its `\x00-\x1F` exclusion, and a
+//! conservative `[^"\\]` form), so it is not one grammar's typo.
+//!
+//! A background daemon must not hold a path that can abort the process, so
+//! `json_schema` stays ignored and the translator's reliability comes from a
+//! tolerant parser instead (`local_rag_memory::normalize::translate`). Anyone
+//! revisiting this needs a llama.cpp that returns an error rather than
+//! aborting, and should verify *that* before writing a line of grammar.
+//!
 //! # No grammar-constrained decoding in v0 (as-built scope decision)
 //!
 //! `llama-cpp-2`'s `LlamaSampler::grammar` takes a raw GBNF string, not a JSON

@@ -182,7 +182,16 @@ CREATE INDEX memory_normalization_queue
 /// established for consolidation, expressed as an explicit version rather than
 /// a git hash because a normalizer change is a deliberate product decision, not
 /// an incidental rebuild.
-pub const CURRENT_NORMALIZER_VERSION: i64 = 1;
+///
+/// **Bumped 1 → 2 by `T21-16`**, which gave the translator grammar-constrained
+/// decoding and raised its source limit. The bump is the mechanism, not a
+/// courtesy: the dead-letter predicate is
+/// `status='failed' AND attempt_count >= … AND normalizer_version >= <current>`,
+/// so a row written under version 1 stops counting as a dead-letter the moment
+/// current is 2 — and `entries_needing_normalization` offers it again. That is
+/// what *releases* the entries an older normalizer gave up on. Translating them
+/// is `T21-17`'s: nothing rewrites an existing entry's canon before that.
+pub const CURRENT_NORMALIZER_VERSION: i64 = 2;
 
 /// How many `failed` attempts one entry gets under a single normalizer version
 /// before the queue stops offering it (ADR-0010 Decision 10: "failures degrade
@@ -737,7 +746,11 @@ mod tests {
                created_at INTEGER NOT NULL);",
         )
         .unwrap();
+        // v14 **then** v15: the migration is the only definition of the
+        // current shape, and building the table any other way would let these
+        // tests pass against a schema the store never actually has.
         conn.execute_batch(SCHEMA_V14).unwrap();
+        conn.execute_batch(SCHEMA_V15).unwrap();
         conn
     }
 
@@ -788,28 +801,33 @@ mod tests {
         ] {
             assert_eq!(NormalizationStatus::from_db(status.as_str()), Some(status));
         }
-        assert_eq!(NormalizationStatus::from_db("translated"), None);
+        // The pre-v15 vocabulary is not merely absent, it is refused: a store
+        // that somehow still holds `ready` must read as corrupt, not as
+        // translated.
+        for retired in ["ready", "skipped", "", "READY"] {
+            assert_eq!(NormalizationStatus::from_db(retired), None, "{retired:?}");
+        }
     }
 
-    /// The table's central invariant, both directions: `ready` always carries
-    /// text a reader may use, and nothing else ever carries text a reader might
-    /// mistake for a translation.
+    /// The table's central invariant, both directions: `translated` always
+    /// carries the author's own text, and nothing else ever carries text a
+    /// reader might mistake for provenance.
     #[test]
-    fn the_check_binds_ready_to_text_in_both_directions() {
+    fn the_check_binds_translated_to_text_in_both_directions() {
         let conn = conn_with_normalization();
         seed_entry(&conn, "m-1", "active", "исходный текст", 1_000);
 
-        let ready_without_text = conn.execute(
+        let translated_without_text = conn.execute(
             "INSERT INTO memory_text_normalization \
                (memory_id, status, canon_text_sha256, source_text, normalizer_version, \
                 created_at, updated_at) \
-             VALUES ('m-1', 'ready', 'abc', NULL, 1, 1000, 1000)",
+             VALUES ('m-1', 'translated', 'abc', NULL, 1, 1000, 1000)",
             [],
         );
         assert_eq!(
-            ready_without_text.unwrap_err().sqlite_error_code(),
+            translated_without_text.unwrap_err().sqlite_error_code(),
             Some(rusqlite::ErrorCode::ConstraintViolation),
-            "a ready row with no text would promise a reader something it does not have"
+            "a translated row with no source_text would lose the words it exists to keep"
         );
 
         let failed_with_text = conn.execute(
@@ -822,14 +840,17 @@ mod tests {
         assert_eq!(
             failed_with_text.unwrap_err().sqlite_error_code(),
             Some(rusqlite::ErrorCode::ConstraintViolation),
-            "text on a non-ready row is text no reader is allowed to use"
+            "source_text on a non-translated row is provenance for a translation that \
+             never happened"
         );
 
+        // A status outside the domain — including the pre-v15 vocabulary,
+        // which is exactly what a half-finished rename would leave behind.
         let unknown_status = conn.execute(
             "INSERT INTO memory_text_normalization \
                (memory_id, status, canon_text_sha256, source_text, normalizer_version, \
                 created_at, updated_at) \
-             VALUES ('m-1', 'translated', 'abc', 'some english', 1, 1000, 1000)",
+             VALUES ('m-1', 'ready', 'abc', 'the author''s words', 1, 1000, 1000)",
             [],
         );
         assert_eq!(
@@ -976,15 +997,17 @@ mod tests {
             2_000,
         );
 
+        // `ORDER BY status` is the reader's contract, so the expected order is
+        // alphabetical on the stored value: english < translated.
         assert_eq!(
             normalization_counts(&conn).unwrap(),
             vec![
                 NormalizationCountRow {
-                    status: NormalizationStatus::Translated,
+                    status: NormalizationStatus::English,
                     count: 1,
                 },
                 NormalizationCountRow {
-                    status: NormalizationStatus::English,
+                    status: NormalizationStatus::Translated,
                     count: 1,
                 },
             ],
