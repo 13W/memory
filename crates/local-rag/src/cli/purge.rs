@@ -13,12 +13,13 @@
 use std::process::ExitCode;
 
 use local_rag_store::{
-    PurgeMemoryError, preview_purge_all, preview_purge_memory, preview_purge_session, purge_all,
-    purge_memory, purge_session,
+    PurgeMemoryError, SubjectKind, delete_all_memory_embeddings, delete_embeddings_for_subject,
+    preview_purge_all, preview_purge_memory, preview_purge_session, purge_all, purge_memory,
+    purge_session,
 };
 
 use super::{EXIT_USAGE, block_on, fail, resolve_layout_and_config, system_now_ms};
-use local_rag::indexing::open_state;
+use local_rag::indexing::{open_cache, open_state};
 
 const BIN: &str = "local-rag";
 
@@ -72,7 +73,7 @@ pub fn run(args: PurgeArgs) -> ExitCode {
             eprintln!("{BIN} purge: --expected-version is required with --memory");
             return ExitCode::from(EXIT_USAGE);
         };
-        return run_purge_memory(&state, &id, expected_version, yes, now_ms);
+        return run_purge_memory(&state, &layout, &id, expected_version, yes, now_ms);
     }
     if expected_version.is_some() {
         eprintln!("{BIN} purge: --expected-version is only valid with --memory");
@@ -81,11 +82,46 @@ pub fn run(args: PurgeArgs) -> ExitCode {
     if let Some(id) = session_id {
         return run_purge_session(&state, &id, yes);
     }
-    run_purge_all(&state, yes, now_ms)
+    run_purge_all(&state, &layout, yes, now_ms)
+}
+
+/// Delete the `embedding_cache` rows a purge is about to orphan (`D-074`).
+///
+/// Runs **before** the `state.sqlite` transaction, which is the reverse of
+/// this system's usual "state is the source of truth, the cache catches up".
+/// That rule is right for derivation and wrong here: a cache row's key is
+/// `H(memory_id, H(text))`, and the purge deletes the text, so after the state
+/// commit there is nothing left to derive the key from and an orphaned vector
+/// of private text becomes permanently unfindable. In this order the failure
+/// window points the safe way — a crash leaves a vector the next backfill
+/// recomputes, never one nothing can find.
+///
+/// Returns the number of rows removed, or an error message. A cache that
+/// cannot be opened is fatal to the purge on purpose: silently purging the
+/// entry while leaving its vector behind is precisely the defect `D-074`
+/// records.
+fn purge_vectors(
+    state: &local_rag_store::StateDb,
+    layout: &local_rag_core::paths::StoreLayout,
+    subject_hash: Option<&str>,
+) -> Result<u64, String> {
+    let cache = block_on(open_cache(state, layout))?;
+    let hash = subject_hash.map(str::to_string);
+    block_on(async move {
+        cache
+            .writer()
+            .transaction(move |tx| match hash.as_deref() {
+                Some(h) => delete_embeddings_for_subject(tx, SubjectKind::MemoryEntry, h),
+                None => delete_all_memory_embeddings(tx),
+            })
+            .await
+    })
+    .map_err(|e| format!("could not remove cached vectors: {e}"))
 }
 
 fn run_purge_memory(
     state: &local_rag_store::StateDb,
+    layout: &local_rag_core::paths::StoreLayout,
     id: &str,
     expected_version: i64,
     yes: bool,
@@ -107,6 +143,17 @@ fn run_purge_memory(
     if !preview.exists {
         return fail(BIN, &format!("no memory entry with id {id}"));
     }
+    // Read while the text is still there: after the purge the subject hash
+    // cannot be derived at all (see `purge_vectors`).
+    let subject_hash = match local_rag_store::memory_subject_hash(&conn, id) {
+        Ok(h) => h,
+        Err(e) => {
+            return fail(
+                BIN,
+                &format!("could not read the subject of memory {id}: {e}"),
+            );
+        }
+    };
     drop(conn);
 
     if !yes {
@@ -119,6 +166,11 @@ fn run_purge_memory(
         return ExitCode::from(EXIT_USAGE);
     }
 
+    let vectors_removed = match purge_vectors(state, layout, subject_hash.as_deref()) {
+        Ok(n) => n,
+        Err(e) => return fail(BIN, &e),
+    };
+
     let id_owned = id.to_string();
     let outcome = block_on(async {
         state
@@ -129,7 +181,7 @@ fn run_purge_memory(
     match outcome {
         Ok(Ok(report)) => {
             println!(
-                "{BIN}: purged memory {id} ({} evidence rows removed, {} descendants relinked, {} audit rows tombstoned, {} normalization rows removed)",
+                "{BIN}: purged memory {id} ({} evidence rows removed, {} descendants relinked, {} audit rows tombstoned, {} normalization rows removed, {vectors_removed} cached vectors removed)",
                 report.evidence_rows_removed,
                 report.descendants_relinked,
                 report.audit_rows_tombstoned,
@@ -193,7 +245,12 @@ fn run_purge_session(state: &local_rag_store::StateDb, id: &str, yes: bool) -> E
     }
 }
 
-fn run_purge_all(state: &local_rag_store::StateDb, yes: bool, now_ms: i64) -> ExitCode {
+fn run_purge_all(
+    state: &local_rag_store::StateDb,
+    layout: &local_rag_core::paths::StoreLayout,
+    yes: bool,
+    now_ms: i64,
+) -> ExitCode {
     let conn = match state.open_read() {
         Ok(c) => c,
         Err(e) => return fail(BIN, &format!("could not open state.sqlite: {e}")),
@@ -212,6 +269,15 @@ fn run_purge_all(state: &local_rag_store::StateDb, yes: bool, now_ms: i64) -> Ex
         return ExitCode::from(EXIT_USAGE);
     }
 
+    // `None` means "every memory subject", not "the subjects of the entries
+    // about to go": `purge --all` removes them all anyway, and the wholesale
+    // form additionally takes any row that has already lost its entry. An
+    // orphan is exactly what must not survive this operation.
+    let vectors_removed = match purge_vectors(state, layout, None) {
+        Ok(n) => n,
+        Err(e) => return fail(BIN, &e),
+    };
+
     let outcome = block_on(async {
         state
             .writer()
@@ -221,7 +287,7 @@ fn run_purge_all(state: &local_rag_store::StateDb, yes: bool, now_ms: i64) -> Ex
     match outcome {
         Ok(report) => {
             println!(
-                "{BIN}: purged everything ({} memory entries, {} sessions, {} observations)",
+                "{BIN}: purged everything ({} memory entries, {} sessions, {} observations, {vectors_removed} cached vectors removed)",
                 report.memory_entries_purged, report.sessions_purged, report.observations_purged,
             );
             ExitCode::SUCCESS

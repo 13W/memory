@@ -391,15 +391,16 @@ pub use cache::{
     FtsProjectionHeadRow, FtsRebuildError, LEXICAL_SCHEMA_VERSION, LastUsedSink,
     LastUsedSinkEmbedding, LexicalHit, LexicalQuery, MIN_CANDIDATE_DEPTH, NormalizedTextRow,
     SubjectKind, TOKENIZER_VERSION, ValidationDepth, VectorLengthError, all_embedding_meta,
-    candidate_depth, check_fts, decode_vector_le, delete_embedding, delete_normalized_text,
-    document_frequencies, embeddings_for_subjects, encode_vector_le, flush_last_used,
-    flush_last_used_embeddings, fts_doc_occurrence_count, fts_doc_occurrence_ids,
-    fts_manifest_hash, fts_match_expression, fts_match_expression_from_terms, get_embedding,
-    get_normalized_text, indexed_document_count, insert_embedding, insert_normalized_text,
-    lexical_leg, materialize_fts, open_and_validate_fts, query_fts, read_fts_projection_head,
-    requires_index_unavailable, selective_terms, should_rebuild_synchronously, tokenize_identifier,
-    tokenize_path, tokenize_qualified_name, tokenize_signature, validate_fts_cheap,
-    validate_fts_strong, verify_cached_embedding, verify_cached_text,
+    candidate_depth, check_fts, decode_vector_le, delete_all_memory_embeddings, delete_embedding,
+    delete_embeddings_for_subject, delete_normalized_text, document_frequencies,
+    embeddings_for_subjects, encode_vector_le, flush_last_used, flush_last_used_embeddings,
+    fts_doc_occurrence_count, fts_doc_occurrence_ids, fts_manifest_hash, fts_match_expression,
+    fts_match_expression_from_terms, get_embedding, get_normalized_text, indexed_document_count,
+    insert_embedding, insert_normalized_text, lexical_leg, materialize_fts, open_and_validate_fts,
+    query_fts, read_fts_projection_head, requires_index_unavailable, selective_terms,
+    should_rebuild_synchronously, tokenize_identifier, tokenize_path, tokenize_qualified_name,
+    tokenize_signature, validate_fts_cheap, validate_fts_strong, verify_cached_embedding,
+    verify_cached_text,
 };
 pub use code::{
     ALGO_VERSION, BlobOutcome, CONTEXT_VERSION, ContextInput, ContextSubject, DerivedContentBlob,
@@ -535,6 +536,6 @@ pub use state::{
     WriteError,
 };
 pub use subjects::{
-    SubjectSet, expected_subject_keys, memory_entry_subject_keys, pinned_generations,
-    protected_model_space_ids, protected_subject_keys,
+    SubjectSet, expected_subject_keys, memory_entry_subject_keys, memory_subject_hash,
+    pinned_generations, protected_model_space_ids, protected_subject_keys,
 };

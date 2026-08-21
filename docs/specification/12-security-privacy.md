@@ -187,6 +187,36 @@ carries `source_text` — what the **author** wrote — beside the English canon
 survives the migration-15 table rebuild (asserted by `pragma_foreign_key_check` in
 `crates/store/tests/migrate_fixtures.rs`).
 
+As-built note (`D-074`, `[SPEC]`): `purge` now also removes the entry's **derived vector** from
+`embedding_cache`. Until this it did not, and nothing else did either: the purge transaction is
+over `state.sqlite` alone (cross-database transactions are forbidden, 03 §1.4), and the only
+`embedding_cache` deletions in the system are integrity eviction and budget LRU — `corrupt` and
+`too big`, never `its subject no longer exists`. A vector derived from a user's own text therefore
+survived the only hard-delete path this section defines, and disappeared eventually, by LRU or a
+full cache rebuild: non-deterministically, unobservably, and long after the operation that was
+supposed to have removed it.
+
+The deletion runs in its own `cache.sqlite` transaction **before** the `state.sqlite` one, which is
+the reverse of this system's usual "state is the source of truth, the cache catches up". That rule
+is right for derivation and wrong for deletion, for a concrete reason: an `embedding_cache` row's
+key is `H(memory_id, H(text))` (`subject_memory_entry`), and the purge deletes the text. After the
+state commit there is nothing left to derive the key from, so a crash in that order would leave a
+vector of private text that nothing — not a retry, not a sweep — can ever find again. In the
+chosen order the failure window points the safe way: a crash leaves a vector the next backfill
+recomputes, never one that cannot be found. The narrow cost is stated rather than hidden: a purge
+the state transaction refuses (a version race after the preview) has already dropped the vector,
+and pays for it with a recomputation.
+
+`purge --memory` deletes by `(subject_kind, subject_hash)` across **every** representation —
+`delete_embeddings_for_subject` — because a subject may hold a vector in every model space the
+store has ever had, and making completeness depend on the caller enumerating them would make it
+depend on a list the caller has no reason to know. `purge --all` uses
+`delete_all_memory_embeddings`, which clears the kind wholesale rather than looping over the
+hashes of the entries being purged: the two agree for rows that still have a live subject and
+differ for rows that no longer do, and an orphan is exactly what must not survive that particular
+operation. Both report a count, which the CLI prints alongside the other numbers. `purge --session`
+is unchanged — memory entries survive a session purge, so it orphans no memory vector.
+
 As-built note (T21-07, `[SPEC]`, ADR-0010): since migration 14 an entry may carry a second copy of
 the user's own writing — `memory_text_normalization.normalized_text`, the English variant a local
 model produced from it (03 §2.5) — and all three operations above now account for it.

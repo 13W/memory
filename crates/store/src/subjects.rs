@@ -273,6 +273,23 @@ pub fn memory_entry_subject_keys(
         .collect())
 }
 
+/// One entry's `embedding_cache` subject hash, or `None` if no such entry
+/// exists — `D-074`'s half of a privacy purge.
+///
+/// The hash is `H(memory_id, H(text))`, so it can only be computed while the
+/// text is still there. A purge deletes that text, which is why the vector has
+/// to be removed *before* the state transaction rather than after it: once the
+/// row is gone there is nothing left to derive the key from, and the orphan
+/// becomes permanently unfindable.
+///
+/// Derived through [`subject_memory_entry`], the same call
+/// [`memory_entry_subject_keys`] uses, so the delete path and the backfill
+/// path cannot disagree about which row belongs to an entry.
+pub fn memory_subject_hash(conn: &Connection, memory_id: &str) -> rusqlite::Result<Option<String>> {
+    Ok(crate::memory::memory_entry_by_id(conn, memory_id)?
+        .map(|entry| subject_memory_entry(memory_id, &entry.text)))
+}
+
 /// Every protected subject key in the store: the pin set eviction must honor.
 ///
 /// Union of [`expected_subject_keys`] over [`protected_model_space_ids`] against

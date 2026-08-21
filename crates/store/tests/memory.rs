@@ -2874,3 +2874,29 @@ async fn normalization_counts_group_by_status_over_a_real_store() {
         Some("source text"),
     );
 }
+
+/// D-074: the delete path and the backfill path must agree about which cache
+/// row belongs to an entry, or a purge removes nothing and reports success.
+/// Both go through `subject_memory_entry`; this pins that they still do.
+#[tokio::test]
+async fn memory_subject_hash_agrees_with_the_backfills_own_subject_key() {
+    let (_home, db) = open_state();
+    let id = memory(&db, 90, MemoryKind::Fact).await;
+
+    let read = db.open_read().expect("read conn");
+    let hash = local_rag_store::memory_subject_hash(&read, &id)
+        .expect("read subject hash")
+        .expect("the entry exists");
+    let keys = local_rag_store::memory_entry_subject_keys(&read, "rep-1").expect("subject keys");
+
+    assert!(
+        keys.iter().any(|k| k.subject_hash == hash
+            && k.subject_kind == local_rag_store::SubjectKind::MemoryEntry),
+        "the purge's hash must be one the backfill would have produced",
+    );
+    assert_eq!(
+        local_rag_store::memory_subject_hash(&read, "no-such-entry").expect("read"),
+        None,
+        "an unknown id has no subject rather than an empty-text hash",
+    );
+}
