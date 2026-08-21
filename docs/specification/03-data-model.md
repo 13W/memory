@@ -907,6 +907,31 @@ As-built note (T03-04, `[SPEC]`): the batched-`last_used_at` seam for the cache 
 `LastUsedSink`/`BatchingLastUsed` + `flush_last_used` (§4.2 note); the flush-cadence driver is a
 later task. The `last_seen_at` registry updates remain immediate single-row writes for now.
 
+As-built note (D-083, `[SPEC]`): this section's own checkpoint policy — "`PASSIVE`
+opportunistically; `TRUNCATE` when WAL > 64 MiB and no readers" — had **no implementation at all**
+outside shutdown. `local_rag_store::StateWriter::checkpoint` existed and was correct, but the only
+production caller was `daemon::shutdown` (02 §4.3's step). While the daemon ran, nothing
+checkpointed, and SQLite's own automatic checkpoint cannot compensate: it can never transfer a
+frame that a reader still needs, and an indexing cycle reads the store essentially without a gap
+(`build_generation`'s per-file `file_revision_id_by_content_key` accounted for ~96 % of one
+sampled cycle) while writing gigabytes of `generation_file`/`occurrence` frames. The result was
+unbounded growth, measured on the owner's store: `state.sqlite-wal` at **324 GB** against a 41 GB
+database, 336 GB for the store as a whole, and a full disk. `PRAGMA wal_checkpoint(PASSIVE)`
+reported `busy = 0` with `checkpointed_frames` frozen at exactly 206 516 for tens of minutes while
+`log_frames` climbed from 6.3 to 10 million — the checkpointer was not blocked, it simply had
+nothing it was allowed to move. That signature is now pinned by a deterministic test
+(`crates/store/tests/checkpoint.rs`).
+
+The checkpoint is now taken at the end of every indexing cycle
+(`daemon::indexing::worktree_task`), after the durable status write, where the cycle's own readers
+are gone. It is unconditionally `TRUNCATE` rather than this section's 64 MiB threshold: the
+threshold exists so a blocking truncate is not paid too often, and once per cycle is already rare,
+while `PASSIVE` alone would leave the file at its high-water mark — transferring the frames but
+never returning the disk, which is the half that actually mattered here. The numbers in this
+section are `[SPEC]`, so this is a documented refinement of the cadence, not a change to the
+policy's shape. Consolidation is deliberately left out: its per-run write volume is a handful of
+rows, and nothing measured points at it.
+
 ## 4. `cache.sqlite` — rebuildable, independently validated
 
 ```sql

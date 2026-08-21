@@ -19,6 +19,12 @@
 //!
 //! # Why a dedicated OS thread, not a plain `tokio::spawn`
 //!
+//! Each cycle ends by folding `state.sqlite`'s WAL back into the database
+//! (D-083): while a cycle runs, its own reads keep SQLite from transferring a
+//! single frame, so the automatic checkpoint starves and the `-wal` file grows
+//! for as long as the daemon lives. The cycle boundary is the one moment the
+//! cycle's readers are provably gone. See spec 03 §3's D-083 note.
+//!
 //! `project_generation`'s embedding step (`local_rag_embed::run_backfill`)
 //! deliberately keeps one `state.sqlite` read connection open across the
 //! whole backfill pass — `state_read` is read at the start and used again
@@ -67,7 +73,8 @@ use local_rag_index::reconcile::{
     load_worktree_meta, spawn_reconciler, spawn_watcher,
 };
 use local_rag_store::{
-    CacheDb, IndexingOutcome, RetentionParams, StateDb, WorktreeLockRegistry, write_indexing_status,
+    CacheDb, CheckpointMode, IndexingOutcome, RetentionParams, StateDb, WorktreeLockRegistry,
+    write_indexing_status,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
@@ -633,6 +640,38 @@ async fn project_one(
             "could not persist the indexing status (the index itself is unaffected)"
         );
     }
+    // D-083: fold the WAL back into `state.sqlite` now that the cycle's own
+    // readers are gone. A cycle writes gigabytes of `generation_file`/
+    // `occurrence` frames while `build_generation` queries the store
+    // essentially without a gap, and SQLite cannot advance `nBackfill` past a
+    // reader's mark — so the automatic checkpoint starves for the whole cycle
+    // and the `-wal` file grows without bound (measured on the owner's store:
+    // 324 GB against a 41 GB database, `PRAGMA wal_checkpoint(PASSIVE)`
+    // returning `busy=0` with `checkpointed_frames` frozen for tens of
+    // minutes). Here, between cycles, nothing is reading: `TRUNCATE` both
+    // transfers the frames and returns the disk. Failure is logged and
+    // otherwise ignored — a checkpoint that could not run is a bounded loss of
+    // disk space, never of data, and must not fail a completed cycle.
+    match ctx
+        .state
+        .writer()
+        .checkpoint(CheckpointMode::Truncate)
+        .await
+    {
+        Ok(stats) => tracing::debug!(
+            worktree_id = %worktree_id_str,
+            busy = stats.busy,
+            log_frames = stats.log_frames,
+            checkpointed_frames = stats.checkpointed_frames,
+            "wal checkpoint after indexing cycle"
+        ),
+        Err(e) => tracing::warn!(
+            worktree_id = %worktree_id_str,
+            reason = %e,
+            "wal checkpoint after indexing cycle failed"
+        ),
+    }
+
     // `_job` drops here — before control returns to the outer `select!`.
 }
 
@@ -912,6 +951,46 @@ mod tests {
         );
 
         handle.stop().await;
+    }
+
+    /// D-083: an indexing cycle folds its own `-wal` back into the database
+    /// before it finishes.
+    ///
+    /// Without this the file only ever grows while the daemon runs: the cycle
+    /// writes gigabytes of frames while `build_generation` reads the store
+    /// without a gap, and SQLite cannot transfer a frame a reader still needs
+    /// (`crates/store/tests/checkpoint.rs` pins that mechanism deterministically).
+    /// On the owner's store the result was a 324 GB `-wal` against a 41 GB
+    /// database, and a disk with nothing left on it.
+    #[tokio::test]
+    async fn an_indexing_cycle_leaves_the_wal_checkpointed() {
+        let fx = Fixture::new("repo").await;
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        handle.stop().await;
+
+        let wal = {
+            let mut name = fx
+                .layout
+                .state_db()
+                .file_name()
+                .expect("file name")
+                .to_os_string();
+            name.push("-wal");
+            fx.layout.state_db().with_file_name(name)
+        };
+        let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            size,
+            0,
+            "the cycle must return its log to the database; {} bytes left in {}",
+            size,
+            wal.display(),
+        );
     }
 
     #[tokio::test]
