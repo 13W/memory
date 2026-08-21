@@ -512,6 +512,19 @@ async fn run_one_config(
                 repo_hint: None,
             },
             query: config.query_text(query),
+            // `None`, and deliberately so. The daemon sets this field at the
+            // query boundary (`T21-15`) to say "the legs did not get the
+            // canon's language, and here is why"; this harness calls `recall`
+            // directly, *below* that boundary, where there is no translator to
+            // fail. The query's language here is the experiment's own
+            // independent variable — `config.query_text` chooses it — not an
+            // accident anyone needs warning about.
+            //
+            // It cannot skew a measurement either way: the field is read in
+            // exactly two places and both are presentational (`pipeline.rs`
+            // clones it into the response; the search pipeline pushes it into
+            // `diagnostics`). Fusion, leg selection and scoring never see it.
+            query_degraded: None,
         };
 
         let mut ranked_ids: Vec<String> = Vec::new();
@@ -994,6 +1007,8 @@ mod tests {
                 repo_hint: None,
             },
             query: "notification queue rabbitmq",
+            // Below the query boundary — see the bench loop's own note.
+            query_degraded: None,
         };
         let outcome = recall::recall(
             &state_read,
@@ -1320,6 +1335,8 @@ mod tests {
                 repo_hint: None,
             },
             query: "notification queue rabbitmq",
+            // Below the query boundary — see the bench loop's own note.
+            query_degraded: None,
         };
         let outcome = recall::recall(
             &state_read,

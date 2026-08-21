@@ -47,6 +47,30 @@ those stay one job each and run fully concurrently. `root:test` and
 queued first so a free worker never idles behind a cheap `clippy` job while
 they are still running.
 
+### When `cargo xtask ci` cannot finish
+
+On some machines it does not — this project has a documented case where every
+`cargo` process sits at 0% CPU with no live `rustc` and the run never returns
+(`env-macos-exec-hang-xprotect-spotlight`, recorded in `PROGRESS.md`'s D-036
+and G17 evidence). The established workaround is to substitute per-crate runs
+for the crates a change touched, and record exactly what was and was not run.
+
+That substitution has one hole, and it is not theoretical: per-crate runs of
+the crates you touched cannot, by construction, catch a crate you **did not**
+touch that stopped compiling. `D-076` is what that looks like — `crates/xtask`
+had not built for a day because a required field was added to a struct three
+of its call sites construct, and every task since had run only its own crates.
+
+So when the full gate cannot run, the minimum substitute is:
+
+```
+cargo check --workspace --all-targets
+```
+
+It is far cheaper than the gate (no codegen, no test binaries), it completes
+on machines where `cargo xtask ci` does not, and it is the one check that sees
+the whole workspace. Run it before committing.
+
 `cargo-nextest` is a required host tool (not a workspace dependency `cargo
 fetch` pulls in): install it once with `cargo install cargo-nextest --locked`.
 `cargo xtask ci` checks for it up front and fails immediately with that
