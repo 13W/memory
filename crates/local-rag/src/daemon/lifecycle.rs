@@ -197,6 +197,14 @@ pub struct StartOptions {
 /// This is what tests drive directly (no subprocess needed for pure
 /// lock/lifecycle/idle-gating scenarios) and what [`run`] wraps with the
 /// OS-signal/idle wait for the real `serve` binary.
+/// How long [`DaemonHandle::shutdown`] waits for the consolidation-trigger,
+/// memory-normalization and startup-resume tasks before cancelling them
+/// (D-081). Sized against `cli::service::STOP_TIMEOUT` (10 s), the budget the
+/// CLI prints as a promise: this wait, the indexing supervisor's own
+/// `SHUTDOWN_JOIN_BUDGET` (3 s) and the closing WAL checkpoint all have to fit
+/// inside it.
+pub(crate) const SHUTDOWN_WORKER_BUDGET: Duration = Duration::from_secs(3);
+
 pub struct DaemonHandle {
     pub layout: StoreLayout,
     pub mode: watch::Receiver<DaemonMode>,
@@ -761,20 +769,34 @@ impl DaemonHandle {
             supervisor.shutdown().await;
         }
 
-        // Step 3: now wait. The startup resume passes are still awaited to
-        // natural completion — they are catch-up work with no stop signal of
-        // their own, and unlike the workers above they do not schedule more.
-        for handle in self.resume_handles.drain(..) {
-            log_if_task_panicked("a startup resume task", handle.await);
-        }
-        if let Some(join) = self.consolidation_trigger_join.take() {
-            log_if_task_panicked("the consolidation-trigger worker", join.await);
-        }
-        // A tick in flight holds a `JobKind::Normalization` guard and is
-        // mid-way through the store, so it must finish before it closes below.
-        if let Some(join) = self.normalization_join.take() {
-            log_if_task_panicked("the memory-normalization worker", join.await);
-        }
+        // Step 3: now wait — under a budget (D-081). These three observe their
+        // stop signal *between* units of work, so the wait is bounded by
+        // whatever unit is in flight, and a consolidation tick's unit contains
+        // an LLM call. Measured on the owner's store: 26 s, and `local-rag
+        // stop` printing "did not stop within 10s" — the budget the CLI prints
+        // as a promise.
+        //
+        // Abandoning an in-flight tick is safe, and safe by an existing
+        // mechanism rather than by hope. A run that does not reach its apply
+        // stays `running` with a lease, which is exactly the state the startup
+        // resume sweep already reclaims (D-050/D-073); nothing is half-written,
+        // because every mutation goes through the single write queue as a whole
+        // transaction. Cancelling here drops the *future* awaiting that queue,
+        // never the queued job: the writer thread owns it and runs it to
+        // completion, and the queue is FIFO, so it lands before the checkpoint
+        // `drain_and_shutdown` enqueues below.
+        //
+        // Cancelling matters as much as the budget. Dropping a `JoinHandle`
+        // detaches its task, which would leave it running *while the store
+        // closes* — strictly worse than waiting. So the handles are taken
+        // first, their `AbortHandle`s kept, and the timeout path aborts them.
+        await_workers_bounded(
+            SHUTDOWN_WORKER_BUDGET,
+            std::mem::take(&mut self.resume_handles),
+            self.consolidation_trigger_join.take(),
+            self.normalization_join.take(),
+        )
+        .await;
         tracing::debug!("background jobs stopped");
         let lock_guard = self.lock_guard.take().expect("shutdown runs once");
         drain_and_shutdown(
@@ -787,6 +809,58 @@ impl DaemonHandle {
         .await;
         tracing::info!("daemon stopped");
     }
+}
+
+/// The budgeted half of [`DaemonHandle::shutdown`]'s step 3 (D-081), split out
+/// so it can be tested for the two things that actually matter: that it
+/// returns within `budget`, and that a worker which overruns is **cancelled**
+/// rather than detached. Returns `true` when every worker finished on its own.
+///
+/// Dropping a `JoinHandle` detaches its task, which would leave it running
+/// while `drain_and_shutdown` closes the store — strictly worse than waiting.
+/// So the handles' `AbortHandle`s are taken up front and the timeout path uses
+/// them.
+async fn await_workers_bounded(
+    budget: Duration,
+    mut resume_handles: Vec<JoinHandle<()>>,
+    consolidation_join: Option<JoinHandle<()>>,
+    normalization_join: Option<JoinHandle<()>>,
+) -> bool {
+    let aborts: Vec<tokio::task::AbortHandle> = resume_handles
+        .iter()
+        .map(JoinHandle::abort_handle)
+        .chain(consolidation_join.iter().map(JoinHandle::abort_handle))
+        .chain(normalization_join.iter().map(JoinHandle::abort_handle))
+        .collect();
+    let waits = async move {
+        // The startup resume passes are catch-up work with no stop signal of
+        // their own, and unlike the workers above they do not schedule more —
+        // but they are not exempt from the budget either.
+        for handle in resume_handles.drain(..) {
+            log_if_task_panicked("a startup resume task", handle.await);
+        }
+        if let Some(join) = consolidation_join {
+            log_if_task_panicked("the consolidation-trigger worker", join.await);
+        }
+        // A tick in flight holds a `JobKind::Normalization` guard and is
+        // mid-way through the store, so it finishes before it closes below
+        // whenever it can do so inside the budget.
+        if let Some(join) = normalization_join {
+            log_if_task_panicked("the memory-normalization worker", join.await);
+        }
+    };
+    if tokio::time::timeout(budget, waits).await.is_err() {
+        tracing::warn!(
+            ?budget,
+            "a background worker did not finish within the shutdown budget; cancelling it — an \
+             unfinished consolidation run stays leased and is resumed at the next start"
+        );
+        for abort in aborts {
+            abort.abort();
+        }
+        return false;
+    }
+    true
 }
 
 /// D-046: `JoinHandle::await`'s `Err` is a lost background-task panic —
@@ -1072,6 +1146,77 @@ mod tests {
         assert!(
             !logged.contains("a healthy task"),
             "a clean join must not be logged: {logged}"
+        );
+    }
+
+    /// D-081: the shutdown wait returns inside its budget, and — the half that
+    /// matters more — the worker that overran is **cancelled**, not detached.
+    /// A detached task keeps running while `drain_and_shutdown` closes the
+    /// store, which is strictly worse than having waited for it.
+    #[tokio::test]
+    async fn a_worker_that_overruns_the_shutdown_budget_is_cancelled_not_detached() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Its `Drop` runs when the task's future is dropped — which happens on
+        /// cancellation and not on detachment, so this distinguishes the two.
+        struct CancelWitness(Arc<AtomicBool>);
+        impl Drop for CancelWitness {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let witness = Arc::clone(&cancelled);
+        let hung = tokio::spawn(async move {
+            let _witness = CancelWitness(witness);
+            // Longer than any budget this test would use; the point is that
+            // the wait does not sit here.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        });
+
+        let budget = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let finished_on_own = await_workers_bounded(budget, Vec::new(), Some(hung), None).await;
+        let elapsed = started.elapsed();
+
+        assert!(!finished_on_own, "the hung worker cannot have finished");
+        assert!(
+            elapsed < budget * 8,
+            "the wait must be bounded by the budget, not by the worker: {elapsed:?}"
+        );
+        // Cancellation is observed, not assumed: give the runtime a moment to
+        // drop the aborted future.
+        for _ in 0..100 {
+            if cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the overrunning worker must be aborted; dropping its JoinHandle would only detach it"
+        );
+    }
+
+    /// The budget is a ceiling, not a delay: workers that finish promptly are
+    /// still awaited to completion, and the wait returns as soon as they do.
+    #[tokio::test]
+    async fn workers_that_finish_promptly_are_awaited_not_cut_short() {
+        let quick = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let resume = vec![tokio::spawn(async {})];
+
+        let started = std::time::Instant::now();
+        let finished_on_own =
+            await_workers_bounded(Duration::from_secs(30), resume, Some(quick), None).await;
+
+        assert!(finished_on_own, "every worker finished on its own");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait returns with the workers, not with the budget"
         );
     }
 }
