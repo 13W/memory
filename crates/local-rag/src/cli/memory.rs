@@ -1,5 +1,6 @@
-//! `local-rag memory list|approve|reject|edit|retract|merge|rescope|evidence`
-//! (spec 11 §6, D-025; `rescope` is X-009). Thin CLI adapters over the exact same domain calls
+//! `local-rag memory
+//! list|approve|reject|edit|retract|confirm|refute|merge|rescope|evidence`
+//! (spec 11 §6, D-025; `rescope` is X-009, `confirm`/`refute` are D-079). Thin CLI adapters over the exact same domain calls
 //! `crates/local-rag/src/daemon/mcp/{memory,memory_write}.rs` already make
 //! (T15-04/T15-05) — parse args, open a transaction/read connection against
 //! `state.sqlite`, call a domain function, print the outcome. `memory
@@ -20,11 +21,12 @@ use std::process::ExitCode;
 use local_rag_core::identity::{SystemUuidV7, UuidSource};
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
-    Actor, CandidateState, EditMemoryOp, GLOBAL_SCOPE_OWNER_ID, MemoryEntryRow, MemoryKind,
-    MemoryOpError, MemoryState, MergeLoser, MergeMemoryOp, RequestRoot, RetractMemoryOp,
-    ReviewError, ScopeKind, SupersedeMemoryOp, apply_edit, apply_merge, apply_retract,
-    apply_supersede, approve_candidate, list_candidates, list_memory_entries_for_scope,
-    memory_entry_by_id, memory_evidence_for, reject_candidate, resolve,
+    Actor, CandidateState, ConfirmMemoryOp, EditMemoryOp, GLOBAL_SCOPE_OWNER_ID, MemoryEntryRow,
+    MemoryKind, MemoryOpError, MemoryState, MergeLoser, MergeMemoryOp, RejectMemoryOp, RequestRoot,
+    RetractMemoryOp, ReviewError, ScopeKind, SupersedeMemoryOp, apply_confirm, apply_edit,
+    apply_merge, apply_reject, apply_retract, apply_supersede, approve_candidate, list_candidates,
+    list_memory_entries_for_scope, memory_entry_by_id, memory_evidence_for, reject_candidate,
+    resolve,
 };
 
 use local_rag::daemon::gitroot;
@@ -69,6 +71,10 @@ pub enum MemoryCommand {
     Approve {
         candidate_id: String,
     },
+    /// Reject a pending review candidate (spec 04 §6).
+    ///
+    /// This is the candidate-review verb. To reject a durable hypothesis
+    /// entry, see `refute`.
     Reject {
         candidate_id: String,
     },
@@ -82,6 +88,29 @@ pub enum MemoryCommand {
         importance: Option<f64>,
     },
     Retract {
+        memory_id: String,
+        #[arg(long)]
+        expected_version: i64,
+    },
+    /// Confirm a hypothesis on strong evidence (`active` -> `confirmed`).
+    ///
+    /// Spec 04 §5. The entry keeps `kind=hypothesis` and stays eligible for
+    /// recall as high trust; promotion to a `fact` is a separate, explicit
+    /// `supersede`, not this command. Legal only for `hypothesis`.
+    Confirm {
+        memory_id: String,
+        #[arg(long)]
+        expected_version: i64,
+    },
+    /// Reject a hypothesis entry the evidence disproves (`active` ->
+    /// `rejected`).
+    ///
+    /// Spec 04 §5. Terminal: recall stops showing the entry, which survives
+    /// for review. Named `refute`, not `reject`, because `memory reject`
+    /// already means "reject a pending review candidate" — a different
+    /// table. Illegal once the hypothesis is confirmed; from there the only
+    /// exit is `supersede`.
+    Refute {
         memory_id: String,
         #[arg(long)]
         expected_version: i64,
@@ -127,6 +156,14 @@ pub fn run(command: MemoryCommand) -> ExitCode {
             memory_id,
             expected_version,
         } => run_retract(memory_id, expected_version),
+        MemoryCommand::Confirm {
+            memory_id,
+            expected_version,
+        } => run_confirm(memory_id, expected_version),
+        MemoryCommand::Refute {
+            memory_id,
+            expected_version,
+        } => run_refute(memory_id, expected_version),
         MemoryCommand::Merge { survivor, losers } => run_merge(survivor, losers),
         MemoryCommand::Rescope {
             memory_id,
@@ -656,6 +693,107 @@ fn run_retract(id: String, expected_version: i64) -> ExitCode {
         }
         Ok(Err(e)) => fail(BIN, &memory_op_error_message(&e)),
         Err(e) => fail(BIN, &format!("could not retract {id}: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// confirm / refute (D-079)
+//
+// The `hypothesis` machine's own two verbs. Same shape as `run_retract`, which
+// they sit next to deliberately: whichever kind an entry has, the CLI's
+// state-moving commands are one domain call in one transaction with an
+// `--expected-version` precondition, and nothing else.
+// ---------------------------------------------------------------------------
+
+fn run_confirm(id: String, expected_version: i64) -> ExitCode {
+    let (layout, _config) = match resolve_layout_and_config() {
+        Ok(v) => v,
+        Err(e) => return fail(BIN, &e),
+    };
+    let state = match open_state(&layout) {
+        Ok(s) => s,
+        Err(e) => return fail(BIN, &e),
+    };
+    let now_ms = system_now_ms();
+    let outcome = block_on({
+        let id = id.clone();
+        async move {
+            state
+                .writer()
+                .transaction(move |tx| {
+                    apply_confirm(
+                        tx,
+                        &ConfirmMemoryOp {
+                            memory_id: &id,
+                            expected_version,
+                            evidence: &[],
+                            actor: Actor::User,
+                            idempotency_key: None,
+                        },
+                        now_ms,
+                    )
+                })
+                .await
+        }
+    });
+
+    match outcome {
+        Ok(Ok(op_outcome)) => {
+            println!(
+                "{BIN}: confirmed {id} -> entry_version {}, audit_id {}",
+                op_outcome_entry_version(&op_outcome),
+                op_outcome_audit_id(&op_outcome)
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Err(e)) => fail(BIN, &memory_op_error_message(&e)),
+        Err(e) => fail(BIN, &format!("could not confirm {id}: {e}")),
+    }
+}
+
+fn run_refute(id: String, expected_version: i64) -> ExitCode {
+    let (layout, _config) = match resolve_layout_and_config() {
+        Ok(v) => v,
+        Err(e) => return fail(BIN, &e),
+    };
+    let state = match open_state(&layout) {
+        Ok(s) => s,
+        Err(e) => return fail(BIN, &e),
+    };
+    let now_ms = system_now_ms();
+    let outcome = block_on({
+        let id = id.clone();
+        async move {
+            state
+                .writer()
+                .transaction(move |tx| {
+                    apply_reject(
+                        tx,
+                        &RejectMemoryOp {
+                            memory_id: &id,
+                            expected_version,
+                            evidence: &[],
+                            actor: Actor::User,
+                            idempotency_key: None,
+                        },
+                        now_ms,
+                    )
+                })
+                .await
+        }
+    });
+
+    match outcome {
+        Ok(Ok(op_outcome)) => {
+            println!(
+                "{BIN}: rejected {id} -> entry_version {}, audit_id {}",
+                op_outcome_entry_version(&op_outcome),
+                op_outcome_audit_id(&op_outcome)
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Err(e)) => fail(BIN, &memory_op_error_message(&e)),
+        Err(e) => fail(BIN, &format!("could not reject {id}: {e}")),
     }
 }
 

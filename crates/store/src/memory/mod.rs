@@ -43,7 +43,10 @@
 //!
 //! T14-03 adds the lifecycle/edit ops in the same module:
 //! [`op::apply_resolve`]/[`op::apply_retract`] (kind-specific state
-//! transitions, spec 04 §5), [`op::apply_supersede`] (the promotion op —
+//! transitions, spec 04 §5), joined by [`op::apply_confirm`]/
+//! [`op::apply_reject`] (D-079: the `hypothesis` machine's own two verbs,
+//! declared by that same table since rev 6 and until then unreachable by any
+//! op), [`op::apply_supersede`] (the promotion op —
 //! create a new entry, retire the old one, one transaction; see D-020 below),
 //! and [`op::apply_edit`] (the one op allowed to change `text`).
 //!
@@ -135,10 +138,10 @@ pub use normalization::{
 };
 pub(crate) use normalization::{SCHEMA_V14, SCHEMA_V15};
 pub use op::{
-    CreateMemoryOp, EditMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome, MemoryOpResult,
-    MergeLoser, MergeMemoryOp, ReinforceMemoryOp, ResolveMemoryOp, RetractMemoryOp,
-    SupersedeMemoryOp, apply_create, apply_edit, apply_merge, apply_noop, apply_reinforce,
-    apply_resolve, apply_retract, apply_supersede,
+    ConfirmMemoryOp, CreateMemoryOp, EditMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome,
+    MemoryOpResult, MergeLoser, MergeMemoryOp, ReinforceMemoryOp, RejectMemoryOp, ResolveMemoryOp,
+    RetractMemoryOp, SupersedeMemoryOp, apply_confirm, apply_create, apply_edit, apply_merge,
+    apply_noop, apply_reinforce, apply_reject, apply_resolve, apply_retract, apply_supersede,
 };
 pub use review::{
     ApproveCandidateOutcome, CandidateRow, ProposedOperation, ReviewError, approve_candidate,

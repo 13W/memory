@@ -1,4 +1,4 @@
-//! `local-rag memory list|approve|reject|edit|retract|merge|evidence`
+//! `local-rag memory list|approve|reject|edit|retract|confirm|refute|merge|evidence`
 //! acceptance tests (spec 11 §6, D-025), driving the real compiled binary —
 //! mirrors `tests/cli_repo.rs`'s own `open_layout`/`run_cli`/seeding helpers
 //! (duplicated here per this crate's established per-file-fixture
@@ -41,6 +41,16 @@ fn run_cli(home: &TempHome, args: &[&str]) -> Output {
 }
 
 async fn seed_entry(state: &StateDb, memory_id: &str, text: &str, now_ms: i64) {
+    seed_entry_of_kind(state, memory_id, MemoryKind::Fact, text, now_ms).await;
+}
+
+async fn seed_entry_of_kind(
+    state: &StateDb,
+    memory_id: &str,
+    kind: MemoryKind,
+    text: &str,
+    now_ms: i64,
+) {
     let (id, text) = (memory_id.to_string(), text.to_string());
     state
         .writer()
@@ -49,7 +59,7 @@ async fn seed_entry(state: &StateDb, memory_id: &str, text: &str, now_ms: i64) {
                 tx,
                 &NewMemoryEntry {
                     memory_id: &id,
-                    kind: MemoryKind::Fact,
+                    kind,
                     text: &text,
                     canonical_key: None,
                     scope_kind: ScopeKind::Global,
@@ -293,6 +303,79 @@ async fn memory_retract_is_not_delete_and_remains_visible_by_state_filter() {
         "{:?}",
         stdout(&output)
     );
+}
+
+// ---------------------------------------------------------------------------
+// confirm / refute (D-079)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn memory_confirm_moves_a_hypothesis_to_confirmed() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry_of_kind(&state, "mem-hyp", MemoryKind::Hypothesis, "text", 1_000).await;
+    }
+
+    let output = run_cli(
+        &home,
+        &["memory", "confirm", "mem-hyp", "--expected-version", "1"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("confirmed mem-hyp -> entry_version 2"),
+        "{:?}",
+        stdout(&output)
+    );
+
+    let output = run_cli(&home, &["memory", "list", "--state", "confirmed"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stdout(&output).contains("mem-hyp"), "{:?}", stdout(&output));
+}
+
+#[tokio::test]
+async fn memory_refute_moves_a_hypothesis_to_rejected() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry_of_kind(&state, "mem-hyp", MemoryKind::Hypothesis, "text", 1_000).await;
+    }
+
+    let output = run_cli(
+        &home,
+        &["memory", "refute", "mem-hyp", "--expected-version", "1"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("rejected mem-hyp -> entry_version 2"),
+        "{:?}",
+        stdout(&output)
+    );
+
+    let output = run_cli(&home, &["memory", "list", "--state", "rejected"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stdout(&output).contains("mem-hyp"), "{:?}", stdout(&output));
+}
+
+/// The kind guard reaches the CLI as a typed message, not a panic — the same
+/// contract `memory retract` has for a hypothesis (whose state set has no
+/// `retracted`), only mirrored.
+#[tokio::test]
+async fn memory_confirm_on_a_fact_is_a_typed_illegal_transition() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_entry(&state, "mem-fact", "text", 1_000).await;
+    }
+
+    let output = run_cli(
+        &home,
+        &["memory", "confirm", "mem-fact", "--expected-version", "1"],
+    );
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let err = stderr(&output);
+    assert!(err.contains("illegal memory transition"), "{err}");
+    assert!(err.contains("fact"), "{err}");
 }
 
 #[tokio::test]

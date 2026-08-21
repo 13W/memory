@@ -300,7 +300,8 @@ pub enum MemoryNav {
         losers: Vec<(String, i64)>,
         error: Option<String>,
     },
-    /// Gates a `destructiveHint: true` action (today, exactly `retract_memory`) behind an explicit
+    /// Gates a `destructiveHint: true` action (today `retract_memory`, and `reject_memory` since
+    /// D-079, though this screen has no reject action) behind an explicit
     /// yes/no before `execute_memory_action` ever runs — see `gate`'s own doc.
     ConfirmAction {
         action: Box<MemoryAction>,
@@ -790,8 +791,9 @@ fn catalog_requires_confirmation(tool_name: &str) -> bool {
 
 /// Every mutation trigger funnels through here: consult the real MCP catalog for `action`'s own
 /// tool, and either gate it behind an explicit `ConfirmAction` or let it execute immediately. Today
-/// this inserts a confirm step only for `retract_memory` (verified against the real `catalog()`,
-/// never a mock — `daemon/mcp/tools.rs`'s own regression test holds that invariant catalog-wide),
+/// this inserts a confirm step only for `retract_memory` — the catalog's other destructive tool,
+/// `reject_memory` (D-079), has no action on this screen — verified against the real `catalog()`,
+/// never a mock (`daemon/mcp/tools.rs`'s own regression test holds that invariant catalog-wide),
 /// and will automatically follow the catalog if it ever changes.
 fn gate(action: MemoryAction) -> MemoryKeyOutcome {
     let list = action.list().clone();
@@ -872,7 +874,7 @@ fn start_edit(list: &ListNav, data: &MemoryScreenData) -> MemoryKeyOutcome {
 }
 
 /// `x`/`X` — retract the selected entry. `Entries` mode only. Always `ConfirmAction`-gated in
-/// practice (`retract_memory` is the one `destructiveHint: true` tool), decided dynamically by
+/// practice (`retract_memory` is `destructiveHint: true`), decided dynamically by
 /// `gate`, never hardcoded here.
 fn start_retract(list: &ListNav, data: &MemoryScreenData) -> MemoryKeyOutcome {
     if list.mode != MemoryMode::Entries {

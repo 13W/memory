@@ -38,7 +38,7 @@ version, never a silent change.
 ## 3. Transactional memory operations `[FIXED]`
 
 Operations: `create | reinforce | resolve | supersede | retract | noop`
-(+ `edit`, `merge` from review tools). Contract for every operation:
+(+ `edit`, `merge`, `confirm`, `reject` from review tools). Contract for every operation:
 
 - Single `state.sqlite` tx containing: the entry mutation, `memory_evidence` rows,
   `audit_event` (with `idempotency_key` when router-originated), and — for consolidation —
@@ -62,6 +62,8 @@ Operations: `create | reinforce | resolve | supersede | retract | noop`
   `purge` (12 §5) which also rewrites audit references to tombstones `[SPEC]`.
 - `merge_memories`: one tx — survivor absorbs evidence, losers → `superseded` with
   `supersedes_id` → survivor; audit records the merge set.
+- `confirm`/`reject`: the `hypothesis` machine's own two transitions (04 §5), `active →
+  confirmed` and `active → rejected` `[SPEC]` — see the D-079 note below.
 
 Amendment note (T21-12, `[FIXED]` change under
 [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)): the two `[FIXED]` bullets above about
@@ -74,6 +76,17 @@ explains why refusing a write whose translation failed would be the worse failur
 that performs the boundary translation is `T21-14`'s and lives **above** `crates/store`: a
 generative model must not run inside the write transaction (the precedent D-063 set for
 subprocesses).
+
+As-built note (D-079, `[SPEC]`): `confirm`/`reject` are listed above with `edit` and `merge`
+rather than in the headline six on purpose — like those two they are **review-tool** verbs, not
+router ops. This list and 04 §5's transition table had disagreed since idea.md rev 6: the table
+declared `hypothesis: active → confirmed | rejected | superseded` while this list held no verb
+able to reach the first two states, so the transitions were legal, tested at the guard, and
+unreachable by any caller. `op::apply_confirm`/`apply_reject` close that (04 §5's D-079 note has
+the full account). Two boundaries this deviation deliberately did **not** cross: §4's router op
+envelope is unchanged, so the model still cannot emit `confirm`/`reject` and the
+`memory.router.op.*` corpus is unmoved; and `ProposedOperation` is unchanged, so a candidate
+cannot propose them either — for the same reason it cannot propose `edit`/`merge`.
 
 As-built note (T14-02, `[SPEC]`): `local_rag_store::memory::op` ships exactly `create`/
 `reinforce`/`noop` — the shared transactional engine `resolve`/`supersede`/`retract`/`edit`

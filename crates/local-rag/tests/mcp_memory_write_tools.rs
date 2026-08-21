@@ -1,6 +1,7 @@
 //! T15-05 store-backed MCP tool tests: `remember`/`approve_memory_candidate`/
 //! `reject_memory_candidate`/`edit_memory_candidate`/`edit_memory`/
-//! `retract_memory`/`merge_memories`/`give_feedback` — happy/error/retry per
+//! `retract_memory`/`confirm_memory`/`reject_memory`/`merge_memories`/
+//! `give_feedback` — happy/error/retry per
 //! tool, `expected_version` conflicts, actor/trust semantics, feedback
 //! duplicate request.
 
@@ -1042,6 +1043,226 @@ async fn retract_memory_happy_path() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
     assert_eq!(parsed["outcome"], "applied", "{text}");
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+// ---------------------------------------------------------------------
+// confirm_memory / reject_memory (D-079)
+//
+// The two verbs spec 04 §5 declared for `hypothesis` and nothing implemented
+// until D-079. `retract_memory_illegal_for_hypothesis` right below is the
+// other half of the same story: `retracted` is not in a hypothesis's state
+// set, so before these two tools a hypothesis had no legal exit but a merge.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn confirm_memory_happy_path() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_memory_entry(
+            &state,
+            "mem-1",
+            MemoryKind::Hypothesis,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "a hypothesis",
+            1_000,
+        )
+        .await;
+    }
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"confirm_memory","arguments":{"id":"mem-1","expected_version":1}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(false), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["outcome"], "applied", "{text}");
+    assert_eq!(parsed["entry_version"], 2, "{text}");
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn confirm_memory_illegal_for_a_fact() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_memory_entry(
+            &state,
+            "mem-1",
+            MemoryKind::Fact,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "a fact",
+            1_000,
+        )
+        .await;
+    }
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"confirm_memory","arguments":{"id":"mem-1","expected_version":1}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(true), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("\"code\":\"ILLEGAL_MEMORY_TRANSITION\""),
+        "{text}"
+    );
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn confirm_memory_expected_version_conflict() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_memory_entry(
+            &state,
+            "mem-1",
+            MemoryKind::Hypothesis,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "a hypothesis",
+            1_000,
+        )
+        .await;
+    }
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let body = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"confirm_memory","arguments":{"id":"mem-1","expected_version":42}}}"#,
+            None,
+        )
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(body["result"]["isError"], Value::Bool(true), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"code\":\"OPTIMISTIC_CONFLICT\""), "{text}");
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn reject_memory_happy_path_and_retry_is_optimistic_conflict() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_memory_entry(
+            &state,
+            "mem-1",
+            MemoryKind::Hypothesis,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "a hypothesis",
+            1_000,
+        )
+        .await;
+    }
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let (first, second) = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reject_memory","arguments":{"id":"mem-1","expected_version":1}}}"#;
+        let first = client.call_and_read(call, None);
+        let second = client.call_and_read(call, None);
+        (first, second)
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(first["result"]["isError"], Value::Bool(false), "{first}");
+    assert_eq!(second["result"]["isError"], Value::Bool(true), "{second}");
+    let text = second["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"code\":\"OPTIMISTIC_CONFLICT\""), "{text}");
+
+    drop(home);
+    handle.shutdown().await;
+}
+
+/// D-079's own boundary, and the reason `reject_memory` is not "undo a
+/// confirm": spec 04 §5 gives `reject` no role once a hypothesis is confirmed
+/// (D-020), so the only way out of `confirmed` stays `supersede`.
+#[tokio::test]
+async fn reject_memory_illegal_once_the_hypothesis_is_confirmed() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_memory_entry(
+            &state,
+            "mem-1",
+            MemoryKind::Hypothesis,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "a hypothesis",
+            1_000,
+        )
+        .await;
+    }
+
+    let socket_path = layout.socket_path();
+    let handle = start(&layout).await;
+    let (confirmed, rejected) = tokio::task::spawn_blocking(move || {
+        let mut client = Client::connect(&socket_path);
+        let confirmed = client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"confirm_memory","arguments":{"id":"mem-1","expected_version":1}}}"#,
+            None,
+        );
+        let rejected = client.call_and_read(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reject_memory","arguments":{"id":"mem-1","expected_version":2}}}"#,
+            None,
+        );
+        (confirmed, rejected)
+    })
+    .await
+    .expect("blocking task");
+
+    assert_eq!(
+        confirmed["result"]["isError"],
+        Value::Bool(false),
+        "{confirmed}"
+    );
+    assert_eq!(
+        rejected["result"]["isError"],
+        Value::Bool(true),
+        "{rejected}"
+    );
+    let text = rejected["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("\"code\":\"ILLEGAL_MEMORY_TRANSITION\""),
+        "{text}"
+    );
 
     drop(home);
     handle.shutdown().await;

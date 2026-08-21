@@ -230,6 +230,12 @@ async fn route_tools_call(
         "retract_memory" => {
             super::memory_write::retract_memory(memory, &call.arguments, ctx.now_ms).await
         }
+        "confirm_memory" => {
+            super::memory_write::confirm_memory(memory, &call.arguments, ctx.now_ms).await
+        }
+        "reject_memory" => {
+            super::memory_write::reject_memory(memory, &call.arguments, ctx.now_ms).await
+        }
         "merge_memories" => {
             super::memory_write::merge_memories(memory, &call.arguments, ctx.now_ms).await
         }
