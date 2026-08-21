@@ -16,22 +16,41 @@
 //!
 //! `local_rag_store::memory::runner`'s own module doc reserves the *name* "scored
 //! relevance pipeline" for [`pipeline`] and keeps
-//! [`local_rag_store::ConsolidationWindow`] free of any such field — the
-//! router's use case (find entries a proposed op might conflict with) is
-//! answered correctly by an honest union of touched scopes, and pulling in
-//! the FTS/cosine machinery here would duplicate [`pipeline`] for no gain: a
-//! consolidation window is not a recall request, and the router already
-//! shows the model every relevant entry (bounded, not ranked) rather than a
-//! ranked top-K a small local model would have no reliable way to ask for
-//! "the next one" beyond.
+//! [`local_rag_store::ConsolidationWindow`] free of any such field. What the
+//! router receives is still an **unscored set**, not a ranked top-K a small
+//! local model would have no reliable way to ask for "the next one" beyond:
+//! every recall-eligible entry in every scope the window's own observations
+//! actually touch (global, always; each distinct `repo_id`/`worktree_id` seen
+//! among the window's [`WindowObservation`]s). [`crate::prompt`] shows that
+//! set to the model so it can target an existing entry by `memory_id` (see
+//! [`crate::schema`]'s module doc for why `memory_id`, never `canonical_key`,
+//! is the addressing key).
 //!
-//! Every recall-eligible entry in every scope the window's own observations
-//! actually touch (global, always; each distinct `repo_id`/`worktree_id`
-//! seen among the window's [`WindowObservation`]s) — a real, unscored
-//! candidate set, not a fabricated relevance ranking. [`crate::prompt`] shows
-//! this set to the model so it can target an existing entry by `memory_id`
-//! (see [`crate::schema`]'s module doc for why `memory_id`, never
-//! `canonical_key`, is the addressing key).
+//! What this doc used to claim, and D-080 had to take back: that the router
+//! "already shows the model every relevant entry (bounded, not ranked)". It
+//! did not. The set was sorted by `memory_id` — UUIDv7, so time-ascending —
+//! and truncated at [`MAX_PROMPT_CANDIDATES`], which means a scope holding
+//! more than the cap showed the model only its **oldest** entries and hid
+//! everything recent, including what the router itself had written a window
+//! earlier. The reasoning above was sound about the *shape* of the answer and
+//! silently wrong about its *contents*; the paragraph discussed only whether
+//! the truncation was deterministic, never what the chosen order threw away.
+//! That blind spot is the mechanism behind D-078's 136 copies of one
+//! sentence, and on the owner's store it was live: 68 eligible entries
+//! against a cap of 50, the 18 newest discarded on every run.
+//!
+//! So ranking now enters — narrowly, and only where the prompt overflows.
+//! When the union fits, nothing changed. When it does not,
+//! [`candidate_conflict_set`] keeps the entries the window is lexically
+//! related to (spec 08 §4 step 3's own word: "plausibly related") and then
+//! fills what is left newest-first — and shows them in that order, because
+//! putting the entry the window is about at the bottom of a fifty-item list
+//! spends the fix on nothing. This is not [`pipeline`] duplicated:
+//! only its lexical leg is reused, and that leg is a pure synchronous
+//! function over an already-fetched list backed by an ephemeral in-memory
+//! FTS5 table — no embedder, no persistence, nothing async. "A consolidation
+//! window is not a recall request" still holds for what the router *gets*;
+//! it never justified choosing what to drop by age.
 //!
 //! [`resolve_target`] is the second, independent use of recall: **after**
 //! generation, re-resolving whatever `target_memory_id` the model echoed back
@@ -62,7 +81,7 @@ pub use pipeline::{
     recall, scopes_for,
 };
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use local_rag_store::rusqlite;
 use local_rag_store::rusqlite::Connection;
@@ -73,16 +92,43 @@ use local_rag_store::{
 
 /// `[SPEC]` placeholder cap on how many existing entries [`candidate_conflict_set`]
 /// puts in front of the model — bounds prompt size for a small local model's
-/// context window. Entries are ordered by `memory_id` (time-ordered, since
-/// ids are UUIDv7) before truncating, so which entries survive the cap is
-/// deterministic and golden-testable, not a function of scope-iteration
-/// order.
+/// context window.
+///
+/// **Which** entries survive it is D-080's rule, not a byproduct of the sort:
+/// entries lexically related to the window first, then the rest newest-first
+/// (see [`candidate_conflict_set`]). Until D-080 the set was simply sorted by
+/// `memory_id` — time-ascending, since ids are UUIDv7 — and truncated, so a
+/// scope larger than the cap showed the model only its **oldest** entries and
+/// hid everything recent, including what the router itself had written a
+/// window earlier.
 pub const MAX_PROMPT_CANDIDATES: usize = 50;
 
 /// Every recall-eligible entry in a scope the window's observations touch:
 /// the global scope, plus one lookup per distinct `repo_id`/`worktree_id`
-/// seen. Deduplicated and ordered by `memory_id`, truncated to
-/// [`MAX_PROMPT_CANDIDATES`].
+/// seen, deduplicated.
+///
+/// At most [`MAX_PROMPT_CANDIDATES`] of them reach the model. When the union
+/// fits, every entry goes, ordered by `memory_id` — byte-identical to what
+/// this function did before D-080. When it does not fit, the survivors are
+/// chosen (D-080), not truncated off the tail:
+///
+/// 1. entries the window is lexically related to, best match first — this is
+///    spec 08 §4 step 3's own word, "plausibly related";
+/// 2. then the remaining entries **newest first**, filling the rest of the
+///    budget, because the entries the router most often needs to reinforce,
+///    supersede or retract are the ones it wrote most recently.
+///
+/// Above the cap the set is also **presented** in that order, most related
+/// first. Below it, order stays `memory_id` ascending as it always was —
+/// where nothing was dropped, the order carries no signal to pass on. That
+/// asymmetry was measured, not assumed: presenting the selection in
+/// `memory_id` order left the one entry the window was about sitting at
+/// position 49 of 50, and the model answered `noop`; moving it to the front
+/// changed the answer (D-080's evidence has the full three-way run).
+///
+/// A window with no excerpt text at all yields no query terms, so selection
+/// falls back to rule 2 alone and no SQL is issued — the same treatment
+/// [`lexical_leg`] gives a termless query.
 pub fn candidate_conflict_set(
     conn: &Connection,
     observations: &[WindowObservation],
@@ -118,8 +164,57 @@ pub fn candidate_conflict_set(
 
     out.sort_by(|a, b| a.memory_id.cmp(&b.memory_id));
     out.dedup_by(|a, b| a.memory_id == b.memory_id);
-    out.truncate(MAX_PROMPT_CANDIDATES);
+    if out.len() > MAX_PROMPT_CANDIDATES {
+        out = select_prompt_candidates(out, observations)?;
+    }
     Ok(out)
+}
+
+/// D-080's selection, applied only when the union overflows
+/// [`MAX_PROMPT_CANDIDATES`]: lexical matches against the window's own text
+/// first, then the rest newest-first. `entries` arrives sorted by `memory_id`
+/// ascending and deduplicated.
+fn select_prompt_candidates(
+    entries: Vec<MemoryEntrySummary>,
+    observations: &[WindowObservation],
+) -> rusqlite::Result<Vec<MemoryEntrySummary>> {
+    let query = window_query(observations);
+    let docs: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|e| (e.memory_id.as_str(), e.text.as_str()))
+        .collect();
+    let ranked = lexical::rank_by_lexical(&query, &docs, MAX_PROMPT_CANDIDATES)?;
+
+    let mut by_id: BTreeMap<&str, &MemoryEntrySummary> =
+        entries.iter().map(|e| (e.memory_id.as_str(), e)).collect();
+
+    let mut chosen: Vec<MemoryEntrySummary> = Vec::with_capacity(MAX_PROMPT_CANDIDATES);
+    for (memory_id, _) in &ranked {
+        if let Some(entry) = by_id.remove(memory_id.as_str()) {
+            chosen.push(entry.clone());
+        }
+    }
+    // `by_id` is a BTreeMap keyed by `memory_id`, so iterating it in reverse
+    // is newest-first: ids are UUIDv7, and lexicographic order on them is
+    // chronological.
+    for (_, entry) in by_id.iter().rev() {
+        if chosen.len() >= MAX_PROMPT_CANDIDATES {
+            break;
+        }
+        chosen.push((*entry).clone());
+    }
+    Ok(chosen)
+}
+
+/// The query D-080's selection ranks against: the window's own excerpt text,
+/// which is exactly what [`crate::prompt`] shows the model. An observation
+/// with no excerpt contributes nothing (it has no content to be related to).
+fn window_query(observations: &[WindowObservation]) -> String {
+    observations
+        .iter()
+        .filter_map(|o| o.short_evidence_excerpt.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Fresh-resolve `target_memory_id` (see the module doc's "never trust an
@@ -162,6 +257,16 @@ mod tests {
         uuidv7_from(1000, rand).to_string()
     }
 
+    /// Ids that stay chronologically ordered past 256 entries: `uuidv7_from`
+    /// pins the timestamp, so ordering comes from the random tail, and the
+    /// last two bytes ascending means the id string ascends too.
+    fn uuid_at(i: u16) -> String {
+        let mut rand = [0u8; 10];
+        rand[8] = (i >> 8) as u8;
+        rand[9] = (i & 0xff) as u8;
+        uuidv7_from(1000, rand).to_string()
+    }
+
     fn open_state() -> (TempHome, StateDb) {
         let home = TempHome::new().expect("temp home");
         let layout = StoreLayout::new(home.join("local-rag"));
@@ -177,7 +282,30 @@ mod tests {
         scope_kind: ScopeKind,
         scope_owner_id: &str,
     ) {
-        let (id, owner) = (memory_id.to_string(), scope_owner_id.to_string());
+        create_memory_with_text(
+            db,
+            memory_id,
+            kind,
+            scope_kind,
+            scope_owner_id,
+            "some durable text",
+        )
+        .await;
+    }
+
+    async fn create_memory_with_text(
+        db: &StateDb,
+        memory_id: &str,
+        kind: MemoryKind,
+        scope_kind: ScopeKind,
+        scope_owner_id: &str,
+        text: &str,
+    ) {
+        let (id, owner, text) = (
+            memory_id.to_string(),
+            scope_owner_id.to_string(),
+            text.to_string(),
+        );
         db.writer()
             .transaction(move |tx| {
                 create_memory_entry(
@@ -185,7 +313,7 @@ mod tests {
                     &NewMemoryEntry {
                         memory_id: &id,
                         kind,
-                        text: "some durable text",
+                        text: &text,
                         canonical_key: None,
                         scope_kind,
                         scope_owner_id: &owner,
@@ -276,6 +404,174 @@ mod tests {
         let read = db.open_read().expect("read conn");
         let found = candidate_conflict_set(&read, &[]).expect("query");
         assert!(found.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // D-080: which entries survive MAX_PROMPT_CANDIDATES
+    //
+    // Every test here seeds a global scope *larger* than the cap, because
+    // that is the only situation in which the selection rule runs at all —
+    // and, until D-080, the only situation in which the router went blind.
+    // -----------------------------------------------------------------
+
+    /// Filler text with no term in common with [`WINDOW_TEXT`], so the
+    /// lexical half of the rule cannot match it and the recency half decides.
+    fn filler_text(i: u16) -> String {
+        format!("Unrelated durable note number {i} about build tooling.")
+    }
+
+    const WINDOW_TEXT: &str =
+        "We changed our mind: the internal API will use gRPC instead of REST from now on.";
+
+    /// `n` global entries, ids ascending with `i` (so higher `i` is newer).
+    /// `related` gets text that overlaps [`WINDOW_TEXT`]; everything else gets
+    /// [`filler_text`].
+    async fn seed_global_entries(db: &StateDb, n: u16, related: &[u16]) {
+        for i in 0..n {
+            let text = if related.contains(&i) {
+                format!("Use REST for the internal API ({i}).")
+            } else {
+                filler_text(i)
+            };
+            create_memory_with_text(
+                db,
+                &uuid_at(i),
+                MemoryKind::Decision,
+                ScopeKind::Global,
+                GLOBAL_SCOPE_OWNER_ID,
+                &text,
+            )
+            .await;
+        }
+    }
+
+    fn window_with_text(text: Option<&str>) -> Vec<WindowObservation> {
+        let mut o = window_observation(None, None);
+        o.short_evidence_excerpt = text.map(str::to_string);
+        vec![o]
+    }
+
+    /// The defect D-080 exists for: the entry the window is actually about was
+    /// created most recently, so the old "sort by id, truncate" rule dropped
+    /// it — the router could not reinforce, supersede or retract what it had
+    /// just written.
+    #[tokio::test]
+    async fn a_recent_related_entry_survives_a_store_larger_than_the_cap() {
+        let (_home, db) = open_state();
+        let n = (MAX_PROMPT_CANDIDATES + 10) as u16;
+        let newest = n - 1;
+        seed_global_entries(&db, n, &[newest]).await;
+
+        let read = db.open_read().expect("read conn");
+        let found =
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+
+        assert_eq!(found.len(), MAX_PROMPT_CANDIDATES);
+        let ids: Vec<&str> = found.iter().map(|e| e.memory_id.as_str()).collect();
+        assert!(
+            ids.contains(&uuid_at(newest).as_str()),
+            "the entry this window is about must reach the model",
+        );
+    }
+
+    /// The other half of the rule: whatever budget the lexical matches leave
+    /// goes to the newest entries, not the oldest. Before D-080 this was
+    /// exactly inverted.
+    #[tokio::test]
+    async fn the_rest_of_the_budget_goes_to_the_newest_entries() {
+        let (_home, db) = open_state();
+        let n = (MAX_PROMPT_CANDIDATES + 10) as u16;
+        seed_global_entries(&db, n, &[0]).await;
+
+        let read = db.open_read().expect("read conn");
+        let found =
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+        let ids: Vec<&str> = found.iter().map(|e| e.memory_id.as_str()).collect();
+
+        assert!(
+            ids.contains(&uuid_at(0).as_str()),
+            "the one lexical match is kept even though it is the oldest entry",
+        );
+        assert!(
+            ids.contains(&uuid_at(n - 1).as_str()),
+            "the newest entry fills the budget",
+        );
+        assert!(
+            !ids.contains(&uuid_at(1).as_str()),
+            "an old, unrelated entry is what gets dropped: {ids:?}",
+        );
+    }
+
+    /// A window with nothing quotable yields no query terms, so no SQL runs
+    /// and recency alone decides — still the newest, never the oldest.
+    #[tokio::test]
+    async fn a_window_with_no_excerpt_keeps_the_newest_entries() {
+        let (_home, db) = open_state();
+        let n = (MAX_PROMPT_CANDIDATES + 10) as u16;
+        seed_global_entries(&db, n, &[]).await;
+
+        let read = db.open_read().expect("read conn");
+        let found = candidate_conflict_set(&read, &window_with_text(None)).expect("query");
+        let ids: Vec<&str> = found.iter().map(|e| e.memory_id.as_str()).collect();
+
+        assert_eq!(found.len(), MAX_PROMPT_CANDIDATES);
+        assert!(ids.contains(&uuid_at(n - 1).as_str()), "{ids:?}");
+        assert!(!ids.contains(&uuid_at(0).as_str()), "{ids:?}");
+    }
+
+    /// The guard on everything that already worked: a union within the cap is
+    /// returned whole, in `memory_id` order, whether or not the window matches
+    /// it. All 42 `memory.router.op.*` fixtures live in this branch (their
+    /// conflict sets are at most one entry), as do the two scope tests above.
+    #[tokio::test]
+    async fn a_union_within_the_cap_is_returned_whole_and_ordered_by_id() {
+        let (_home, db) = open_state();
+        seed_global_entries(&db, 10, &[3]).await;
+
+        let read = db.open_read().expect("read conn");
+        let found =
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+
+        let ids: Vec<String> = found.into_iter().map(|e| e.memory_id).collect();
+        let expected: Vec<String> = (0..10u16).map(uuid_at).collect();
+        assert_eq!(ids, expected, "no reordering, no dropping below the cap");
+    }
+
+    /// Above the cap the survivors are also *shown* related-first. Measured,
+    /// not assumed: with the same selection presented in `memory_id` order
+    /// the one entry the window was about sat at position 49 of 50 and the
+    /// model answered `noop`.
+    #[tokio::test]
+    async fn above_the_cap_the_most_related_entry_is_shown_first() {
+        let (_home, db) = open_state();
+        let n = (MAX_PROMPT_CANDIDATES + 10) as u16;
+        let newest = n - 1;
+        seed_global_entries(&db, n, &[newest]).await;
+
+        let read = db.open_read().expect("read conn");
+        let found =
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+
+        assert_eq!(
+            found[0].memory_id,
+            uuid_at(newest),
+            "the only lexical match must lead the list, not trail it",
+        );
+    }
+
+    /// Selection must stay golden-testable — the property the pre-D-080 sort
+    /// was chosen for, and the one a ranked rule could most easily lose.
+    #[tokio::test]
+    async fn selection_is_deterministic_across_calls() {
+        let (_home, db) = open_state();
+        let n = (MAX_PROMPT_CANDIDATES + 10) as u16;
+        seed_global_entries(&db, n, &[7, 9, 11]).await;
+
+        let read = db.open_read().expect("read conn");
+        let window = window_with_text(Some(WINDOW_TEXT));
+        let first = candidate_conflict_set(&read, &window).expect("query");
+        let second = candidate_conflict_set(&read, &window).expect("query");
+        assert_eq!(first, second);
     }
 
     #[tokio::test]

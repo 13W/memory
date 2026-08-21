@@ -95,7 +95,38 @@ pub fn lexical_leg(
     candidates: &[RecallCandidate],
     limit: usize,
 ) -> rusqlite::Result<Vec<LexicalRecallHit>> {
-    if candidates.is_empty() {
+    let docs: Vec<(&str, &str)> = candidates
+        .iter()
+        .map(|c| (c.memory_id.as_str(), c.text.as_str()))
+        .collect();
+
+    Ok(rank_by_lexical(query, &docs, limit)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, (memory_id, bm25))| LexicalRecallHit {
+            memory_id,
+            rank: i + 1,
+            bm25,
+        })
+        .collect())
+}
+
+/// The leg's actual ranking, over bare `(id, text)` pairs: build the ephemeral
+/// FTS5 table, `MATCH` the tokenized query, return `(id, bm25)` best-first
+/// (`bm25 ASC`, `id ASC` as the deterministic tie-break), cut at `limit`.
+///
+/// Separated from [`lexical_leg`] for [`super::candidate_conflict_set`]
+/// (D-080), which ranks [`local_rag_store::MemoryEntrySummary`]s rather than
+/// [`RecallCandidate`]s and needs no scores. Both callers must tokenize,
+/// match and break ties **identically** — two similar implementations of an
+/// FTS idiom drift, and the router's selection is exactly where a silent
+/// drift would be least visible.
+pub(super) fn rank_by_lexical(
+    query: &str,
+    docs: &[(&str, &str)],
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, f64)>> {
+    if docs.is_empty() {
         return Ok(Vec::new());
     }
     let Some(expr) = match_expression(query) else {
@@ -108,8 +139,8 @@ pub fn lexical_leg(
     )?;
     {
         let mut stmt = conn.prepare("INSERT INTO recall_fts (memory_id, body) VALUES (?1, ?2)")?;
-        for candidate in candidates {
-            stmt.execute(params![candidate.memory_id, candidate.text])?;
+        for (memory_id, text) in docs {
+            stmt.execute(params![memory_id, text])?;
         }
     }
 
@@ -117,23 +148,12 @@ pub fn lexical_leg(
                WHERE recall_fts MATCH ?1 ORDER BY rank ASC, memory_id ASC LIMIT ?2";
     let mut stmt = conn.prepare(sql)?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let rows = stmt
-        .query_map(params![expr, limit], |r| {
-            let memory_id: String = r.get(0)?;
-            let bm25: f64 = r.get(1)?;
-            Ok((memory_id, bm25))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    Ok(rows
-        .into_iter()
-        .enumerate()
-        .map(|(i, (memory_id, bm25))| LexicalRecallHit {
-            memory_id,
-            rank: i + 1,
-            bm25,
-        })
-        .collect())
+    stmt.query_map(params![expr, limit], |r| {
+        let memory_id: String = r.get(0)?;
+        let bm25: f64 = r.get(1)?;
+        Ok((memory_id, bm25))
+    })?
+    .collect::<rusqlite::Result<Vec<_>>>()
 }
 
 #[cfg(test)]

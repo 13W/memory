@@ -380,6 +380,30 @@ mod tests {
         }
     }
 
+    /// D-080: at least one case must put more entries in front of the router
+    /// than `MAX_PROMPT_CANDIDATES` allows through, or the corpus cannot
+    /// observe the selection rule at all. Before D-080 the whole corpus
+    /// seeded at most **one** existing entry against a cap of 50, so the
+    /// router being blind to everything recent was invisible here — the
+    /// defect had to be found on a live store instead.
+    #[test]
+    fn the_shipped_fixture_has_a_case_that_saturates_the_prompt_candidate_cap() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/memory/index.json");
+        let (_version, cases) = load_router_cases(&path).expect("shipped fixture loads");
+        let cap = local_rag_memory::recall::MAX_PROMPT_CANDIDATES;
+        let deepest = cases
+            .iter()
+            .map(|c| c.input.existing_entries.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            deepest > cap,
+            "no case seeds more than the {cap}-entry prompt cap (deepest is {deepest}), so the \
+             corpus cannot tell a working candidate selection from a broken one"
+        );
+    }
+
     #[test]
     fn the_shipped_fixture_has_both_ru_and_en_cases() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -230,6 +230,21 @@ in round two — lives in `fixtures/memory/baseline/`, never deleted even once s
 model-selection decisions (including the `chat_template_override` mechanism round two needed)
 are ADR-0006.
 
+As-built note (D-080, `[SPEC]`): the `memory.router.op.*` corpus gained
+`supersede-existing-past-the-cap-en`, and the reason is worth stating because it is a gap this
+corpus had from the start. Every one of its first 42 cases seeded **at most one** existing entry
+against a router prompt cap of 50, so `candidate_conflict_set`'s ordering and truncation never
+ran: a corpus that cannot saturate the cap cannot tell a working candidate selection from a broken
+one, and D-080's defect — the router being shown only a scope's oldest entries — had to be found
+on a live store instead. The new case is a deliberate twin of `supersede-existing-en`: identical
+observations, identical `expected.op_kinds`, with the same target entry buried as the newest of 56
+global entries. Its 55 fillers share no wording with the window; their job is to saturate the cap,
+not to mislead the model. `crates/xtask/src/memory_bench/corpus.rs` now asserts that *some* case
+exceeds `MAX_PROMPT_CANDIDATES`, so the blind spot cannot silently return. The gate's floors are
+ratios, so the denominator moving from 42 to 43 shifts the aggregate; `thresholds.json` is
+unchanged, and any future move of it stays what that file's own rule requires — a reviewable diff
+with a stated derivation.
+
 As-built note (T10-02, `[SPEC]`): for the brute-force candidate, warm search p95 /
 open / close / registry-startup are measured generically by
 `spike/harness/src/lib.rs::measure_metrics` (adapter-agnostic — the fake and future

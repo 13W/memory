@@ -215,6 +215,44 @@ Router placement rules `[FIXED]`:
   is precisely why the quality gate (§7) exists.
 - Router runs strictly behind the cursor `[FIXED]`.
 
+As-built note (D-080, `[SPEC]`): step 3 says "recall of **plausibly related** existing entries",
+and until D-080 the code did not do that. `local_rag_memory::recall::candidate_conflict_set` built
+the honest scope union, sorted it by `memory_id` — UUIDv7, so time-ascending — and truncated to
+`MAX_PROMPT_CANDIDATES` (50). Past 50 entries in a scope the model was therefore shown only the
+**oldest** ones and never anything recent, including entries the router itself had written a window
+earlier: it could not reinforce, supersede or retract its own output, and re-proposed it instead.
+That is the mechanism behind D-078's 136 copies of one sentence. Measured on the owner's store the
+day D-080 was written: 56 active entries in one repository scope plus 12 global = 68 against a cap
+of 50, so the 18 newest were being discarded on every consolidation.
+
+The cap stays; **which** entries survive it is now a rule rather than a byproduct of the sort:
+lexical matches against the window's own excerpt text first (best match first), then the remaining
+entries newest-first to fill the budget — and above the cap they are presented in that same order.
+Below the cap nothing changed at all: the union is returned whole in `memory_id` order, so the
+function is byte-identical to its pre-D-080 self wherever it already worked. A window with no
+excerpt text yields no query terms and falls back to newest-first without issuing SQL.
+
+The presentation half was measured rather than argued. The first shipped attempt kept `memory_id`
+order after selecting, on the reasoning that changing membership and order at once would confound
+the A/B — and that left the one entry the window was about at position **49 of 50**, where the
+model answered `noop` instead of `supersede`. Front-loading the selection changed the answer.
+Three runs of the same release binary over the same corpus, differing only in this function:
+control (pre-D-080 selection) predicted `create` on the saturating case, `memory_id`-order
+selection predicted `noop`, related-first selection predicted `propose_candidate`. None is the
+labeled `supersede`, and that is stated rather than smoothed: what D-080 fixes is that the entry
+reaches the model at all, which the three different answers prove it now does. Whether this model
+then picks the right op on a 50-entry prompt is §7's quality question, not this one's. The failure
+mode does improve monotonically across the three — writing a duplicate, doing nothing, asking a
+human — but that is one case, and one case is not a quality claim.
+
+This partially revisits `crates/memory/src/recall/mod.rs`'s own "a consolidation window is not a
+recall request" reasoning, deliberately and narrowly: ranking enters only as the rule for *choosing
+what to drop when the prompt overflows*, never as the shape of what the router receives — it still
+gets an unscored set, not a ranked top-K. The machinery is not a second copy of the §6 pipeline
+either: only its lexical leg is used, and that leg (`recall::lexical`) is a pure synchronous
+function over an already-fetched candidate list, backed by an ephemeral in-memory FTS5 table. No
+embedder, no persistence, no cross-database work.
+
 As-built note (T14-06, `[SPEC]`): `local_rag_store::memory::runner` ships steps 1 (extending
 `consolidation.rs`'s T14-01 primitives with lease acquire/renew and the bounded snapshot) and 2–4
 (`run_once`/`commit_apply_run`) — everything except the router itself (step 3's actual generation
