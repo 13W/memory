@@ -248,3 +248,73 @@ async fn a_locked_store_refuses_startup() {
 
     first.shutdown().await;
 }
+
+/// `D-077`: shutdown must **signal** everything before it **waits** for
+/// anything, and it must stop accepting first rather than last.
+///
+/// The order is the whole defect. `shutdown` used to await each worker to
+/// completion before telling the next one anything, so for the length of the
+/// first join the rest of the daemon was still running — and the indexing
+/// supervisor, the one worker that starts minutes-long work on a timer, was
+/// told last. Measured on the owner's store: `daemon stopping` at 11:16:28,
+/// two fresh `indexing cycle started` lines at 11:16:59 and 11:17:17, and
+/// `daemon stopped` only at 11:18:18. An indexing cycle there takes 109–140
+/// seconds, so letting one start during shutdown costs two more minutes.
+///
+/// Asserted on the source rather than by driving a real daemon: reproducing it
+/// needs a worker whose tick is long enough for another to start work inside
+/// it, which is minutes of real indexing, and the property itself — "no await
+/// stands between `daemon stopping` and the last signal" — is exactly a
+/// statement about the order of the statements. Same shape and same reason as
+/// `memory_normalization_worker.rs::the_generator_pool_is_built_once_per_process`.
+#[test]
+fn shutdown_signals_every_worker_before_it_waits_for_any_of_them() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/daemon/lifecycle.rs"
+    ))
+    .expect("read lifecycle.rs");
+    let body = source
+        .split_once("pub async fn shutdown(mut self) {")
+        .expect("shutdown exists")
+        .1;
+    let body = body
+        .split_once("drain_and_shutdown(")
+        .expect("shutdown drains at the end")
+        .0;
+    // Comments quote these same identifiers; the assertions are about the code.
+    let body: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("shutdown must still contain {needle:?}"))
+    };
+
+    let stop_accepting = at("handshake_join.take()");
+    let signal_consolidation = at("consolidation_trigger_stop.take()");
+    let signal_normalization = at("normalization_stop.take()");
+    let cancel_indexing = at("indexing_supervisor.take()");
+    let first_wait = at("resume_handles.drain(")
+        .min(at("consolidation_trigger_join.take()"))
+        .min(at("normalization_join.take()"));
+
+    assert!(
+        stop_accepting < first_wait,
+        "step 1 of spec 02 §4.3 is \"stop accepting\" — it cannot come after a wait",
+    );
+    for (what, at) in [
+        ("the consolidation trigger", signal_consolidation),
+        ("the normalization worker", signal_normalization),
+        ("the indexing supervisor", cancel_indexing),
+    ] {
+        assert!(
+            at < first_wait,
+            "{what} must be told to stop before shutdown waits on anything — otherwise it \
+             keeps running, and keeps starting new work, for the length of that wait (D-077)",
+        );
+    }
+}

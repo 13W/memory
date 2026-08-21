@@ -459,17 +459,69 @@ async fn reconcile(
     ReloadOutcome { started, stopped }
 }
 
-/// Stop every task in `tasks` concurrently and wait for all of them —
-/// `WorktreeTaskHandle::stop` already flushes each task's own last successful
-/// generation before returning (T20-05), so this leaves no dangling tasks and
-/// no orphaned `building` generation behind.
-async fn stop_all(tasks: HashMap<String, WorktreeTaskHandle>) {
+/// How long shutdown waits for the indexing tasks after cancelling them.
+///
+/// Comfortably inside `cli::service::STOP_TIMEOUT` (10 s), because the drain
+/// this bounds is only the first of shutdown's steps — the checkpoint, the
+/// cache close and the lock release all still have to happen before
+/// `local-rag stop` can report success.
+pub(crate) const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(3);
+
+/// Cancel every task in `tasks`, then wait — bounded — for their threads
+/// (`D-077`).
+///
+/// **Cancel, not ask.** Spec 02 §4.3 is explicit that SIGTERM "cancel[s]
+/// reconciles at the next safe point (state tx boundaries)", and
+/// [`WorktreeTaskHandle::stop`] alone does not cancel anything: it signals,
+/// then *joins the OS thread*, so it waits out however long the in-flight
+/// `project_generation` still has to run. On a large store mid-indexing that
+/// is minutes, and `local-rag stop` gives up after ten seconds while the
+/// daemon keeps running — measured on the owner's 24 GB store, where the only
+/// way out was `kill -9`.
+///
+/// [`WorktreeTaskHandle::abort`] is the preemptive half, and the composition
+/// below is the one its own doc prescribes ("a caller that also wants to wait
+/// for the background thread to fully exit afterward may still call `stop`").
+/// It had no production caller before this; the one place it was exercised was
+/// `worktree_task`'s own `cancelling_the_task_mid_cycle_leaves_the_store_valid
+/// _and_reusable`, which is also the proof that cancelling here cannot corrupt
+/// the store.
+///
+/// **Why the wait is still bounded.** Cancellation lands on an `.await`, and
+/// the embed loop's are its `flush` calls — genuine `cache.sqlite` transaction
+/// boundaries, exactly what the spec asks for. But `run_backfill` also has a
+/// long *synchronous* stretch before the first of them (`blob_index` →
+/// `occurrences_for_fts`, called straight from an `async fn`), and no cancel
+/// can preempt that. So the budget exists for the case where the thread is
+/// inside it. Abandoning the join there is safe by the spec's own next
+/// sentence — "Kill at any point is safe by construction (05, 07)" — and by
+/// what the stretch actually is: a read. The thread finishes it, unwinds at
+/// its next `.await`, and exits; the process simply does not wait.
+///
+/// Deregistration is deliberately *not* routed through here: `reconcile`'s
+/// own `handle.stop().await` stays graceful, because a worktree leaving the
+/// registry is not a reason to throw away the projection it is halfway
+/// through.
+pub(crate) async fn stop_all(tasks: HashMap<String, WorktreeTaskHandle>) {
     let mut stopping = Vec::with_capacity(tasks.len());
     for (_, handle) in tasks {
+        handle.abort();
         stopping.push(tokio::spawn(handle.stop()));
     }
-    for join in stopping {
-        let _ = join.await;
+    let joined = async {
+        for join in stopping {
+            let _ = join.await;
+        }
+    };
+    if tokio::time::timeout(SHUTDOWN_JOIN_BUDGET, joined)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "local-rag: an indexing task did not exit within {SHUTDOWN_JOIN_BUDGET:?} of being \
+             cancelled — it is inside a synchronous scan and will exit on its own; shutdown \
+             continues without it"
+        );
     }
 }
 
