@@ -251,11 +251,15 @@ fn handle_create(
 
     // D-078: the claim is already in the store, so re-observing it is a
     // `reinforce`, not a second copy. Checked here rather than hoped for from
-    // the prompt, because the router *cannot* see the duplicate: the candidate
-    // set it is shown is capped at the oldest `MAX_PROMPT_CANDIDATES` entries,
-    // so past that cap it is structurally blind to its own recent output. On
-    // the owner's store that produced 136 identical entries — over half of the
-    // durable memory, and still climbing.
+    // the prompt: when this guard was written the router *could not* see the
+    // duplicate at all, because the candidate set it is shown was capped at
+    // the **oldest** `MAX_PROMPT_CANDIDATES` entries, leaving it structurally
+    // blind to its own recent output. On the owner's store that produced 136
+    // identical entries — over half of the durable memory, and still climbing.
+    // D-080 fixed that selection (related first, then newest), so the router
+    // now usually does see it; this check stays because "usually" is not a
+    // guarantee, and byte-equality is a fact a guard may act on silently
+    // where a model's judgement is not.
     //
     // Deliberately below the review gate, not above it: `propose_candidate`
     // creates no entry, so it cannot duplicate one, and turning a request for

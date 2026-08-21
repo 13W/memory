@@ -519,9 +519,12 @@ pub fn active_entries_for_scope(
 /// The router creates an entry per window and cannot be relied on to notice
 /// that it already made this exact claim: the candidate set it is shown is
 /// capped ([`MAX_PROMPT_CANDIDATES`](crate::MAX_PROMPT_CANDIDATES)-equivalent
-/// on the caller's side), so past that cap it is structurally blind to its own
-/// recent output. On the owner's store that produced **136** copies of one
-/// sentence, over half of the durable memory. `canonical_key` cannot catch
+/// on the caller's side). When this reader was written that cap kept the
+/// **oldest** entries, so past it the router was structurally blind to its own
+/// recent output — on the owner's store that produced **136** copies of one
+/// sentence, over half of the durable memory. D-080 changed which entries
+/// survive the cap (related first, then newest); this lookup still stands,
+/// because the cap itself did not go away. `canonical_key` cannot catch
 /// this: the uniqueness index is partial on non-null keys, and the router
 /// leaves the key null.
 ///
