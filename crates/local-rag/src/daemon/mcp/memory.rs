@@ -11,6 +11,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use local_rag_memory::recall as recall_pipeline;
+
+use crate::daemon::normalization::boundary;
 use local_rag_protocol::ErrorEnvelope;
 use local_rag_store::{
     CURRENT_NORMALIZER_VERSION, CandidateState, MemoryEntryRow, MemoryKind, MemoryState,
@@ -110,6 +112,12 @@ struct RecallResult {
     candidate_count: usize,
     truncated: bool,
     dense_degraded: Option<String>,
+    /// Why the query was not in the store's language, if it wasn't (`T21-15`).
+    /// Its own field beside `dense_degraded` for the same reason that one has
+    /// one: a caller must be able to tell a thin answer from a broken leg
+    /// without parsing prose (02 §6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_degraded: Option<String>,
 }
 
 /// Human-readable degradation reason (T15-04, `[SPEC]` — no wire shape for
@@ -123,6 +131,64 @@ fn dense_degraded_label(d: &recall_pipeline::DenseLegUnavailable) -> String {
         }
         recall_pipeline::DenseLegUnavailable::DimensionMismatch { expected, got } => {
             format!("dimension_mismatch: expected {expected} got {got}")
+        }
+    }
+}
+
+fn query_degraded_label(q: &recall_pipeline::QueryNotNormalized) -> String {
+    match q {
+        recall_pipeline::QueryNotNormalized::NoGenerator => {
+            "no_generator: the query was searched as written".to_string()
+        }
+        recall_pipeline::QueryNotNormalized::TranslationRefused(reason) => {
+            format!("translation_refused: {reason}")
+        }
+    }
+}
+
+/// Decide the query both legs will read.
+///
+/// Reuses the write boundary's own decision function (`T21-14`): "what should
+/// this text be in the canon's language" is one question, and answering it
+/// twice would be two chances to answer it differently.
+///
+/// Measured on the real model, a query-sized translation is ~324 ms (median of
+/// three prompt-shaped samples, `tests/memory_translate_real_model.rs`) — not
+/// the ~800 ms ADR-0010 recorded, which was the *router*'s much larger prompt.
+/// That number is what `local_rag_hook::recall::RECALL_BUDGET` was re-derived
+/// from.
+async fn normalize_query(
+    ctx: &MemoryContext,
+    query: &str,
+) -> (String, Option<recall_pipeline::QueryNotNormalized>) {
+    let generators = ctx.generators.clone();
+    let policy = ctx.data_policy;
+    let model_id = ctx.generator_model_id.clone();
+    let owned = query.to_string();
+    let decided = tokio::task::spawn_blocking(move || {
+        boundary::normalize_for_write(generators.as_deref(), policy, &model_id, "recall", &owned)
+    })
+    .await
+    .unwrap_or_else(|e| boundary::Normalized::Refused {
+        reason: format!("the translation task did not finish: {e}"),
+        kind: local_rag_memory::normalize::translate::TranslateFailureKind::Transient,
+    });
+
+    match decided {
+        boundary::Normalized::AlreadyEnglish { .. } => (query.to_string(), None),
+        boundary::Normalized::Translated { english, .. } => (english, None),
+        // The recall still runs, on the author's own words: the dense leg is
+        // multilingual and does most of the work. What the caller must not get
+        // is silence about why the lexical leg found nothing (02 §6).
+        boundary::Normalized::Refused { reason, kind } => {
+            let marker = if kind
+                == local_rag_memory::normalize::translate::TranslateFailureKind::Unavailable
+            {
+                recall_pipeline::QueryNotNormalized::NoGenerator
+            } else {
+                recall_pipeline::QueryNotNormalized::TranslationRefused(reason)
+            };
+            (query.to_string(), Some(marker))
         }
     }
 }
@@ -151,9 +217,20 @@ pub async fn recall(
         Err(e) => return Ok(infra_err(e)),
     };
 
+    // T21-15, ADR-0011 §Decision 2: the query crosses the same boundary the
+    // write path does, and for the same reason — a store kept in one language
+    // can only rank coherently if the query is in that language too. An empty
+    // (termless) query has nothing to decide, so it never reaches the
+    // translator.
+    let (query, query_degraded) = if query.trim().is_empty() {
+        (query, None)
+    } else {
+        normalize_query(ctx, &query).await
+    };
     let request = recall_pipeline::RecallRequest {
         root,
         query: &query,
+        query_degraded,
     };
     let outcome = match recall_pipeline::recall(
         &state_read,
@@ -181,6 +258,7 @@ pub async fn recall(
         candidate_count: outcome.candidate_count,
         truncated: outcome.truncated,
         dense_degraded: outcome.dense_degraded.as_ref().map(dense_degraded_label),
+        query_degraded: outcome.query_degraded.as_ref().map(query_degraded_label),
     }))
 }
 
@@ -884,4 +962,235 @@ pub async fn health(
         daemon_version: local_rag_core::VERSION.to_string(),
         store_instance_uuid: store_instance_uuid_value,
     }))
+}
+
+#[cfg(test)]
+mod query_boundary_tests {
+    //! The query boundary (T21-15), through the real `recall` handler.
+    //!
+    //! The sharp test here is `a_russian_query_reaches_the_lexical_leg`: it runs
+    //! with the dense leg deliberately unavailable, so the *only* way the entry
+    //! can be found is BM25 — which means finding it proves the translated text
+    //! reached the lexical leg, not merely that a multilingual embedder saved
+    //! the day. That distinction is the whole point of the card, and asserting
+    //! it any other way would assert something weaker.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use local_rag_core::config::DataPolicy;
+    use local_rag_core::identity::SystemUuidV7;
+    use local_rag_core::paths::StoreLayout;
+    use local_rag_embed::{
+        FinishReason, GenError, GenRequest, GenResponse, Generator, GeneratorEntry, GeneratorPool,
+    };
+    use local_rag_memory::recall::{BruteForceCosine, UnavailableEmbedder};
+    use local_rag_store::{
+        CacheDb, GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, ScopeKind, StateDb,
+        create_memory_entry,
+    };
+    use local_rag_test_support::TempHome;
+    use serde_json::json;
+
+    use super::*;
+    use crate::daemon::memory::MemoryContext;
+
+    const STORE_UUID: &str = "01a00000-0000-7000-8000-00000000fffc";
+    /// Distinctive enough that a lexical hit cannot be luck.
+    const ENTRY: &str = "the consolidation runner dead-letters a mechanical failure per build \
+                         fingerprint instead of retrying it forever";
+    const RU_QUERY: &str = "что делает раннер консолидации с механическим отказом";
+    const EN_QUERY: &str = "what does the consolidation runner do with a mechanical failure";
+
+    #[derive(Clone)]
+    struct ScriptedGenerator {
+        calls: Arc<AtomicUsize>,
+        answer: Option<String>,
+    }
+
+    impl ScriptedGenerator {
+        fn translating(english: &str) -> Self {
+            ScriptedGenerator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: Some(english.to_string()),
+            }
+        }
+
+        fn refusing() -> Self {
+            ScriptedGenerator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: None,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn pool(&self) -> Arc<GeneratorPool> {
+            Arc::new(GeneratorPool::new(vec![GeneratorEntry::local(
+                "scripted",
+                Arc::new(self.clone()),
+            )]))
+        }
+    }
+
+    impl Generator for ScriptedGenerator {
+        fn generate(&self, _req: GenRequest) -> Result<GenResponse, GenError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.answer {
+                Some(english) => Ok(GenResponse {
+                    text: json!({ "en": english }).to_string(),
+                    finish_reason: FinishReason::Stop,
+                    tokens_generated: None,
+                }),
+                None => Ok(GenResponse {
+                    text: "not a translation".to_string(),
+                    finish_reason: FinishReason::Stop,
+                    tokens_generated: None,
+                }),
+            }
+        }
+    }
+
+    struct Fixture {
+        _home: TempHome,
+        ctx: MemoryContext,
+    }
+
+    async fn fixture(generators: Option<Arc<GeneratorPool>>) -> Fixture {
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let state = Arc::new(StateDb::open(layout.state_db()).expect("open state.sqlite"));
+        let cache = Arc::new(CacheDb::open(layout.cache_db(), STORE_UUID).expect("open cache"));
+
+        state
+            .writer()
+            .transaction(move |tx| {
+                create_memory_entry(
+                    tx,
+                    &NewMemoryEntry {
+                        memory_id: "mem-1",
+                        kind: MemoryKind::Fact,
+                        text: ENTRY,
+                        canonical_key: None,
+                        scope_kind: ScopeKind::Global,
+                        scope_owner_id: GLOBAL_SCOPE_OWNER_ID,
+                        confidence: 0.6,
+                        importance: 0.5,
+                        valid_from_tree: None,
+                        last_verified_tree: None,
+                        supersedes_id: None,
+                    },
+                    1_000,
+                )
+            })
+            .await
+            .expect("seed tx")
+            .expect("seed ok");
+
+        let ctx = MemoryContext {
+            state,
+            cache,
+            // Deliberately unavailable: see this module's own doc.
+            embedder: Arc::new(UnavailableEmbedder),
+            dense_backend: Arc::new(BruteForceCosine),
+            recall_token_budget: 1500,
+            uuids: Arc::new(SystemUuidV7),
+            generators,
+            generator_model_id: "scripted-model".to_string(),
+            data_policy: DataPolicy::LocalOnly,
+        };
+        Fixture { _home: home, ctx }
+    }
+
+    async fn call_recall(fx: &Fixture, query: Option<&str>) -> Value {
+        let mut args = Map::new();
+        if let Some(q) = query {
+            args.insert("query".to_string(), json!(q));
+        }
+        let raw = recall(&fx.ctx, RequestRoot::default(), &args)
+            .await
+            .expect("handler ran");
+        let value = serde_json::to_value(&raw).expect("serializable");
+        let text = value["content"][0]["text"]
+            .as_str()
+            .expect("one text content block")
+            .to_string();
+        serde_json::from_str(&text).expect("the block is JSON")
+    }
+
+    /// The store is English, so an English query needs no translator at all.
+    #[tokio::test]
+    async fn an_english_query_never_reaches_the_generator() {
+        let generator = ScriptedGenerator::translating("SHOULD NOT BE USED");
+        let fx = fixture(Some(generator.pool())).await;
+
+        let out = call_recall(&fx, Some(EN_QUERY)).await;
+
+        assert_eq!(generator.calls(), 0, "the detector answered on its own");
+        assert_eq!(out["entries"].as_array().map(Vec::len), Some(1));
+        assert!(out.get("query_degraded").is_none(), "{out}");
+    }
+
+    /// The card's actual claim: the translated query reaches **BM25**. With the
+    /// dense leg unavailable there is no other way this entry can be found.
+    #[tokio::test]
+    async fn a_russian_query_reaches_the_lexical_leg() {
+        let generator = ScriptedGenerator::translating(EN_QUERY);
+        let fx = fixture(Some(generator.pool())).await;
+
+        let out = call_recall(&fx, Some(RU_QUERY)).await;
+
+        assert_eq!(generator.calls(), 1);
+        assert!(
+            out["dense_degraded"].is_string(),
+            "the dense leg must be out of the picture for this test to mean anything: {out}",
+        );
+        assert_eq!(
+            out["entries"].as_array().map(Vec::len),
+            Some(1),
+            "found with only BM25 running, which is only possible if the translation \
+             reached the lexical leg: {out}",
+        );
+        assert!(out.get("query_degraded").is_none(), "{out}");
+    }
+
+    /// A refusal degrades the query, not the recall — and says so.
+    #[tokio::test]
+    async fn a_refused_translation_searches_the_original_and_says_so() {
+        let generator = ScriptedGenerator::refusing();
+        let fx = fixture(Some(generator.pool())).await;
+
+        let out = call_recall(&fx, Some(RU_QUERY)).await;
+
+        assert_eq!(generator.calls(), 1);
+        let marker = out["query_degraded"].as_str().expect("marker is present");
+        assert!(marker.starts_with("translation_refused"), "{marker}");
+    }
+
+    /// No installed model is a degradation the caller is told about, not a
+    /// panic and not a silent monolingual search.
+    #[tokio::test]
+    async fn a_missing_model_is_reported_rather_than_hidden() {
+        let fx = fixture(None).await;
+
+        let out = call_recall(&fx, Some(RU_QUERY)).await;
+
+        let marker = out["query_degraded"].as_str().expect("marker is present");
+        assert!(marker.starts_with("no_generator"), "{marker}");
+    }
+
+    /// A termless recall has nothing to translate and must not pay for one.
+    #[tokio::test]
+    async fn a_termless_recall_never_reaches_the_generator() {
+        let generator = ScriptedGenerator::translating("SHOULD NOT BE USED");
+        let fx = fixture(Some(generator.pool())).await;
+
+        let out = call_recall(&fx, None).await;
+
+        assert_eq!(generator.calls(), 0);
+        assert!(out.get("query_degraded").is_none(), "{out}");
+    }
 }

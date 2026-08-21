@@ -356,6 +356,26 @@ query normalization: script-detect the query; translate to English if it is not
 → empty result ⇒ empty additionalContext (no text at all) [FIXED]
 ```
 
+As-built note (T21-15, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)): the
+query-normalization stage above is implemented, and one detail of *where* is worth pinning because
+the obvious reading is wrong. The decision is made **above** this pipeline —
+`crates/local-rag/src/daemon/mcp/memory.rs`, under `spawn_blocking`, reusing the same
+`normalize_for_write` the write boundary uses (T21-14) — and only the already-decided query travels
+down, together with a `query_degraded` marker. `recall()` is synchronous and holds `!Send`
+connections, so it cannot be moved off the async worker from inside; and answering "what is this
+text in the canon's language" in two places would be two chances to answer it differently.
+
+Both legs then read one string, which is the entire point: the store is English, so a query that
+is not reaches only the dense leg. `crates/local-rag/src/daemon/mcp/memory.rs::
+query_boundary_tests::a_russian_query_reaches_the_lexical_leg` proves the fix with the dense leg
+deliberately unavailable — the entry can only be found by BM25 there, so finding it is proof the
+translation reached the lexical leg rather than a multilingual embedder covering for it.
+
+A termless recall never reaches the translator, an already-English query is short-circuited by the
+pure detector at no cost, and a refusal searches the author's own words with the marker set rather
+than failing (02 §6). The hook's budget moved to accommodate the step — 11 §3.2's own amendment
+note has the measurement it was re-derived from.
+
 Model-space migration covers the memory representation exactly like code `[FIXED]`.
 
 Full recall (deferred, additive): + tree-validity/provenance → evidence trust → weak
