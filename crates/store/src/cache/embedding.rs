@@ -279,6 +279,45 @@ pub fn delete_embedding(tx: &Transaction<'_>, key: &EmbeddingKey) -> rusqlite::R
     Ok(removed > 0)
 }
 
+/// Delete every `embedding_cache` row for one subject, across **all**
+/// representations, returning how many went.
+///
+/// [`delete_embedding`] needs the full three-field key because its callers —
+/// integrity eviction and budget LRU — are always acting on one specific row.
+/// A privacy purge is not: it is deleting a subject, and a subject may hold a
+/// vector in every model space the store has ever had. Enumerating those
+/// spaces at the call site would make the deletion's completeness depend on a
+/// list the caller has no reason to know, so the filter drops the
+/// representation instead (`D-074`).
+pub fn delete_embeddings_for_subject(
+    tx: &Transaction<'_>,
+    subject_kind: SubjectKind,
+    subject_hash: &str,
+) -> rusqlite::Result<u64> {
+    let removed = tx.execute(
+        "DELETE FROM embedding_cache WHERE subject_kind = ?1 AND subject_hash = ?2",
+        params![subject_kind.as_str(), subject_hash],
+    )?;
+    Ok(removed as u64)
+}
+
+/// Delete every `embedding_cache` row belonging to a memory entry, returning
+/// how many went — `purge --all`'s half of `D-074`.
+///
+/// Deliberately a wholesale delete by kind rather than a loop over the hashes
+/// of the entries being purged. `purge --all` removes every memory entry, so
+/// the two are equivalent for rows that have a live subject; they differ for
+/// rows that no longer do, and there the wholesale form is the correct one.
+/// An orphan is exactly what must not survive the operation whose whole
+/// purpose is that nothing derived from the purged text remains.
+pub fn delete_all_memory_embeddings(tx: &Transaction<'_>) -> rusqlite::Result<u64> {
+    let removed = tx.execute(
+        "DELETE FROM embedding_cache WHERE subject_kind = ?1",
+        params![SubjectKind::MemoryEntry.as_str()],
+    )?;
+    Ok(removed as u64)
+}
+
 /// One row of a bulk [`embeddings_for_subjects`] read: the row's
 /// `subject_hash` (the other two key fields are the read's own filter, so
 /// repeating them per row would be redundant) alongside its full vector

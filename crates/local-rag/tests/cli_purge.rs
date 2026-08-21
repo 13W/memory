@@ -16,7 +16,8 @@ use std::process::{Output, Stdio};
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, ScopeKind, StateDb, create_memory_entry,
+    CacheDb, EmbeddingKey, GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, ScopeKind, StateDb,
+    SubjectKind, create_memory_entry, insert_embedding,
 };
 use local_rag_test_support::TempHome;
 
@@ -63,6 +64,88 @@ async fn seed_entry(state: &StateDb, memory_id: &str, now_ms: i64) {
         .await
         .expect("seed entry tx")
         .expect("seed entry domain");
+}
+
+/// Seed the `embedding_cache` row a real backfill would have written for
+/// `memory_id`, under two representations, so `D-074`'s tests can prove a
+/// purge takes **every** representation rather than one.
+async fn seed_vectors(layout: &StoreLayout, state: &StateDb, memory_id: &str, text: &str) {
+    let cache = open_cache_for_test(layout, state).await;
+    let hash = local_rag_core::identity::domain::subject_memory_entry(memory_id, text);
+    cache
+        .writer()
+        .transaction(move |tx| {
+            for representation_id in ["rep-a", "rep-b"] {
+                insert_embedding(
+                    tx,
+                    &EmbeddingKey {
+                        subject_kind: SubjectKind::MemoryEntry,
+                        subject_hash: hash.clone(),
+                        representation_id: representation_id.to_string(),
+                    },
+                    2,
+                    &[0.5, 0.5],
+                    1_000,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed vectors");
+}
+
+/// A vector belonging to something that is not a memory entry — the control
+/// for `purge --all`, which must not reach outside its own subject kind.
+async fn seed_foreign_vector(layout: &StoreLayout, state: &StateDb) {
+    let cache = open_cache_for_test(layout, state).await;
+    cache
+        .writer()
+        .transaction(|tx| {
+            insert_embedding(
+                tx,
+                &EmbeddingKey {
+                    subject_kind: SubjectKind::ContentBlob,
+                    subject_hash: "not-a-memory-subject".to_string(),
+                    representation_id: "rep-a".to_string(),
+                },
+                2,
+                &[0.25, 0.75],
+                1_000,
+            )
+        })
+        .await
+        .expect("seed foreign vector");
+}
+
+async fn open_cache_for_test(layout: &StoreLayout, state: &StateDb) -> std::sync::Arc<CacheDb> {
+    local_rag::indexing::open_cache(state, layout)
+        .await
+        .expect("open cache.sqlite")
+}
+
+/// How many `embedding_cache` rows exist for `memory_id`'s subject.
+async fn vectors_for(layout: &StoreLayout, state: &StateDb, memory_id: &str, text: &str) -> i64 {
+    let cache = open_cache_for_test(layout, state).await;
+    let hash = local_rag_core::identity::domain::subject_memory_entry(memory_id, text);
+    let read = cache.open_read().expect("cache read conn");
+    read.query_row(
+        "SELECT count(*) FROM embedding_cache WHERE subject_kind = 'memory_entry' \
+         AND subject_hash = ?1",
+        [hash],
+        |r| r.get(0),
+    )
+    .expect("count vectors")
+}
+
+async fn total_vectors(layout: &StoreLayout, state: &StateDb, subject_kind: &str) -> i64 {
+    let cache = open_cache_for_test(layout, state).await;
+    let read = cache.open_read().expect("cache read conn");
+    read.query_row(
+        "SELECT count(*) FROM embedding_cache WHERE subject_kind = ?1",
+        [subject_kind],
+        |r| r.get(0),
+    )
+    .expect("count vectors by kind")
 }
 
 async fn seed_observation(state: &StateDb, observation_id: &str, session_id: &str) {
@@ -307,8 +390,9 @@ async fn purge_all_with_yes_succeeds_then_memory_list_and_stats_report_empty() {
     let output = run_cli(&home, &["purge", "--all", "--yes"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(
-        stdout(&output)
-            .contains("purged everything (1 memory entries, 1 sessions, 1 observations)"),
+        stdout(&output).contains(
+            "purged everything (1 memory entries, 1 sessions, 1 observations, 0 cached vectors removed)"
+        ),
         "{output:?}"
     );
 
@@ -346,4 +430,126 @@ async fn purge_of_an_unknown_memory_id_with_yes_fails_with_exit_1() {
     );
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(stderr(&output).contains("no memory entry"), "{output:?}");
+}
+
+// ---------------------------------------------------------------------------
+// D-074: the derived vector dies with the text it was derived from
+// ---------------------------------------------------------------------------
+
+const SEEDED_TEXT: &str = "some durable text";
+
+#[tokio::test]
+async fn purge_memory_removes_every_cached_vector_of_that_entry_and_no_others() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    seed_entry(&state, "mem-purged", 1_000).await;
+    seed_entry(&state, "mem-kept", 1_000).await;
+    seed_vectors(&layout, &state, "mem-purged", SEEDED_TEXT).await;
+    seed_vectors(&layout, &state, "mem-kept", SEEDED_TEXT).await;
+    assert_eq!(
+        vectors_for(&layout, &state, "mem-purged", SEEDED_TEXT).await,
+        2,
+        "two representations seeded"
+    );
+
+    let output = run_cli(
+        &home,
+        &[
+            "purge",
+            "--memory",
+            "mem-purged",
+            "--expected-version",
+            "1",
+            "--yes",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("2 cached vectors removed"),
+        "the report counts exactly what went: {:?}",
+        stdout(&output)
+    );
+
+    assert_eq!(
+        vectors_for(&layout, &state, "mem-purged", SEEDED_TEXT).await,
+        0,
+        "the purged entry's vectors must not survive the only hard-delete path",
+    );
+    assert_eq!(
+        vectors_for(&layout, &state, "mem-kept", SEEDED_TEXT).await,
+        2,
+        "another entry's vectors are none of this purge's business",
+    );
+}
+
+/// The cost of deleting the vector before the entry, stated as a test rather
+/// than left to be discovered: a purge that the state transaction refuses has
+/// already dropped the vector. That is deliberate and it is the safe
+/// direction — the next backfill recomputes it, whereas the opposite order
+/// would leave a vector of private text that nothing can find, because its key
+/// is derived from the text the purge deleted.
+#[tokio::test]
+async fn a_refused_purge_leaves_the_entry_and_costs_only_a_recomputable_vector() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    seed_entry(&state, "mem-stale", 1_000).await;
+    seed_vectors(&layout, &state, "mem-stale", SEEDED_TEXT).await;
+
+    let output = run_cli(
+        &home,
+        &[
+            "purge",
+            "--memory",
+            "mem-stale",
+            "--expected-version",
+            "42",
+            "--yes",
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stderr(&output).contains("optimistic conflict"),
+        "{:?}",
+        stderr(&output)
+    );
+
+    assert!(
+        inspect_memory_json(&home, "mem-stale").is_some(),
+        "a refused purge must not remove the entry",
+    );
+    assert_eq!(
+        vectors_for(&layout, &state, "mem-stale", SEEDED_TEXT).await,
+        0,
+        "the vector is gone, and that is the accepted cost of the safe order",
+    );
+}
+
+#[tokio::test]
+async fn purge_all_leaves_no_memory_vectors_and_does_not_reach_other_subject_kinds() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    seed_entry(&state, "mem-a", 1_000).await;
+    seed_entry(&state, "mem-b", 1_000).await;
+    seed_vectors(&layout, &state, "mem-a", SEEDED_TEXT).await;
+    seed_vectors(&layout, &state, "mem-b", SEEDED_TEXT).await;
+    seed_foreign_vector(&layout, &state).await;
+
+    let output = run_cli(&home, &["purge", "--all", "--yes"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("4 cached vectors removed"),
+        "{:?}",
+        stdout(&output)
+    );
+
+    assert_eq!(
+        total_vectors(&layout, &state, "memory_entry").await,
+        0,
+        "purge --all is exactly the operation after which no derived memory vector may remain",
+    );
+    assert_eq!(
+        total_vectors(&layout, &state, "content_blob").await,
+        1,
+        "and it stays inside its own subject kind",
+    );
 }

@@ -33,9 +33,10 @@ use local_rag_store::rusqlite;
 use local_rag_store::{
     BatchingLastUsedEmbeddings, CacheDb, EmbeddingCacheMeta, EmbeddingDivergence, EmbeddingKey,
     EvictionParams, LastUsedSinkEmbedding, StateDb, SubjectKind, all_embedding_meta,
-    delete_embedding, derive_content_blob, encode_vector_le, flush_last_used_embeddings,
-    get_embedding, insert_content_blob, insert_embedding, insert_file_revision,
-    insert_generation_file, insert_occurrence, insert_parsed_unit, occurrence_id, rows_to_evict,
+    delete_all_memory_embeddings, delete_embedding, delete_embeddings_for_subject,
+    derive_content_blob, encode_vector_le, flush_last_used_embeddings, get_embedding,
+    insert_content_blob, insert_embedding, insert_file_revision, insert_generation_file,
+    insert_occurrence, insert_parsed_unit, occurrence_id, rows_to_evict,
     run_embedding_cache_eviction, verify_cached_embedding,
 };
 use local_rag_test_support::TempHome;
@@ -952,4 +953,111 @@ async fn embeddings_for_subjects_reads_every_key_across_chunk_boundaries() {
         let distinct: std::collections::BTreeSet<&str> = returned.iter().copied().collect();
         assert_eq!(distinct.len(), prefix, "no key may be returned twice");
     }
+}
+
+// ---------------------------------------------------------------------------
+// D-074: subject-scoped deletion for the privacy purge
+// ---------------------------------------------------------------------------
+
+/// Seed one subject under two representations plus a neighbouring subject, so
+/// both halves of the claim can be checked at once.
+async fn seed_three(cache: &CacheDb) {
+    cache
+        .writer()
+        .transaction(|tx| {
+            for (kind, hash, rep) in [
+                (SubjectKind::MemoryEntry, "subject-a", "rep-1"),
+                (SubjectKind::MemoryEntry, "subject-a", "rep-2"),
+                (SubjectKind::MemoryEntry, "subject-b", "rep-1"),
+                (SubjectKind::ContentBlob, "subject-c", "rep-1"),
+            ] {
+                insert_embedding(
+                    tx,
+                    &EmbeddingKey {
+                        subject_kind: kind,
+                        subject_hash: hash.to_string(),
+                        representation_id: rep.to_string(),
+                    },
+                    2,
+                    &[0.5, 0.5],
+                    NOW,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed");
+}
+
+async fn count_rows(cache: &CacheDb, kind: &str, hash: Option<&str>) -> i64 {
+    let read = cache.open_read().expect("read conn");
+    match hash {
+        Some(h) => read.query_row(
+            "SELECT count(*) FROM embedding_cache WHERE subject_kind = ?1 AND subject_hash = ?2",
+            rusqlite::params![kind, h],
+            |r| r.get(0),
+        ),
+        None => read.query_row(
+            "SELECT count(*) FROM embedding_cache WHERE subject_kind = ?1",
+            rusqlite::params![kind],
+            |r| r.get(0),
+        ),
+    }
+    .expect("count")
+}
+
+/// A purge deletes a *subject*, and a subject can hold a vector in every model
+/// space the store has ever had. `delete_embedding` cannot express that — it
+/// needs the representation — so the completeness of a privacy deletion would
+/// otherwise depend on the caller knowing a list it has no reason to know.
+#[tokio::test]
+async fn delete_embeddings_for_subject_takes_every_representation_and_only_that_subject() {
+    let (_home, _state, cache) = open_both();
+    seed_three(&cache).await;
+
+    let removed = cache
+        .writer()
+        .transaction(|tx| delete_embeddings_for_subject(tx, SubjectKind::MemoryEntry, "subject-a"))
+        .await
+        .expect("delete");
+
+    assert_eq!(removed, 2, "both representations of the subject");
+    assert_eq!(
+        count_rows(&cache, "memory_entry", Some("subject-a")).await,
+        0
+    );
+    assert_eq!(
+        count_rows(&cache, "memory_entry", Some("subject-b")).await,
+        1,
+        "a neighbouring subject is none of this deletion's business",
+    );
+    assert_eq!(
+        count_rows(&cache, "content_blob", Some("subject-c")).await,
+        1,
+        "nor is another subject kind",
+    );
+}
+
+/// `purge --all` clears the kind wholesale rather than looping over the hashes
+/// of the entries being purged: the two agree for rows that still have a live
+/// subject and differ for rows that no longer do, and an orphan is exactly what
+/// must not survive this particular operation.
+#[tokio::test]
+async fn delete_all_memory_embeddings_clears_the_kind_and_stays_inside_it() {
+    let (_home, _state, cache) = open_both();
+    seed_three(&cache).await;
+
+    let removed = cache
+        .writer()
+        .transaction(delete_all_memory_embeddings)
+        .await
+        .expect("delete");
+
+    assert_eq!(removed, 3, "every memory row, across subjects and reps");
+    assert_eq!(count_rows(&cache, "memory_entry", None).await, 0);
+    assert_eq!(
+        count_rows(&cache, "content_blob", None).await,
+        1,
+        "other subject kinds are untouched",
+    );
 }
