@@ -164,10 +164,11 @@ pub struct StartOptions {
     /// parameter, not a config field, so a lifecycle-level test can drive it
     /// directly instead of waiting out a production cadence.
     pub normalization_poll_interval: Duration,
-    /// T21-06's normalization worker's own budget and switch. Shipped with
-    /// `enabled: false` until T21-08 wires `MemoryConfig.normalize_to_english`
-    /// — a worker that spends GPU before the switch that stops it exists is not
-    /// something to hand a user.
+    /// The normalization worker's own budget and switch — `MemoryConfig.
+    /// normalize_to_english` and `normalization_batch`, wired in `main.rs`.
+    /// The switch ships **on** again since `T21-17`, because the sweep is what
+    /// resolves a store written under two canons; the batch is its inference
+    /// bound.
     pub normalization: super::normalization::NormalizationParams,
     /// T20-06's indexing supervisor's per-worktree retention defaults
     /// (`config.storage`, `RetentionParams::from_storage_config`) — the same
@@ -425,6 +426,13 @@ impl DaemonHandle {
             _ => (None, None),
         };
 
+        // T21-17: the backfill sweep translates through the very same value the
+        // MCP write boundary uses — same pool, same model id, same policy —
+        // taken from the context here because `McpHandler::new` moves it below.
+        // `None` exactly in `MigrationOnly`, where there is no store to sweep
+        // either, so the worker is not spawned at all.
+        let normalization_translator = memory_ctx.as_ref().map(|ctx| ctx.translator());
+
         // Step 4: bind endpoint, write readiness marker, start the real
         // HELLO/WELCOME connection handler.
         let listener =
@@ -614,25 +622,30 @@ impl DaemonHandle {
         // fourth ONNX session would be pure cost, and the laziness picks up a
         // model installed after startup for free (D-037).
         //
-        // T21-13: no generator, no embedder, no `cache.sqlite`. Since ADR-0011
-        // made English the canon this worker only detects and settles — the
-        // translation it used to drive moved to the boundary (T21-14/T21-15).
-        let (normalization_stop, normalization_join) = match state_db.as_ref() {
-            Some(db) => {
-                tracing::info!(job = "normalization", "background job spawned");
-                let (stop_tx, stop_rx) = oneshot::channel();
-                let join = tokio::spawn(super::normalization::run_normalization_worker(
-                    Arc::clone(db),
-                    jobs.clone(),
-                    normalization,
-                    normalization_poll_interval,
-                    system_now_ms,
-                    stop_rx,
-                ));
-                (Some(stop_tx), Some(join))
-            }
-            None => (None, None),
-        };
+        // T21-13/T21-17: no embedder and no `cache.sqlite` any more — since
+        // ADR-0011 made English the canon, an entry has one text and one
+        // subject hash, and its vector is written by the ordinary backfill.
+        // What the worker kept is the generator, because the legacy entries
+        // written before the boundary existed are still in the author's own
+        // language and only this sweep will move them (T21-17).
+        let (normalization_stop, normalization_join) =
+            match (state_db.as_ref(), normalization_translator) {
+                (Some(db), Some(translator)) => {
+                    tracing::info!(job = "normalization", "background job spawned");
+                    let (stop_tx, stop_rx) = oneshot::channel();
+                    let join = tokio::spawn(super::normalization::run_normalization_worker(
+                        Arc::clone(db),
+                        jobs.clone(),
+                        translator,
+                        normalization,
+                        normalization_poll_interval,
+                        system_now_ms,
+                        stop_rx,
+                    ));
+                    (Some(stop_tx), Some(join))
+                }
+                _ => (None, None),
+            };
 
         Ok(DaemonHandle {
             socket_path: layout.socket_path(),
