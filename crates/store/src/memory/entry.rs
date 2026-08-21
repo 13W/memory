@@ -513,6 +513,49 @@ pub fn active_entries_for_scope(
     Ok(rows)
 }
 
+/// The recall-eligible entry in `(scope_kind, scope_owner_id)` whose text is
+/// **exactly** `text`, if there is one — `D-078`'s deduplication lookup.
+///
+/// The router creates an entry per window and cannot be relied on to notice
+/// that it already made this exact claim: the candidate set it is shown is
+/// capped ([`MAX_PROMPT_CANDIDATES`](crate::MAX_PROMPT_CANDIDATES)-equivalent
+/// on the caller's side), so past that cap it is structurally blind to its own
+/// recent output. On the owner's store that produced **136** copies of one
+/// sentence, over half of the durable memory. `canonical_key` cannot catch
+/// this: the uniqueness index is partial on non-null keys, and the router
+/// leaves the key null.
+///
+/// Exact text, not similarity, and deliberately so. "Is this the same claim?"
+/// asked loosely is a judgement call that belongs to the model and to review;
+/// asked as byte equality it is a fact, and a fact is what a mechanical guard
+/// can act on without ever silently discarding something a human meant to
+/// keep. Near-duplicates stay — they are exactly the case where a wrong answer
+/// costs information.
+///
+/// Recall-eligibility mirrors [`active_entries_for_scope`]: a terminal entry
+/// does not block a new one, because an author who retracted a claim and then
+/// stated it again means the new one. The tie-break on a store that already
+/// has duplicates is the oldest (`memory_id` is UUIDv7), so the answer does
+/// not move under a caller.
+pub fn active_entry_with_text(
+    conn: &Connection,
+    scope_kind: ScopeKind,
+    scope_owner_id: &str,
+    text: &str,
+) -> rusqlite::Result<Option<MemoryEntrySummary>> {
+    conn.query_row(
+        &format!(
+            "SELECT {SUMMARY_COLUMNS} FROM memory_entry \
+             WHERE scope_kind = ?1 AND scope_owner_id = ?2 AND text = ?3 \
+               AND state NOT IN ('resolved', 'retracted', 'rejected', 'superseded') \
+             ORDER BY memory_id LIMIT 1"
+        ),
+        params![scope_kind.as_str(), scope_owner_id, text],
+        read_summary_row,
+    )
+    .optional()
+}
+
 /// One entry's summary by id, regardless of state (unlike
 /// [`active_entries_for_scope`], which only lists recall-eligible rows) — for
 /// re-resolving a specific `memory_id` a generator named directly (T14-07's
