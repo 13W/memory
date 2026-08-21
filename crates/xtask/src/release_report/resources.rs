@@ -112,7 +112,7 @@ pub async fn measure(
     );
     let shard_dir_bytes = dir_size_bytes(&shard_dir, &[])?;
 
-    let occurrences = indexed.report.build.occurrences;
+    let occurrences = indexed.report.expect_built().occurrences;
     let bytes_per_symbol = if occurrences == 0 {
         0.0
     } else {
@@ -151,7 +151,7 @@ pub async fn measure(
                 "SELECT COALESCE(SUM(fr.source_size), 0) FROM generation_file gf \
                  JOIN file_revision fr ON fr.file_revision_id = gf.file_revision_id \
                  WHERE gf.generation_id = ?1",
-                [&indexed.report.build.generation_id],
+                [&indexed.report.expect_built().generation_id],
                 |r| r.get(0),
             )
             .map_err(|e| format!("source_bytes query: {e}"))?;

@@ -448,6 +448,21 @@ fn run_on_dedicated_thread(
                             .clone();
                         if generation_id != last {
                             project_one(&params, &status_for_loop, generation_id, &on_job_started).await;
+                        } else if let Some(generation_id) = generation_id {
+                            // D-089: the reconciler publishes on every success,
+                            // including the ones where it decided the tree was
+                            // unchanged and built nothing. Reaching this arm with
+                            // the id already projected *is* that case — the only
+                            // other way to get here is a duplicate publish of a
+                            // generation this task has already served, which is
+                            // equally a no-op. `debug`, not `info`: it is frequent
+                            // and entirely routine, unlike the skips D-088 made
+                            // loud, which meant work was silently not happening.
+                            tracing::debug!(
+                                worktree_id = %params.worktree_id,
+                                generation_id = %generation_id,
+                                "reconcile produced no new generation; nothing to project"
+                            );
                         }
                     }
                     changed = failures.changed() => {
@@ -1102,6 +1117,67 @@ mod tests {
             s.last_generation_id.is_some() && s.last_generation_id != first_generation
         })
         .await;
+
+        handle.stop().await;
+    }
+
+    /// D-089: repeated triggers over an unchanged tree cost one generation, not
+    /// one per trigger.
+    ///
+    /// The watcher schedules a reconcile for *any* path event under the root with
+    /// no filtering at all, while the scan is gitignore-aware — so on a repository
+    /// being built, every write into an ignored `target/` used to buy a
+    /// generation, and every generation is a permanent pin root the embedding
+    /// backfill walks on every later cycle.
+    ///
+    /// The trick is proving the no-op triggers were actually *served*, since a
+    /// no-op leaves nothing to wait for. So a real edit follows them: the
+    /// reconciler runs one reconcile at a time, so observing the edit's generation
+    /// proves everything queued before it has been drained. Two generations total
+    /// — the cold start and the edit — means the three triggers in between minted
+    /// nothing. Without the skip they mint three more.
+    #[tokio::test]
+    async fn repeated_triggers_over_an_unchanged_tree_build_one_generation() {
+        let fx = Fixture::new("repo").await;
+        let state = Arc::clone(&fx.state);
+        let root = fx.root.clone();
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        let first = handle.status().last_generation_id;
+
+        for _ in 0..3 {
+            handle
+                .trigger(TriggerKind::Manual)
+                .await
+                .expect("trigger the reconciler");
+        }
+
+        std::fs::write(root.join("main.rs"), "fn parse_config() {}\nfn two() {}")
+            .expect("modify file");
+        handle
+            .trigger(TriggerKind::Manual)
+            .await
+            .expect("trigger the reconciler");
+        wait_for(Duration::from_secs(10), || {
+            let s = handle.status();
+            s.last_generation_id.is_some() && s.last_generation_id != first
+        })
+        .await;
+
+        let generations: i64 = state
+            .open_read()
+            .expect("read conn")
+            .query_row("SELECT COUNT(*) FROM generation", [], |r| r.get(0))
+            .expect("count generations");
+        assert_eq!(
+            generations, 2,
+            "one generation for the cold start and one for the edit; the three \
+             triggers over an unchanged tree must have minted nothing"
+        );
 
         handle.stop().await;
     }

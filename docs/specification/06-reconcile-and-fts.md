@@ -157,6 +157,38 @@ re-embedding of known content, but cost ∝ reading/verifying the changed tree +
 occurrences/graph. Rename is free **only** for content embeddings (occurrence context and FTS
 rows change) `[FIXED]`.
 
+As-built note (D-089, `[SPEC]`): a reconcile always scans; it does not always build. When the
+scan reproduces the very [`ScanManifest`] that produced the last generation, no generation is
+minted — the reconcile publishes the existing id and stops. The manifest is the right thing to
+compare because §2's own pipeline consumes exactly it, and because it is documented as a
+deterministic function of the tree's bytes, independent of walk order, mtimes and the advisory
+stat cache.
+
+Why this was needed. The trigger side and the scan side disagree about which paths matter: the
+scan is gitignore-aware (`ignore::WalkBuilder`, §1), while the watcher filters **nothing** — every
+non-`Access` event under the root schedules a reconcile. So on a repository under active build,
+every write into an ignored `target/` bought a fresh generation, and `build_generation` mints
+before it examines anything (its first statement allocates the id, and the row is committed before
+one file is read). Measured on the owner's store: generations #5415…#5422, 479 files each,
+consecutive pairs identical in `(normalized_path, file_revision_id)` with equal cardinality, and
+~114 minted per hour. Each is permanent cost, because §5 pins `building`/`projection_ready` roots
+unconditionally and the embedding backfill enumerates every pin root on every cycle (D-088).
+
+The memory is process-local — the manifest and id of the last build, held by the reconciler beside
+its stat cache — and deliberately not reconstructed from the store. A store-side comparison would
+have to re-derive this section's own build decisions, and the first of them is invisible: a file
+whose extension selects no v0 language is counted `files_deferred` and written **nowhere**, so such
+a comparison would differ on every reconcile of a normal repository and never skip. Being
+process-local also makes two cases correct for free: a `parser_fingerprint` change and a
+classifier/redaction-policy change both arrive with a new binary, hence a restart, which empties
+the memory — so the next reconcile builds. The cost of that is one generation per worktree per
+daemon start.
+
+One-shot callers (`local-rag index`, the benches) supply no memory and therefore always build: an
+explicit user command does not skip. And the `ScanMode::Fast` stat cache being stale is not a new
+failure mode — a stale hash already produced a content-identical generation through structural
+sharing; the 6 h `Periodic` strict scan remains the backstop either way.
+
 As-built note (T05-03, `[SPEC]`): the "build generation N+1" body is
 `local_rag_index::reconcile::build_generation`, consuming the T05-02 `ScanManifest`. It allocates a
 `building` generation, then per manifest entry: a `huge` entry (no `content_hash`) becomes

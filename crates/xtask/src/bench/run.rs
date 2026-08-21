@@ -315,18 +315,20 @@ pub(crate) async fn build_indexed_store(options: &Options) -> Result<IndexedStor
         &Scanner::new(),
         uuids.as_ref(),
         now_ms,
+        None,
     )
     .await
     .map_err(|e| format!("reconcile: {e:?}"))?;
     let index_ms = indexed_at.elapsed().as_millis() as u64;
     let generation_id: Uuid = report
-        .build
+        .expect_built()
         .generation_id
         .parse()
         .map_err(|_| "generation id is not a UUID".to_string())?;
     eprintln!(
         "[bench] indexed {} files, {} occurrences in {index_ms} ms",
-        report.build.files_indexed, report.build.occurrences
+        report.expect_built().files_indexed,
+        report.expect_built().occurrences
     );
 
     // `build_generation` already leaves the generation `projection_ready`
@@ -399,7 +401,7 @@ pub(crate) async fn build_indexed_store(options: &Options) -> Result<IndexedStor
         &state,
         &cache,
         &worktree_id.to_string(),
-        &report.build.generation_id,
+        &report.expect_built().generation_id,
         now_ms,
     )
     .await
@@ -582,8 +584,8 @@ pub(crate) async fn score_queries(
                 corpus_version: corpus.version.clone(),
                 model_id: entry.model_id.to_string(),
                 mode: options.mode.as_str().to_string(),
-                files_indexed: report.build.files_indexed,
-                occurrences: report.build.occurrences,
+                files_indexed: report.expect_built().files_indexed,
+                occurrences: report.expect_built().occurrences,
                 host: std::env::consts::ARCH.to_string() + "-" + std::env::consts::OS,
             },
             metrics,

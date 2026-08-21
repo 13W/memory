@@ -35,7 +35,7 @@ use super::build::{BuildError, BuildOutcome, build_generation};
 use super::clock::WallClock;
 use super::schedule::{Debouncer, PlannedReconcile, ScheduleConfig, TriggerKind};
 use crate::classify::ClassifierConfig;
-use crate::scan::{ScanMode, ScanStats, StatCache, scan};
+use crate::scan::{ScanManifest, ScanMode, ScanStats, StatCache, scan};
 
 /// The routing/config facts a reconcile needs about one worktree.
 ///
@@ -125,16 +125,98 @@ pub struct ReconcileFailure {
     pub backoff_until_ms: i64,
 }
 
+/// The manifest that produced a generation, and which generation it produced
+/// (D-089) — what a long-lived caller threads back in to let the next cycle skip.
+///
+/// Deliberately process-local rather than reconstructed from the store. Rebuilding
+/// the previous manifest out of `generation_file`/`skipped_file` would have to
+/// re-derive `run_build`'s own decisions, and the first of those decisions is
+/// invisible: a file whose extension selects no v0 language is counted as
+/// `files_deferred` and written **nowhere**, so a store-side comparison would
+/// differ on every reconcile of a normal repository and never skip. Comparing
+/// manifests compares exactly what `build_generation` consumes.
+///
+/// Being process-local is also what makes two otherwise-missing cases correct for
+/// free: a parser-fingerprint change and a classifier/redaction-policy change both
+/// arrive with a new binary, hence a restart, which empties this — so the next
+/// reconcile builds. The cost is one generation per worktree per daemon start.
+#[derive(Debug, Clone)]
+pub struct LastBuilt {
+    /// The scan that produced [`Self::generation_id`].
+    pub manifest: ScanManifest,
+    /// The generation built from it.
+    pub generation_id: String,
+}
+
+/// What one reconcile cycle did about generations (D-089).
+///
+/// A reconcile always scans; it does not always build. The scan is the cheap,
+/// authoritative half and its result — [`ScanManifest`] — is documented as a
+/// deterministic function of the tree's bytes, independent of walk order, mtimes
+/// and the advisory cache. So when it matches the manifest that produced the last
+/// generation, building again cannot produce anything but a content-identical
+/// generation, and the honest answer is to build nothing.
+#[derive(Debug)]
+pub enum ReconcileOutcome {
+    /// A new generation was built and left in `projection_ready`.
+    Built(BuildOutcome),
+    /// The tree is byte-identical to what `generation_id` was built from, so no
+    /// generation was minted. Callers that track "the newest generation" should
+    /// treat this id exactly as they would a freshly built one — it is still the
+    /// generation this scan describes.
+    Unchanged { generation_id: String },
+}
+
+impl ReconcileOutcome {
+    /// The generation this cycle leaves as the newest for the worktree, built now
+    /// or carried over.
+    pub fn generation_id(&self) -> &str {
+        match self {
+            ReconcileOutcome::Built(outcome) => &outcome.generation_id,
+            ReconcileOutcome::Unchanged { generation_id } => generation_id,
+        }
+    }
+
+    /// The build that ran, if one did.
+    pub fn built(&self) -> Option<&BuildOutcome> {
+        match self {
+            ReconcileOutcome::Built(outcome) => Some(outcome),
+            ReconcileOutcome::Unchanged { .. } => None,
+        }
+    }
+}
+
 /// The result of one reconcile cycle: the scan mode used, its fast-path telemetry,
-/// and the built generation.
+/// and what became of the generation.
 #[derive(Debug)]
 pub struct ReconcileReport {
     /// The scan mode this cycle ran in.
     pub mode: ScanMode,
     /// Fast-path telemetry (hashed vs cache-reused candidates).
     pub scan: ScanStats,
-    /// The generation that was built (state `projection_ready`).
-    pub build: BuildOutcome,
+    /// Whether a generation was built, or the tree was already described by one.
+    pub outcome: ReconcileOutcome,
+    /// The manifest this cycle scanned — the value a caller threads back in as
+    /// `last_built` to make the next cycle's skip decision.
+    pub manifest: ScanManifest,
+}
+
+impl ReconcileReport {
+    /// The build this cycle ran, for callers that passed `last_built: None`.
+    ///
+    /// Such a caller — `local-rag index`, the benches — asked for a reconcile
+    /// unconditionally, so `Unchanged` is not a state it can observe: the skip is
+    /// decided solely by the `last_built` it declined to supply. Panicking here
+    /// says that rather than papering over an impossible branch with a default.
+    pub fn expect_built(&self) -> &BuildOutcome {
+        match &self.outcome {
+            ReconcileOutcome::Built(outcome) => outcome,
+            ReconcileOutcome::Unchanged { generation_id } => panic!(
+                "reconcile skipped a build against generation {generation_id}, but this \
+                 caller passed no `last_built` and therefore cannot be skipped"
+            ),
+        }
+    }
 }
 
 /// Run one reconcile cycle for `meta`: the authoritative [`scan`] then
@@ -155,6 +237,7 @@ pub async fn reconcile_once(
     scanner: &Scanner,
     uuids: &(dyn UuidSource + Send + Sync),
     now_ms: i64,
+    last_built: Option<&LastBuilt>,
 ) -> Result<ReconcileReport, ReconcileError> {
     let (manifest, scan_stats) = scan(
         &meta.root,
@@ -166,6 +249,29 @@ pub async fn reconcile_once(
         cache,
     )
     .map_err(ReconcileError::Scan)?;
+
+    // D-089: the scan is the authoritative half and it has already run. If it
+    // produced the very manifest that built `generation_id`, a build now can only
+    // produce a content-identical generation — and every one of those is a
+    // permanent cost, because 06 §5 pins `building`/`projection_ready` roots
+    // unconditionally and the embedding backfill walks every pin root on every
+    // cycle. Measured on the owner's store before this: generations #5415..#5422,
+    // 479 files each, pairwise identical, ~114 minted per hour, because the
+    // watcher schedules a reconcile for *any* path event (`watcher.rs`, no
+    // filtering) while the scan is gitignore-aware — so every write into
+    // `target/` bought a generation.
+    if let Some(previous) = last_built
+        && previous.manifest == manifest
+    {
+        return Ok(ReconcileReport {
+            mode,
+            scan: scan_stats,
+            outcome: ReconcileOutcome::Unchanged {
+                generation_id: previous.generation_id.clone(),
+            },
+            manifest,
+        });
+    }
 
     let build = build_generation(
         db,
@@ -183,7 +289,8 @@ pub async fn reconcile_once(
     Ok(ReconcileReport {
         mode,
         scan: scan_stats,
-        build,
+        outcome: ReconcileOutcome::Built(build),
+        manifest,
     })
 }
 
@@ -211,6 +318,12 @@ pub struct WorktreeReconciler {
     /// [`ReconcileHandle::successes`] to drive its own embed/switch/
     /// materialize_fts follow-up after each reconcile.
     success_tx: watch::Sender<Option<String>>,
+    /// The manifest/generation pair the last successful build produced (D-089),
+    /// and the reason a reconcile over an unchanged tree costs nothing. `None`
+    /// until this process builds its first generation, which is what makes a
+    /// parser-fingerprint or policy change — both of which arrive with a new
+    /// binary — rebuild rather than be skipped.
+    last_built: Option<LastBuilt>,
 }
 
 impl WorktreeReconciler {
@@ -243,6 +356,7 @@ impl WorktreeReconciler {
             clock,
             failure_tx,
             success_tx,
+            last_built: None,
         }
     }
 
@@ -324,6 +438,7 @@ impl WorktreeReconciler {
             &self.scanner,
             &*self.uuids,
             now_ms,
+            self.last_built.as_ref(),
         )
         .await
     }
@@ -350,7 +465,24 @@ impl WorktreeReconciler {
             Ok(report) => {
                 self.debouncer.record_success();
                 let _ = self.failure_tx.send(None);
-                let _ = self.success_tx.send(Some(report.build.generation_id));
+                // D-089: publish on both paths, and publish the same id a build
+                // would have. `watch::send` wakes the consumer unconditionally; it
+                // then compares the id against the one it last projected and does
+                // nothing when they match (`worktree_task`'s own gate). Publishing
+                // `None` here would instead un-say what the last build said.
+                let generation_id = report.outcome.generation_id().to_string();
+                // The skip itself is reported by the consumer, not here: this
+                // crate carries no `tracing` dependency (nothing under
+                // `reconcile/` logs), and the daemon can already tell a skip from
+                // a build — a published id equal to the one it last projected is
+                // exactly that.
+                if let ReconcileOutcome::Built(_) = &report.outcome {
+                    self.last_built = Some(LastBuilt {
+                        manifest: report.manifest,
+                        generation_id: generation_id.clone(),
+                    });
+                }
+                let _ = self.success_tx.send(Some(generation_id));
             }
             Err(e) => {
                 self.debouncer.record_failure(mono_ms);

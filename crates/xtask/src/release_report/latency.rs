@@ -86,6 +86,7 @@ pub async fn measure(indexed: &mut IndexedStore) -> Result<ReconcileLatency, Str
             &Scanner::new(),
             indexed.uuids.as_ref(),
             indexed.now_ms,
+            None,
         )
         .await
         .map_err(|e| format!("one-file reconcile: {e:?}"))?;
@@ -117,6 +118,7 @@ pub async fn measure(indexed: &mut IndexedStore) -> Result<ReconcileLatency, Str
             &Scanner::new(),
             indexed.uuids.as_ref(),
             indexed.now_ms,
+            None,
         )
         .await
         .map_err(|e| format!("branch-checkout reconcile: {e:?}"))?;
@@ -153,7 +155,7 @@ async fn indexed_absolute_paths(indexed: &IndexedStore) -> Result<Vec<std::path:
         )
         .map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
-        .query_map([&indexed.report.build.generation_id], |r| {
+        .query_map([&indexed.report.expect_built().generation_id], |r| {
             r.get::<_, String>(0)
         })
         .map_err(|e| format!("query generation_file: {e}"))?;
