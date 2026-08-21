@@ -99,7 +99,35 @@ const ENTRY_OVERHEAD_TOKENS: u32 = 8;
 /// any prompt exists to key relevance off.
 pub struct RecallRequest<'a> {
     pub root: RequestRoot,
+    /// The query **as both legs will read it** — already English if the caller
+    /// translated it (ADR-0011 §Decision 2, `T21-15`).
+    ///
+    /// The decision is made above this pipeline, not inside it: translating
+    /// takes a local generator and about a third of a second, and `recall` is a
+    /// synchronous function holding `!Send` connections, so it could not be
+    /// moved off the async worker from in here. The caller decides, then hands
+    /// down both the text and what happened to it.
     pub query: &'a str,
+    /// Why the query is not English, when it is not. `None` means either the
+    /// query was already English or the caller translated it successfully —
+    /// in both cases what the legs got is the canon's language.
+    pub query_degraded: Option<QueryNotNormalized>,
+}
+
+/// Why a recall ran against a query in a language the store is not kept in.
+///
+/// Spec 02 §6 `[FIXED]`: nothing degrades silently. A recall in this state
+/// still returns results — the dense leg is multilingual and does most of the
+/// work — but the lexical leg is matching English text against a query that is
+/// not, so the caller is told rather than left to wonder why the answer looks
+/// thin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryNotNormalized {
+    /// No generative model is installed, so nothing could translate it.
+    NoGenerator,
+    /// The translator was asked and refused; the reason travels for the
+    /// caller's diagnostics.
+    TranslationRefused(String),
 }
 
 /// One chosen recall entry with its `memory_id` attached — T15-04's MCP
@@ -145,6 +173,10 @@ pub struct RecallOutcome {
     /// Why the dense leg produced nothing, if it didn't — `None` means the
     /// dense leg ran normally (whether or not it found any hits).
     pub dense_degraded: Option<DenseLegUnavailable>,
+    /// Why the query was not in the store's language, if it wasn't — copied
+    /// through from [`RecallRequest::query_degraded`] so a caller reading the
+    /// outcome does not have to keep the request around to know (`T21-15`).
+    pub query_degraded: Option<QueryNotNormalized>,
 }
 
 /// Run the full recall pipeline and render its result.
@@ -181,6 +213,7 @@ pub fn recall(
 
     if candidates.is_empty() {
         return Ok(RecallOutcome {
+            query_degraded: request.query_degraded.clone(),
             additional_context: String::new(),
             scope_label,
             entries: Vec::new(),
@@ -288,6 +321,7 @@ pub fn recall(
 
     let additional_context = format_additional_context(&scope_label, &chosen);
     Ok(RecallOutcome {
+        query_degraded: request.query_degraded.clone(),
         additional_context,
         scope_label,
         entries,
@@ -447,6 +481,7 @@ mod tests {
 
     fn global_only_request(query: &'static str) -> RecallRequest<'static> {
         RecallRequest {
+            query_degraded: None,
             root: RequestRoot {
                 worktree_root: None,
                 repo_hint: None,

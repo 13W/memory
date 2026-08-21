@@ -114,3 +114,70 @@ fn the_real_model_produces_a_translation_the_validator_accepts() {
         );
     }
 }
+
+/// T21-15: how long a *query*-sized translation actually takes on the real
+/// model, measured rather than assumed.
+///
+/// This exists because `RECALL_BUDGET` had to move and the new number must come
+/// from data. ADR-0010's "≈ 800 ms (p50)" was measured for the **router**,
+/// whose prompt carries a whole observation window plus recall candidates; a
+/// user prompt is one or two sentences, so reusing that figure would have set
+/// the budget from the wrong workload.
+///
+/// Not an assertion: hardware varies, and a test that fails on a slower machine
+/// would be a flaky gate rather than a measurement. The number it prints is
+/// what the budget is justified by, and that justification lives in the
+/// evidence, not in a threshold here.
+#[test]
+fn measure_query_sized_translation_latency() {
+    let Some(layout) = require_model_home() else {
+        return;
+    };
+    let pool = real_pool(&layout);
+
+    // Prompt-shaped, not entry-shaped: what a user actually types before
+    // Claude Code starts working.
+    let queries = [
+        "почему для поиска выбрали именно такое значение k у RRF-фьюжна",
+        "где в демоне обрабатывается перезапуск консолидации после падения",
+        "покажи что мы решили про кэш нормализованного текста",
+    ];
+
+    let mut samples = Vec::new();
+    for query in queries {
+        // One warm-up per query is deliberate: the first call after opening the
+        // model pays for weights the later ones do not, and the budget governs
+        // a daemon that has been running, not one starting up.
+        for round in 0..2 {
+            let started = std::time::Instant::now();
+            let outcome = translate(
+                &pool,
+                DataPolicy::LocalOnly,
+                TranslateRequest {
+                    memory_id: "budget-probe",
+                    text: query,
+                },
+            );
+            let elapsed = started.elapsed();
+            if round == 1 {
+                samples.push(elapsed.as_millis());
+                eprintln!(
+                    "[budget-probe] {} ms — {:?}",
+                    elapsed.as_millis(),
+                    outcome.map(|t| match t {
+                        Translation::Translated { english } => english,
+                        Translation::Passthrough { class } => format!("passthrough {class:?}"),
+                    })
+                );
+            }
+        }
+    }
+
+    samples.sort_unstable();
+    eprintln!(
+        "QUERY_TRANSLATION_MS min={} median={} max={}",
+        samples.first().copied().unwrap_or_default(),
+        samples[samples.len() / 2],
+        samples.last().copied().unwrap_or_default(),
+    );
+}

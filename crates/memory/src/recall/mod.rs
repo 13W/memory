@@ -58,7 +58,8 @@ pub use format::{
 pub use fusion::{FusedRecallHit, rrf};
 pub use lexical::lexical_leg;
 pub use pipeline::{
-    MAX_RECALL_CANDIDATES, RecallOutcome, RecallRequest, RecallResultEntry, recall, scopes_for,
+    MAX_RECALL_CANDIDATES, QueryNotNormalized, RecallOutcome, RecallRequest, RecallResultEntry,
+    recall, scopes_for,
 };
 
 use std::collections::BTreeSet;

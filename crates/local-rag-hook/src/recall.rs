@@ -86,7 +86,30 @@ use crate::event::{EventPayload, ParsedEvent, event_type_name};
 
 /// The recall RPC's hard budget (spec 11 §3.2 `[SPEC]`) — the *whole*
 /// connect-through-response exchange, not per I/O call.
-pub const RECALL_BUDGET: Duration = Duration::from_millis(300);
+///
+/// **Raised from 300 ms to 1500 ms by T21-15** (ADR-0011 §Decision 2, owner's
+/// decision 2026-08-21), because this hook sends the user's *prompt* as the
+/// recall query and a non-English prompt is now translated before either leg
+/// sees it. The old budget predates that step and could not cover it.
+///
+/// The number comes from a measurement, not from rounding up a guess.
+/// `crates/local-rag/tests/memory_translate_real_model.rs::
+/// measure_query_sized_translation_latency` times prompt-shaped translations on
+/// the real `gemma-4-e2b`: **307/324/337 ms** across three samples. ADR-0010's
+/// often-quoted "≈ 800 ms" is the *router*'s figure, whose prompt carries a
+/// whole observation window — reusing it here would have set this budget from
+/// the wrong workload.
+///
+/// 1500 ms is ~4.5× the measured median, which is headroom for slower hardware
+/// rather than a target. Two things keep the generosity honest:
+///
+/// - an **English** prompt is not translated at all (the detector is pure), so
+///   the common case still completes in the tens of milliseconds this budget
+///   used to bound;
+/// - the hook stays best-effort. Exceeding the budget prints nothing, exactly
+///   as before, so the cost of a wedged daemon is one bounded wait per prompt
+///   and never a failure the user has to act on.
+pub const RECALL_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Best-effort read-only recall + stdout print. Never returns an error,
 /// never panics on an ordinary failure (every fallible step collapses to
@@ -478,5 +501,27 @@ mod tests {
         });
         write_message(&mut buf, &hello).unwrap();
         assert_eq!(buf, encode_message(&hello).unwrap());
+    }
+
+    /// T21-15: the budget must stay above what a translation actually costs.
+    ///
+    /// Pinned as a relation between constants rather than as a timing
+    /// assertion — a test that timed the model would be a flaky gate on slower
+    /// hardware. The measured figure is evidence
+    /// (`crates/local-rag/tests/memory_translate_real_model.rs::
+    /// measure_query_sized_translation_latency`: 307/324/337 ms on the real
+    /// `gemma-4-e2b`); this exists so the budget cannot quietly drift back
+    /// below it, which is exactly what would happen if someone "restored" the
+    /// old 300 ms without knowing why it moved.
+    #[test]
+    fn the_budget_covers_a_measured_query_translation() {
+        const MEASURED_TRANSLATION_MS: u128 = 337;
+        assert!(
+            RECALL_BUDGET.as_millis() > MEASURED_TRANSLATION_MS * 2,
+            "RECALL_BUDGET is {} ms — it must keep real headroom over a measured query \
+             translation ({MEASURED_TRANSLATION_MS} ms), because this hook now sends the \
+             user's prompt through the translator before either leg reads it",
+            RECALL_BUDGET.as_millis(),
+        );
     }
 }

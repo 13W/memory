@@ -494,7 +494,8 @@ budget ≤ 200 ms self-imposed for the append path `[SPEC]`.
 ### 3.2 Recall injection (SessionStart, UserPromptSubmit) `[SPEC, satisfies v1 contract]`
 
 The same hook binary, after the spool append, performs a **read-only** recall RPC to the
-daemon over the endpoint with a hard budget of 300 ms `[SPEC]`:
+daemon over the endpoint with a hard budget of 1500 ms `[SPEC]` (300 ms before T21-15 —
+see the amendment note below):
 
 - daemon reachable → prints `additionalContext` JSON (format §5) to stdout;
 - daemon unreachable / timeout / any error → prints nothing, exit 0.
@@ -521,7 +522,25 @@ shipped code:
   deliberately tokio-free by its own design specifically so it composes with either a sync or
   async caller. A single `Instant`-based deadline is recomputed before each of the four I/O calls
   (connect, HELLO write, WELCOME read, `tools/call` write, `Response` read), so the *whole*
-  exchange stays under the 300 ms budget rather than each call individually.
+  exchange stays under the budget rather than each call individually.
+
+Amendment note (T21-15, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
+the budget is **1500 ms**, raised from 300 ms. This hook sends the user's *prompt* as the recall
+query, and since T21-15 a non-English query is translated before either leg reads it (ADR-0011
+§Decision 2) — the old budget predates that step and cannot cover it.
+
+The number is measured, not rounded up from a guess: prompt-shaped translations on the real
+`gemma-4-e2b` take **307/324/337 ms**
+(`crates/local-rag/tests/memory_translate_real_model.rs::measure_query_sized_translation_latency`).
+ADR-0010's frequently-quoted "≈ 800 ms" is the *router*'s figure, whose prompt carries an entire
+observation window; setting this budget from it would have used the wrong workload. 1500 ms is
+~4.5× the measured median — headroom for slower hardware, not a target.
+
+Two properties keep the larger budget from being a regression in practice. An **English** prompt is
+never translated (the detector is a pure function), so the common case still completes in the tens
+of milliseconds the old budget bounded. And the hook remains best-effort: exceeding the budget
+prints nothing, exactly as before, so a wedged daemon costs one bounded wait per prompt and never
+an error the user must act on.
   `local_rag_hook::recall`'s own `read_bounded_line`/`write_message` are a sync port of
   `local-rag-proxy/src/transport.rs`'s identical algorithm — a third copy of the same D-002/D-010
   duplicated-fragment precedent (`local_rag_protocol` must stay free of any I/O runtime).
