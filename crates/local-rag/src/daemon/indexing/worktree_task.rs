@@ -404,6 +404,7 @@ fn run_on_dedicated_thread(
 
         let status = Arc::new(Mutex::new(WorktreeTaskStatus::default()));
         let status_for_loop = Arc::clone(&status);
+        let worktree_id_for_loop = params.worktree_id;
 
         let inner = tokio::task::spawn_local(async move {
             let mut successes = successes;
@@ -453,6 +454,17 @@ fn run_on_dedicated_thread(
                         if changed.is_ok()
                             && let Some(f) = failures.borrow().clone()
                         {
+                            // D-088: a scan/build that fails every time used to
+                            // update two in-memory fields and produce no output
+                            // at all — `crates/index/src/reconcile/` has no
+                            // tracing of its own, so this arm is the only place
+                            // its failures can become visible.
+                            tracing::warn!(
+                                worktree_id = %worktree_id_for_loop,
+                                consecutive_failures = f.consecutive_failures,
+                                reason = %f.last_error,
+                                "reconcile failed"
+                            );
                             let mut s = status_for_loop
                                 .lock()
                                 .expect("worktree task status mutex poisoned");
@@ -494,6 +506,13 @@ async fn project_one(
         return;
     };
     let Ok(gid) = generation_id.parse::<Uuid>() else {
+        // D-088: an in-memory `last_error` nobody polls is not a report. Spec 02
+        // §6 `[FIXED]` — nothing degrades silently.
+        tracing::error!(
+            worktree_id = %params.worktree_id,
+            generation_id = %generation_id,
+            "indexing cycle skipped: generation id is not a UUID"
+        );
         let mut s = status.lock().expect("worktree task status mutex poisoned");
         s.consecutive_failures += 1;
         s.last_error = Some(format!(
@@ -516,6 +535,18 @@ async fn project_one(
         params.embedder_provider.code(),
         params.embedder_provider.memory(),
     ) else {
+        // D-088: this was the quietest path in the daemon and it cost ten hours
+        // of stale index on the owner's store. `LazyEmbedderProvider` latches an
+        // unusable model for the whole process, so once this branch is taken it
+        // is taken on *every* trigger until a restart — and it produced no log
+        // line, no `JobGuard` and no durable status, so `background job spawned
+        // job="indexing_supervisor"` was the last thing anyone saw. Spec 02 §6
+        // `[FIXED]`: nothing degrades silently.
+        tracing::warn!(
+            worktree_id = %params.worktree_id,
+            generation_id = %generation_id,
+            "indexing cycle skipped: embedding model not installed or not openable yet"
+        );
         let mut s = status.lock().expect("worktree task status mutex poisoned");
         s.last_error = Some(
             "embedding model not installed/opened yet; will retry on the next trigger".to_string(),
@@ -951,6 +982,64 @@ mod tests {
         );
 
         handle.stop().await;
+    }
+
+    /// D-088: a generation the cycle supersedes must stop being a pin root.
+    ///
+    /// `retention::mark_pins` pins every `building`/`projection_ready`
+    /// generation unconditionally and nothing ever retries an abandoned one, so
+    /// before this each one left behind was walked again by every future
+    /// backfill — a ratchet that ended, on the owner's store, with 3086 of them
+    /// and cycles that ran for 52 minutes at full CPU without finishing.
+    #[tokio::test]
+    async fn a_cycle_retires_the_generations_it_supersedes() {
+        use local_rag_store::generation_meta_for_worktree;
+        use local_rag_store::registry::{
+            GenerationState, allocate_generation, transition_generation,
+        };
+
+        let fx = Fixture::new("repo").await;
+
+        // A generation stranded exactly the way an aborted cycle strands one:
+        // built to `projection_ready`, never activated. Allocated first, so its
+        // number is lower than the one the cycle is about to produce.
+        let stranded = fx.uuids.next_uuid().to_string();
+        {
+            let (w, g) = (fx.worktree_id.to_string(), stranded.clone());
+            fx.state
+                .writer()
+                .transaction(move |tx| {
+                    allocate_generation(tx, &w, &g, 1_000)?;
+                    transition_generation(tx, &g, GenerationState::ProjectionReady)
+                })
+                .await
+                .expect("seed tx")
+                .expect("legal transition");
+        }
+
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+        wait_for(Duration::from_secs(10), || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+        handle.stop().await;
+
+        let state_now = generation_meta_for_worktree(
+            &fx.state.open_read().expect("read conn"),
+            &fx.worktree_id.to_string(),
+        )
+        .expect("meta")
+        .into_iter()
+        .find(|g| g.generation_id == stranded)
+        .expect("the stranded generation still exists")
+        .state;
+
+        assert_eq!(
+            state_now,
+            GenerationState::Failed,
+            "a superseded generation must leave the pin set; left as {state_now:?} it is walked \
+             by every future backfill, forever"
+        );
     }
 
     /// D-083: an indexing cycle folds its own `-wal` back into the database

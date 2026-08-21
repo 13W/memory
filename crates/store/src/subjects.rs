@@ -68,7 +68,7 @@ use rusqlite::Connection;
 use local_rag_core::identity::domain::{subject_content_blob, subject_memory_entry};
 
 use crate::cache::{EmbeddingKey, SubjectKind};
-use crate::code::{content_blob_ids_for_generation, context_subjects_for_generation};
+use crate::code::{content_blob_ids_for_generations, context_subjects_for_generation};
 use crate::registry::{
     ModelSpaceState, RepresentationKind, all_worktree_ids, default_model_space_id,
     model_space_ids_in_states, model_space_required_representation_ids, model_space_state,
@@ -202,9 +202,12 @@ pub fn expected_subject_keys(
     for (kind, representation_id) in &representations {
         match kind {
             RepresentationKind::CodeRaw => {
-                for generation_id in generations {
+                // One batched read rather than one statement per generation
+                // (D-088); the keys land in a `BTreeSet`, so nothing here can
+                // observe row order.
+                {
                     for (_occurrence_id, blob_id) in
-                        content_blob_ids_for_generation(conn, generation_id)?
+                        content_blob_ids_for_generations(conn, generations)?
                     {
                         // N occurrences of one blob collapse to one subject; the
                         // BTreeSet does the dedup (spec 03 §4.2 `[FIXED]`).

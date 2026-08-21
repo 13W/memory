@@ -48,7 +48,7 @@ use local_rag_store::{
     ModelSpaceState, RepresentationKind, RetentionParams, StateDb, SubjectSet, WriteError,
     context_subjects_for_generation, delete_embedding, derive_content_blob, expected_subject_keys,
     get_embedding, get_normalized_text, insert_embedding, model_space_required_kinds,
-    model_space_required_representation_ids, occurrences_for_fts, pinned_generations,
+    model_space_required_representation_ids, occurrences_for_generations, pinned_generations,
     recompute_coverage, rusqlite, source_bytes, transition_model_space, verify_cached_embedding,
     verify_cached_text, write_model_space_coverage,
 };
@@ -819,18 +819,23 @@ fn blob_index(
     state: &Connection,
     expected: &SubjectSet,
 ) -> Result<BTreeMap<String, SubjectSource>, BackfillError> {
+    // One batched read, not one statement per generation (D-088). The reader
+    // returns rows in `(generation_id, occurrence_id)` order — the exact order
+    // the nested loop produced — so `or_insert`'s first-wins choice of a
+    // representative row for each blob is unchanged, and with it the text every
+    // subject embeds from. On the owner's store this loop was running ~3200
+    // statements per cycle, one per pinned generation, and cycles had stopped
+    // finishing at all.
     let mut index: BTreeMap<String, SubjectSource> = BTreeMap::new();
-    for generation_id in &expected.generations {
-        for row in occurrences_for_fts(state, generation_id)? {
-            let hash = local_rag_core::identity::domain::subject_content_blob(&row.blob_id);
-            index.entry(hash).or_insert(SubjectSource {
-                blob_id: row.blob_id,
-                file_revision_id: row.file_revision_id,
-                span_start: row.span_start,
-                span_end: row.span_end,
-                language: row.language,
-            });
-        }
+    for row in occurrences_for_generations(state, &expected.generations)? {
+        let hash = local_rag_core::identity::domain::subject_content_blob(&row.blob_id);
+        index.entry(hash).or_insert(SubjectSource {
+            blob_id: row.blob_id,
+            file_revision_id: row.file_revision_id,
+            span_start: row.span_start,
+            span_end: row.span_end,
+            language: row.language,
+        });
     }
     Ok(index)
 }

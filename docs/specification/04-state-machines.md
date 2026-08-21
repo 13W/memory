@@ -22,6 +22,36 @@ building ──▶ projection_ready ──▶ active ──▶ retiring ──�
 
 `retiring` is **never** consulted for routing `[FIXED]` — search resolves only the active tuple.
 
+As-built note (D-088, `[SPEC]`): the `projection_ready → failed` edge has a **second** trigger, and
+it is the one that keeps the machine finite. The table above names only "error in reconcile/switch",
+which covers the generation the failure happened to; it says nothing about a generation nothing ever
+looks at again. That case is not rare — every abandoned cycle produces one, and abandoning a cycle
+is what a daemon restart, an idle shutdown, a failed switch, a not-yet-openable embedder and a
+watch-channel that coalesced two builds all do. Nothing retries such a generation: every retry path
+allocates a *fresh* id (`build.rs`'s `uuids.next_uuid()` per run), so the stranded row is finished by
+construction while its state still says otherwise.
+
+It could not simply be left there, because 06 §5's pin rules make `building` and `projection_ready`
+**unconditional** pin roots — no window, no `keep_last_k` — so each stranded generation stays a
+retention root forever, and the embedding backfill walks every root on every cycle. That is a
+ratchet: each one makes every future cycle slower, and a cycle slow enough to be abandoned produces
+another. Measured on the owner's store: **3086** `projection_ready` generations against 2 `active`,
+a backfill reading ~32 million occurrence rows per cycle, and one cycle observed running **52
+minutes at ~100 % CPU without finishing** — while search kept answering from a generation ten hours
+old and `wal_checkpoint(TRUNCATE)`, whose only driver is the cycle boundary (03 §3, D-083), never
+ran.
+
+So: the cycle that supersedes a generation retires it. Before its backfill, under the worktree's
+already-held `L2.write`, every `building`/`projection_ready` generation of that worktree with a
+**strictly lower** `generation_number` than the one being activated moves to `failed`
+(`local_rag_store::fail_superseded_generations`, batched, through `transition_generation` so the
+machine stays the authority). `failed` rather than `retiring` because the machine forbids
+`projection_ready → retiring` and because 06 §5 already treats `retiring` and `failed` alike as GC
+targets rather than pin roots — one edge, and the existing sweep collects the rows. Ordering is
+deliberate: doing it *before* the backfill means the first cycle after this change already sees a
+small pin set, rather than having to survive the expensive one to earn the cheap ones.
+
+
 As-built note (T05-01, `[SPEC]`): the generation lifecycle is `local_rag_store::registry::generation`
 (the `generation` table itself ships with `SCHEMA_V2`, T02-03). `allocate_generation` mints the
 `∅ → building` row with a per-worktree monotone `generation_number = MAX(number) + 1` over **all** of

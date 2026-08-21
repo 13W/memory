@@ -380,6 +380,95 @@ pub fn content_blob_ids_for_generation(
     Ok(rows)
 }
 
+/// How many generation ids one batched read binds per statement (D-088).
+///
+/// Comfortably under SQLite's parameter ceiling with room for the statement's
+/// own binds, and small enough that one prepared statement stays cheap. The
+/// point is not this number but that the read stops being one statement *per
+/// generation*: the embedding backfill walks every pinned generation, and a
+/// store that has accumulated thousands of them was spending entire cycles
+/// preparing and sorting the same query over and over.
+const GENERATION_ID_CHUNK: usize = 400;
+
+/// Bind `n` positional parameters as `?1, ?2, …` for an `IN` list.
+fn in_list(offset: usize, n: usize) -> String {
+    (0..n)
+        .map(|i| format!("?{}", offset + i))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`occurrences_for_fts`] over a whole set of generations in one pass (D-088).
+///
+/// Rows come back ordered by `(generation_id, occurrence_id)`, which is exactly
+/// the order the caller's previous nested loop produced — a `BTreeSet<String>`
+/// of ids iterates lexicographically, and each generation's rows came back
+/// `ORDER BY occurrence_id`. That matters because the caller keeps the **first**
+/// row it sees for each subject hash, so a different order would silently pick a
+/// different representative row and change the text a subject embeds from.
+/// Chunking preserves it too: the ids are consumed in sorted order and each
+/// chunk is a contiguous run of them.
+pub fn occurrences_for_generations(
+    conn: &Connection,
+    generation_ids: &std::collections::BTreeSet<String>,
+) -> rusqlite::Result<Vec<FtsSourceRow>> {
+    let ids: Vec<&String> = generation_ids.iter().collect();
+    let mut out = Vec::new();
+    for chunk in ids.chunks(GENERATION_ID_CHUNK) {
+        let sql = format!(
+            "SELECT o.occurrence_id, o.normalized_path, o.qualified_name, \
+                    pu.unit_kind, pu.local_name, pu.kind, pu.blob_id, \
+                    pu.file_revision_id, pu.span_start, pu.span_end, \
+                    cb.language \
+             FROM generation_unit_occurrence o \
+             JOIN parsed_unit pu ON pu.unit_id = o.unit_id \
+             JOIN content_blob cb ON cb.blob_id = pu.blob_id \
+             WHERE o.generation_id IN ({}) \
+             ORDER BY o.generation_id, o.occurrence_id",
+            in_list(1, chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(chunk.iter().map(|id| id.as_str()));
+        let rows = stmt
+            .query_map(params, fts_source_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        out.extend(rows);
+    }
+    Ok(out)
+}
+
+/// [`content_blob_ids_for_generation`] over a whole set of generations (D-088).
+///
+/// Unlike [`occurrences_for_generations`] this one has no ordering contract to
+/// keep — its caller folds the rows into a `BTreeSet` of subject keys, where
+/// order cannot be observed — so the sort is dropped along with the per-
+/// generation statement.
+pub fn content_blob_ids_for_generations(
+    conn: &Connection,
+    generation_ids: &std::collections::BTreeSet<String>,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let ids: Vec<&String> = generation_ids.iter().collect();
+    let mut out = Vec::new();
+    for chunk in ids.chunks(GENERATION_ID_CHUNK) {
+        let sql = format!(
+            "SELECT guo.occurrence_id, pu.blob_id \
+             FROM generation_unit_occurrence guo \
+             JOIN parsed_unit pu ON pu.unit_id = guo.unit_id \
+             WHERE guo.generation_id IN ({})",
+            in_list(1, chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(chunk.iter().map(|id| id.as_str()));
+        let rows = stmt
+            .query_map(params, |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        out.extend(rows);
+    }
+    Ok(out)
+}
+
 /// One occurrence's source data for FTS materialization (spec 06 §2/§4, T08-02):
 /// everything the FTS materializer (`cache::fts::materialize_fts`) needs from
 /// `state.sqlite` for one `generation_unit_occurrence` row, joined against its
@@ -441,31 +530,39 @@ pub fn occurrences_for_fts(
          ORDER BY o.occurrence_id",
     )?;
     let rows = stmt
-        .query_map(params![generation_id], |r| {
-            let unit_kind_raw: String = r.get(3)?;
-            let unit_kind = UnitKind::from_db(&unit_kind_raw).ok_or_else(|| {
-                Error::FromSqlConversionFailure(
-                    3,
-                    Type::Text,
-                    format!("invalid parsed_unit.unit_kind {unit_kind_raw:?}").into(),
-                )
-            })?;
-            Ok(FtsSourceRow {
-                occurrence_id: r.get(0)?,
-                normalized_path: r.get(1)?,
-                qualified_name: r.get(2)?,
-                unit_kind,
-                local_name: r.get(4)?,
-                lang_kind: r.get(5)?,
-                blob_id: r.get(6)?,
-                file_revision_id: r.get(7)?,
-                span_start: r.get(8)?,
-                span_end: r.get(9)?,
-                language: r.get(10)?,
-            })
-        })?
+        .query_map(params![generation_id], fts_source_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Map one row of the `occurrence × parsed_unit × content_blob` projection.
+///
+/// Shared by [`occurrences_for_fts`] and [`occurrences_for_generations`] so the
+/// two cannot drift: the batched reader exists to replace the per-generation one
+/// in a hot path, and "same columns, same conversions" is a property worth
+/// having by construction rather than by review.
+fn fts_source_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FtsSourceRow> {
+    let unit_kind_raw: String = r.get(3)?;
+    let unit_kind = UnitKind::from_db(&unit_kind_raw).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            format!("invalid parsed_unit.unit_kind {unit_kind_raw:?}").into(),
+        )
+    })?;
+    Ok(FtsSourceRow {
+        occurrence_id: r.get(0)?,
+        normalized_path: r.get(1)?,
+        qualified_name: r.get(2)?,
+        unit_kind,
+        local_name: r.get(4)?,
+        lang_kind: r.get(5)?,
+        blob_id: r.get(6)?,
+        file_revision_id: r.get(7)?,
+        span_start: r.get(8)?,
+        span_end: r.get(9)?,
+        language: r.get(10)?,
+    })
 }
 
 /// One occurrence's presentable metadata — the non-`snippet` half of spec 09
@@ -891,6 +988,94 @@ mod tests {
 
         assert_eq!(rows[1].occurrence_id, "occ-b");
         assert_eq!(rows[1].unit_kind, UnitKind::File);
+    }
+
+    /// D-088: the batched reader must be **equivalent** to running the
+    /// per-generation one over the same ids in `BTreeSet` order — not merely
+    /// "also correct". Its caller keeps the first row it sees per blob, so a
+    /// different order silently changes which source a subject embeds from.
+    #[test]
+    fn the_batched_reader_matches_the_per_generation_one_row_for_row() {
+        use std::collections::BTreeSet;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        seed_fts_source_schema(&conn);
+        conn.execute_batch(
+            "INSERT INTO content_blob VALUES ('blob-1', 'rust'), ('blob-2', 'go');\n\
+             INSERT INTO parsed_unit VALUES \
+               ('u1', 'rev-1', 'symbol', 'blob-1', 0, 10, 'foo', 'function'), \
+               ('u2', 'rev-2', 'file', 'blob-2', 0, 20, NULL, NULL);\n\
+             INSERT INTO generation_unit_occurrence VALUES \
+               ('occ-b', 'g-b', 'b.rs', 'u2', NULL), \
+               ('occ-a', 'g-b', 'a.rs', 'u1', NULL), \
+               ('occ-z', 'g-a', 'z.rs', 'u1', NULL), \
+               ('occ-c', 'g-a', 'c.rs', 'u2', NULL), \
+               ('occ-x', 'g-unpinned', 'x.rs', 'u1', NULL);",
+        )
+        .expect("seed rows");
+
+        // Deliberately insert the ids out of order: the set, not the caller,
+        // decides iteration order.
+        let ids: BTreeSet<String> = ["g-b", "g-a"].iter().map(|s| s.to_string()).collect();
+
+        let expected: Vec<FtsSourceRow> = ids
+            .iter()
+            .flat_map(|g| occurrences_for_fts(&conn, g).expect("per-generation read"))
+            .collect();
+        let batched = occurrences_for_generations(&conn, &ids).expect("batched read");
+
+        assert_eq!(
+            batched, expected,
+            "the batched reader must reproduce the nested loop exactly, in order"
+        );
+        assert_eq!(
+            batched.iter().map(|r| &r.occurrence_id).collect::<Vec<_>>(),
+            vec!["occ-c", "occ-z", "occ-a", "occ-b"],
+            "generation first, occurrence_id within it"
+        );
+        assert!(
+            batched.iter().all(|r| r.occurrence_id != "occ-x"),
+            "a generation outside the set must not leak in"
+        );
+    }
+
+    /// The set-scoped blob reader is scoped the same way; its caller folds into
+    /// a `BTreeSet`, so only membership matters.
+    #[test]
+    fn the_batched_blob_reader_is_scoped_to_the_set() {
+        use std::collections::BTreeSet;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        seed_fts_source_schema(&conn);
+        conn.execute_batch(
+            "INSERT INTO content_blob VALUES ('blob-1', 'rust'), ('blob-2', 'go');\n\
+             INSERT INTO parsed_unit VALUES \
+               ('u1', 'rev-1', 'symbol', 'blob-1', 0, 10, 'foo', 'function'), \
+               ('u2', 'rev-2', 'file', 'blob-2', 0, 20, NULL, NULL);\n\
+             INSERT INTO generation_unit_occurrence VALUES \
+               ('occ-a', 'g-a', 'a.rs', 'u1', NULL), \
+               ('occ-b', 'g-b', 'b.rs', 'u2', NULL), \
+               ('occ-x', 'g-unpinned', 'x.rs', 'u1', NULL);",
+        )
+        .expect("seed rows");
+
+        let ids: BTreeSet<String> = ["g-a", "g-b"].iter().map(|s| s.to_string()).collect();
+        let mut got = content_blob_ids_for_generations(&conn, &ids).expect("batched read");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("occ-a".to_string(), "blob-1".to_string()),
+                ("occ-b".to_string(), "blob-2".to_string()),
+            ]
+        );
+
+        assert!(
+            content_blob_ids_for_generations(&conn, &BTreeSet::new())
+                .expect("empty set")
+                .is_empty(),
+            "an empty set must read nothing, not everything"
+        );
     }
 
     /// A stored `parsed_unit.unit_kind` outside the CHECK domain (corruption)

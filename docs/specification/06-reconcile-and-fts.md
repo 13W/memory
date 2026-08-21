@@ -396,6 +396,23 @@ Generation deletion order: occurrences/edges → generation_file/skipped_file �
 then file_revision sweep. Shard/FTS rows for retired generations disappear naturally via
 desired-set reconciliation (they are never part of an expected set).
 
+As-built note (D-088, `[SPEC]`): the first pin line — "active + building/projection-target
+generations" — is unconditional by design, and stays so. It protects a generation a worker is
+producing right now, which is exactly what it should do; what it cannot do is tell that generation
+apart from one a *later* generation has already overtaken. Nothing else could, either: nothing
+retries a stranded generation, so there is no worker whose absence the retention side could observe.
+The gap is therefore closed on the **producing** side rather than here — the cycle that supersedes a
+generation moves it to `failed` before its backfill (04 §1's D-088 note), after which this section's
+own last rule applies unchanged, because `failed` is a GC target and not a pin root.
+
+Why it had to be closed at all: pinned roots are what the embedding backfill enumerates, once per
+root, on every cycle. Left unbounded, the roots grow by one per abandoned cycle and never shrink,
+so cycle cost grows with the store's *history* rather than its content. Measured on the owner's
+store across one day: cycle duration 88 s in the morning, 8 minutes by evening, 25 minutes at its
+worst, and one cycle running 52 minutes at ~100 % CPU without finishing — with 3086
+`projection_ready` roots against 2 `active`. The `[SPEC: K=2, T=168h]` numbers on the retired line
+were never the binding constraint; the unbounded line above them was.
+
 As-built note (T06-01, `[SPEC]`): the **mark phase** — computing the pinned generation roots,
 not the sweep — is `local_rag_store::retention` (`mark_pins` pure core + `pinned_generation_roots`
 / `generation_meta_for_worktree` DB readers; the batched, mutating sweep is T06-02). It is a pure

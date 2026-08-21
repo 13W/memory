@@ -949,6 +949,17 @@ surface as `INCOMPATIBLE_STORE`, disambiguated by a `details` field (e.g.
 progress surfaces as `MIGRATION_IN_PROGRESS`. The runner's own typed errors (13 §3) are
 finer-grained than the wire codes.
 
+As-built note (D-088, `[SPEC]`): "nothing degrades silently" `[FIXED]` binds background work too,
+not only responses. Three paths in the daemon's indexing task used to skip a whole cycle while
+writing nothing anywhere a human or a log reader could see it — they set an in-memory `last_error`
+field that only `admin/projects_list` ever reads. The quietest was the embedder gate: a model that
+is installed but not openable latches `Unusable` for the lifetime of the process
+(`daemon::embedder_provider::LazyProvider`), so once taken that branch is taken on *every* trigger
+until a restart, and the last thing the log said was `background job spawned
+job="indexing_supervisor"`. On the owner's store that is what ten hours of a silently frozen index
+looked like from the outside. All three now log, and so does the one remaining branch that latched
+`Unusable` without a word (`DEFAULT_MODEL_ID` absent from the binary's catalog).
+
 As-built note (T12-04, `[SPEC]`): `ErrorCode::PathNotIndexed` (`PATH_NOT_INDEXED`) now exists,
 produced by `get_file_context` when the requested path is not part of the active generation. Like
 `UNSUPPORTED_MODE` it is a tool-contract condition rather than a store/degradation one, so it has
