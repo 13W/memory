@@ -298,9 +298,15 @@ fn shutdown_signals_every_worker_before_it_waits_for_any_of_them() {
     let signal_consolidation = at("consolidation_trigger_stop.take()");
     let signal_normalization = at("normalization_stop.take()");
     let cancel_indexing = at("indexing_supervisor.take()");
-    let first_wait = at("resume_handles.drain(")
-        .min(at("consolidation_trigger_join.take()"))
-        .min(at("normalization_join.take()"));
+    // D-085: this used to name the three joins individually, and one of those
+    // names — `resume_handles.drain(` — stopped existing when D-081 routed all
+    // three through `await_workers_bounded` and took the handles with
+    // `std::mem::take`. `at` panicked on the missing needle, so the test was
+    // red on `master` from that commit onward. The anchor is now the single
+    // construct that actually does the waiting, which is also the one this
+    // assertion is about: the joins themselves are arguments evaluated on the
+    // way into it, not separate wait points.
+    let first_wait = at("await_workers_bounded(");
 
     assert!(
         stop_accepting < first_wait,
