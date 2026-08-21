@@ -581,14 +581,34 @@ a real window, between the lock being marked ready and the wait loop actually st
 signal kills the process ungracefully instead of draining it — caught by
 `tests/serve_subprocess.rs` flaking under concurrent test-suite load before the fix.
 
-As-built note (T21-13, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)): the
-worker the next note describes no longer translates anything, and the note is kept as history.
-ADR-0011 moved translation to the boundary — the write path (T21-14) and the query path
-(T21-15/T21-19) — so this background task holds no generator, no embedder and no `cache.sqlite`
-handle. What is left is the detector: it sweeps non-terminal entries, settles every already-English
-one as `english` in a single `state.sqlite` transaction, and spends no inference at all. That
-marker is structural rather than cosmetic — the queue excludes an entry by stored status, never by
-re-examination, so without it the `LIMIT` fills with English entries and starves the rest.
+As-built note (T21-13/T21-17, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
+the worker the next note describes translates something different now, and the note is kept as
+history. ADR-0011 moved *ordinary* translation to the boundary — the write path (T21-14) and the
+query paths (T21-15/T21-19) — so this background task holds no embedder and no `cache.sqlite`
+handle, and a new entry never reaches it untranslated. Two halves are left:
+
+- **detect**, which is free. It sweeps non-terminal entries and settles every already-English one
+  as `english` in a single `state.sqlite` transaction, spending no inference at all. That marker is
+  structural rather than cosmetic — the queue excludes an entry by stored status, never by
+  re-examination, so without it the `LIMIT` fills with English entries and starves the rest.
+- **backfill** (T21-17), which is what remains of translation here. Entries written before the
+  boundary existed are still in their author's language and nothing else will move them, so the
+  worker translates them, bounded by `translate_batch` per tick, and installs the result as the
+  entry's canon: `apply_edit(Actor::System, …)` and then the provenance row, in **one** transaction
+  and in that order, because `apply_edit` deletes the normalization row when the text changes
+  (T21-07) and the reverse order would leave an English canon with no record of the author's words.
+  The entry's `entry_version` travels from the queue read into `apply_edit` as the optimistic
+  guard, so an entry edited while its translation was in flight is skipped, never overwritten.
+
+T21-17 also **bounds** the deference the next note describes as unconditional. The rule itself is
+right — one process-wide model, and consolidation is the latency-sensitive owner — but T21-17's own
+live acceptance measured what unbounded politeness does on a store whose consolidation never goes
+idle: six ticks in a row, `settled` climbing, `translated 0` every time, `awaiting translation`
+pinned at 19, against a candidate backlog that was growing. That is starvation, not courtesy, and
+it leaves the store permanently split between two canons. The worker now counts consecutive yields
+and, past `MAX_CONSECUTIVE_YIELDS` (3 ticks, ~3 minutes at the shipped cadence), takes its turn
+anyway — still only one `translate_batch` of it. Consolidation still wins by default; it can no
+longer win forever.
 
 As-built note (T21-06, `[SPEC]`, ADR-0010): the durable-memory English-normalization worker
 (`local_rag::daemon::normalization::run_normalization_worker`) is this section's newest
@@ -630,10 +650,13 @@ version cost exactly one attempt and bumping the version grants exactly one more
 carry identifiers and counts only; entry text never appears in any of them (asserted by log
 capture), which is 12 §1's `local_only` posture applied to the daemon's own log file.
 
-The worker ships **disabled** (`NormalizationParams::enabled = false` in `lifecycle`). Its switch,
-`config.memory.normalize_to_english`, belongs to T21-08 and is what turns it on; until then the
-worker is registered and wired but no tick does any work — a background job that spends GPU before
-its own switch exists is not something to hand a user.
+The worker shipped **disabled** in T21-06 (`NormalizationParams::enabled = false`), because a
+background job that spends GPU before its own switch exists is not something to hand a user. T21-08
+wired the switch, `config.memory.normalize_to_english`; T21-11 defaulted it **off** after measuring
+the then-shipped design at `Δ MRR = +0.0000`; T21-17 defaulted it back **on**, because that design
+is gone and the sweep is now the only thing that resolves a store the write boundary has already
+begun writing in English. The honest caveat travels with the default: a coherent canon is not a
+measured recall gain, and the latter stays unmeasured until T21-18.
 
 The generator pool is built exactly once per process and shared by `Arc` with all three consumers
 (consolidation resume, consolidation trigger, normalization) — D-054's warning verbatim:

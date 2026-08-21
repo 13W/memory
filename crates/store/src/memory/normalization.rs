@@ -439,6 +439,13 @@ pub struct PendingNormalization {
     /// Attempts already recorded under this entry's existing row (`0` when
     /// there is none).
     pub attempt_count: i64,
+    /// The entry's `entry_version` as the queue read it.
+    ///
+    /// A caller that installs a translated canon does so through `apply_edit`,
+    /// whose optimistic guard needs exactly this (`T21-17`). Reading it here
+    /// rather than re-reading later is what makes "the entry moved while we
+    /// were translating" a skip instead of an overwrite.
+    pub entry_version: i64,
 }
 
 /// Every non-terminal entry whose English variant is missing, stale, or due for
@@ -484,7 +491,7 @@ fn scan_pending(
 ) -> rusqlite::Result<Vec<PendingNormalization>> {
     let sql = format!(
         "SELECT e.memory_id, e.text, COALESCE(n.attempt_count, 0), n.status, \
-                n.canon_text_sha256, n.normalizer_version \
+                n.canon_text_sha256, n.normalizer_version, e.entry_version \
          FROM memory_entry e \
          LEFT JOIN memory_text_normalization n ON n.memory_id = e.memory_id \
          WHERE e.state NOT IN ({TERMINAL_STATES}) \
@@ -510,11 +517,13 @@ fn scan_pending(
             let status: Option<String> = r.get(3)?;
             let canon_text_sha256: Option<String> = r.get(4)?;
             let row_version: Option<i64> = r.get(5)?;
+            let entry_version: i64 = r.get(6)?;
             Ok((
                 PendingNormalization {
                     memory_id,
                     text,
                     attempt_count,
+                    entry_version,
                 },
                 status,
                 canon_text_sha256,
@@ -743,6 +752,7 @@ mod tests {
                memory_id TEXT PRIMARY KEY, \
                state TEXT NOT NULL, \
                text TEXT NOT NULL, \
+               entry_version INTEGER NOT NULL DEFAULT 1, \
                created_at INTEGER NOT NULL);",
         )
         .unwrap();
@@ -1073,6 +1083,38 @@ mod tests {
             entries_needing_normalization(&conn, CURRENT_NORMALIZER_VERSION, 200, usize::MAX)
                 .unwrap();
         assert_eq!(queued.len() as i64, backlog.pending);
+    }
+
+    /// The queue carries the entry's live `entry_version`, because the sweep
+    /// that translates an entry (`T21-17`) has to hand it back to `apply_edit`
+    /// as the optimistic guard. A stale or invented version here would turn
+    /// "somebody edited this while we were translating" from a skip into a
+    /// silent overwrite of the author's newer text.
+    #[test]
+    fn the_queue_reports_each_entry_s_live_version() {
+        let conn = conn_with_normalization();
+        seed_entry(&conn, "m-fresh", "active", "непереведённый текст", 100);
+        seed_entry(&conn, "m-edited", "active", "текст, который правили", 100);
+        conn.execute(
+            "UPDATE memory_entry SET entry_version = 7 WHERE memory_id = ?1",
+            params!["m-edited"],
+        )
+        .unwrap();
+
+        // Sorted here on purpose: the queue's own ordering is a separate
+        // property, and pinning it in this test would make an unrelated
+        // ordering change look like a version bug.
+        let mut queued = entries_needing_normalization(&conn, CURRENT_NORMALIZER_VERSION, 200, 10)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.memory_id, p.entry_version))
+            .collect::<Vec<_>>();
+        queued.sort();
+
+        assert_eq!(
+            queued,
+            vec![("m-edited".to_string(), 7), ("m-fresh".to_string(), 1)],
+        );
     }
 
     #[test]

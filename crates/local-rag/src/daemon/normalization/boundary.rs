@@ -478,7 +478,7 @@ fn normalize_operation(
 }
 
 /// How much of a refusal's reason the row keeps.
-const LAST_ERROR_MAX_CHARS: usize = 200;
+pub(crate) const LAST_ERROR_MAX_CHARS: usize = 200;
 
 /// A refusal's reason, shortened for `last_error`.
 ///
