@@ -1,8 +1,9 @@
 //! T15-01 acceptance tests for `daemon::lock::acquire` (spec 02 §4.1 step 1):
-//! live conflict, PID reuse mismatch, and stale socket/lock recovery.
+//! live conflict, PID reuse mismatch, and stale socket/lock recovery — plus
+//! D-065's and D-084's rule that the `WouldBlock` branch reclaims nothing at
+//! all, and D-084's bounded handover wait that replaced the reclaim.
 //!
-//! All in-process: a background thread (for the genuine live-holder case) or
-//! a hand-rolled `UnixListener` (for the liveness probe) stand in for a
+//! All in-process: a background thread holding a real `flock` stands in for a
 //! second daemon — no real second `local-rag serve` process is needed for
 //! these lock-mechanics scenarios (that is `tests/serve_subprocess.rs`'s
 //! job). Deterministic: no wall-clock sleeps — a `std::sync::mpsc` handshake
@@ -13,11 +14,11 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use local_rag::daemon::probe::{LivenessOutcome, LivenessProbe};
 use local_rag::daemon::{
-    SocketLivenessProbe, StoreLockError, StoreLockFileState, StoreLockGuard, StoreLockInfo,
-    acquire, read_store_lock_file,
+    StoreLockError, StoreLockFileState, StoreLockGuard, StoreLockInfo, acquire,
+    read_store_lock_file,
 };
 use local_rag_core::paths::StoreLayout;
 use local_rag_protocol::{Message, PROTO_VERSION, Welcome, encode_message};
@@ -30,15 +31,10 @@ fn open_layout() -> (TempHome, StoreLayout) {
     (home, layout)
 }
 
-/// A probe that always answers the same fixed outcome, for tests that don't
-/// want to stand up a real socket.
-struct FixedProbe(LivenessOutcome);
-
-impl LivenessProbe for FixedProbe {
-    fn check(&self, _pid: u32, _expected_instance_uuid: &str) -> LivenessOutcome {
-        self.0
-    }
-}
+/// The budget almost every test here wants: none at all. A store that is free
+/// must be acquirable *now*, and a store that is held must be refused *now* —
+/// waiting would only blur which of the two happened.
+const NO_WAIT: Duration = Duration::ZERO;
 
 /// Bind a `UnixListener` at `socket_path` that answers every connection with
 /// the real HELLO/WELCOME handshake — reads (and discards) one HELLO line,
@@ -88,8 +84,8 @@ fn spawn_greeter(socket_path: std::path::PathBuf, store_instance_uuid: String) -
 }
 
 /// A background thread genuinely holds `store.lock` (a real, live `flock`
-/// contender) and answers the liveness probe correctly — `acquire` must
-/// report `Locked` naming that holder, never silently take over.
+/// contender) — `acquire` must report `Locked` naming that holder, never
+/// silently take over.
 #[test]
 fn live_conflict_is_reported_and_names_the_owner() {
     let (_home, layout) = open_layout();
@@ -128,9 +124,7 @@ fn live_conflict_is_reported_and_names_the_owner() {
     });
 
     ready_rx.recv().expect("holder ready");
-
-    let probe = SocketLivenessProbe::new(layout.socket_path());
-    let result = acquire(&layout, "candidate-uuid", 999_999, "0.0.0", 2_000, &probe);
+    let result = acquire(&layout, "candidate-uuid", 999_999, "0.0.0", 2_000, NO_WAIT);
 
     release_tx.send(()).expect("release holder");
     holder.join().expect("holder thread");
@@ -174,11 +168,12 @@ fn pid_reuse_mismatch_is_reclaimed() {
 
     // No real flock held on the file — a fresh `try_lock` succeeds
     // immediately, so this specifically exercises the *success-path* stale
-    // socket cleanup, not the WouldBlock recovery branch (see
-    // `wouldblock_recovery_reclaims_after_probe_reports_stale` below for that
-    // one, and `daemon::probe`'s own unit tests for the probe logic itself).
-    let probe = SocketLivenessProbe::new(layout.socket_path());
-    let guard = acquire(&layout, "new-instance-uuid", 42, "0.0.0", 2_000, &probe)
+    // socket cleanup. That is also why D-084 left this test intact: the
+    // reclaim it deleted lives on the `WouldBlock` branch, which this scenario
+    // never reaches. Nothing here ever depended on a liveness verdict; the
+    // greeter answering with a different uuid is scene-setting, not the
+    // mechanism.
+    let guard = acquire(&layout, "new-instance-uuid", 42, "0.0.0", 2_000, NO_WAIT)
         .expect("stale owner must be reclaimed");
     assert_eq!(guard.info().instance_uuid, "new-instance-uuid");
     assert!(
@@ -189,11 +184,98 @@ fn pid_reuse_mismatch_is_reclaimed() {
     stop_greeter();
 }
 
-/// `WouldBlock` recovery specifically (the file genuinely was `flock`'d by a
-/// holder that has since become unreachable — probe reports `Stale`):
-/// `acquire` must reclaim on the single retry.
+/// **D-084's reproduction.** A live owner that has stopped answering — this is
+/// a daemon in shutdown, which unlinks its socket in step 1 (`daemon::shutdown`,
+/// D-077) and releases the lock last, so for the whole length of its drain it
+/// is alive, still writing, and unreachable. Its record parses, names a live
+/// pid, and says `ready: true`; nothing can answer on the socket.
+///
+/// Before D-084 that combination was read as "the owner is dead" and the lock
+/// was reclaimed: the file unlinked, a fresh one created, and the incumbent's
+/// real `flock` — which lives on its open file description, not on the path —
+/// left untouched. Two daemons, one canonical store. Live capture:
+/// `daemon stopping` 11:53:47, a second `store lock acquired` 11:54:02, the
+/// first `daemon stopped` 11:54:14.
+///
+/// The inode assertion is the sharp one, exactly as in D-065's tests: a
+/// `Locked` result with a *changed* inode would still be the defect.
 #[test]
-fn wouldblock_recovery_reclaims_after_probe_reports_stale() {
+fn a_live_owner_that_stopped_answering_is_never_reclaimed() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_home, layout) = open_layout();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let lock_path = layout.store_lock();
+
+    // A well-formed, `ready: true` record naming a genuinely live pid (ours),
+    // written by the holder through the same handle that holds the `flock` —
+    // exactly the state a daemon leaves behind when it enters shutdown.
+    let owner_json = serde_json::json!({
+        "instance_uuid": "draining-owner",
+        "pid": std::process::id(),
+        "daemon_version": "0.0.0",
+        "started_at": 1_000,
+        "ready": true,
+        "ready_at": 1_000,
+        "socket_path": layout.socket_path().display().to_string(),
+    })
+    .to_string();
+
+    let holder = std::thread::spawn(move || {
+        local_rag_core::paths::ensure_file_0600(&lock_path).expect("ensure lock file");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        file.lock().expect("blocking lock");
+        file.write_all(owner_json.as_bytes()).expect("write info");
+        file.flush().expect("flush");
+        ready_tx.send(()).expect("signal ready");
+        release_rx.recv().expect("wait for release signal");
+    });
+    ready_rx.recv().expect("holder ready");
+
+    // Deliberately no `spawn_greeter`: the socket the record names does not
+    // exist, which is the whole scenario.
+    let ino_before = std::fs::metadata(layout.store_lock())
+        .expect("lock file exists before acquire")
+        .ino();
+    let result = acquire(&layout, "candidate-uuid", 999_999, "0.0.0", 2_000, NO_WAIT);
+    let ino_after = std::fs::metadata(layout.store_lock())
+        .expect("lock file must still exist — a reclaim would have unlinked it")
+        .ino();
+
+    release_tx.send(()).expect("release holder");
+    holder.join().expect("holder thread");
+
+    match result {
+        Err(StoreLockError::Locked { owner }) => {
+            assert_eq!(owner.instance_uuid, "draining-owner");
+            assert_eq!(owner.pid, std::process::id());
+        }
+        other => panic!(
+            "expected Locked (a live owner that stopped answering must never be reclaimed), \
+             got {other:?}"
+        ),
+    }
+    assert_eq!(
+        ino_before, ino_after,
+        "the lock file was unlinked and recreated — this is the reclaim that leaves two \
+         daemons each owning the store"
+    );
+}
+
+/// The budget is a real wait, not a formality: a lock held for its whole
+/// length is refused *after* it, not immediately. Asserting a lower bound on
+/// the elapsed time is safe — an upper bound is what would flake — and it is
+/// the only thing that distinguishes "retried until the budget ran out" from
+/// "returned on the first `WouldBlock`".
+#[test]
+fn a_lock_held_past_the_budget_is_refused_after_waiting_it_out() {
+    use std::os::unix::fs::MetadataExt;
+
     let (_home, layout) = open_layout();
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -212,39 +294,134 @@ fn wouldblock_recovery_reclaims_after_probe_reports_stale() {
     });
     ready_rx.recv().expect("holder ready");
 
-    // No greeting: the probe's `pid_exists` check for our own live test
-    // process would pass, but with no listener at all the socket half of the
-    // handshake fails — `Stale` (see `daemon::probe`'s own
-    // `no_listener_at_all_is_stale`). Note: the lock file has no parseable
-    // JSON in it in this scenario (nothing wrote one), so `acquire` takes the
-    // "unparseable ⇒ treat as stale" path, not a probe-driven one — proven
-    // separately by `stale_unparseable_lock_file_is_reclaimed` below. This
-    // test instead seeds a well-formed-but-mismatched record so the probe
-    // itself is exercised on the WouldBlock path.
-    let stale_json = serde_json::json!({
-        "instance_uuid": "unreachable-owner",
-        "pid": std::process::id(),
-        "daemon_version": "0.0.0",
-        "started_at": 1_000,
-        "ready": true,
-        "ready_at": 1_000,
-        "socket_path": layout.socket_path().display().to_string(),
-    })
-    .to_string();
-    // Written by the holder before signaling ready would race the `file`
-    // handle above; instead write it via a second, independent open — still
-    // valid, since `flock` is advisory and this is a plain content write, not
-    // a second lock attempt.
-    std::fs::write(layout.store_lock(), stale_json).expect("seed owner json");
-
-    let probe = FixedProbe(LivenessOutcome::Stale);
-    let result = acquire(&layout, "candidate-uuid", 1, "0.0.0", 2_000, &probe);
+    let budget = Duration::from_millis(200);
+    let ino_before = std::fs::metadata(layout.store_lock())
+        .expect("lock file exists")
+        .ino();
+    let started = Instant::now();
+    let result = acquire(&layout, "candidate-uuid", 999_999, "0.0.0", 2_000, budget);
+    let elapsed = started.elapsed();
+    let ino_after = std::fs::metadata(layout.store_lock())
+        .expect("lock file must still exist")
+        .ino();
 
     release_tx.send(()).expect("release holder");
     holder.join().expect("holder thread");
 
-    let guard = result.expect("stale WouldBlock owner must be reclaimed on retry");
-    assert_eq!(guard.info().instance_uuid, "candidate-uuid");
+    assert!(
+        matches!(result, Err(StoreLockError::Locked { .. })),
+        "a lock held for the whole budget must be refused: {result:?}"
+    );
+    assert!(
+        elapsed >= budget,
+        "the budget must be spent waiting, not skipped: {elapsed:?} < {budget:?}"
+    );
+    assert_eq!(ino_before, ino_after, "waiting must not reclaim either");
+}
+
+/// The other half of the budget: a store released while a contender is waiting
+/// is handed over, not refused. This is the case the reclaim used to "solve"
+/// by stealing — a daemon spawned during someone else's drain.
+///
+/// The zero-budget probe first proves the lock is genuinely held, so the
+/// budgeted call that follows is known to start against a real incumbent. The
+/// handover itself is asserted on the outcome, never on timing.
+#[test]
+fn an_incumbent_that_releases_is_handed_over_to_within_the_budget() {
+    let (_home, layout) = open_layout();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (blocked_tx, blocked_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let lock_path = layout.store_lock();
+
+    let holder = std::thread::spawn(move || {
+        local_rag_core::paths::ensure_file_0600(&lock_path).expect("ensure lock file");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        file.lock().expect("blocking lock");
+        ready_tx.send(()).expect("signal ready");
+        release_rx.recv().expect("wait for release signal");
+        // `file` drops here: the flock goes, exactly as an exiting daemon's
+        // would.
+    });
+    ready_rx.recv().expect("holder ready");
+
+    let contender_layout = layout.clone();
+    let contender = std::thread::spawn(move || {
+        let refused = acquire(
+            &contender_layout,
+            "contender",
+            424_242,
+            "0.0.0",
+            3_000,
+            NO_WAIT,
+        );
+        assert!(
+            matches!(refused, Err(StoreLockError::Locked { .. })),
+            "the incumbent must genuinely hold the lock first: {refused:?}"
+        );
+        blocked_tx.send(()).expect("signal blocked");
+        acquire(
+            &contender_layout,
+            "contender",
+            424_242,
+            "0.0.0",
+            3_000,
+            Duration::from_secs(5),
+        )
+    });
+
+    blocked_rx.recv().expect("contender blocked once");
+    release_tx.send(()).expect("release holder");
+    holder.join().expect("holder thread");
+
+    let guard = contender
+        .join()
+        .expect("contender thread")
+        .expect("a released lock must be handed over within the budget");
+    assert_eq!(guard.info().instance_uuid, "contender");
+}
+
+/// D-084's second half: an owner on its way out must never unlink a record
+/// that is no longer its own. `flock` lives on the open file description and
+/// the record lives at a path; anything that recreates the file while a guard
+/// is alive pulls them apart. Before this check, the exiting daemon deleted
+/// its successor's record, and the daemon after *that* found no file at all
+/// and acquired cleanly alongside both — the third process in the live
+/// capture, 57 seconds after the second.
+#[test]
+fn a_departing_owner_never_unlinks_a_record_it_no_longer_owns() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_home, layout) = open_layout();
+    let guard = acquire(&layout, "departing", 111, "0.0.0", 1_000, NO_WAIT).expect("acquire");
+
+    // A successor takes the path: unlink and recreate, exactly what a reclaim
+    // (or any recreate-in-place) does to it.
+    std::fs::remove_file(layout.store_lock()).expect("unlink the departing owner's record");
+    local_rag_core::paths::ensure_file_0600(&layout.store_lock()).expect("successor's record");
+    std::fs::write(layout.store_lock(), b"successor's record").expect("seed successor content");
+    let successor_ino = std::fs::metadata(layout.store_lock())
+        .expect("successor record exists")
+        .ino();
+
+    guard.release(&layout);
+
+    let after = std::fs::metadata(layout.store_lock())
+        .expect("the successor's record must survive the departing owner's release");
+    assert_eq!(
+        after.ino(),
+        successor_ino,
+        "release unlinked a record that was not its own"
+    );
+    assert_eq!(
+        std::fs::read(layout.store_lock()).expect("read"),
+        b"successor's record",
+        "the successor's content must be untouched"
+    );
 }
 
 /// A `store.lock` naming a **definitely dead** PID (spawned and reaped
@@ -274,9 +451,7 @@ fn stale_lock_content_from_a_dead_owner_is_overwritten() {
     .to_string();
     local_rag_core::paths::ensure_file_0600(&layout.store_lock()).expect("ensure lock file");
     std::fs::write(layout.store_lock(), stale_json).expect("seed dead-owner lock file");
-
-    let probe = FixedProbe(LivenessOutcome::Stale);
-    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, &probe)
+    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, NO_WAIT)
         .expect("dead owner must not block acquisition");
     assert_eq!(guard.info().instance_uuid, "fresh-instance");
 }
@@ -290,9 +465,7 @@ fn orphaned_socket_file_does_not_block_acquisition_and_is_removed() {
     let (_home, layout) = open_layout();
     std::fs::write(layout.socket_path(), b"not a real socket").expect("seed orphan socket file");
     assert!(layout.socket_path().exists());
-
-    let probe = FixedProbe(LivenessOutcome::Stale);
-    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, &probe)
+    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, NO_WAIT)
         .expect("orphan socket must not block acquisition");
     assert_eq!(guard.info().instance_uuid, "fresh-instance");
     assert!(
@@ -308,9 +481,7 @@ fn unparseable_lock_content_is_treated_as_stale() {
     let (_home, layout) = open_layout();
     local_rag_core::paths::ensure_file_0600(&layout.store_lock()).expect("ensure lock file");
     std::fs::write(layout.store_lock(), b"{not valid json at all").expect("seed torn write");
-
-    let probe = FixedProbe(LivenessOutcome::Alive); // must not even be consulted
-    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, &probe)
+    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, NO_WAIT)
         .expect("unparseable content must not block acquisition");
     assert_eq!(guard.info().instance_uuid, "fresh-instance");
 }
@@ -329,25 +500,17 @@ fn unparseable_lock_content_is_treated_as_stale() {
 #[test]
 fn mark_ready_never_drops_the_lock() {
     let (_home, layout) = open_layout();
-    let probe = FixedProbe(LivenessOutcome::Stale);
     let mut guard = acquire(
         &layout,
         "instance-a",
         std::process::id(),
         "0.0.0",
         1_000,
-        &probe,
+        NO_WAIT,
     )
     .expect("acquire");
 
-    let contender = acquire(
-        &layout,
-        "instance-b",
-        200,
-        "0.0.0",
-        1_000,
-        &FixedProbe(LivenessOutcome::Alive),
-    );
+    let contender = acquire(&layout, "instance-b", 200, "0.0.0", 1_000, NO_WAIT);
     assert!(matches!(contender, Err(StoreLockError::Locked { .. })));
 
     guard
@@ -355,14 +518,7 @@ fn mark_ready_never_drops_the_lock() {
         .expect("mark ready");
     assert!(guard.info().ready);
 
-    let contender_after = acquire(
-        &layout,
-        "instance-c",
-        300,
-        "0.0.0",
-        1_600,
-        &FixedProbe(LivenessOutcome::Alive),
-    );
+    let contender_after = acquire(&layout, "instance-c", 300, "0.0.0", 1_600, NO_WAIT);
     assert!(matches!(
         contender_after,
         Err(StoreLockError::Locked { .. })
@@ -376,12 +532,11 @@ fn mark_ready_never_drops_the_lock() {
 #[test]
 fn release_lets_a_fresh_acquire_succeed_without_recovery() {
     let (_home, layout) = open_layout();
-    let probe = FixedProbe(LivenessOutcome::Alive); // must not be consulted at all
-    let guard = acquire(&layout, "instance-a", 100, "0.0.0", 1_000, &probe).expect("acquire");
+    let guard = acquire(&layout, "instance-a", 100, "0.0.0", 1_000, NO_WAIT).expect("acquire");
     guard.release(&layout);
     assert!(!layout.store_lock().exists());
 
-    let second = acquire(&layout, "instance-b", 200, "0.0.0", 2_000, &probe);
+    let second = acquire(&layout, "instance-b", 200, "0.0.0", 2_000, NO_WAIT);
     assert!(second.is_ok(), "release must free the lock: {second:?}");
 }
 
@@ -390,10 +545,11 @@ fn release_lets_a_fresh_acquire_succeed_without_recovery() {
 /// socket at all. A naive probe would see "no listener" and misclassify it
 /// as dead, wrongly reclaiming the lock out from under a genuinely live
 /// daemon (whose real OS `flock` on its own open file descriptor is never
-/// actually released by that reclaim — see `daemon::lock::is_owner_alive`'s
-/// doc comment). `acquire` must instead trust the PID alone while
-/// `ready == false`, and correctly report `Locked`, not silently steal the
-/// store from a daemon that is still migrating.
+/// actually released by that reclaim — this file's `daemon::lock` module doc).
+/// `acquire` must report `Locked`, not silently steal the store from a daemon
+/// that is still migrating. Since D-084 that follows from the branch rule
+/// rather than from a `ready`-specific exception, and the test is unchanged:
+/// the property it guards is the one that survived.
 #[test]
 fn a_not_yet_ready_live_owner_is_never_mistaken_for_dead() {
     let (_home, layout) = open_layout();
@@ -405,8 +561,8 @@ fn a_not_yet_ready_live_owner_is_never_mistaken_for_dead() {
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let lock_path = layout.store_lock();
     // Deliberately no `spawn_greeter`: this is the whole point — the owner
-    // has bound no socket yet, so a real `SocketLivenessProbe` would see
-    // "connection refused" if consulted at all.
+    // has bound no socket yet, so anything asking the socket would see
+    // "connection refused".
     let owner_json = serde_json::json!({
         "instance_uuid": "still-migrating-instance",
         "pid": std::process::id(),
@@ -432,9 +588,7 @@ fn a_not_yet_ready_live_owner_is_never_mistaken_for_dead() {
         release_rx.recv().expect("wait for release signal");
     });
     ready_rx.recv().expect("holder ready");
-
-    let probe = SocketLivenessProbe::new(layout.socket_path());
-    let result = acquire(&layout, "candidate-uuid", 999_999, "0.0.0", 2_000, &probe);
+    let result = acquire(&layout, "candidate-uuid", 999_999, "0.0.0", 2_000, NO_WAIT);
 
     release_tx.send(()).expect("release holder");
     holder.join().expect("holder thread");
@@ -451,7 +605,7 @@ fn a_not_yet_ready_live_owner_is_never_mistaken_for_dead() {
 }
 
 /// The same not-yet-ready record, but the PID is genuinely dead (a crash
-/// mid-migration) — this must still be reclaimed. A dead process cannot
+/// mid-migration) — this must still be recovered from. A dead process cannot
 /// realistically hold a real `flock` either (POSIX releases it on exit, see
 /// this module's own doc comment), so — unlike the live sibling test above —
 /// this one takes the success-path content overwrite, not the `WouldBlock`
@@ -478,9 +632,7 @@ fn a_not_yet_ready_owner_with_a_dead_pid_is_reclaimed() {
     .to_string();
     local_rag_core::paths::ensure_file_0600(&layout.store_lock()).expect("ensure lock file");
     std::fs::write(layout.store_lock(), owner_json).expect("seed dead not-yet-ready lock file");
-
-    let probe = SocketLivenessProbe::new(layout.socket_path());
-    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, &probe)
+    let guard = acquire(&layout, "fresh-instance", 7, "0.0.0", 2_000, NO_WAIT)
         .expect("a dead not-yet-ready owner must be reclaimed");
     assert_eq!(guard.info().instance_uuid, "fresh-instance");
 }
@@ -533,12 +685,9 @@ fn acquire_against_a_live_holder(
         .expect("lock file exists before acquire")
         .ino();
 
-    // `Stale` on purpose: under the pre-D-065 code this verdict is what drove
-    // the reclaim, so a probe that says "dead" makes the regression loud. With
-    // the fix the probe is never consulted at all — there is no parsed record
-    // to consult it about.
-    let probe = FixedProbe(LivenessOutcome::Stale);
-    let result = acquire(layout, "candidate-uuid", 999_999, "0.0.0", 2_000, &probe);
+    // Under the pre-D-065 code an unreadable record drove the reclaim all by
+    // itself; since D-084 nothing on this branch can drive one at all.
+    let result = acquire(layout, "candidate-uuid", 999_999, "0.0.0", 2_000, NO_WAIT);
 
     let ino_after = std::fs::metadata(layout.store_lock())
         .expect("lock file must still exist — a reclaim would have unlinked it")
@@ -599,15 +748,8 @@ fn a_shrinking_rewrite_leaves_no_padding_on_disk() {
     let (_home, layout) = open_layout();
 
     // A long record first: `ready: true` carries `ready_at` and `socket_path`.
-    let mut guard = acquire(
-        &layout,
-        "long-instance-uuid",
-        4242,
-        "0.0.0",
-        1_000,
-        &FixedProbe(LivenessOutcome::Stale),
-    )
-    .expect("first acquire");
+    let mut guard = acquire(&layout, "long-instance-uuid", 4242, "0.0.0", 1_000, NO_WAIT)
+        .expect("first acquire");
     guard
         .mark_ready(1_500, &layout.socket_path())
         .expect("mark ready");
@@ -617,15 +759,7 @@ fn a_shrinking_rewrite_leaves_no_padding_on_disk() {
     drop(guard); // releases the `flock`, leaves the content behind
 
     // Now a shorter one over it: fresh records carry neither field.
-    let _guard = acquire(
-        &layout,
-        "short",
-        7,
-        "0.0.0",
-        2_000,
-        &FixedProbe(LivenessOutcome::Stale),
-    )
-    .expect("second acquire");
+    let _guard = acquire(&layout, "short", 7, "0.0.0", 2_000, NO_WAIT).expect("second acquire");
 
     let bytes = std::fs::read(layout.store_lock()).expect("read lock file");
     assert!(
@@ -666,8 +800,7 @@ fn read_store_lock_file_is_corrupt_on_unparseable_content() {
 #[test]
 fn read_store_lock_file_parses_a_real_lock_written_by_acquire() {
     let (_home, layout) = open_layout();
-    let probe = FixedProbe(LivenessOutcome::Alive); // never consulted -- fresh acquire
-    let guard = acquire(&layout, "instance-a", 42, "0.0.0", 1_000, &probe).expect("acquire");
+    let guard = acquire(&layout, "instance-a", 42, "0.0.0", 1_000, NO_WAIT).expect("acquire");
     assert_eq!(guard.info().pid, 42);
 
     match read_store_lock_file(&layout) {
@@ -683,11 +816,9 @@ fn read_store_lock_file_parses_a_real_lock_written_by_acquire() {
 #[test]
 fn read_store_lock_file_never_contends_with_a_live_flock() {
     let (_home, layout) = open_layout();
-    let probe = FixedProbe(LivenessOutcome::Alive);
-    // Hold the real flock via a live guard for the whole test -- a mutating
     // read (or one that tried to `try_lock`) would either fail or need to
     // wait; `read_store_lock_file` must do neither.
-    let guard = acquire(&layout, "instance-b", 99, "0.0.0", 1_000, &probe).expect("acquire");
+    let guard = acquire(&layout, "instance-b", 99, "0.0.0", 1_000, NO_WAIT).expect("acquire");
 
     match read_store_lock_file(&layout) {
         StoreLockFileState::Parsed(info) => assert_eq!(info.instance_uuid, "instance-b"),

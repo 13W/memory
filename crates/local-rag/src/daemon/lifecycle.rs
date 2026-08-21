@@ -32,7 +32,6 @@ use super::mcp::McpHandler;
 use super::memory::build_memory_context;
 use super::mode::DaemonMode;
 #[cfg(unix)]
-use super::probe::SocketLivenessProbe;
 use super::query_embedder::{code_query_embedder, memory_query_embedder};
 use super::resume::{build_best_effort_pool, resume_spool_import};
 use super::search::build_search_engine;
@@ -126,6 +125,12 @@ pub struct StartOptions {
     /// and `local_rag::indexing::write_locked` (write side, T20-04/T20-05).
     /// Production callers pass `Arc::new(WorktreeLockRegistry::new())`.
     pub locks: Arc<WorktreeLockRegistry>,
+    /// How long step 1 waits out a handover before refusing (D-084, spec 02
+    /// §4.1). Production passes [`lock::LOCK_HANDOVER_BUDGET_MS`]; tests that
+    /// assert *refusal* pass `Duration::ZERO`, because a store held right now
+    /// must be refused right now — waiting would only blur which of the two
+    /// outcomes the test observed.
+    pub lock_handover_budget: Duration,
     /// The MCP code-query tools' dense-leg query embedder. `None` — the
     /// production case — derives it from `embedder_provider` via
     /// `code_query_embedder`, so "one session per kind" holds by
@@ -292,6 +297,7 @@ impl DaemonHandle {
             layout,
             daemon_version,
             now_ms,
+            lock_handover_budget: handover_budget,
             uuids,
             write_queue_capacity,
             payload_ttl_hours,
@@ -327,32 +333,31 @@ impl DaemonHandle {
 
         layout.ensure().map_err(DaemonStartupError::Path)?;
 
-        // Step 1: store lock (L0), with stale-owner recovery.
+        // Step 1: store lock (L0), waiting out a handover from an outgoing
+        // owner within `LOCK_HANDOVER_BUDGET_MS` (D-084).
         let instance_uuid = uuids.next_uuid().to_string();
         let pid = std::process::id();
-        // `acquire` does blocking file-lock and (on contention) blocking
-        // socket I/O (`SocketLivenessProbe`, up to `LIVENESS_PROBE_TIMEOUT_MS`).
-        // Called directly, that blocking work would run *on this async task's
-        // own executor thread* — on a single-worker runtime, that starves the
-        // very connection-accept task (spec 02 §4.1 step 4) another
-        // instance's probe would need answered, making every liveness check
-        // spuriously time out. `spawn_blocking` moves it to the blocking
-        // thread pool, the same discipline `StateWriter`/`CacheWriter`
-        // already use for their own blocking SQLite I/O (dedicated OS
-        // threads, never inline on an async task).
+        // `acquire` does blocking file-lock I/O and, on contention, sleeps
+        // between retries for up to `LOCK_HANDOVER_BUDGET_MS`. Called
+        // directly, that blocking work would run *on this async task's own
+        // executor thread*, which on a single-worker runtime starves the very
+        // connection-accept task (spec 02 §4.1 step 4) the rest of the daemon
+        // is built around. `spawn_blocking` moves it to the blocking thread
+        // pool, the same discipline `StateWriter`/`CacheWriter` already use
+        // for their own blocking SQLite I/O (dedicated OS threads, never
+        // inline on an async task).
         let mut lock_guard = {
             let layout = layout.clone();
             let instance_uuid = instance_uuid.clone();
             let daemon_version = daemon_version.clone();
             tokio::task::spawn_blocking(move || {
-                let probe = SocketLivenessProbe::new(layout.socket_path());
                 lock::acquire(
                     &layout,
                     &instance_uuid,
                     pid,
                     &daemon_version,
                     now_ms,
-                    &probe,
+                    handover_budget,
                 )
             })
             .await

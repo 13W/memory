@@ -81,9 +81,9 @@ pub use lock::{
 pub use mcp::McpHandler;
 pub use memory::{MemoryContext, build_memory_context};
 pub use mode::{DaemonMode, MigrationOnlyReason};
+pub use probe::LIVENESS_PROBE_TIMEOUT_MS;
 #[cfg(unix)]
-pub use probe::{CallAdminError, SocketLivenessProbe, call_admin, fetch_welcome};
-pub use probe::{LIVENESS_PROBE_TIMEOUT_MS, LivenessOutcome, LivenessProbe};
+pub use probe::{CallAdminError, call_admin, fetch_welcome};
 pub use query_embedder::{
     EmbedderQueryAdapter, LazyQueryEmbedder, MemoryEmbedderQueryAdapter, code_query_embedder,
     memory_query_embedder,

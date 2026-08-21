@@ -135,6 +135,9 @@ async fn serve() -> ExitCode {
         daemon_version: test_daemon_version_override()
             .unwrap_or_else(|| local_rag_core::VERSION.to_string()),
         now_ms,
+        lock_handover_budget: std::time::Duration::from_millis(
+            local_rag::daemon::lock::LOCK_HANDOVER_BUDGET_MS,
+        ),
         uuids: Arc::new(SystemUuidV7),
         write_queue_capacity: DEFAULT_WRITE_QUEUE_CAPACITY,
         payload_ttl_hours: config.storage.payload_ttl_hours,
@@ -178,7 +181,18 @@ async fn serve() -> ExitCode {
         Ok(ShutdownReason::Idle) => ExitCode::SUCCESS,
         Ok(ShutdownReason::UpgradeRequested) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{BIN}: {}", startup_error_message(&e));
+            let message = startup_error_message(&e);
+            // Both, and not by accident (D-084). `eprintln!` is for a human
+            // running `local-rag serve` in a terminal; the tracing line is for
+            // everyone else, because the daemon that most often fails here was
+            // spawned by the proxy, whose `spawn_detached_daemon` gives it
+            // `Stdio::null()` for stderr. That is how eight of twenty-six
+            // starts on the owner's machine on 2026-08-21 left `daemon
+            // starting` in `logs/daemon.<date>.log` and then nothing at all —
+            // a refusal no surface recorded. Spec 02 §6 `[FIXED]`: nothing
+            // degrades silently.
+            tracing::warn!(reason = %message, "daemon startup refused");
+            eprintln!("{BIN}: {message}");
             ExitCode::FAILURE
         }
     }

@@ -51,6 +51,9 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         layout,
         daemon_version: "0.0.0".to_string(),
         now_ms: 1_000,
+        // No handover wait in tests: a store that is free must be acquirable
+        // now, and one that is held must be refused now (D-084).
+        lock_handover_budget: std::time::Duration::ZERO,
         uuids: Arc::new(SeqUuidV7::new()),
         write_queue_capacity: 8,
         payload_ttl_hours: 72,
@@ -146,9 +149,16 @@ async fn shutdown_checkpoints_the_wal_and_releases_the_lock() {
         !layout.store_lock().exists(),
         "shutdown must remove store.lock"
     );
-    let probe = local_rag::daemon::SocketLivenessProbe::new(layout.socket_path());
-    let reacquired =
-        local_rag::daemon::acquire(&layout, "post-shutdown", 999, "0.0.0", 5_000, &probe);
+    // Zero handover budget: a released lock must be free *now*, not after a
+    // wait. Any retry here would hide exactly the failure this asserts.
+    let reacquired = local_rag::daemon::acquire(
+        &layout,
+        "post-shutdown",
+        999,
+        "0.0.0",
+        5_000,
+        std::time::Duration::ZERO,
+    );
     assert!(
         reacquired.is_ok(),
         "the lock must be fully released: {reacquired:?}"
