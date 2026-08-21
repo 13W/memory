@@ -285,7 +285,7 @@ async fn the_version_10_checksum_matches_the_frozen_migration_and_survives_reope
         .expect("v10 in ALL")
         .checksum();
 
-    let checksum = {
+    let (checksum, applied_before_reopen) = {
         let db = StateDb::open(layout.state_db()).expect("first open");
         let read = db.open_read().expect("read conn");
         let checksum: String = read
@@ -299,7 +299,10 @@ async fn the_version_10_checksum_matches_the_frozen_migration_and_survives_reope
             checksum, expected,
             "recorded checksum matches the frozen SQL"
         );
-        checksum
+        let applied: i64 = read
+            .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
+            .expect("count migrations before reopen");
+        (checksum, applied)
     };
 
     let db2 = StateDb::open(layout.state_db()).expect("reopen");
@@ -315,8 +318,23 @@ async fn the_version_10_checksum_matches_the_frozen_migration_and_survives_reope
         checksum2, checksum,
         "checksum is byte-identical across reopen"
     );
+    // D-082: the claim is "reopen adds no new rows", so the comparison is
+    // before-versus-after. This used to assert an absolute `13`, which stopped
+    // being true the moment schema v14 landed (T21-01) and left the test red on
+    // `master` for 24 commits — asserting a number the test does not care about
+    // is how a green suite turns red without anyone breaking anything.
     let count: i64 = read2
         .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .expect("count migrations");
-    assert_eq!(count, 13, "reopen adds no new migration rows");
+    assert_eq!(
+        count, applied_before_reopen,
+        "reopen adds no new migration rows"
+    );
+    // And the store really is fully migrated, expressed against the migration
+    // list itself so the next migration keeps this true for free.
+    assert_eq!(
+        count,
+        local_rag_store::ALL.len() as i64,
+        "a freshly opened store has every migration applied"
+    );
 }
