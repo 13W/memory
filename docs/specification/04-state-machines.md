@@ -38,8 +38,10 @@ ratchet: each one makes every future cycle slower, and a cycle slow enough to be
 another. Measured on the owner's store: **3086** `projection_ready` generations against 2 `active`,
 a backfill reading ~32 million occurrence rows per cycle, and one cycle observed running **52
 minutes at ~100 % CPU without finishing** — while search kept answering from a generation ten hours
-old and `wal_checkpoint(TRUNCATE)`, whose only driver is the cycle boundary (03 §3, D-083), never
-ran.
+old and `wal_checkpoint(TRUNCATE)`, whose only driver *at that time* was the cycle boundary
+(03 §3, D-083), never ran. D-086 has since given the policy a second driver on the consolidation
+tick, so "the cycle boundary is the only driver" describes the state this paragraph is about, not
+the current one.
 
 So: the cycle that supersedes a generation retires it. Before its backfill, under the worktree's
 already-held `L2.write`, every `building`/`projection_ready` generation of that worktree with a

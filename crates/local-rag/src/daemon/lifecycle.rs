@@ -977,6 +977,10 @@ async fn spawn_consolidation_trigger(
         queue_threshold,
         payload_ttl_hours,
         idle_checkpoint_hours,
+        // D-086: production takes spec 03 §3's number as written. Tests pass a
+        // small one, so the threshold's behaviour can be observed without
+        // manufacturing 64 MiB of WAL.
+        wal_truncate_threshold_bytes: local_rag_store::WAL_TRUNCATE_THRESHOLD_BYTES,
     };
     super::consolidation_trigger::run_consolidation_trigger(
         db,

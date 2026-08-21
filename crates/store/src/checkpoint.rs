@@ -51,3 +51,83 @@ pub struct CheckpointStats {
     /// The number of frames actually transferred into the database file.
     pub checkpointed_frames: i64,
 }
+
+/// spec 03 §3's threshold, verbatim: "`TRUNCATE` when WAL > 64 MiB and no
+/// readers".
+///
+/// `[SPEC]` in that section, so it is a number this crate may state rather than
+/// derive. The threshold's purpose is that a blocking truncate is not paid too
+/// often — not that the WAL is kept below it at all times, which nothing can
+/// promise while a reader holds a snapshot.
+pub const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The size of the `-wal` file sitting beside `db_path`, or `0` when there is
+/// none (no WAL yet, or it has just been truncated away).
+///
+/// The file size, not [`CheckpointStats`], is what a caller should test: this
+/// module's own note above records that `Truncate`'s counters read zero on a
+/// connection's first checkpoint even when it truncated. An unreadable path is
+/// `0` for the same reason a missing one is — the caller's question is "is
+/// there enough WAL to be worth a blocking truncate", and "cannot tell" answers
+/// it with "not now" rather than with an error nobody could act on.
+pub fn wal_bytes(db_path: &std::path::Path) -> u64 {
+    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+    name.push("-wal");
+    std::fs::metadata(db_path.with_file_name(name))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Whether spec 03 §3's `TRUNCATE` clause fires right now (D-086).
+///
+/// Both halves matter and the second is the subtle one. "No readers" is not
+/// politeness towards concurrent queries — a reader holding a snapshot pins the
+/// frames after it, so a truncate under one transfers what it may and leaves the
+/// file at its high-water mark, having taken the blocking cost for nothing.
+/// Measured on the owner's store: during one 2.8-minute indexing cycle the
+/// `-wal` grew to 2.5 GB at roughly 0.9 GB/min, all of it pinned by the embedding
+/// backfill's read connection, and only the cycle's own end-of-run truncate
+/// returned it.
+pub fn should_truncate_wal(wal_bytes: u64, threshold_bytes: u64, readers_open: bool) -> bool {
+    wal_bytes > threshold_bytes && !readers_open
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_truncate_clause_needs_both_halves() {
+        let over = WAL_TRUNCATE_THRESHOLD_BYTES + 1;
+        let under = WAL_TRUNCATE_THRESHOLD_BYTES;
+        for (wal, readers, expected, why) in [
+            (
+                over,
+                false,
+                true,
+                "over the threshold with no reader: truncate",
+            ),
+            (
+                over,
+                true,
+                false,
+                "a reader pins the frames; truncating buys nothing",
+            ),
+            (under, false, false, "at the threshold is not over it"),
+            (under, true, false, "neither half holds"),
+            (0, false, false, "no WAL at all"),
+        ] {
+            assert_eq!(
+                should_truncate_wal(wal, WAL_TRUNCATE_THRESHOLD_BYTES, readers),
+                expected,
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_wal_file_measures_zero_rather_than_erroring() {
+        let dir = std::env::temp_dir().join("local-rag-wal-bytes-probe");
+        assert_eq!(wal_bytes(&dir.join("no-such.sqlite")), 0);
+    }
+}
