@@ -127,11 +127,11 @@ async fn the_indexing_pipeline_is_reachable_from_outside_the_binary() {
     .await
     .expect("index_worktree");
 
-    assert_eq!(first.reconcile.build.files_indexed, 1);
+    assert_eq!(first.reconcile.expect_built().files_indexed, 1);
     assert!(first.project.switch.upserted >= 1);
     assert_eq!(
         first.project.fts.occurrence_count,
-        first.reconcile.build.occurrences as u64
+        first.reconcile.expect_built().occurrences as u64
     );
 
     // A direct call to `project_generation` — proves it is public separately
@@ -141,7 +141,7 @@ async fn the_indexing_pipeline_is_reachable_from_outside_the_binary() {
     // materialization always re-derives cleanly).
     let generation_id = first
         .reconcile
-        .build
+        .expect_built()
         .generation_id
         .parse()
         .expect("generation id is a UUID");

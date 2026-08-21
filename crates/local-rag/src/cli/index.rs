@@ -75,9 +75,9 @@ async fn run_pipeline(ctx: &IndexCtx, worktree_id: Uuid, now_ms: i64) -> ExitCod
                 "{BIN}: indexed {} files ({} occurrences) into generation {}; \
                  embedded {} subjects ({} reused, {} repaired, {} failed); \
                  dense +{}/-{}; fts {} occurrences",
-                outcome.reconcile.build.files_indexed,
-                outcome.reconcile.build.occurrences,
-                outcome.reconcile.build.generation_id,
+                outcome.reconcile.expect_built().files_indexed,
+                outcome.reconcile.expect_built().occurrences,
+                outcome.reconcile.expect_built().generation_id,
                 outcome.project.backfill.embedded,
                 outcome.project.backfill.reused,
                 outcome.project.backfill.repaired,

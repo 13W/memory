@@ -26,8 +26,9 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_core::redaction::Scanner;
 use local_rag_index::classify::ClassifierConfig;
 use local_rag_index::reconcile::{
-    FixedWallClock, ReconcileHandle, ScheduleConfig, TriggerKind, WallClock, WorktreeMeta,
-    WorktreeReconciler, load_worktree_meta, nested_prune_roots, reconcile_once, spawn_reconciler,
+    FixedWallClock, LastBuilt, ReconcileHandle, ScheduleConfig, TriggerKind, WallClock,
+    WorktreeMeta, WorktreeReconciler, load_worktree_meta, nested_prune_roots, reconcile_once,
+    spawn_reconciler,
 };
 use local_rag_index::scan::{ScanMode, StatCache};
 use local_rag_store::registry::{
@@ -269,6 +270,138 @@ async fn driver_stamps_rows_with_wall_clock_not_loop_time() {
     }
 }
 
+/// D-089: a reconcile whose scan reproduces the manifest that built the last
+/// generation must not mint another one.
+///
+/// Before this, every reconcile minted unconditionally — `build_generation`'s
+/// first statement is `uuids.next_uuid()` and the row is committed before a single
+/// file is examined. The watcher schedules a reconcile for *any* path event with
+/// no filtering at all, while the scan is gitignore-aware, so on the owner's store
+/// every write into `target/` bought a generation: 114 an hour, and generations
+/// #5415..#5422 were byte-identical in membership, 479 files each. Each one is a
+/// permanent cost, because 06 §5 pins `building`/`projection_ready` roots
+/// unconditionally and the embedding backfill walks every pin root every cycle.
+#[tokio::test]
+async fn an_unchanged_tree_does_not_mint_another_generation() {
+    let fx = fixture().await;
+    write(&fx.root, "a.rs", b"fn a() {}\n");
+    let uuids = SeqUuidV7::new();
+    let m = meta(&fx);
+    let cfg = ClassifierConfig::new(1 << 20);
+    let scanner = Scanner::new();
+    let mut cache = StatCache::new();
+
+    let first = reconcile_once(
+        &fx.db,
+        &m,
+        ScanMode::Strict,
+        &mut cache,
+        &cfg,
+        &scanner,
+        &uuids,
+        1000,
+        None,
+    )
+    .await
+    .expect("first reconcile");
+    let built = first.expect_built().generation_id.clone();
+    let last = LastBuilt {
+        manifest: first.manifest,
+        generation_id: built.clone(),
+    };
+    {
+        let read = fx.db.open_read().expect("read");
+        assert_eq!(count(&read, "generation"), 1);
+    }
+
+    // Same tree, same manifest: no new generation, and the cycle still names the
+    // generation that does describe this tree.
+    let again = reconcile_once(
+        &fx.db,
+        &m,
+        ScanMode::Strict,
+        &mut cache,
+        &cfg,
+        &scanner,
+        &uuids,
+        2000,
+        Some(&last),
+    )
+    .await
+    .expect("second reconcile");
+    assert!(
+        again.outcome.built().is_none(),
+        "an unchanged tree must not mint a generation"
+    );
+    assert_eq!(again.outcome.generation_id(), built);
+    {
+        let read = fx.db.open_read().expect("read");
+        assert_eq!(
+            count(&read, "generation"),
+            1,
+            "the generation table must not have grown"
+        );
+    }
+
+    // A real edit is still indexed — the skip is a skip, not a stop.
+    write(&fx.root, "a.rs", b"fn a() { let x = 1; }\n");
+    let after_edit = reconcile_once(
+        &fx.db,
+        &m,
+        ScanMode::Strict,
+        &mut cache,
+        &cfg,
+        &scanner,
+        &uuids,
+        3000,
+        Some(&last),
+    )
+    .await
+    .expect("third reconcile");
+    assert_ne!(
+        after_edit.expect_built().generation_id,
+        built,
+        "a changed tree must mint"
+    );
+    {
+        let read = fx.db.open_read().expect("read");
+        assert_eq!(count(&read, "generation"), 2);
+    }
+}
+
+/// The skip is decided **only** by the `last_built` the caller supplies, so a
+/// caller that supplies none — `local-rag index`, the benches — always builds.
+/// That keeps an explicit user command explicit.
+#[tokio::test]
+async fn a_caller_without_a_remembered_manifest_always_builds() {
+    let fx = fixture().await;
+    write(&fx.root, "a.rs", b"fn a() {}\n");
+    let uuids = SeqUuidV7::new();
+    let m = meta(&fx);
+    let cfg = ClassifierConfig::new(1 << 20);
+    let scanner = Scanner::new();
+    let mut cache = StatCache::new();
+
+    for now_ms in [1000, 2000, 3000] {
+        let report = reconcile_once(
+            &fx.db,
+            &m,
+            ScanMode::Strict,
+            &mut cache,
+            &cfg,
+            &scanner,
+            &uuids,
+            now_ms,
+            None,
+        )
+        .await
+        .expect("reconcile");
+        report.expect_built();
+    }
+    let read = fx.db.open_read().expect("read");
+    assert_eq!(count(&read, "generation"), 3);
+}
+
 #[tokio::test]
 async fn reconcile_mode_fast_uses_cache_strict_rehashes() {
     let fx = fixture().await;
@@ -290,6 +423,7 @@ async fn reconcile_mode_fast_uses_cache_strict_rehashes() {
         &scanner,
         &uuids,
         1000,
+        None,
     )
     .await
     .expect("cold fast");
@@ -307,6 +441,7 @@ async fn reconcile_mode_fast_uses_cache_strict_rehashes() {
         &scanner,
         &uuids,
         2000,
+        None,
     )
     .await
     .expect("warm fast");
@@ -324,6 +459,7 @@ async fn reconcile_mode_fast_uses_cache_strict_rehashes() {
         &scanner,
         &uuids,
         3000,
+        None,
     )
     .await
     .expect("strict");
@@ -385,7 +521,7 @@ async fn cancellation_leaves_active_generation_valid() {
     tokio::select! {
         biased;
         _ = std::future::ready(()) => {}
-        _ = reconcile_once(&fx.db, &m, ScanMode::Strict, &mut cache, &cfg, &scanner, &uuids, 1000) => {
+        _ = reconcile_once(&fx.db, &m, ScanMode::Strict, &mut cache, &cfg, &scanner, &uuids, 1000, None) => {
             panic!("the reconcile future should have been dropped");
         }
     }
@@ -418,6 +554,7 @@ async fn cancellation_leaves_active_generation_valid() {
         &scanner,
         &uuids,
         2000,
+        None,
     )
     .await
     .expect("completed reconcile");
@@ -429,7 +566,7 @@ async fn cancellation_leaves_active_generation_valid() {
         "the new generation is projection_ready, not active",
     );
     assert_eq!(
-        generation_state(&read, &report.build.generation_id).expect("state"),
+        generation_state(&read, &report.expect_built().generation_id).expect("state"),
         Some(GenerationState::ProjectionReady),
     );
     assert_eq!(

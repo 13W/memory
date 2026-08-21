@@ -27,8 +27,9 @@ pub mod watcher;
 pub use build::{BuildError, BuildErrorKind, BuildOutcome, build_generation};
 pub use clock::{FixedWallClock, SystemWallClock, WallClock};
 pub use driver::{
-    MetaError, ReconcileError, ReconcileFailure, ReconcileHandle, ReconcileReport, WorktreeMeta,
-    WorktreeReconciler, load_worktree_meta, nested_prune_roots, reconcile_once, spawn_reconciler,
+    LastBuilt, MetaError, ReconcileError, ReconcileFailure, ReconcileHandle, ReconcileOutcome,
+    ReconcileReport, WorktreeMeta, WorktreeReconciler, load_worktree_meta, nested_prune_roots,
+    reconcile_once, spawn_reconciler,
 };
 pub use schedule::{
     DEBOUNCE_MS, Debouncer, PERIODIC_MS, PlannedReconcile, RETRY_BACKOFF_BASE_MS,

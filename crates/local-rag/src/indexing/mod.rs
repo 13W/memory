@@ -308,12 +308,13 @@ pub async fn index_worktree(
         scanner,
         ctx.uuids.as_ref(),
         now_ms,
+        None,
     )
     .await
     .map_err(IndexError::Reconcile)?;
 
     let generation_id: Uuid = report
-        .build
+        .expect_built()
         .generation_id
         .parse()
         .map_err(|_| IndexError::InvalidGenerationId)?;
@@ -703,7 +704,7 @@ mod tests {
         .await
         .expect("index");
 
-        assert_eq!(outcome.reconcile.build.files_indexed, 1);
+        assert_eq!(outcome.reconcile.expect_built().files_indexed, 1);
         assert!(
             outcome.project.backfill.embedded >= 1,
             "nothing embedded: {:?}",
@@ -712,7 +713,7 @@ mod tests {
         assert!(outcome.project.switch.upserted >= 1);
         assert_eq!(
             outcome.project.fts.occurrence_count,
-            outcome.reconcile.build.occurrences as u64
+            outcome.reconcile.expect_built().occurrences as u64
         );
 
         // Prove it end to end through the real production `SearchEngine` —
@@ -1089,10 +1090,13 @@ mod tests {
         .expect("second index");
 
         assert_ne!(
-            first.reconcile.build.generation_id,
-            second.reconcile.build.generation_id
+            first.reconcile.expect_built().generation_id,
+            second.reconcile.expect_built().generation_id
         );
-        assert!(second.reconcile.build.generation_number > first.reconcile.build.generation_number);
+        assert!(
+            second.reconcile.expect_built().generation_number
+                > first.reconcile.expect_built().generation_number
+        );
     }
 
     #[tokio::test]
