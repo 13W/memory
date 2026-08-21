@@ -312,3 +312,62 @@ async fn read_only_connection_cannot_write() {
         .expect("read count");
     assert_eq!(count, 0);
 }
+
+/// D-081's safety premise, checked rather than assumed: cancelling the caller
+/// that is *awaiting* a transaction does not cancel the transaction.
+///
+/// The daemon's shutdown now aborts background workers that overrun its budget.
+/// That is only safe because a job handed to this writer belongs to the writer
+/// thread: dropping the caller's future drops the receiver, never the queued
+/// work. The queue is also FIFO, so the checkpoint that shutdown enqueues next
+/// runs *after* whatever was already in flight — the store is never closed
+/// mid-write.
+///
+/// Deterministic: the writer thread is gated with std channels, exactly like
+/// this file's backpressure test. No timers, no sleeps. `multi_thread` because
+/// the test itself blocks on those channels — on the default single-threaded
+/// runtime that would starve the very task it is waiting for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_caller_does_not_cancel_its_queued_transaction() {
+    let (_home, db) = open_state(8);
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    let writer = db.writer().clone();
+    let caller = tokio::spawn(async move {
+        writer
+            .transaction(move |tx| {
+                // Tell the test the job is running on the writer thread, then
+                // hold that thread until it says to go on.
+                started_tx.send(()).expect("test is still listening");
+                release_rx.recv().expect("test releases the writer");
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS cancelled_caller (id INTEGER PRIMARY KEY);\
+                     INSERT INTO cancelled_caller (id) VALUES (1);",
+                )?;
+                Ok(())
+            })
+            .await
+    });
+
+    started_rx
+        .recv()
+        .expect("the job reached the writer thread");
+    // The caller goes away mid-transaction — the shutdown-budget case.
+    caller.abort();
+    release_tx.send(()).expect("writer thread is waiting");
+
+    // FIFO: this second job cannot run before the first one finishes, so
+    // awaiting it is a barrier — no sleep needed.
+    let landed: i64 = db
+        .writer()
+        .transaction(|tx| tx.query_row("SELECT count(*) FROM cancelled_caller", [], |r| r.get(0)))
+        .await
+        .expect("barrier transaction");
+    assert_eq!(
+        landed, 1,
+        "the queued transaction is the writer thread's, not the caller's — cancelling the caller \
+         must not lose a committed write"
+    );
+}

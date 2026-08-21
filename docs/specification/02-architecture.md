@@ -511,6 +511,31 @@ running index/consolidation/GC jobs `[FIXED]`. SIGTERM/CTRL-C: stop accepting, c
 reconciles at the next safe point (state tx boundaries), flush WAL checkpoint, release lock.
 Kill at any point is safe by construction (05, 07).
 
+As-built note (`D-081`, `[SPEC]`): `D-077` bounded the *indexing* half of this step and left the
+rest unbounded, which it said so at the time. The consolidation-trigger, memory-normalization and
+startup-resume joins were still awaited to natural completion, and a consolidation tick's unit of
+work contains an LLM call — measured on the owner's store immediately after `D-077` landed: 26 s,
+with `local-rag stop` printing "did not stop within 10s", the budget the CLI prints as a promise.
+All three now share a `SHUTDOWN_WORKER_BUDGET` (3 s), sized so that this wait, the supervisor's own
+`SHUTDOWN_JOIN_BUDGET` (3 s) and the closing checkpoint fit inside `cli::service::STOP_TIMEOUT`.
+
+Overrunning workers are **cancelled**, not dropped: dropping a `JoinHandle` detaches its task,
+which would leave it running while the store closes — strictly worse than having waited. Abandoning
+an in-flight tick is safe by a mechanism that already exists rather than by assumption: a run that
+does not reach its apply stays `running` with a lease, exactly the state the startup resume sweep
+reclaims (`D-050`/`D-073`), and cancelling drops only the *future awaiting* the write queue, never
+the queued job — the writer thread owns that job and runs it to completion, and the queue is FIFO,
+so it lands before the checkpoint `drain_and_shutdown` enqueues next. That last property is the
+premise the whole change rests on, so it is checked by a test
+(`crates/store/tests/state.rs::a_cancelled_caller_does_not_cancel_its_queued_transaction`) rather
+than argued.
+
+What this note does **not** claim: that `local-rag stop` always fits in 10 s. The closing
+`wal_checkpoint(TRUNCATE)` is deliberately left unbounded — it is the step that returns disk, and
+abandoning it would trade a bounded wait for unbounded growth. Its cost is bounded instead by
+`D-083`, which stops the WAL from accumulating in the first place; before that fix a shutdown on
+the owner's store had to fold a 62 GB log and ran for tens of minutes.
+
 As-built note (`D-077`, `[SPEC]`): "cancel reconciles at the next safe point" is now what the
 shutdown actually does. It did not: `supervisor::stop_all` called
 `WorktreeTaskHandle::stop`, which signals and then **joins the OS thread**, so shutdown waited out
