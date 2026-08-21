@@ -357,6 +357,41 @@ concurrent reader (`read_store_lock_file`, behind `status`/`doctor`) sees the ol
 one but never an empty file. Before this rule, two daemons started in the same millisecond both
 reported acquiring the lock, and the loser left a record naming itself behind.
 
+As-built note (D-084, `[SPEC]`, supersedes both bullets above on the `WouldBlock` branch and
+narrows step 1's own "If the owner is dead/stale: remove stale socket + lock, retry once"): the
+`WouldBlock` branch **never reclaims, for any reason**. It has no liveness check left at all —
+no PID test, no socket greeting, no `ready` special case. Reaching it is itself the proof that a
+live process holds the `flock` *at this instant*, so the owner's death is not merely hard to
+establish there, it is unestablishable; the sentence about removing a dead owner's lock belongs
+exclusively to the **successful**-`flock` branch, which recovers by overwriting whatever the
+record held. What the branch does instead is wait: `try_lock` is retried until
+`local_rag::daemon::lock::LOCK_HANDOVER_BUDGET_MS` (10 s, chosen not derived — sized to sit
+inside the proxy's own 20 s `connect_or_spawn` budget) is spent, and only then
+`STORE_LOCKED`/`MIGRATION_IN_PROGRESS`, naming the owner when the record reads and
+`unknown_owner` when it does not (D-065, unchanged).
+
+D-065 refused one door; this closes the rest. Its own door was an unreadable record. D-084's was
+the socket greeting the T15-01 bullet above required: §4.3 step 1 stops accepting and unlinks
+`run/daemon.sock` **first**, and the lock is released **last**, so for the whole length of a
+drain the outgoing daemon is alive, still writing, and unreachable — indistinguishable from dead
+to any probe, and reclaimed accordingly. Live capture on the owner's store,
+`logs/daemon.2026-08-21.log`: `daemon stopping` 11:53:47.851, a second process logging `store
+lock acquired` 11:54:02.929, and the first only reaching `daemon stopped` 11:54:14.180. Twelve
+seconds of two daemons on one canonical `state.sqlite`, and the pattern repeated: 26 `daemon
+starting` lines that day against 18 `store lock acquired`. Reclaiming leaves the incumbent's real
+`flock` in place — it lives on the open file description, not on the path — so the reclaimer wins
+only a fresh lock on the *name*, which is exactly the "two daemons each convinced they alone own
+the store" outcome the T15-01 bullet already warned about for the `ready: false` case.
+
+Two consequences worth stating. First, the `ready: false` exception is now redundant rather than
+wrong: a still-migrating owner is protected by the branch rule itself, not by a carve-out, and
+`local_rag::daemon::probe`'s `LivenessProbe`/`SocketLivenessProbe`/`LivenessOutcome` are deleted
+with the decision they existed for (`fetch_welcome` remains — `status`, `stop` and the shared CLI
+liveness path still read a live daemon's `Welcome`, where "does it answer" is a fine thing to
+*report* and never was evidence of death). Second, a daemon spawned during a handover no longer
+steals the store; it waits for the incumbent and takes the lock legitimately, which is what the
+reclaim was really being used for.
+
 As-built note (T15-01, `[SPEC]`): step 2's `store_instance_uuid` (03 §2.1, consumed by step 3's
 cache-open) is seeded here, inside the same step — `local_rag_store::registry::
 ensure_store_instance_uuid`, a first-writer-wins atomic upsert (`INSERT ... ON CONFLICT DO UPDATE
@@ -577,6 +612,24 @@ a tick in flight runs to its own run boundary, which *is* a safe point in this s
 It has not been measured to exceed the budget; if a shutdown ever does again, that is where to
 look first.
 
+As-built note (D-084, `[SPEC]`): "release lock" is now conditional on still owning the record.
+`StoreLockGuard::release` unlinks `store.lock` only when the path still resolves to the very file
+the guard holds open (`dev`/`ino` compared against its own descriptor); otherwise it drops the
+`flock` and leaves the file alone. The two can come apart because `flock` lives on an open file
+description while the record lives at a path, so anything that recreates the file under a live
+guard leaves that guard holding a lock on an inode the name no longer refers to. Unlinking by
+path then deletes a *live successor's* record, and the daemon after that finds no lock file at
+all and acquires cleanly alongside both — the third process in D-084's live capture, 57 seconds
+after the second (`store lock acquired pid=61517` at 11:54:59 with pid 60944 still serving).
+With §4.1's reclaim gone the divergence should be unreachable; the check is kept because it is
+two `stat` calls and because this file's *identity*, not its content, is what other processes
+rely on.
+
+Also part of this section's contract now: the window it opens is deliberate and safe. Between
+step 1 (stop accepting, unlink the socket) and the final release, the store is held by a daemon
+that answers nothing. §4.1's `WouldBlock` branch is what makes that safe — a contender waits it
+out rather than concluding the owner is dead.
+
 As-built note (T15-01, `[SPEC]`): the idle gate's three inputs are
 `local_rag::daemon::idle::IdleGateInputs { live_sessions: usize, pending_spool_bytes: bool,
 running_jobs: usize }`, read from a protocol-agnostic `SessionRegistry` (registered by T15-02's
@@ -737,6 +790,14 @@ installed after startup for free (D-037).
 One daemon per OS user per store `[FIXED]`. Identity = `instance_uuid` (+ PID as advisory)
 `[FIXED]`. Orphan artifacts (stale socket, stale lock, orphan shard temp dirs, spool of dead
 sessions) are cleaned at startup and by periodic GC.
+
+As-built note (D-084, `[SPEC]`): "one daemon per OS user per store" `[FIXED]` is now enforced by
+a mechanism rather than asserted as an invariant. Both ways it had been broken were recovery
+paths that unlinked `store.lock` — §4.1's reclaim on `WouldBlock` and §4.3's unconditional
+release — and both are closed above. Note what is *not* the mechanism: the store root comes from
+`LOCAL_RAG_HOME`/`XDG_DATA_HOME` and never from the binary's own path, so two installations of
+the same version contend for one lock by construction; D-084's third daemon arriving from a third
+install path was a symptom of the unlinking, not a separate route around the lock.
 
 As-built note (T15-01, `[SPEC]`): of this list, T15-01 cleans the stale socket and stale lock
 classes, both at startup (§4.1's as-built note above) and, for the socket, again as part of an

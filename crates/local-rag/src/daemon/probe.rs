@@ -1,54 +1,33 @@
-//! The store-lock liveness probe (spec 02 §4.1: "verify the owning process
-//! exists **and** its instance UUID matches a live handshake on the socket").
+//! Reading a running daemon's own greeting, without being a proxy.
 //!
 //! Speaks the real HELLO/WELCOME handshake (spec 02 §4.2, [`super::handshake`])
-//! against `store_instance_uuid` in [`local_rag_protocol::Welcome`] — a
-//! recovering daemon that finds `store.lock` already held needs to tell "a
+//! to obtain [`local_rag_protocol::Welcome`] — `store_instance_uuid` tells "a
 //! live daemon, genuinely still this store's owner" apart from "a
 //! dead/replaced process whose lock file or PID happens to still be lying
-//! around": `kill(pid, 0)` alone cannot make that distinction, because an
-//! unrelated process may have been assigned the same PID since (PID reuse)
-//! — this is exactly the gap the card's "PID reuse mismatch" test exercises.
-//! This probe is itself never a real proxy: it sends its own synthetic HELLO
-//! (fixed `session_id`, no `worktree_root`) purely to elicit a WELCOME to
-//! compare `store_instance_uuid` against, and never registers a session or
-//! sends any `Request`.
+//! around", which `kill(pid, 0)` alone cannot do (PID reuse), and `Welcome
+//! .mode` is the only channel distinguishing `Normal` from `MigrationOnly`
+//! (spec 11 §6). [`fetch_welcome`] never registers a session or sends any
+//! `Request`: it sends one synthetic HELLO (fixed `session_id`, no
+//! `worktree_root`), reads one line, and disconnects.
+//!
+//! Its callers are the CLI liveness checks — `local-rag status`, `stop`, and
+//! `cli::mod`'s shared `read_store_lock_file → pid_exists → fetch_welcome`
+//! path. It used to have one more: a `LivenessProbe` trait behind
+//! `daemon::lock`'s reclaim decision, deleted with that decision in D-084.
+//! Whether the owner answers is a fine thing to *report*; it was never
+//! evidence that the owner was dead, because a daemon in shutdown stops
+//! answering long before it lets go of the lock.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use local_rag_core::process::pid_exists;
 use local_rag_protocol::{
     Hello, Message, PROTO_VERSION, RequestContext, RequestEnvelope, Welcome, decode_message,
     encode_message,
 };
 use serde_json::Value;
 use serde_json::value::RawValue;
-
-/// The result of probing a candidate store-lock owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LivenessOutcome {
-    /// The PID exists **and** the socket answered WELCOME with the expected
-    /// `store_instance_uuid`: the same daemon that wrote the lock is still
-    /// running.
-    Alive,
-    /// The PID is gone, or the socket did not answer WELCOME with a matching
-    /// `store_instance_uuid` — unreachable, timed out, INCOMPATIBLE, or (PID
-    /// reuse) a different process entirely.
-    Stale,
-}
-
-/// How to determine whether a candidate `store.lock` owner is still alive.
-///
-/// A trait, not a bare function, so tests can inject a synthetic probe target
-/// deterministically (a hand-rolled listener in the test process) instead of
-/// needing a second real daemon.
-pub trait LivenessProbe {
-    /// Check whether `pid`/`expected_instance_uuid` together identify a
-    /// still-live owner.
-    fn check(&self, pid: u32, expected_instance_uuid: &str) -> LivenessOutcome;
-}
 
 /// Bounded wait for the liveness probe's connect + HELLO/WELCOME round trip.
 ///
@@ -66,53 +45,14 @@ pub const LIVENESS_PROBE_TIMEOUT_MS: u64 = 1000;
 /// entropy would be.
 const PROBE_SESSION_ID: &str = "store-lock-liveness-probe";
 
-/// The production [`LivenessProbe`]: connects to the store's UDS, sends
-/// HELLO, and reads one newline-terminated WELCOME (or INCOMPATIBLE) line.
-#[cfg(unix)]
-pub struct SocketLivenessProbe {
-    socket_path: PathBuf,
-    timeout: Duration,
-}
-
-#[cfg(unix)]
-impl SocketLivenessProbe {
-    /// A probe targeting `socket_path` with the default
-    /// [`LIVENESS_PROBE_TIMEOUT_MS`] budget.
-    pub fn new(socket_path: PathBuf) -> Self {
-        Self {
-            socket_path,
-            timeout: Duration::from_millis(LIVENESS_PROBE_TIMEOUT_MS),
-        }
-    }
-}
-
-#[cfg(unix)]
-impl LivenessProbe for SocketLivenessProbe {
-    fn check(&self, pid: u32, expected_instance_uuid: &str) -> LivenessOutcome {
-        if !pid_exists(pid) {
-            return LivenessOutcome::Stale;
-        }
-        match read_welcome(&self.socket_path, self.timeout) {
-            Some(welcome) if welcome.store_instance_uuid == expected_instance_uuid => {
-                LivenessOutcome::Alive
-            }
-            // INCOMPATIBLE, garbage, a timeout, or a mismatched uuid are all
-            // exactly "stale" to this recovery probe — it has no version
-            // negotiation of its own to fall back to.
-            _ => LivenessOutcome::Stale,
-        }
-    }
-}
-
 /// Connect to `socket_path` and read the live daemon's own [`Welcome`],
-/// bounded by `timeout` — a thin public wrapper over [`read_welcome`] for
-/// callers that need more than [`LivenessOutcome`]'s bare alive/stale bit
+/// bounded by `timeout` — a thin public wrapper over [`read_welcome`]
 /// (`local-rag status`, T15-07: `Welcome.mode` is the only channel that
 /// distinguishes `Normal` from `MigrationOnly` — `store.lock`'s own `ready`
 /// flag is set in both cases, spec 11 §6). `None` on any failure (no
-/// listener, refused, timed out, INCOMPATIBLE, malformed line) — the same
-/// "every failure is uniformly unreachable" policy [`SocketLivenessProbe`]
-/// itself already uses.
+/// listener, refused, timed out, INCOMPATIBLE, malformed line): every failure
+/// is uniformly unreachable to this caller, which has no version negotiation
+/// of its own to fall back on.
 #[cfg(unix)]
 pub fn fetch_welcome(socket_path: &Path, timeout: Duration) -> Option<Welcome> {
     read_welcome(socket_path, timeout)
@@ -281,10 +221,11 @@ fn read_welcome(socket_path: &Path, timeout: Duration) -> Option<Welcome> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
 
     /// A hand-rolled listener that reads (and discards) one HELLO line, then
     /// replies with one WELCOME line carrying `store_instance_uuid` — enough
-    /// to drive [`SocketLivenessProbe`] without a real daemon.
+    /// to drive [`fetch_welcome`] without a real daemon.
     fn bind_greeter(dir: &std::path::Path, store_instance_uuid: &str) -> PathBuf {
         let socket_path = dir.join("daemon.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind");
@@ -311,53 +252,40 @@ mod tests {
         socket_path
     }
 
-    #[test]
-    fn matching_instance_uuid_and_live_pid_is_alive() {
-        let dir = tempdir();
-        let socket_path = bind_greeter(dir.path(), "uuid-a");
-        let probe = SocketLivenessProbe::new(socket_path);
-        assert_eq!(
-            probe.check(std::process::id(), "uuid-a"),
-            LivenessOutcome::Alive
-        );
+    /// The budget every caller passes; short enough that a test with no
+    /// listener at all is not a wall-clock wait.
+    fn budget() -> Duration {
+        Duration::from_millis(LIVENESS_PROBE_TIMEOUT_MS)
     }
 
     #[test]
-    fn mismatched_instance_uuid_is_stale_even_though_the_pid_is_alive() {
-        // The PID-reuse scenario: the process at `pid` is genuinely alive
-        // (our own test process), but it is not the daemon `store.lock`
-        // claims — a different `instance_uuid` answers.
+    fn a_live_daemon_answers_with_its_own_store_instance_uuid() {
+        let dir = tempdir();
+        let socket_path = bind_greeter(dir.path(), "uuid-a");
+        let welcome = fetch_welcome(&socket_path, budget()).expect("a greeter answers");
+        assert_eq!(welcome.store_instance_uuid, "uuid-a");
+    }
+
+    #[test]
+    fn a_different_daemon_answers_with_a_different_uuid() {
+        // The PID-reuse scenario, which is why callers compare the uuid and
+        // not just "something answered": the listener is genuinely alive, but
+        // it is not the daemon `store.lock` claims.
         let dir = tempdir();
         let socket_path = bind_greeter(dir.path(), "uuid-different");
-        let probe = SocketLivenessProbe::new(socket_path);
-        assert_eq!(
-            probe.check(std::process::id(), "uuid-a"),
-            LivenessOutcome::Stale
-        );
+        let welcome = fetch_welcome(&socket_path, budget()).expect("a greeter answers");
+        assert_ne!(welcome.store_instance_uuid, "uuid-a");
     }
 
     #[test]
-    fn dead_pid_is_stale_regardless_of_the_socket() {
-        let dir = tempdir();
-        let socket_path = bind_greeter(dir.path(), "uuid-a");
-        let dead_pid = spawn_and_reap();
-        let probe = SocketLivenessProbe::new(socket_path);
-        assert_eq!(probe.check(dead_pid, "uuid-a"), LivenessOutcome::Stale);
-    }
-
-    #[test]
-    fn no_listener_at_all_is_stale() {
+    fn no_listener_at_all_is_none() {
         let dir = tempdir();
         let socket_path = dir.path().join("no-such-daemon.sock");
-        let probe = SocketLivenessProbe::new(socket_path);
-        assert_eq!(
-            probe.check(std::process::id(), "uuid-a"),
-            LivenessOutcome::Stale
-        );
+        assert!(fetch_welcome(&socket_path, budget()).is_none());
     }
 
     #[test]
-    fn incompatible_proto_is_stale() {
+    fn incompatible_proto_is_none() {
         let dir = tempdir();
         let socket_path = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind");
@@ -376,20 +304,7 @@ mod tests {
                 let _ = stream.write_all(&bytes);
             }
         });
-        let probe = SocketLivenessProbe::new(socket_path);
-        assert_eq!(
-            probe.check(std::process::id(), "uuid-a"),
-            LivenessOutcome::Stale
-        );
-    }
-
-    fn spawn_and_reap() -> u32 {
-        let mut child = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn trivial child");
-        let pid = child.id();
-        child.wait().expect("wait");
-        pid
+        assert!(fetch_welcome(&socket_path, budget()).is_none());
     }
 
     fn tempdir() -> local_rag_test_support::TempHome {

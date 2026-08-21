@@ -63,6 +63,9 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         layout,
         daemon_version: "0.0.0".to_string(),
         now_ms: 1_000,
+        // No handover wait in tests: a store that is free must be acquirable
+        // now, and one that is held must be refused now (D-084).
+        lock_handover_budget: std::time::Duration::ZERO,
         uuids: Arc::new(SeqUuidV7::new()),
         write_queue_capacity: 8,
         payload_ttl_hours: 72,

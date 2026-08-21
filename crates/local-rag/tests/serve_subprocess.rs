@@ -24,6 +24,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+use local_rag::daemon::{StoreLockFileState, read_store_lock_file};
 use local_rag_core::paths::StoreLayout;
 #[cfg(feature = "failpoints")]
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
@@ -157,6 +158,24 @@ fn a_stalled_spool_session_is_reported_on_stderr_not_silently_dropped() {
     );
 }
 
+/// Everything both daemons wrote to the store's rotated log file. Both share
+/// one `logs_dir`, so a refusal by the loser lands in the same file the winner
+/// is writing to — which is the point of asserting on it (D-084).
+fn read_todays_daemon_log(layout: &StoreLayout) -> String {
+    let dir = layout.logs_dir();
+    let mut body = String::new();
+    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+    let mut files: Vec<_> = entries
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    for file in files {
+        body.push_str(&std::fs::read_to_string(&file).unwrap_or_default());
+    }
+    body
+}
+
 /// Send a real `SIGTERM` (not `SIGKILL` — `std::process::Child::kill` is
 /// unix-`SIGKILL`-only and cannot express this).
 fn send_sigterm(pid: u32) {
@@ -202,6 +221,33 @@ fn live_conflict_the_second_daemon_refuses_and_the_first_is_unaffected() {
         stderr.contains("STORE_LOCKED") || stderr.contains(&owner_pid.to_string()),
         "stderr should name the conflict: {stderr}"
     );
+
+    // D-084: stderr alone is not enough. The daemon that most often loses this
+    // race was spawned by the proxy, whose `spawn_detached_daemon` hands it
+    // `Stdio::null()` — on the owner's machine eight of twenty-six starts on
+    // 2026-08-21 left `daemon starting` in the shared log and then nothing at
+    // all. The refusal has to reach the file too (spec 02 §6: nothing degrades
+    // silently).
+    let log = read_todays_daemon_log(&layout);
+    assert!(
+        log.contains("daemon startup refused"),
+        "the refusal must be recorded in the daemon log, not only on a stderr \
+         the spawner discarded: {log}"
+    );
+    assert!(
+        log.contains("STORE_LOCKED"),
+        "the logged refusal must carry the spec 02 §6 code: {log}"
+    );
+
+    // And the incumbent's record is untouched: whatever the loser did, it did
+    // not take, rewrite, or unlink the lock (D-084).
+    match read_store_lock_file(&layout) {
+        StoreLockFileState::Parsed(info) => assert_eq!(
+            info.pid, owner_pid as u32,
+            "the lock must still name the first daemon"
+        ),
+        other => panic!("expected the first daemon's record, got {other:?}"),
+    }
 
     // The first daemon must still be alive and unaffected throughout.
     assert!(

@@ -5,7 +5,7 @@
 //! readiness marker step 4 of the startup sequence requires ("write
 //! readiness marker into store.lock JSON").
 //!
-//! # Why the recovery algorithm has two independent branches
+//! # Why the failure branch never reclaims
 //!
 //! `std::fs::File::lock`/`try_lock` (the same primitive
 //! `crate::migrate::MigrationLock` already uses for L1) is advisory and
@@ -16,17 +16,28 @@
 //! few microseconds after our failed `try_lock`. A crashed prior daemon
 //! cannot leave a "stale but still flock'd" lock file behind.
 //!
-//! That property is load-bearing, not just explanatory (D-065): because the
-//! failure branch implies a live holder, an *unreadable* record found there
-//! cannot be a crashed owner's leftovers — it is a live owner that has not
-//! written its record yet, or is rewriting it. So the failure branch reclaims
-//! only against a record it could parse and then prove dead; recovery from a
-//! torn write belongs to the success branch, which simply overwrites it.
+//! That property is load-bearing, not just explanatory, and it decides the
+//! whole branch (D-084): since a live holder is a *premise* of reaching it,
+//! nothing found there can prove the owner dead — not an unreadable record,
+//! not a mismatched pid, not a socket that will not answer. So the failure
+//! branch reclaims nothing at all. It waits out a handover within a bounded
+//! budget and otherwise refuses; recovery from a genuinely dead owner belongs
+//! to the success branch, which simply overwrites whatever the record held.
+//!
 //! Getting this wrong is not a cosmetic bug: reclaiming unlinks the path the
 //! live owner's `flock` is *not* attached to (the lock lives on the open file
-//! description), so both instances end up believing they own the store — see
-//! `is_owner_alive`'s own comment, and the two daemons that did exactly this
-//! on the reporter's machine before this rule existed.
+//! description), so both instances end up believing they own the store. It
+//! has now happened twice on the reporter's machine, through two different
+//! doors. D-065 came through an unreadable record and was closed by refusing
+//! that one case. D-084 came through the socket probe: a daemon in shutdown
+//! stops accepting and unlinks its socket *first* (D-077) and releases the
+//! lock *last*, so for the length of its drain it is alive, still writing,
+//! and unreachable — indistinguishable from dead to any probe. Live capture,
+//! `logs/daemon.2026-08-21.log`: `daemon stopping` at 11:53:47, a second
+//! process logging `store lock acquired` at 11:54:02, and the first one only
+//! reaching `daemon stopped` at 11:54:14. Twelve seconds of two daemons on
+//! one canonical store. Refusing one door at a time is what let the second
+//! one stay open, hence the rule rather than another special case.
 //!
 //! The store's UDS socket file has no such auto-cleanup: `run/daemon.sock`
 //! left by a `SIGKILL`ed daemon is a plain filesystem entry that persists
@@ -40,12 +51,11 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use local_rag_core::paths::{PathError, StoreLayout, ensure_file_0600};
 use local_rag_store::lock::{LockLevel, checked_scope_sync};
 use serde::{Deserialize, Serialize};
-
-use super::probe::{LivenessOutcome, LivenessProbe};
 
 /// The `store.lock` JSON shape (spec 02 §2), extended with the readiness
 /// marker (spec 02 §4.1 step 4).
@@ -113,13 +123,48 @@ impl StoreLockGuard {
     }
 
     /// Release the lock (spec 02 §4.3 shutdown: "release lock"): best-effort
-    /// unlink `store.lock`, then drop the handle (releasing the OS `flock`).
-    /// Prefer this at the end of an orderly shutdown sequence over a bare
-    /// `drop` — both release the `flock`, but only this leaves nothing
-    /// behind for the next `acquire` to treat as (harmlessly) stale.
+    /// unlink `store.lock` **if the path still names this guard's own file**,
+    /// then drop the handle (releasing the OS `flock`). Prefer this at the end
+    /// of an orderly shutdown sequence over a bare `drop` — both release the
+    /// `flock`, but only this leaves nothing behind for the next `acquire` to
+    /// treat as (harmlessly) stale.
+    ///
+    /// The identity check is D-084's second half. `flock` lives on the open
+    /// file description, the record lives at a path, and the two can come
+    /// apart: anything that unlinks and recreates `store.lock` while this
+    /// guard is alive leaves us holding a lock on an inode the path no longer
+    /// names. Unlinking by path then deletes a *live* successor's record, and
+    /// the daemon after that finds no file at all and acquires cleanly
+    /// alongside both. That is the third daemon in D-084's live capture, 57
+    /// seconds after the second. With D-084's reclaim gone the divergence
+    /// should be unreachable, which is exactly why the check is cheap enough
+    /// to keep: D-065's lesson is that this file's identity is what other
+    /// processes rely on.
     pub fn release(self, layout: &StoreLayout) {
-        let _ = std::fs::remove_file(layout.store_lock());
+        let path = layout.store_lock();
+        if self.still_owns_path(&path) {
+            let _ = std::fs::remove_file(&path);
+        }
         drop(self);
+    }
+
+    /// Whether `path` still resolves to the very file this guard holds open.
+    #[cfg(unix)]
+    fn still_owns_path(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (self.file.metadata(), std::fs::metadata(path)) {
+            (Ok(mine), Ok(named)) => mine.dev() == named.dev() && mine.ino() == named.ino(),
+            // Our own handle is unreadable, or nothing is at the path: either
+            // way there is nothing of ours left to unlink.
+            _ => false,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn still_owns_path(&self, _path: &Path) -> bool {
+        // No inode identity to compare against off POSIX; keep the previous
+        // unconditional behaviour rather than invent a weaker check.
+        true
     }
 }
 
@@ -172,8 +217,26 @@ impl std::error::Error for StoreLockError {
     }
 }
 
-/// Acquire the store lock (spec 02 §4.1 step 1), recovering from a stale
-/// prior owner exactly once.
+/// How long [`acquire`] keeps retrying a `WouldBlock` before it refuses
+/// (D-084).
+///
+/// Not a `[SPEC]` number — spec 02 §4.1 names the mechanism, not a budget for
+/// this wait. Chosen, not derived: it has to sit comfortably inside the
+/// proxy's own `connect_or_spawn` budget (`local_rag_proxy::connect::
+/// DEFAULT_BACKOFF.total_budget_ms`, 20 s), because that is what is waiting on
+/// the far end while a spawned daemon tries to take over a store the outgoing
+/// one has not finished releasing. Same precedent as
+/// [`crate::daemon::probe::LIVENESS_PROBE_TIMEOUT_MS`] for an internal bounded
+/// wait with no normative number behind it.
+pub const LOCK_HANDOVER_BUDGET_MS: u64 = 10_000;
+
+/// How often [`acquire`] re-tries inside [`LOCK_HANDOVER_BUDGET_MS`]. Short
+/// enough that a handover is imperceptible, long enough that a genuinely busy
+/// store is not polled thousands of times for nothing.
+const HANDOVER_POLL_MS: u64 = 25;
+
+/// Acquire the store lock (spec 02 §4.1 step 1), waiting out a handover from
+/// an outgoing owner within a bounded budget.
 ///
 /// Wrapped in [`checked_scope_sync`] against [`LockLevel::L0`] — this is what
 /// makes `L0` a real participant in the strict lock-order check (spec 02
@@ -186,30 +249,43 @@ impl std::error::Error for StoreLockError {
 /// 2. On success: this instance is the sole owner. Best-effort remove any
 ///    orphaned socket file left by a crashed prior owner, write fresh lock
 ///    info, and return.
-/// 3. On `WouldBlock`: read the existing lock JSON and run `probe` against
-///    its `(pid, instance_uuid)`.
-///    - [`LivenessOutcome::Alive`] → [`StoreLockError::Locked`].
-///    - [`LivenessOutcome::Stale`] → best-effort remove both `store.lock`
-///      and the socket file, retry step 1 **exactly once**. A second
-///      `WouldBlock` (someone else won the race) is `Locked`, not a further
-///      retry.
-///    - The JSON could not be read at all (D-065) → [`StoreLockError::Locked`]
-///      with an unnamed owner, **never** a reclaim. Step 1 having failed
-///      already proves a live holder, so there is nothing here that a dead
-///      owner could have left behind; see `read_lock_info_settling` for the
-///      full argument and for the bounded re-read that usually names the
-///      owner anyway. A torn write from a crash is recovered by step 2
-///      instead, where it belongs.
+/// 3. On `WouldBlock`: **never reclaim** (D-084). Retry step 1 until
+///    `handover_budget` is spent, then [`StoreLockError::Locked`], naming the
+///    owner when the record can be read and [`unknown_owner`] when it cannot
+///    (D-065).
+///
+/// Step 3 has no liveness check at all any more, and that is the point.
+/// Reaching it proves a live process holds the `flock` *at this instant* —
+/// POSIX releases it when its holder exits, so a dead owner cannot hold one
+/// (this module's own header). Death is therefore unprovable in this branch no
+/// matter what the record says, and every attempt to prove it anyway has
+/// unlinked a live owner's lock file: D-065 through an unreadable record,
+/// D-084 through a socket probe that a *shutting-down* owner legitimately
+/// fails — it stops accepting and removes its socket first (`daemon::shutdown`
+/// step 1, D-077) and releases the lock last, so for the length of its drain
+/// it is alive, writing, and unreachable. Recovery from a genuinely dead owner
+/// belongs to step 2, which simply overwrites whatever the record held.
+///
+/// The budget replaces what the reclaim was really being used for. A daemon
+/// spawned during someone else's drain used to steal the store; now it waits
+/// for the incumbent to finish and takes the lock legitimately, or refuses.
 pub fn acquire(
     layout: &StoreLayout,
     instance_uuid: &str,
     pid: u32,
     daemon_version: &str,
     now_ms: i64,
-    probe: &dyn LivenessProbe,
+    handover_budget: Duration,
 ) -> Result<StoreLockGuard, StoreLockError> {
     checked_scope_sync(LockLevel::L0, || {
-        acquire_inner(layout, instance_uuid, pid, daemon_version, now_ms, probe)
+        acquire_inner(
+            layout,
+            instance_uuid,
+            pid,
+            daemon_version,
+            now_ms,
+            handover_budget,
+        )
     })
 }
 
@@ -219,91 +295,52 @@ fn acquire_inner(
     pid: u32,
     daemon_version: &str,
     now_ms: i64,
-    probe: &dyn LivenessProbe,
+    handover_budget: Duration,
 ) -> Result<StoreLockGuard, StoreLockError> {
     let path = layout.store_lock();
-    ensure_file_0600(&path).map_err(StoreLockError::LockPath)?;
+    let deadline = Instant::now() + handover_budget;
 
-    match try_acquire(&path, instance_uuid, pid, daemon_version, now_ms) {
-        Ok(guard) => {
-            // Sole legitimate owner now: any leftover socket is provably
-            // garbage from a crashed prior owner (spec 02 §4.4).
-            let _ = std::fs::remove_file(layout.socket_path());
-            Ok(guard)
-        }
-        Err(TryAcquireError::Io(e)) => Err(StoreLockError::Io(e)),
-        Err(TryAcquireError::WouldBlock) => {
-            // D-065: an *unreadable* record is not evidence of a dead owner.
-            // Reaching this branch already proves a live process holds the
-            // `flock` right now (POSIX releases it on exit — this module's
-            // own doc comment), so the record can only be one a live owner
-            // has not written yet, or is rewriting this instant. A crashed
-            // owner's torn write cannot appear here at all: with no holder,
-            // `try_lock` succeeds and the success branch above simply
-            // overwrites it. Reclaiming on an unreadable record unlinks a
-            // live owner's lock file and leaves two daemons each convinced it
-            // alone owns the store — the exact outcome `is_owner_alive`'s doc
-            // comment warns about, observed in production on 2026-08-18.
-            let Some(owner) = read_lock_info_settling(&path) else {
-                return Err(StoreLockError::Locked {
-                    owner: unknown_owner(),
-                });
-            };
-            if is_owner_alive(&owner, probe) {
-                return Err(StoreLockError::Locked { owner });
+    loop {
+        // Inside the loop, not before it: an outgoing owner unlinks the path
+        // on its way out (`StoreLockGuard::release`), so between two of our
+        // attempts the file can legitimately stop existing. `ensure_file_0600`
+        // is `create_new`, so re-running it costs one `EEXIST` in the common
+        // case and recreates the file in that one.
+        ensure_file_0600(&path).map_err(StoreLockError::LockPath)?;
+
+        match try_acquire(&path, instance_uuid, pid, daemon_version, now_ms) {
+            Ok(guard) => {
+                // Sole legitimate owner now: any leftover socket is provably
+                // garbage from a crashed prior owner (spec 02 §4.4).
+                let _ = std::fs::remove_file(layout.socket_path());
+                return Ok(guard);
             }
-
-            // Genuinely stale (dead PID, mismatched instance, or an
-            // unreachable socket — always a *parsed* record): reclaim and
-            // retry exactly once.
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(layout.socket_path());
-            ensure_file_0600(&path).map_err(StoreLockError::LockPath)?;
-
-            match try_acquire(&path, instance_uuid, pid, daemon_version, now_ms) {
-                Ok(guard) => {
-                    let _ = std::fs::remove_file(layout.socket_path());
-                    Ok(guard)
+            // The path was unlinked between `ensure_file_0600` and the open —
+            // the same handover race, one step later. Retry rather than
+            // reporting an I/O failure for a file we are about to recreate.
+            Err(TryAcquireError::Io(e))
+                if e.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {}
+            Err(TryAcquireError::Io(e)) => return Err(StoreLockError::Io(e)),
+            Err(TryAcquireError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    // D-065: name the owner when the record can be read, and
+                    // stand in for it when it cannot — never treat an
+                    // unreadable record as an absent one.
+                    return Err(StoreLockError::Locked {
+                        owner: read_lock_info_settling(&path).unwrap_or_else(unknown_owner),
+                    });
                 }
-                Err(TryAcquireError::Io(e)) => Err(StoreLockError::Io(e)),
-                Err(TryAcquireError::WouldBlock) => Err(StoreLockError::Locked {
-                    owner: read_lock_info(&path).unwrap_or_else(unknown_owner),
-                }),
             }
         }
-    }
-}
 
-/// Whether `owner` — a lock file we could parse — is still alive.
-///
-/// `ready == false` gets a **different** check than `ready == true`, not the
-/// full [`LivenessProbe`]: an owner mid-startup (between acquiring `store.lock`
-/// at step 1 and binding the endpoint at step 4 — most commonly, an actual
-/// migration in progress, spec 02 §4.1 step 2, which can legitimately take a
-/// while on a large store) has genuinely bound no socket yet. Running the
-/// socket half of the probe against it would always fail — indistinguishable
-/// from a truly dead owner — and wrongly reclaim the lock out from under a
-/// live, still-starting daemon (whose OS `flock` is never actually released;
-/// the reclaiming instance would just take a fresh lock on the same *path*,
-/// leaving two daemons each convinced they alone own the store). A `ready:
-/// false` record is inherently recent (this instance is actively starting up
-/// right now), so PID reuse in that narrow window is not the realistic threat
-/// the full probe exists to guard against — trusting `pid_exists` alone here
-/// is deliberate, not a shortcut. Once `ready == true`, the full probe (PID
-/// **and** a matching socket greeting) applies exactly as documented on
-/// [`acquire`].
-fn is_owner_alive(owner: &StoreLockInfo, probe: &dyn LivenessProbe) -> bool {
-    if !owner.ready {
-        return local_rag_core::process::pid_exists(owner.pid);
+        std::thread::sleep(Duration::from_millis(HANDOVER_POLL_MS));
     }
-    probe.check(owner.pid, &owner.instance_uuid) == LivenessOutcome::Alive
 }
 
 /// A placeholder for a live conflict we cannot name: the holder's record was
-/// still unreadable after [`read_lock_info_settling`] gave up (D-065), or the
-/// retry's contender left one behind. Either way we did lose the race — this
-/// stands in for the owner in the resulting [`StoreLockError::Locked`], never
-/// for an owner we believe to be dead.
+/// still unreadable after [`read_lock_info_settling`] gave up (D-065). We did
+/// lose the race either way — this stands in for the owner in the resulting
+/// [`StoreLockError::Locked`], never for an owner we believe to be dead.
 ///
 /// `pid: 0` is the sentinel for "unnamed": no daemon ever runs as pid 0, and
 /// `main`'s startup message keys off it to drop the parenthetical rather than
