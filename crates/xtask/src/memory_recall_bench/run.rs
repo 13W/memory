@@ -84,8 +84,9 @@ use crate::stats::percentile;
 pub const QUERY_LIMIT: usize = 5;
 
 /// Generous enough that the token budget never truncates the ranked list
-/// before [`QUERY_LIMIT`] — this corpus's 24 entries, at a few hundred
-/// characters each, sit far under it even all at once. The point of this run
+/// before [`QUERY_LIMIT`] — this corpus's 200 entries (T21-18; median 409
+/// bytes, longest 1 251) sit under it even all at once, at roughly a fifth of
+/// the budget. The point of this run
 /// is measuring rank quality, not budget behavior (that is
 /// `recall`'s own `zero_token_budget_yields_empty_additional_context`-style
 /// test's job).

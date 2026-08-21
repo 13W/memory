@@ -165,6 +165,32 @@ instructions unreliably. How much net is needed is measured, not assumed — `st
   test it; until then this decision stands on coherence and the owner's product call, and any
   later claim of an MRR gain must cite that run, not this ADR.
 
+## Amendment (T21-18, 2026-08-21): the first measurement this decision can actually rest on
+
+This ADR was decided on a corpus that could not test it. `fixtures/memory-recall/corpus.json`
+version 1.0.0 scored `store_en` and `both_en` at a flat 1.000 on every language pair and had the
+dense leg rank the expected entry first in 24 of 24 queries in **every** configuration, so nothing
+in it could distinguish English canon from the alternative, or show what English canon costs.
+T21-18 rebuilt it to 200 entries and 60 queries and reran all five configurations. Full numbers and
+the per-pair table live in spec 14 §7's T21-18 note; three of them matter here.
+
+**The decision holds on the cross-language pairs, by a wide margin.** English canon plus an English
+query takes `en-ru` from 0.072 to 1.000 MRR and `ru-en` from 0.200 to 0.967. Overall MRR goes
+0.547 → 0.945. The gap this ADR exists to close is real and closing it works.
+
+**It has a cost this ADR did not know about.** `ru-ru` — a Russian query against an entry its
+author wrote in Russian — falls from 0.917 to 0.813, about 0.10 MRR. Version 1.0.0 scored that pair
+1.000 in every configuration and could not have shown it. The cost is not a reason to reverse the
+decision — 0.10 lost on one pair against 0.93 and 0.77 gained on two others is not a close call —
+but it is now a known, measured price rather than an assumed absence, and any future argument about
+the canon should quote it.
+
+**The shipped pipeline nearly reaches the hand-written ceiling.** `pipeline_en`, the only
+configuration that runs the real translator rather than the fixture's hand translation, scores
+0.870 against `store_en`'s 0.885 — within 0.015 MRR, with 100 of 200 entries translated and no
+failures. On version 1.0.0 the same configuration had returned numbers byte-identical to
+`baseline`, which this ADR's phase-1 evidence never explained. Whatever that was, it is gone.
+
 ## Alternatives rejected
 
 - **Keep the original as canon and feed the English variant to both legs.** Retrieval-equivalent,

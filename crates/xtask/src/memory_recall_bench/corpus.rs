@@ -26,8 +26,8 @@ use serde::Deserialize;
 /// How many entries/queries the corpus must hold — fixed once the fixture is
 /// authored, exactly like `bench::corpus::EXPECTED_QUERY_COUNT`, so a
 /// silently truncated or padded fixture is refused rather than scored.
-pub const EXPECTED_ENTRY_COUNT: usize = 24;
-pub const EXPECTED_QUERY_COUNT: usize = 24;
+pub const EXPECTED_ENTRY_COUNT: usize = 200;
+pub const EXPECTED_QUERY_COUNT: usize = 60;
 
 /// The corpus document.
 #[derive(Debug, Clone, Deserialize)]

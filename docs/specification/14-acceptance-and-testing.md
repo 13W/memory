@@ -245,6 +245,54 @@ ratios, so the denominator moving from 42 to 43 shifts the aggregate; `threshold
 unchanged, and any future move of it stays what that file's own rule requires — a reviewable diff
 with a stated derivation.
 
+As-built note (T21-18, `[SPEC]`): the memory-recall corpus
+(`fixtures/memory-recall/corpus.json`) went from 24 entries / 24 queries to **200 / 60**
+(`version` 2.0.0), because version 1.0.0 could not measure the question it was used to decide.
+Three separate reasons, all measured: the dense leg ranked the expected entry first in **24/24**
+for every one of the five configurations; `store_en` and `both_en` both sat at a flat **1.000** on
+every language pair, so a ceiling was being asked to rank two things; and each cross-language pair
+had only four queries, moving a per-pair hit@1 in steps of 0.25 — which is why the recorded
+`baseline` figure for `en-ru` is exactly 0.25. The harness itself was not at fault: the recorded
+reports carry `v2_commit: eb4c6c9`, which is *after* `D-068`'s determinism fix, so they were
+reproducible — they were simply measuring a task too easy to tell the configurations apart.
+
+The new corpus keeps the relevance model (`single-relevant`, one judgment per query) and the
+metrics untouched — those are outside this card. It is 60 judged entries at realistic length (30
+above the 1 KiB `RECALL_ENTRY_CAP_BYTES` in bytes, since Russian text costs about two bytes a
+character) plus 140 thematically adjacent distractors that no query targets, and 60 queries, 15 per
+pair. `lang_pair` reads as (entry original language)-(query language).
+
+Measured on it, one release binary, five configurations (reports:
+`fixtures/memory-recall/baseline/run-2026-08-21-t21-18-*.json`):
+
+| config | hit@1 | MRR | en-en | en-ru | ru-en | ru-ru | dense ranked #1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline | 0.500 | 0.547 | 1.000 | 0.072 | 0.200 | 0.917 | 50/60 |
+| store_en | 0.833 | 0.885 | 1.000 | 0.867 | 0.967 | 0.706 | 55/60 |
+| query_en | 0.583 | 0.617 | 1.000 | 1.000 | 0.200 | 0.267 | 53/60 |
+| both_en | **0.917** | **0.945** | 1.000 | 1.000 | 0.967 | 0.813 | 57/60 |
+| pipeline_en | 0.817 | 0.870 | 1.000 | 0.811 | 0.967 | 0.702 | 54/60 |
+
+(per-pair cells are MRR.)
+
+The card's acceptance is **half met, and the other half is reported rather than tuned away**.
+English canon plus English query does beat the baseline on both cross-language pairs — `en-ru`
+0.072 → 1.000 and `ru-en` 0.200 → 0.967 — and saturation is gone (50–57 of 60 rather than 60/60).
+But it does **not** clear "no regression on the monolingual pairs": `ru-ru` falls from 0.917 to
+0.813, a real cost of about 0.10 MRR that the old corpus was structurally unable to show, because
+it scored 1.000 there in every configuration. `query_en` shows the same effect far more sharply
+(`ru-ru` 0.917 → 0.267): translating the query while leaving the store in its original language is
+the worst of the four shapes, not a partial improvement. The corpus was not adjusted after seeing
+these numbers; choosing a haystack that produces a wanted result would void the whole exercise.
+
+One anomaly from the old evidence is resolved. In version 1.0.0 `pipeline_en` — the only
+configuration that measures the shipped component rather than a hand-authored ceiling — returned
+numbers byte-identical to `baseline` on every pair, although its own provenance recorded 12
+entries translated. It no longer does: it scores 0.870 against baseline's 0.547 and lands within
+0.015 MRR of `store_en`'s hand-translated ceiling, with 100 of 200 entries translated and zero
+failures. The live translator now reaches essentially the quality of a hand translation for this
+task, which is the strongest single result here.
+
 As-built note (T10-02, `[SPEC]`): for the brute-force candidate, warm search p95 /
 open / close / registry-startup are measured generically by
 `spike/harness/src/lib.rs::measure_metrics` (adapter-agnostic — the fake and future
