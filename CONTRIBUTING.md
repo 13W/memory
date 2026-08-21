@@ -64,12 +64,24 @@ of its call sites construct, and every task since had run only its own crates.
 So when the full gate cannot run, the minimum substitute is:
 
 ```
-cargo check --workspace --all-targets
+cargo check --workspace --all-targets --all-features
 ```
 
 It is far cheaper than the gate (no codegen, no test binaries), it completes
 on machines where `cargo xtask ci` does not, and it is the one check that sees
 the whole workspace. Run it before committing.
+
+`--all-features` is not decoration; it is the second half of the same hole
+(`D-087`). Without it the substitute compiles only the default feature set,
+and this workspace keeps real targets behind non-default features —
+`failpoints` most of all, which several crates forward to their dependencies.
+`crates/search/tests/switch_failpoint_load.rs` sat broken for a day for
+exactly that reason: `T21-15`/`T21-19` added a field to `SearchRequest`,
+`D-076` swept the four call sites the featureless check could see, and the
+fifth compiled only under `--features failpoints`. Two of `cargo xtask ci`'s
+eighteen jobs were red the whole time, while the substitute D-076 itself had
+just recorded reported success. The substitute cannot be weaker than the gate
+in a dimension the gate actually exercises.
 
 `cargo-nextest` is a required host tool (not a workspace dependency `cargo
 fetch` pulls in): install it once with `cargo install cargo-nextest --locked`.
