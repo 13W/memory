@@ -518,6 +518,13 @@ pub(crate) async fn score_queries(
                             mode: options.mode,
                             limit: QUERY_LIMIT,
                             name_pattern: None,
+                            // `None` for the same reason the memory-recall
+                            // bench passes `None` (see its own note): this
+                            // harness drives the engine directly, below the
+                            // query boundary `T21-19` added, so there is no
+                            // translation outcome to report. The field only
+                            // ever reaches `diagnostics` and never the ranking.
+                            query_degraded: None,
                         },
                         now_ms,
                     )
