@@ -530,6 +530,7 @@ async fn do_one_search(
     snapshots: &Mutex<Vec<PipelineSnapshot>>,
 ) {
     let request = SearchRequest {
+        query_degraded: None,
         root: request_root(path),
         query: "search".to_string(),
         limit: 5,

@@ -323,6 +323,29 @@ Reciprocal Rank Fusion: `score(d) = Σ_legs 1 / (k + rank_leg(d))`, `k = 60`. De
 tie-break: `(score desc, occurrence_id asc)`. Per-leg candidate depth: `max(limit·4, 50)`.
 (Per-leg weights were added by D-018 — see its as-built note below.)
 
+As-built note (T21-19, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
+§1's query-normalization stage is implemented, and two details of *where* are worth pinning.
+
+The decision is made **above** the engine — `crates/local-rag/src/daemon/mcp/code.rs`, through the
+same `Translator` the memory boundary uses (T21-14/T21-15) — and only the already-decided query
+reaches `SearchRequest`. `crates/search` gains no generator: a structural grep for one is part of
+this task's acceptance, and translating inside the engine would put a model behind the `L2.read`
+this pipeline holds for its whole duration.
+
+The reason a query could not be translated travels in **`diagnostics`** (§7, "diagnostics always
+says why"), not in `degraded`. `degraded` is the typed marker for a *leg* that could not serve, and
+a query the translator could not reach is not that — it is a query that will reach the dense leg
+alone, which is a different fact and deserves a different channel. It is pushed first, because it
+explains the shape of everything after it.
+
+The common case is free by construction, not by hope. The detector strips identifiers, paths and
+hex-like tokens before it counts anything, so an identifier-shaped query (`register_embedder_
+representation`), a path, or ordinary English is classified without the generator ever being asked
+— measured at **10–20 µs** per query against a hybrid search costing tens of milliseconds. Russian
+prose with an identifier embedded in it is still translated, which is the other half of the same
+threshold and is tested alongside: without it, the first property would only prove the detector was
+asleep.
+
 As-built note (T12-01, `[SPEC]`): the candidate depth is
 `local_rag_store::candidate_depth(limit)` (`crates/store/src/cache/fts_query.rs`,
 `limit.saturating_mul(4).max(MIN_CANDIDATE_DEPTH)`, `MIN_CANDIDATE_DEPTH = 50`), introduced

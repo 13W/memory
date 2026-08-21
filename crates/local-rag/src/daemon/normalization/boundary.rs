@@ -34,6 +34,8 @@
 //!
 //! [ADR-0011]: ../../../../../docs/adr/0011-english-canon-for-durable-memory.md
 
+use std::sync::Arc;
+
 use local_rag_core::config::DataPolicy;
 use local_rag_core::hash::sha256_hex;
 use local_rag_embed::GeneratorPool;
@@ -158,6 +160,103 @@ pub fn normalize_for_write(
             reason: e.to_string(),
             kind: classify_translate_failure(&e),
         },
+    }
+}
+
+/// Why a search or recall ran against a query in a language the store is not
+/// kept in.
+///
+/// Typed rather than a bare string so the two pillars cannot drift apart in
+/// what they mean, and rendered by [`label`](Self::label) so they cannot drift
+/// apart in what they say either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryNotTranslated {
+    /// No generative model is installed, so nothing could translate it.
+    NoGenerator,
+    /// The translator was asked and refused; the reason travels for
+    /// diagnostics.
+    Refused(String),
+}
+
+impl QueryNotTranslated {
+    /// The one wording both pillars surface.
+    pub fn label(&self) -> String {
+        match self {
+            QueryNotTranslated::NoGenerator => {
+                "no_generator: the query was searched as written".to_string()
+            }
+            QueryNotTranslated::Refused(reason) => format!("translation_refused: {reason}"),
+        }
+    }
+}
+
+/// Everything a boundary needs to decide the canon, in one value.
+///
+/// Both boundaries — the write path (`T21-14`) and the two query paths
+/// (`T21-15`, `T21-19`) — need the same three things and the same
+/// `spawn_blocking` hop. Bundling them means a caller in the *code* pillar can
+/// translate without being handed a `MemoryContext`, which is what the plumbing
+/// would otherwise have forced.
+#[derive(Clone)]
+pub struct Translator {
+    pub generators: Option<Arc<GeneratorPool>>,
+    pub model_id: String,
+    pub policy: DataPolicy,
+}
+
+impl Translator {
+    /// Decide the canon for `text`, off the async worker.
+    ///
+    /// `GeneratorPool::generate` is synchronous and a translation takes a few
+    /// hundred milliseconds. Every caller here is on a request path, where
+    /// blocking a tokio worker would delay other requests the daemon is
+    /// serving — so the `spawn_blocking` hop lives here once rather than at
+    /// each call site.
+    ///
+    /// A panicked blocking task degrades to a refusal rather than an error:
+    /// callers still hold the original text, and losing it to an executor
+    /// mishap would be exactly the failure ADR-0011 §Decision 3 prevents.
+    pub async fn decide(&self, subject: &str, text: &str) -> Normalized {
+        let generators = self.generators.clone();
+        let policy = self.policy;
+        let model_id = self.model_id.clone();
+        let (subject, text) = (subject.to_string(), text.to_string());
+        tokio::task::spawn_blocking(move || {
+            normalize_for_write(generators.as_deref(), policy, &model_id, &subject, &text)
+        })
+        .await
+        .unwrap_or_else(|e| Normalized::Refused {
+            reason: format!("the translation task did not finish: {e}"),
+            kind: TranslateFailureKind::Transient,
+        })
+    }
+
+    /// The canon for a **query**, plus why it is not English when it is not.
+    ///
+    /// Shared by both query boundaries so "a query we could not translate" has
+    /// one meaning and one wording, not two. An empty query never reaches the
+    /// translator: there is nothing to decide, and a termless recall must stay
+    /// free.
+    pub async fn decide_query(&self, query: &str) -> (String, Option<QueryNotTranslated>) {
+        if query.trim().is_empty() {
+            return (query.to_string(), None);
+        }
+        match self.decide("query", query).await {
+            Normalized::AlreadyEnglish { .. } => (query.to_string(), None),
+            Normalized::Translated { english, .. } => (english, None),
+            // The search still runs, on the author's own words: the dense leg
+            // is multilingual and does most of the work. What the caller must
+            // not get is silence about why the lexical leg found nothing
+            // (02 §6).
+            Normalized::Refused { reason, kind } => {
+                let why = if kind == TranslateFailureKind::Unavailable {
+                    QueryNotTranslated::NoGenerator
+                } else {
+                    QueryNotTranslated::Refused(reason)
+                };
+                (query.to_string(), Some(why))
+            }
+        }
     }
 }
 

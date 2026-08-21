@@ -14,6 +14,7 @@ use local_rag_search::{SearchEngine, SearchInfraError, SearchRequest};
 use local_rag_store::{RequestRoot, WorktreeRootFacts};
 
 use crate::daemon::gitroot;
+use crate::daemon::normalization::boundary::Translator;
 
 use super::content::{self, CallToolResult};
 use super::tools::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, reject_unknown_keys, require_string};
@@ -34,6 +35,7 @@ fn fold<T: serde::Serialize>(
 
 pub async fn search_code(
     engine: &SearchEngine,
+    translator: &Translator,
     root: RequestRoot,
     args: &Map<String, Value>,
     now_ms: i64,
@@ -64,12 +66,23 @@ pub async fn search_code(
         Some(_) => return Err("name_pattern must be a string".to_string()),
     };
 
+    // T21-19, ADR-0011 §Decision 2: the query crosses the same boundary the
+    // memory one does. It matters more here, not less — indexed code is stored
+    // verbatim (§Decision 5), so a non-Latin query never produces a lexical
+    // match at all and reaches the dense leg alone.
+    //
+    // The common case costs nothing, and structurally rather than by luck: the
+    // detector strips identifiers, paths and hex-like tokens before counting,
+    // so an identifier-shaped query is classified English and never reaches the
+    // generator.
+    let (query, query_degraded) = translator.decide_query(&query).await;
     let request = SearchRequest {
         root,
         query,
         mode,
         limit: limit as usize,
         name_pattern,
+        query_degraded: query_degraded.as_ref().map(|why| why.label()),
     };
     Ok(fold(engine.search_code(request, now_ms).await))
 }
@@ -283,5 +296,148 @@ mod tests {
             normalized_relative_path(&root, "/some/absolute/path", CaseSensitivity::Sensitive)
                 .unwrap_err();
         assert_eq!(err.code, local_rag_protocol::ErrorCode::PathNotIndexed);
+    }
+}
+
+#[cfg(test)]
+mod query_boundary_tests {
+    //! The code pillar's query boundary (T21-19).
+    //!
+    //! These exercise the decision, not the search: whether the translator is
+    //! reached at all is the whole question here, because indexed code is
+    //! stored verbatim and a query that never becomes English reaches only the
+    //! dense leg. Running a full hybrid search to observe that would test the
+    //! search engine, which `crates/search`'s own suites already do.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use local_rag_core::config::DataPolicy;
+    use local_rag_embed::{
+        FinishReason, GenError, GenRequest, GenResponse, Generator, GeneratorEntry, GeneratorPool,
+    };
+    use serde_json::json;
+
+    use crate::daemon::normalization::boundary::Translator;
+
+    /// The card's own claim about identifier-shaped queries, as a fixture set:
+    /// the first three must never reach the generator, the last two must.
+    const FREE: [&str; 3] = [
+        "register_embedder_representation",
+        "crates/store/src/memory/normalization.rs",
+        "where is the consolidation runner's dead-letter handled",
+    ];
+    /// Long enough to clear the validator's `MIN_LENGTH_RATIO` against both
+    /// [`PAID`] queries.
+    const TRANSLATION: &str = "where is register_embedder_representation called from";
+
+    const PAID: [&str; 2] = [
+        "где вызывается register_embedder_representation",
+        "покажи где демон переживает падение консолидации",
+    ];
+
+    #[derive(Clone)]
+    struct CountingGenerator {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingGenerator {
+        fn new() -> Self {
+            CountingGenerator {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn translator(&self) -> Translator {
+            Translator {
+                generators: Some(Arc::new(GeneratorPool::new(vec![GeneratorEntry::local(
+                    "counting",
+                    Arc::new(self.clone()),
+                )]))),
+                model_id: "counting-model".to_string(),
+                policy: DataPolicy::LocalOnly,
+            }
+        }
+    }
+
+    impl Generator for CountingGenerator {
+        fn generate(&self, _req: GenRequest) -> Result<GenResponse, GenError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Proportionate on purpose: the validator rejects an answer
+            // shorter than `MIN_LENGTH_RATIO` of its source (a fragment is not
+            // a translation), so a canned "translated" would be refused and
+            // this test would prove the opposite of what it means to.
+            Ok(GenResponse {
+                text: json!({ "en": TRANSLATION }).to_string(),
+                finish_reason: FinishReason::Stop,
+                tokens_generated: None,
+            })
+        }
+    }
+
+    /// The card claims an identifier-shaped query costs nothing. That claim
+    /// rests on the detector stripping identifiers, paths and hex-like tokens
+    /// *before* it counts, so it is worth checking rather than repeating.
+    #[tokio::test]
+    async fn identifier_and_english_queries_never_reach_the_generator() {
+        for query in FREE {
+            let generator = CountingGenerator::new();
+            let (decided, why) = generator.translator().decide_query(query).await;
+            assert_eq!(
+                generator.calls(),
+                0,
+                "{query:?} must be answered by the pure detector",
+            );
+            assert_eq!(decided, query, "an untranslated query is passed through");
+            assert!(why.is_none());
+        }
+    }
+
+    /// The other half of the same threshold, and the reason the test above is
+    /// not merely proof that the detector is asleep: Russian prose still counts
+    /// as Russian when an identifier is sitting inside it.
+    #[tokio::test]
+    async fn russian_prose_around_an_identifier_is_still_translated() {
+        for query in PAID {
+            let generator = CountingGenerator::new();
+            let (decided, why) = generator.translator().decide_query(query).await;
+            assert_eq!(
+                generator.calls(),
+                1,
+                "{query:?} is prose in another script and must be translated",
+            );
+            assert_eq!(decided, TRANSLATION);
+            assert!(why.is_none());
+        }
+    }
+
+    /// An empty query has nothing to decide and must stay free.
+    #[tokio::test]
+    async fn an_empty_query_never_reaches_the_generator() {
+        let generator = CountingGenerator::new();
+        let (decided, why) = generator.translator().decide_query("   ").await;
+        assert_eq!(generator.calls(), 0);
+        assert_eq!(decided, "   ");
+        assert!(why.is_none());
+    }
+
+    /// No model installed: the search still runs on the author's own words, and
+    /// the reason is rendered for `diagnostics` rather than swallowed (02 §6).
+    #[tokio::test]
+    async fn a_missing_model_degrades_with_a_reason_for_diagnostics() {
+        let translator = Translator {
+            generators: None,
+            model_id: "none".to_string(),
+            policy: DataPolicy::LocalOnly,
+        };
+        let query = "где вызывается register_embedder_representation";
+        let (decided, why) = translator.decide_query(query).await;
+        assert_eq!(decided, query, "the query is searched as written");
+        let label = why.expect("a reason is produced").label();
+        assert!(label.starts_with("no_generator"), "{label}");
     }
 }

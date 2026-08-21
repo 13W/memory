@@ -212,6 +212,18 @@ pub struct SearchRequest {
     /// Optional prefix filter on `local_name`/`qualified_name` (spec 09 §1's
     /// `name_pattern`).
     pub name_pattern: Option<String>,
+    /// Why [`query`](Self::query) is not in the language the index is kept in,
+    /// when it is not (`T21-19`, ADR-0011 §Decision 2).
+    ///
+    /// Already rendered, because its destination is `diagnostics` (spec 09 §7,
+    /// "diagnostics always says why") rather than a field of its own:
+    /// `degraded` is the typed marker for a **leg** that could not serve, and a
+    /// query the translator could not reach is not that.
+    ///
+    /// The decision is made above this engine — a translation needs a
+    /// generative model, and `crates/search` has no business holding one — so
+    /// what arrives here is the outcome, not the question.
+    pub query_degraded: Option<String>,
 }
 
 /// One pipeline run, as an instrumented caller sees it: the canonical
@@ -648,6 +660,13 @@ impl SearchEngine {
         let dense_served = dense_outcome.as_ref().map(|o| o.available);
 
         let mut diagnostics = Vec::new();
+        // First, because it explains the shape of everything after it: a query
+        // that is not in the index's language reaches the dense leg and nothing
+        // else, so a reader seeing thin results should see the reason before
+        // the leg-level notes.
+        if let Some(reason) = &request.query_degraded {
+            diagnostics.push(reason.clone());
+        }
         if let Some(FtsAvailability::Unavailable(Some(divergence))) = &fts_availability {
             diagnostics.push(divergence.to_string());
         }

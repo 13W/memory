@@ -889,6 +889,8 @@ mod tests {
         let response = engine
             .search_code(
                 local_rag_search::SearchRequest {
+                    // An indexing self-check, not a user query — nothing to translate.
+                    query_degraded: None,
                     root: local_rag_store::RequestRoot {
                         worktree_root: Some(facts_for(&fx.root)),
                         repo_hint: None,
