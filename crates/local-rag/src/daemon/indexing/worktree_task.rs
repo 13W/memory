@@ -269,7 +269,7 @@ impl WorktreeTaskHandle {
 /// deterministically (`JobRegistry::len()` is already incremented by the
 /// time this fires), instead of racing a real, possibly sub-millisecond
 /// window with a poll loop.
-type JobStartedHook = Arc<dyn Fn() + Send + Sync>;
+pub(crate) type JobStartedHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Start one worktree's continuous reconcile/project cycle on its own
 /// dedicated background thread (see the module doc for why). Returns once
@@ -287,7 +287,7 @@ pub async fn spawn_worktree_task(
 /// exactly, mirroring `local_rag_search::SearchEngine::
 /// search_code_instrumented`'s identical "same logic, plus an observer only
 /// tests use" shape.
-async fn spawn_worktree_task_instrumented(
+pub(crate) async fn spawn_worktree_task_instrumented(
     params: WorktreeTaskParams,
     on_job_started: JobStartedHook,
 ) -> Result<WorktreeTaskHandle, WorktreeTaskStartError> {
@@ -1049,6 +1049,105 @@ mod tests {
         .await;
         assert_eq!(handle2.status().consecutive_failures, 0);
         handle2.stop().await;
+    }
+
+    /// `D-077`, and the property the deviation is actually about: a task stuck
+    /// in a **synchronous** stretch must not hold the daemon's shutdown.
+    ///
+    /// The blocking hook stands in for the real one — `run_backfill`'s
+    /// `blob_index` → `occurrences_for_fts`, which is called straight from an
+    /// `async fn` with no `.await` before it and therefore cannot be preempted
+    /// by any cancel. On the owner's 24 GB store `sample(1)` caught exactly
+    /// that frame at 99.6% CPU five minutes after `daemon stopping`, while the
+    /// daemon went on serving requests; `kill -9` was the only way out.
+    ///
+    /// This is the test that tells the fix from the defect. `stop_all` used to
+    /// `await` each `handle.stop()` with no bound, and `stop` joins the OS
+    /// thread — so with the hook still held it never returned at all and this
+    /// test would hang to its timeout. It now cancels first and bounds the
+    /// wait, so shutdown proceeds and the thread is left to finish its read
+    /// and exit on its own (spec 02 §4.3: "Kill at any point is safe by
+    /// construction").
+    #[tokio::test]
+    async fn a_task_stuck_in_synchronous_work_does_not_hold_up_shutdown() {
+        use std::collections::HashMap;
+
+        use crate::daemon::indexing::supervisor::{SHUTDOWN_JOIN_BUDGET, stop_all};
+
+        let fx = Fixture::new("repo").await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let hook: JobStartedHook = Arc::new(move || {
+            entered_tx.send(()).ok();
+            // Blocks the dedicated thread inside `project_one`, before its
+            // first `.await` — the same shape as the real synchronous scan.
+            let _ = release_rx.lock().expect("release mutex").recv();
+        });
+        let handle = spawn_worktree_task_instrumented(fx.params(), hook)
+            .await
+            .expect("start task");
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("job started"))
+            .await
+            .expect("join entered-wait");
+
+        let mut tasks = HashMap::new();
+        tasks.insert(fx.worktree_id.to_string(), handle);
+
+        // Generous against the budget itself: this asserts "shutdown is
+        // bounded", not "the bound is tight". Unbounded is what it catches,
+        // and unbounded never finishes.
+        tokio::time::timeout(SHUTDOWN_JOIN_BUDGET * 4, stop_all(tasks))
+            .await
+            .expect("a task stuck in synchronous work must not hold shutdown open");
+
+        // Let the stranded thread go, so the fixture's temp dir can be removed
+        // without a live reader in it.
+        let _ = release_tx.send(());
+    }
+
+    /// The other half of `D-077`, and the half the test above does **not**
+    /// cover: `stop_all` must *cancel*, not merely bound its wait.
+    ///
+    /// Bounding alone would still be wrong in two ways. It would wait out the
+    /// whole in-flight projection before giving up, and then abandon a thread
+    /// in the middle of **writing** rather than reading. And it would leave
+    /// the loop's shutdown branch to run — that branch flushes the reconciler
+    /// and then calls `project_one` on whatever it published, which is how the
+    /// owner's daemon came to log two fresh `indexing cycle started` lines
+    /// *after* `daemon stopping`. Spec 02 §4.3 says shutdown cancels
+    /// reconciles; starting another projection is the opposite of that.
+    ///
+    /// Asserted on the source because the runtime symptom is expensive to
+    /// stage — it needs a projection long enough to matter and a generation
+    /// pending at exactly the right instant — and cheap to lose: deleting one
+    /// line brings the whole defect back. Same reason, and same shape, as
+    /// `tests/memory_normalization_worker.rs::
+    /// the_generator_pool_is_built_once_per_process`.
+    #[test]
+    fn shutdown_cancels_the_indexing_tasks_rather_than_waiting_for_them() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/daemon/indexing/supervisor.rs"
+        ))
+        .expect("read supervisor.rs");
+        let body = source
+            .split_once("async fn stop_all(")
+            .expect("stop_all exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("stop_all has a body").0;
+
+        let abort_at = body
+            .find("handle.abort()")
+            .expect("stop_all must cancel each task (D-077), not only bound its wait");
+        let stop_at = body
+            .find("handle.stop()")
+            .expect("stop_all still joins each task's thread after cancelling it");
+        assert!(
+            abort_at < stop_at,
+            "the cancel must come before the join — `stop()` blocks on the thread, so calling \
+             it first is exactly the wait D-077 removed",
+        );
     }
 
     #[tokio::test]

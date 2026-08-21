@@ -701,53 +701,81 @@ impl DaemonHandle {
         self.indexing_supervisor.as_ref()
     }
 
-    /// Drain and release the store (spec 02 §4.3): await the startup resume
-    /// passes to their natural completion, signal-then-await the continuous
-    /// consolidation-trigger worker (D-024 — unlike the resume passes, it
-    /// never completes on its own), then checkpoint, close the cache, and
-    /// release the lock.
+    /// Drain and release the store (spec 02 §4.3), in the order that section
+    /// actually prescribes: stop accepting, cancel every worker, *then* wait
+    /// for them, then checkpoint, close the cache and release the lock.
+    ///
+    /// `D-077` reordered this. It used to await each worker to completion
+    /// before so much as signalling the next one, and it stopped accepting
+    /// **last** — so for as long as the first join took, every other part of
+    /// the daemon was still running and still taking on new work. Measured on
+    /// the owner's store: `daemon stopping` at 11:16:28, two fresh
+    /// `indexing cycle started` lines at 11:16:59 and 11:17:17 — 31 and 49
+    /// seconds *into* the shutdown, because the supervisor was not told
+    /// anything until the consolidation and normalization joins had returned
+    /// — and `daemon stopped` only at 11:18:18. An indexing cycle on that
+    /// store takes 109–140 s, so a shutdown that lets one start is a shutdown
+    /// that runs for two more minutes.
+    ///
+    /// Signalling is cheap and awaiting is not, so every signal now goes out
+    /// first and the waits happen afterwards. Nothing about the "must finish
+    /// before the store closes" invariant changes: every join below still
+    /// completes strictly before `drain_and_shutdown`.
     pub async fn shutdown(mut self) {
         tracing::info!("daemon stopping");
-        for handle in self.resume_handles.drain(..) {
-            log_if_task_panicked("a startup resume task", handle.await);
+
+        // Step 1, and it belongs first rather than last: every step below
+        // takes time, and until this runs the daemon is still accepting new
+        // connections into a process that is going away.
+        //
+        // `handshake_join` is only the *accept loop* — aborting it stops new
+        // connections. Already-accepted connections run as independent
+        // `tokio::spawn`ed tasks this handle never tracked; they are
+        // deliberately left running rather than awaited or aborted here —
+        // `daemon::handshake`'s own module doc explains why a connection that
+        // sent `SHUTDOWN_REQUEST` must stay open through this very drain, and
+        // `main.rs::run_serve`'s `Runtime` drop is what actually reclaims
+        // them, safe by construction the same way a hard kill is.
+        if let Some(handshake_join) = self.handshake_join.take() {
+            handshake_join.abort();
         }
+        tracing::debug!("no longer accepting connections");
+
+        // Step 2: signal everything that can be signalled, before waiting on
+        // anything. These two workers observe their `oneshot` between ticks;
+        // telling them now means their current tick is their last, instead of
+        // their starting another one while some other join is pending.
         if let Some(stop) = self.consolidation_trigger_stop.take() {
             let _ = stop.send(());
+        }
+        if let Some(stop) = self.normalization_stop.take() {
+            let _ = stop.send(());
+        }
+
+        // The indexing supervisor is cancelled ahead of the waits for the same
+        // reason, and it is the one that matters most: it is the only worker
+        // that starts minutes-long work on a timer. `SupervisorHandle::
+        // shutdown` cancels every worktree task and is itself bounded
+        // (`SHUTDOWN_JOIN_BUDGET`), so this is a short await, not a drain.
+        if let Some(supervisor) = self.indexing_supervisor.take() {
+            supervisor.shutdown().await;
+        }
+
+        // Step 3: now wait. The startup resume passes are still awaited to
+        // natural completion — they are catch-up work with no stop signal of
+        // their own, and unlike the workers above they do not schedule more.
+        for handle in self.resume_handles.drain(..) {
+            log_if_task_panicked("a startup resume task", handle.await);
         }
         if let Some(join) = self.consolidation_trigger_join.take() {
             log_if_task_panicked("the consolidation-trigger worker", join.await);
         }
-        // T21-06: same signal-then-await pair — a tick in flight holds a
-        // `JobKind::Normalization` guard and is mid-way through two databases,
-        // so it must finish before the store closes below.
-        if let Some(stop) = self.normalization_stop.take() {
-            let _ = stop.send(());
-        }
+        // A tick in flight holds a `JobKind::Normalization` guard and is
+        // mid-way through the store, so it must finish before it closes below.
         if let Some(join) = self.normalization_join.take() {
             log_if_task_panicked("the memory-normalization worker", join.await);
         }
-        if let Some(supervisor) = self.indexing_supervisor.take() {
-            // Stops every worktree task it owns (each flushing its own last
-            // successful generation first, T20-05) before returning — must
-            // finish here, strictly before `drain_and_shutdown` below closes
-            // `state`/`cache`.
-            supervisor.shutdown().await;
-        }
         tracing::debug!("background jobs stopped");
-        if let Some(handshake_join) = self.handshake_join.take() {
-            // `handshake_join` is only the *accept loop* — aborting it stops
-            // new connections, matching spec 02 §4.3 step 1 ("stop
-            // accepting"). Already-accepted connections run as independent
-            // `tokio::spawn`ed tasks this handle never tracked; they are
-            // deliberately left running rather than awaited or aborted here
-            // — `daemon::handshake`'s own module doc explains why a
-            // connection that sent `SHUTDOWN_REQUEST` must stay open through
-            // this very drain, and `main.rs::run_serve`'s `Runtime` drop is
-            // what actually reclaims them, safe by construction the same way
-            // a hard kill is (spec 02 §4.3).
-            handshake_join.abort();
-        }
-        tracing::debug!("no longer accepting connections");
         let lock_guard = self.lock_guard.take().expect("shutdown runs once");
         drain_and_shutdown(
             &self.layout,

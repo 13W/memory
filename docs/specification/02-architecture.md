@@ -511,6 +511,47 @@ running index/consolidation/GC jobs `[FIXED]`. SIGTERM/CTRL-C: stop accepting, c
 reconciles at the next safe point (state tx boundaries), flush WAL checkpoint, release lock.
 Kill at any point is safe by construction (05, 07).
 
+As-built note (`D-077`, `[SPEC]`): "cancel reconciles at the next safe point" is now what the
+shutdown actually does. It did not: `supervisor::stop_all` called
+`WorktreeTaskHandle::stop`, which signals and then **joins the OS thread**, so shutdown waited out
+whatever the in-flight `project_generation` still had to do — and the loop's own stop branch went
+on to flush the reconciler and project one *more* generation, which is the opposite of cancelling.
+Measured on the owner's 24 GB store mid-indexing: `local-rag stop` reported "did not stop within
+10s", two fresh `indexing cycle started` lines appeared **after** `daemon stopping`, the daemon
+kept serving requests, and five minutes later `sample(1)` still showed 99.6% CPU inside
+`blob_index` → `occurrences_for_fts`. `kill -9` was the only way out.
+
+Shutdown now cancels first (`WorktreeTaskHandle::abort`, the preemptive half that had no
+production caller at all until this task) and only then joins. Cancellation lands on an `.await`,
+and the embed loop's are its `flush` calls — genuine `cache.sqlite` transaction boundaries, which
+is exactly the safe point this section names. The join is additionally **bounded**
+(`SHUTDOWN_JOIN_BUDGET`, 3 s, well inside `cli::service::STOP_TIMEOUT`) for the one case
+cancellation cannot reach: `run_backfill` calls `blob_index` synchronously from an `async fn`
+before its first `.await`, and no cancel preempts a synchronous stretch. Abandoning that join is
+safe by this section's own next sentence — "Kill at any point is safe by construction (05, 07)" —
+and by what the stretch is: a read. The thread finishes it and exits on its own; the process just
+stops waiting.
+
+Deregistration is deliberately unchanged: `reconcile`'s `handle.stop().await` stays graceful,
+because a worktree leaving the registry is not a reason to discard the projection it is halfway
+through.
+
+The same task also fixed the **order** of the four steps this section's T15-01 note lists, which
+the code had inverted. `DaemonHandle::shutdown` awaited each worker to completion before so much
+as signalling the next one, and it stopped accepting **last** — so for the length of the first
+join every other part of the daemon was still running, and the indexing supervisor, the one worker
+that starts minutes-long work on a timer, was told last of all. That is how two fresh
+`indexing cycle started` lines came to be logged 31 and 49 seconds *into* a shutdown. Signalling
+is cheap and waiting is not, so the accept loop is aborted first, every worker is then signalled
+(and the supervisor cancelled), and only afterwards does shutdown wait on any of them. Every join
+still completes strictly before the checkpoint, so nothing about "the store closes last" changes.
+
+Measured on the owner's store, indexing active: **110 s and `did not stop within 10s`** before,
+**6.5 s and `stopped`** after. The one wait still unbounded is the consolidation-trigger join —
+a tick in flight runs to its own run boundary, which *is* a safe point in this section's sense.
+It has not been measured to exceed the budget; if a shutdown ever does again, that is where to
+look first.
+
 As-built note (T15-01, `[SPEC]`): the idle gate's three inputs are
 `local_rag::daemon::idle::IdleGateInputs { live_sessions: usize, pending_spool_bytes: bool,
 running_jobs: usize }`, read from a protocol-agnostic `SessionRegistry` (registered by T15-02's
