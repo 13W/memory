@@ -402,6 +402,7 @@ pub use cache::{
     tokenize_signature, validate_fts_cheap, validate_fts_strong, verify_cached_embedding,
     verify_cached_text,
 };
+pub use checkpoint::{WAL_TRUNCATE_THRESHOLD_BYTES, should_truncate_wal, wal_bytes};
 pub use code::{
     ALGO_VERSION, BlobOutcome, CONTEXT_VERSION, ContextInput, ContextSubject, DerivedContentBlob,
     EdgeResolution, FtsSourceRow, NORMALIZATION_VERSION, NewContentBlob, NewFileRevision,

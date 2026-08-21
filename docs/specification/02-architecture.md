@@ -569,7 +569,10 @@ What this note does **not** claim: that `local-rag stop` always fits in 10 s. Th
 `wal_checkpoint(TRUNCATE)` is deliberately left unbounded — it is the step that returns disk, and
 abandoning it would trade a bounded wait for unbounded growth. Its cost is bounded instead by
 `D-083`, which stops the WAL from accumulating in the first place; before that fix a shutdown on
-the owner's store had to fold a 62 GB log and ran for tens of minutes.
+the owner's store had to fold a 62 GB log and ran for tens of minutes. `D-086` widened that
+bound: the `TRUNCATE` clause of 03 §3 is now also tested on the consolidation tick, so the
+closing checkpoint no longer depends on an indexing cycle having run recently — which matters
+because `D-089` stopped an unchanged tree from producing a cycle at all.
 
 As-built note (`D-077`, `[SPEC]`): "cancel reconciles at the next safe point" is now what the
 shutdown actually does. It did not: `supervisor::stop_all` called

@@ -932,6 +932,47 @@ section are `[SPEC]`, so this is a documented refinement of the cadence, not a c
 policy's shape. Consolidation is deliberately left out: its per-run write volume is a handful of
 rows, and nothing measured points at it.
 
+As-built note (D-086, `[SPEC]`, amends the note above on its last two sentences): the policy now has
+a **second** driver, and the `TRUNCATE` clause is implemented as this section literally writes it —
+`> 64 MiB and no readers`, checked on the consolidation trigger's tick
+(`daemon::consolidation_trigger`, 15 s). Two of D-083's closing claims are retracted by measurement.
+
+"The checkpoint is now taken at the end of every indexing cycle" was the whole implementation, and
+D-089 has since stopped a reconcile from producing a cycle when the tree is unchanged — so a
+repository nobody is editing reaches that boundary **never**. Nothing else returned the file:
+`journal_size_limit` is unset workspace-wide, so SQLite never shrinks the `-wal` on its own, and
+`PASSIVE` transfers frames without giving the disk back.
+
+"Consolidation is deliberately left out: its per-run write volume is a handful of rows" is
+falsified: it is the largest writer outside indexing, spool import runs inside the same tick, and
+that tick is the one boundary that arrives whether or not the repository changed. It is now where
+the threshold is tested.
+
+"No readers" is **approximated** by "no `JobKind::Reconcile` running", and the approximation's edge
+is stated here rather than glossed. It covers the reader D-083 measured as the blocker — the
+embedding backfill's, held across `blob_index`/`context_index`/`write_coverage` — and every
+short-lived reader (search, the trigger's own queries) opens and drops within a call. It does not
+cover `local_rag_index::reconcile::build`'s own read connection, which is open for the whole build
+and sits *before* the job guard `project_one` takes. The gap is a cost and not a hazard: a
+`TRUNCATE` under a live reader transfers what it may, leaves the file at its high-water mark and
+returns, so the worst case is one wasted `PRAGMA` on a tick during a build — bounded further by the
+threshold. Closing it properly means giving the build phase a job guard, which belongs to the
+indexing task rather than to this policy.
+
+`PASSIVE` gains no explicit caller: SQLite's own `wal_autocheckpoint` (1000 pages, unset here and
+therefore at its default) **is** the opportunistic half, and on a quiet store it demonstrably keeps
+up — measured 2026-08-21, `state.sqlite-wal` flat at 9 747 952 bytes across four consecutive
+one-minute samples while the consolidation trigger wrote on every 15 s tick.
+
+What this does **not** claim: that the threshold would have prevented D-083's 324 GB. It would not.
+That growth happened *under* the indexing cycle's own reader, where this clause correctly declines
+to truncate — measured again on 2026-08-21, one 2.8-minute cycle (`duration_ms=169732`) took the
+`-wal` from 9.7 MB to **2.5 GB**, about 0.9 GB/min, and its own end-of-cycle truncate returned all
+of it. The mechanism behind that number was the cycle failing to *end*, which is D-088's subject,
+not this section's. What the threshold covers is the other case: a large write from outside a cycle
+— spool import, the startup generation sweep, a consolidation burst — on a store whose indexing
+then goes quiet.
+
 ## 4. `cache.sqlite` — rebuildable, independently validated
 
 ```sql

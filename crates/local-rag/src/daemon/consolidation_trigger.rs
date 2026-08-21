@@ -80,9 +80,10 @@ use std::time::Duration;
 use local_rag_core::identity::UuidSource;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    ClassifiedFailure, ConsolidationWindow, GeneratedOp, ImportError, RunOutcome, SnapshotOutcome,
-    StateDb, WriteError, has_unconsolidated_checkpoint, import_session_tail, known_spool_sessions,
-    open_next_run, pending_backlog, run_once, session_idle_since, sessions_with_pending_backlog,
+    CheckpointMode, ClassifiedFailure, ConsolidationWindow, GeneratedOp, ImportError, RunOutcome,
+    SnapshotOutcome, StateDb, WriteError, has_unconsolidated_checkpoint, import_session_tail,
+    known_spool_sessions, open_next_run, pending_backlog, run_once, session_idle_since,
+    sessions_with_pending_backlog,
 };
 use tokio::sync::oneshot;
 
@@ -118,6 +119,12 @@ pub struct ConsolidationTriggerParams {
     /// `SessionEnd` (spool captures only `SessionStart`), which the
     /// queue-size threshold alone never reaches.
     pub idle_checkpoint_hours: u64,
+    /// D-086: the `-wal` size above which this tick takes spec 03 §3's
+    /// `TRUNCATE`, when no reader is open. Production passes
+    /// [`local_rag_store::WAL_TRUNCATE_THRESHOLD_BYTES`]; a test passes a few
+    /// kilobytes, because growing a real WAL past 64 MiB to observe a threshold
+    /// would test the fixture rather than the policy.
+    pub wal_truncate_threshold_bytes: u64,
 }
 
 /// What one session's checkpoint-gated pass did this tick.
@@ -346,8 +353,62 @@ pub async fn run_consolidation_trigger<G, Fut>(
                 let now_ms = system_now_ms();
                 let results = consolidation_trigger_tick(&db, &layout, &*uuids, &jobs, &params, now_ms, build_id, &generate).await;
                 log_session_tick_outcomes(&results);
+                maybe_truncate_wal(&db, &jobs, params.wal_truncate_threshold_bytes).await;
             }
         }
+    }
+}
+
+/// spec 03 §3's `TRUNCATE` clause, on a boundary that does not depend on
+/// indexing (D-086).
+///
+/// The policy had exactly one driver — the end of an indexing cycle (D-083) —
+/// and D-089 has just stopped a reconcile from producing a cycle when nothing
+/// changed, so a repository nobody is editing now reaches that boundary never.
+/// This tick does, every `poll_interval`, for the daemon's whole life. It is
+/// also the right place on the merits: consolidation is the largest writer
+/// outside indexing and spool import runs inside this same tick, so both
+/// non-indexing writers share one boundary. That falsifies D-083's own closing
+/// sentence ("Consolidation is deliberately left out: its per-run write volume
+/// is a handful of rows"), which is amended in 03 §3.
+///
+/// "No readers" is approximated by "no `Reconcile` job running", and the
+/// approximation's edge is worth stating rather than glossing. It covers the
+/// reader D-083 actually measured as the blocker — the embedding backfill's
+/// `state_read`, held across `blob_index`/`context_index`/`write_coverage` — and
+/// every short-lived reader (search, this tick's own queries) opens and drops
+/// within one call, so those never matter. It does **not** cover
+/// `local_rag_index::reconcile::build`'s own read connection, which is opened
+/// for the whole build and sits *before* `project_one` takes the job guard.
+///
+/// That gap is a cost, not a hazard: a `TRUNCATE` under a live reader transfers
+/// what it may, leaves the file at its high-water mark and returns — so the
+/// worst case is one wasted `PRAGMA` per tick during a build, bounded further by
+/// the 64 MiB threshold. Closing it properly means giving the build phase a job
+/// guard, which belongs to the indexing task, not to this tick.
+///
+/// Failure is logged, never propagated: this is housekeeping on a loop that must
+/// keep ticking, and the next tick tries again.
+async fn maybe_truncate_wal(db: &StateDb, jobs: &JobRegistry, threshold_bytes: u64) {
+    let wal = local_rag_store::wal_bytes(db.path());
+    if !local_rag_store::should_truncate_wal(
+        wal,
+        threshold_bytes,
+        jobs.any_running(&[JobKind::Reconcile]),
+    ) {
+        return;
+    }
+    match db.writer().checkpoint(CheckpointMode::Truncate).await {
+        Ok(_) => tracing::debug!(
+            wal_bytes_before = wal,
+            wal_bytes_after = local_rag_store::wal_bytes(db.path()),
+            "wal checkpoint above the truncate threshold"
+        ),
+        Err(e) => tracing::warn!(
+            wal_bytes = wal,
+            error = %e,
+            "wal checkpoint above the truncate threshold failed"
+        ),
     }
 }
 
@@ -483,6 +544,100 @@ mod tests {
         std::fs::write(session_dir.join(format!("{seq:06}.seg")), bytes).expect("write segment");
     }
 
+    /// Grow the `-wal` past a small test threshold: rows through the real write
+    /// queue, which is what a WAL records.
+    async fn grow_wal(db: &StateDb) {
+        db.writer()
+            .transaction(|tx| {
+                tx.execute_batch("CREATE TABLE IF NOT EXISTS d086 (id INTEGER PRIMARY KEY, v TEXT)")
+            })
+            .await
+            .expect("create table");
+        for chunk in 0..8 {
+            db.writer()
+                .transaction(move |tx| {
+                    for i in 0..200 {
+                        tx.execute(
+                            "INSERT INTO d086 (id, v) VALUES (?1, ?2)",
+                            rusqlite::params![chunk * 200 + i, "x".repeat(512)],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("insert rows");
+        }
+    }
+
+    /// D-086: spec 03 §3's `TRUNCATE` clause fires on a boundary that does not
+    /// depend on indexing.
+    ///
+    /// Until this, the policy's only driver was the end of an indexing cycle
+    /// (D-083), and D-089 has just stopped a reconcile from producing a cycle
+    /// when nothing changed — so a repository nobody edits reaches that boundary
+    /// never, and the `-wal` keeps its high-water mark for as long as the daemon
+    /// runs (`journal_size_limit` is unset, and `PASSIVE` moves frames without
+    /// returning disk).
+    #[tokio::test]
+    async fn a_tick_truncates_a_wal_over_the_threshold_when_no_reconcile_is_running() {
+        let (_home, layout, db) = open_state();
+        grow_wal(&db).await;
+        let before = local_rag_store::wal_bytes(&layout.state_db());
+        assert!(
+            before > 4096,
+            "the fixture must produce a real WAL: {before}"
+        );
+
+        let jobs = JobRegistry::new();
+        maybe_truncate_wal(&db, &jobs, 4096).await;
+
+        let after = local_rag_store::wal_bytes(&layout.state_db());
+        assert!(
+            after < before,
+            "a WAL over the threshold with no reader must be truncated: {before} -> {after}"
+        );
+    }
+
+    /// The "and no readers" half, which is not politeness: a reader pins the
+    /// frames after its snapshot, so a truncate under one pays the blocking cost
+    /// and still leaves the file at its high-water mark. `JobKind::Reconcile` is
+    /// the daemon's only read connection held across `await`s (the embedding
+    /// backfill's), so the job registry answers the spec's question exactly.
+    #[tokio::test]
+    async fn a_tick_leaves_the_wal_alone_while_a_reconcile_is_running() {
+        let (_home, layout, db) = open_state();
+        grow_wal(&db).await;
+        let before = local_rag_store::wal_bytes(&layout.state_db());
+
+        let jobs = JobRegistry::new();
+        let _job = jobs.begin(JobKind::Reconcile);
+        maybe_truncate_wal(&db, &jobs, 4096).await;
+
+        assert_eq!(
+            local_rag_store::wal_bytes(&layout.state_db()),
+            before,
+            "a reconcile is a live reader; the tick must not truncate under it"
+        );
+    }
+
+    /// And it is a threshold, not "truncate on every tick": below it the tick
+    /// does nothing, which is what keeps a blocking truncate rare.
+    #[tokio::test]
+    async fn a_tick_below_the_threshold_does_nothing() {
+        let (_home, layout, db) = open_state();
+        grow_wal(&db).await;
+        let before = local_rag_store::wal_bytes(&layout.state_db());
+
+        let jobs = JobRegistry::new();
+        maybe_truncate_wal(&db, &jobs, before + 1).await;
+
+        assert_eq!(
+            local_rag_store::wal_bytes(&layout.state_db()),
+            before,
+            "below the threshold nothing should happen"
+        );
+    }
+
     fn default_params() -> ConsolidationTriggerParams {
         ConsolidationTriggerParams {
             lease_ms: LEASE_DURATION_MS,
@@ -491,6 +646,7 @@ mod tests {
             queue_threshold: 50,
             payload_ttl_hours: 72,
             idle_checkpoint_hours: 24,
+            wal_truncate_threshold_bytes: local_rag_store::WAL_TRUNCATE_THRESHOLD_BYTES,
         }
     }
 
