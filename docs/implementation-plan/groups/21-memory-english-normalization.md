@@ -884,6 +884,31 @@ sweep не перевёл **ни одной** записи. Безусловна
 - **Тесты:** `cargo build --workspace --all-targets` — зелёный; `cargo test -p xtask` проходит.
 - **Приёмка:** воркспейс собирается; расхождение в `DEVIATIONS.md` переведено в `resolved`.
 
+## D-077 — `local-rag stop` не отменяет индексацию, а ждёт её
+
+- **Зависит от:** ничего; блокирует гейт `G21`.
+- **Спецификация:** spec 02 §4.3 — «SIGTERM/CTRL-C: stop accepting, **cancel reconciles at the
+  next safe point (state tx boundaries)**»; as-built заметка T15-01, шаг (2).
+- **Результат:** остановка демона укладывается в свой заявленный бюджет даже на большом сторе
+  посреди индексации, и `kill -9` перестаёт быть единственным способом.
+- **В scope:** (1) `supervisor::stop_all` зовёт `WorktreeTaskHandle::abort()` перед `stop()` —
+  ровно та композиция, которую предписывает doc самого `abort` («a caller that also wants to wait
+  for the background thread to fully exit afterward may still call `stop`»), и которую сегодня в
+  проде не использует никто; (2) точка отмены на границе транзакций проекционного цикла, потому
+  что одного `abort()` мало: отмена tokio садится только на await, а `blob_index` →
+  `occurrences_for_fts` вызывается синхронно из `async fn embed_and_write`
+  (`crates/embed/src/backfill.rs:592`) — это и есть замеренный участок на 99,6 % CPU;
+  (3) заодно проверить, почему супервизор **стартует новые** циклы уже после `daemon stopping`.
+- **Не в scope:** производительность `occurrences_for_fts` как таковая (почему скан такой
+  длинный — отдельный вопрос); размер стора; `D-076`.
+- **Тесты:** остановка посреди активного indexing-цикла укладывается в бюджет (детерминированно,
+  через инструментированный `spawn_worktree_task_instrumented`, а не по часам); после отмены стор
+  валиден и переиспользуем (существующий
+  `cancelling_the_task_mid_cycle_leaves_the_store_valid_and_reusable` расширяется на путь
+  `stop_all`); после `daemon stopping` новых циклов не начинается.
+- **Приёмка:** на живом сторе владельца `local-rag stop` завершает демон без `kill -9` и без
+  строки «did not stop within 10s».
+
 ## G21 — Сверка English normalization
 
 - **Зависит от:** `T21-00…T21-19` и все девиации группы в статусе `resolved`.
