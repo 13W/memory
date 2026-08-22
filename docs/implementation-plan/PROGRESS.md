@@ -1217,7 +1217,7 @@ overall-разрыв, то есть весь измеренный выигрыш
       in-process рестарт — единственный вызывающий, который выйти не может, а фиксированный
       `SHUTDOWN_JOIN_BUDGET = 3s` под нагрузкой не выдерживается (найдено третьим полным прогоном
       гейтовой команды в `G21`)
-- [~] G21 Сверка English normalization
+- [x] G21 Сверка English normalization
 
 
 ## Evidence
@@ -1249,6 +1249,7 @@ overall-разрыв, то есть весь измеренный выигрыш
 | G18 | PASS | строка G18 в «Task evidence» + трейс «G18 — трейс требование → artifact/test» ниже |
 | G19 | PASS | строка G19 в «Task evidence» + трейс «G19 — трейс требование → artifact/test» ниже |
 | G20 | PASS | строка G20 в «Task evidence» ниже |
+| G21 | PASS after D-091, D-092, D-093 | строка G21 в «Task evidence» + трейс «G21 — трейс требование → artifact/test» ниже |
 
 ### Task evidence
 
@@ -1506,6 +1507,7 @@ overall-разрыв, то есть весь измеренный выигрыш
 | D-091 | коммит `D-091: a daemon that has not answered yet has not answered wrong` (строка evidence в том же коммите) | **Найдено прогоном гейтовой команды в `G21` и воспроизводится детерминированно, а не изредка.** `cargo xtask ci` дошёл до конца (~21 мин, впервые с `D-087`) и дал один красный job — `root:test`: `local-rag::cli_project::status_and_reindex_work_through_a_live_daemon`, тест **372 из 576**, `FAIL [2.084s]`, `local-rag: could not reach the daemon: the daemon did not answer in time`. Отдельный `cargo nextest run -p local-rag` повторяет: тот же тест, тот же порядковый номер **372**, `FAIL [2.079s]`. В одиночку `cargo test -p local-rag --test cli_project status_and_reindex_work_through_a_live_daemon` — **1.32 с**, зелёный. **Правка там, где хрупкость** (прецедент `D-031`, где расширили границы тестов и не тронули продукт): транзиентный таймаут админ-вызова опрашивается повторно внутри дедлайна 120 с, который у цикла **уже был**, и `project reindex` — у которого терпимости не было вовсе — получает ту же. `ADMIN_CALL_TIMEOUT = 2s` намеренно **не** тронут: у константы записанное обоснование, и её правка была бы продуктовым решением, а не побочным эффектом починки теста. **Узость совпадения доказана мутацией:** вызов `project reindex` на незарегистрированном пути даёт `local-rag: /definitely/not/enrolled: not an accessible directory`, и тест падает **сразу, за 1.26 с**, а не по истечении 120 с. **Проверка после правки:** `cargo nextest run -p local-rag` — **573/573 зелёных** ровно в тех условиях, где до правки он падал каждый раз. **Записано как гипотеза, а не как установленный механизм:** `admin/projects_list` обслуживает актор супервизора, который во время холодного старта не читает канал команд, то есть демон уже `ready`, а админ-поверхность ещё молчит; но CPU-голодание под 36 параллельными процессами даёт тот же симптом, и этот прогон их не различает — если различать, это отдельная задача с отдельным замером, а правка теста верна при обеих гипотезах. **Собственная правка первой редакции была неполной, и это поймал сам гейт, а не следующая задача:** `let mut last: Option<String> = None` — начальное значение, которое никто не читает, что под `-D warnings` роняет **два** job (`root:clippy` и `local-rag:clippy-failpoints`); ровно они и были двумя из трёх красных во втором прогоне, чьи имена срезал `tail -30`. Исправлено объявлением без значения (`let mut last: String;`) — определённость присваивания доказывает компилятор, а не затычка-инициализатор; `cargo clippy -p local-rag --all-targets -- -D warnings` после этого чист, `cargo test -p local-rag --test cli_project` — **13 из 13** зелёных. **Гейтовая команда прогнана целиком и зелёная:** `cargo xtask ci` — `all 18 jobs passed`, все 18 job, `root:test` 767.4 с. | `crates/local-rag/tests/cli_project.rs` (+`is_transient_admin_timeout`, терпимость в цикле опроса и у `project reindex`) | Claude Opus 5, 2026-08-22 |
 | D-092 | коммит `D-092: the write lock is taken at BEGIN, so busy_timeout means something` (строка evidence в том же коммите) | **Найдено вторым полным прогоном гейтовой команды в `G21`; отказ нагрузочно-зависимый, поэтому его не видел ни один прежний частичный прогон.** `cargo xtask ci` — 3 job из 18 красных, видимый отказ `local-rag-tui::concurrent_write_with_live_serve::tui_writes_and_a_live_daemons_mcp_writes_never_conflict` (G18, gated `PASS`): `remember` возвращает in-band `INDEX_UNAVAILABLE`, `details: state transaction failed (rolled back): database is locked`, **за 0.08–0.18 с** при бюджете `busy_timeout=5000`. **Расширенный код снят замером, а не предположен, и опроверг первую гипотезу:** `SqliteFailure(Error { code: DatabaseBusy, extended_code: 5 })` — **простой `SQLITE_BUSY`**, а не `517 BUSY_SNAPSHOT`, про который крейт уже знает в трёх местах (`cache/text.rs`, `tests/cache.rs`, `tests/normalized_text.rs`). Это документированный отказ SQLite звать busy-handler при промоушене read-lock → write-lock (`sqlite3_busy_handler`: «If SQLite determines that invoking the busy handler could result in a deadlock, it will go ahead and return SQLITE_BUSY»). Обе очереди брали `conn.transaction()` = `BEGIN DEFERRED`, а типичный джоб начинается с чтения (`apply_create` → `find_by_idempotency_key`). Значит `busy_timeout` не мал — он **не применялся вообще**. **Правка:** обе очереди берут `BEGIN IMMEDIATE` (`state/writer.rs`, `cache/writer.rs`). Обе, а не одна: очереди — копии друг друга, и чинить половину класса произвольно. **Замер до и после, на одном и том же бинаре:** 12 параллельных копий tui-теста — **11 падений из 12** до правки и **0 из 12** после; в одиночку тест зелёный **15 из 15** и до правки тоже, то есть нагрузочная зависимость измерена, а не заявлена. **Регрессии детерминированы по устройству, а не по нагрузке:** `state.rs::the_writer_holds_the_write_lock_from_begin_not_from_its_first_write` и её близнец в `cache.rs` пробуют записать сторонним соединением с `busy_timeout=0` **изнутри** транзакции писателя, ещё не тронувшей ни одной таблицы, — под `DEFERRED` замка там нет и стороннее письмо проходит. Обе **доказаны красным мутацией**: `left: None, right: Some((DatabaseBusy, 5))`, откат выполнен. **Поправка к собственному ходу работы, записанная потому, что она меняет метод:** первый изолированный прогон тоже упал, и это выглядело доказательством, что нагрузка ни при чём. Тест запускает **соседний** бинарь `target/debug/local-rag`, который `cargo test -p local-rag-tui` не пересобирает, — то есть тот прогон мерил устаревшего демона. После явной пересборки бинаря тот же тест прошёл 15 раз подряд. **Прогоны:** `cargo test -p local-rag-store` — **44** зелёных бинарника; `cargo fmt --all --check` и `cargo clippy -p local-rag-store --all-targets -- -D warnings` — чисто. **Гейтовая команда прогнана целиком и зелёная:** `cargo xtask ci` — `all 18 jobs passed`, все 18 job, `root:test` 767.4 с. | `crates/store/src/state/writer.rs`, `crates/store/src/cache/writer.rs` (`BEGIN IMMEDIATE` + док-обоснование); тесты `crates/store/tests/state.rs`, `crates/store/tests/cache.rs`; spec 02 §5 и 03 §2 — as-built заметки `D-092` | Claude Opus 5, 2026-08-22 |
 | D-093 | коммит `D-093: the one caller that cannot exit needs a budget it can meet` (строка evidence в том же коммите) | **Найдено третьим полным прогоном гейтовой команды в `G21`; это регрессия, которую внесла верная правка `D-090`.** `cargo xtask ci` — `root:test`, тест **480 из 2695**, `FAIL [13.262s]`: `restart: Lock(Locked { owner: StoreLockInfo { … pid: 58215, started_at: 1000, ready: true } })`. `started_at: 1000` — управляемые часы самого теста, то есть отказавший в рестарте держатель лока это **его же первый демон**. **Продуктовое поведение верно и не трогается:** при `WorkersDrained::No` `D-090` намеренно удерживает лок до выхода процесса — первого момента, про который доказуемо, что писателей не осталось; док-коммент `DaemonHandle::shutdown` это прямо обещает. In-process рестарт — единственный вызывающий, который до этого момента не доживает, а под нагрузкой `nextest` (процесс на тест) фиксированных `SHUTDOWN_JOIN_BUDGET = 3s` не хватает, чтобы цикл индексации остановился. До `D-090` тест проходил всегда, потому что лок отпускался безусловно. **Правка — та же, что уже дважды применена в этом же месте, уровнем выше:** бюджет инъектируется через `StartOptions::indexing_shutdown_budget` (дефолт и продакшн — `SHUTDOWN_JOIN_BUDGET`), ровно как `StartOptions::lock_handover_budget` (`D-084`) и параметр `stop_all` (`D-090`). **Замер до и после, 8 параллельных копий теста:** **4 падения из 8** при бюджете 3 с и **0 из 8** при инъектированных 60 с. **Не тронуто:** `SHUTDOWN_JOIN_BUDGET` (константа с записанным обоснованием `D-081`; её правка была бы продуктовым решением) и `SHUTDOWN_WORKER_BUDGET` (наблюдаемый отказ пришёл с индексирующей половины конъюнкции, расширять scope по аналогии значило бы чинить неизмеренное). **Регрессия структурная**, в форме, которую уже установила `D-054`: ни одна непроверочная строка супервизора не смеет читать константу напрямую — инъекция, которую что-то молча игнорирует, выглядит как работающая инъекция ровно до следующей загруженной машины. **Доказана красным мутацией** (возврат константы в актор роняет `the_supervisor_takes_its_shutdown_budget_from_its_params`), откат выполнен. **Прогоны:** `cargo test -p local-rag --test indexing_supervisor` — 5 из 5; `cargo fmt --all --check`, `cargo clippy -p local-rag --all-targets -- -D warnings` и он же `--features failpoints` — чисто. **Гейтовая команда прогнана целиком и зелёная:** `cargo xtask ci` — `all 18 jobs passed`, все 18 job, `root:test` 767.4 с. | `crates/local-rag/src/daemon/indexing/supervisor.rs` (+`SupervisorParams::shutdown_join_budget`, константа стала `pub`), `crates/local-rag/src/daemon/indexing/mod.rs`, `crates/local-rag/src/daemon/lifecycle.rs` (+`StartOptions::indexing_shutdown_budget`), `crates/local-rag/src/main.rs`; тесты `crates/local-rag/tests/indexing_supervisor.rs` (+структурная регрессия, бюджет в тесте рестарта) и пять конструкторов `StartOptions` в тестах | Claude Opus 5, 2026-08-22 |
+| G21 | коммит `G21: gate — сверка English normalization` (строка evidence в том же коммите) | **Трейс требование → код → тест** — секция «`G21` — трейс требование → artifact/test» ниже: spec 03 §1.4/§2.5, 08 §3/§4/§6, 10 §3, 12 §2/§3/§4, плюс 14 §7 и границы ADR-0011 (решения 5/6), перечитаны целиком; ADR-0010 и ADR-0011 прочитаны оба, без них не читается ни один пункт проверки. Требование → код проверено чтением файлов и запуском именованных тестов лично; субагенты не использовались. **Ключевая находка гейта: два из шести обязательных пунктов написаны под проект, который группа сама же снесла.** Пункты (1) «`subject_memory_entry` ровно в двух файлах» и (2) «parity-тест падает при расхождении ридеров» — из ADR-0010, где у записи было два текста; `T21-13` (ADR-0011) второй текст убрал вместе с обёрткой, типом с приватными полями и **самим линтом** (`domain.rs:234-241`, 10 §3's `T21-13`-заметка — дословно). Сегодня непроверочных вызовов **три**, и док `memory_index` называет избыточность намеренной. Пункт не прочитан по букве и не переписан под факт: проверена замещающая гарантия — у записи один текст, и все четыре вывода читают одну колонку (`all_memory_entries_with_text`, `memory_entry_by_id(...).text`, `recall_candidates_for_scope`'s `e.text`), ни один не джойнит `memory_text_normalization`; расхождение буквы зафиксировано явно, как `G20` поступила со своим grep-подсчётом по `D-043`. **Обе обязательные мутации выполнены и откачены.** Пункт (2): изменение текста, который хэширует `memory_index` (`backfill.rs:811`), роняет `memory_backfill.rs` с `MissingSource { blob_id: "4d6b797c580252e9cc1e0320bf3278982664a168f27fb2bf181bf02202f63580" }` — два теста красные. Пункт (3): второй `build_best_effort_pool(&layout)` в `lifecycle.rs` роняет `the_generator_pool_is_built_once_per_process` с `left: 2, right: 1`; граница теста названа явно — он смотрит только `lifecycle.rs`. **Пункт (4)** держится: единственный продовый `UPDATE memory_entry … SET text` — в `apply_edit` (`op.rs:1085`), с `entry_version` в том же statement и `audit_event` в той же транзакции; `T21-14` нормализует до появления строки, `T21-17` переписывает канон тем же `apply_edit` с `Actor::System`. **Пункт (5):** все 23 девиации, зарегистрированные до гейта, — `resolved`; `D-091` заведена самим гейтом и закрыта в нём же (итого 24); единственный `blocked` в журнале — `D-042`, группа 19. **Пункт (6):** сети нет; реальная модель — только в `memory_translate_real_model.rs`, который скипается без env; единственный `sleep` — опрос по 10 мс внутри `timeout(10s)` в `memory_normalization_worker.rs:715`, то есть дедлайн, а не утверждение о времени. **Четыре расхождения документации при корректном коде закрыты прямо в гейте** (прецедент `G20` — «пробел документации при уже корректном коде, не поведенческое расхождение»): DDL-блок 03 §2.5 нёс схему v14 после миграции 15; комментарий над `ADVERSARIAL` говорил «Six payloads» при семи; `prompt.rs` и 08 §7 говорили «42 фикстуры», тогда как `D-080` довела корпус до 43; `Status` ADR-0010 не имел forward-указателя на ADR-0011. **Гейтовая команда прогонялась по-настоящему.** Первый прогон `cargo xtask ci` **дошёл до конца за ~21 минуту** — на этой машине он раньше документировался как «не возвращается» (`D-036`) — и дал 17 зелёных job из 18. Единственный красный разобран, воспроизведён детерминированно и закрыт как `D-091`. Замер уточняет `D-036` механизмом: `nextest` запускает **процесс на тест**, а каждый exec здесь стоит 28–40 с при 0.0 % CPU (`sample`: 1256 из 1260 сэмплов на `_dyld_start`) при `XprotectService` на 87.7 % CPU; процессы при этом сменяются — то есть это не блокировка, а плата за запуск. **Второй прогон нашёл вторую девиацию — и это главный результат гейта как процедуры.** После правки `D-091` тот же `cargo xtask ci` дал **3 красных job из 18**, причём краснота сменилась: упал `local-rag-tui::concurrent_write_with_live_serve::tui_writes_and_a_live_daemons_mcp_writes_never_conflict` (группа 18, gated `PASS`), которого первый прогон не показывал. Разбор дал `D-092`: очередь-писатель отдавала `SQLITE_BUSY` вызывающему за 0.08–0.18 с при собственном бюджете 5000 мс; расширенный код снят замером (`extended_code: 5`, простой `SQLITE_BUSY`, а не `517 BUSY_SNAPSHOT`) и опроверг первую гипотезу; правка — `BEGIN IMMEDIATE` в обеих очередях; замер до и после на одном бинаре: 11 падений из 12 → 0 из 12. **Оба дефекта жили в тестах уже сданных групп (20 и 18), и ни один частичный прогон их не показывал:** `D-091` требует параллельной нагрузки `nextest`, `D-092` — нагрузки и свежего соседнего бинаря. Замена гейта `D-076`/`D-087` (`cargo check --workspace --all-targets --all-features`) слепа к обоим по устройству — она не запускает ни одного теста. То есть цена `D-036` — не отложенный отчёт, а два незамеченных дефекта, один из них продуктовый. **Поправка к собственному ходу разбора:** первый изолированный прогон tui-теста тоже упал, что выглядело доказательством непричастности нагрузки; тест запускает **соседний** бинарь `target/debug/local-rag`, который `cargo test -p local-rag-tui` не пересобирает, — тот прогон мерил устаревшего демона. После явной пересборки тест прошёл 15 раз подряд, и только тогда нагрузочный замер стал измерением. **Третий прогон нашёл третью девиацию — и она из другой группы и другого рода.** Заменив красноту, `root:test` упал на `indexing_supervisor::a_managed_worktree_is_indexed_at_startup_and_survives_a_daemon_restart` (T20-06): `restart: Lock(Locked { owner: … started_at: 1000 })`, то есть рестарт упёрся в **первый демон того же теста**. `D-093`: это регрессия, которую внесла **верная** правка `D-090` — при `No` лок удерживается до выхода процесса, а in-process рестарт до этого момента не доживает; бюджет стал инъектируемым, как уже дважды сделано рядом (`D-084`, `D-090`), замер 4 падения из 8 → 0 из 8. **Три девиации подряд, каждая из своей группы — 20, 18 и снова 20 — и ни одна не про English normalization.** Это и есть содержательный результат `G21` как процедуры: сама сверка группы 21 расхождений нормативного уровня не нашла, а полный прогон гейтовой команды, которого не было с `D-036`, нашёл три дефекта в уже сданных группах, один из них продуктовый. **Гейтовая команда прогнана целиком и зелёная:** `cargo xtask ci` — `all 18 jobs passed`, все 18 job, `root:test` 767.4 с. | Секция «`G21` — трейс требование → artifact/test» ниже; правки документации: `docs/specification/03-data-model.md` §2.5 (DDL к v15), `docs/specification/08-memory.md` §7, `crates/memory/src/normalize/translate.rs`, `crates/memory/src/prompt.rs`, `docs/adr/0010-memory-english-normalization.md` (forward-указатель на ADR-0011) | Claude Opus 5, 2026-08-22 |
 
 ### G00 — трейс требование → artifact/test
 
@@ -3825,3 +3827,215 @@ trace-scope этого гейта (карта называет только T19-
 D-041 «до»-наблюдением (агент с полным доступом часами не звал recall/remember).
 
 Gate results: `G19` — `PASS`.
+
+### G21 — трейс требование → artifact/test
+
+Дата 2026-08-22, исполнитель Claude Opus 5. Не переоткрывает `G00–G20`; трейс охватывает
+`T21-00…T21-19` (`T21-10` заменена `T21-15` решением владельца) и 23 девиации, зарегистрированные до гейта
+(`D-067…D-069`, `D-071…D-090`; номер `D-070` не выдавался), все `resolved`, плюс `D-091`,
+заведённая самим гейтом и закрытая в нём же, против именованных картой секций: spec 03 §1.4/§2.5, 08 §3/§4/§6,
+10 §3, 12 §2/§4, плюс ADR-0010 и ADR-0011. Методика: требование → код проверено чтением файлов и
+запуском именованных тестов лично, ни одна as-built-цитата не принята на веру; субагенты не
+использовались.
+
+**Группа сменила собственный проект по ходу, и это меняет чтение двух пунктов карточки.** Фаза 1
+(ADR-0010) дала записи два текста и защищала их согласованность дисциплиной: обёртка
+`memory_entry_subject_hash(EffectiveText)`, тип с приватными полями и исходный линт, пришпиливший
+`subject_memory_entry` к двум файлам. Фаза 2 (ADR-0011, `T21-13`) второй текст **убрала**, и вместе
+с ним — обёртку, тип и линт; `crates/core/src/identity/domain.rs:234-241` и spec 10 §3's
+`T21-13`-заметка фиксируют это дословно. Поэтому пункты (1) и (2) обязательного списка проверяются
+по замещающей гарантии, а не по букве; расхождение буквы зафиксировано явно, не замолчано — той же
+формой, что `G20` применила к `D-043` («буквальный grep-подсчёт даёт 2 без явного исключения»).
+
+**Spec 03 §1.4 (cross-database rule) `[FIXED]` — T21-01/T21-05**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `state.sqlite` и `cache.sqlite` никогда не пишутся одной транзакцией через `ATTACH` | во всём воркспейсе нет ни одного SQL `ATTACH`: `rg -in '\battach\b'` по непроверочному коду даёт только доменный глагол `repo attach` (`cli/repo.rs`) и текст фикстуры промпта | `crates/store/tests/cache.rs::no_writable_cross_db_attach` (линт по `crates/store/src`) | as-built, подтверждено |
+| Memory-backfill пишет в обе БД, но раздельными транзакциями | `run_memory_backfill` — векторы пакетами в `cache.sqlite`, покрытие отдельной транзакцией `state.sqlite` (10 §3's «Resumability is recomputation») | `crates/embed/tests/memory_backfill.rs::a_memory_only_pass_leaves_coverage_untouched` | as-built, подтверждено |
+| Перевод живёт в `state.sqlite`, а не в перестраиваемом кэше | `memory_text_normalization` в `SCHEMA_V15` (`crates/store/src/memory/normalization.rs:142`) — обоснование в §2.5's T21-01-заметке («перевод не пересчитывается локально») | `crates/store/tests/migrate_fixtures.rs::migration_15_carries_english_and_failed_rows_and_drops_pending_translations` | as-built, подтверждено |
+
+**Spec 03 §2.5 (memory side) — T21-01/T21-13**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| DDL-блок секции соответствует шипнутой схеме | блок приведён к v15 **в этом гейте**: он всё ещё нёс колонки v14 (`normalized_text`, `source_text_sha256`, `ready\|skipped\|failed`), хотя миграции 8 и 14 в этой же секции блок обновляли; v14 сохранена в T21-01-заметке ниже, где ей и место | `migration_15_...` (сверка колонок и `CHECK`) | расхождение документации при корректном коде — закрыто здесь, без `D-NNN` (прецедент `G20`) |
+| Миграция 15 переносит данные по смыслу | `SCHEMA_V15`'s `INSERT … SELECT … WHERE status IN ('skipped','failed')`, `skipped`→`english`, `ready` дропаются | тот же тест | as-built, подтверждено |
+| Свежесть строки — хэш текста, не `entry_version` | `canon_text_sha256`; `upsert_normalization` отказывает, если хэш больше не совпадает | `normalization::tests::upsert_refuses_a_translation_of_text_that_has_since_changed`, `the_check_binds_translated_to_text_in_both_directions` | as-built, подтверждено |
+
+**Spec 08 §3 (transactional memory operations) `[FIXED]` — T21-12/T21-14/T21-17**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Текст записи меняется **только** через `edit`, с новой `entry_version` и audit-строкой | единственный продовый `UPDATE memory_entry … SET text` — `crates/store/src/memory/op.rs:1085`, внутри `apply_edit`, в том же statement `entry_version = ?4`, следом `insert_audit_event(op:"edit")` в той же транзакции | `crates/store/tests/memory.rs`, `crates/store/tests/memory_op.rs` | as-built, подтверждено |
+| `reinforce` не трогает текст | `op.rs:731` — `SET confidence = COALESCE(?2, confidence), entry_version, updated_at`, колонки `text` нет | те же | as-built, подтверждено |
+| Перевод на write-границе — **над** `crates/store` (генератор не внутри транзакции) | `crates/local-rag/src/daemon/normalization/boundary.rs::normalize_for_write`, вызывается из `mcp/memory_write.rs:409,617` через `Translator::decide` | `boundary::tests::english_text_never_reaches_the_generator`, `a_missing_model_refuses_and_keeps_the_authors_text`, `canon_is_total_over_every_outcome` | as-built, подтверждено |
+| «Eventually English»: отказ перевода не теряет запись | `Normalized::Refused{reason,kind}` → пишется авторский текст, запись попадает в очередь | `crates/local-rag/tests/memory_normalization_worker.rs::a_refused_translation_leaves_the_authors_text_in_place` | as-built, подтверждено |
+| Системная перезапись канона — обычный audited `edit` от `Actor::System` | `daemon/normalization/mod.rs:455-462` — `apply_edit(… actor: Actor::System …)` | `a_backfilled_entry_gets_an_english_canon_and_a_system_audit_row`, `a_re_run_over_a_backfilled_store_writes_no_second_edit` | as-built, подтверждено |
+| Оптимистический гард переживает правку, приехавшую под переводом | `entry_version` из чтения очереди передаётся в `apply_edit` как `expected_version` | `an_entry_edited_under_a_translation_in_flight_is_skipped_not_overwritten` | as-built, подтверждено |
+
+**Spec 08 §4 (consolidation) `[FIXED]` — T21-11 + D-078/D-079/D-080**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Роутер пишет `text` по-английски по контракту, а не переводом постфактум | `crates/memory/src/prompt.rs` — системный промпт и few-shot фиксируют английский вывод; модуль-док объясняет, почему `[FIXED]`-планка 14 §1 п.4 (RU/EN на входе) этим не тронута | 42 фикстуры `memory.router.op.*` утверждают `op_kinds`, никогда язык `text` | as-built, подтверждено |
+| Под `local_only` роутер и переводчик идут в локальный генератор | `crates/embed/src/gen_pool.rs::GeneratorPool::generate` — `allows(policy, locality)`, `PolicyBlockedRemote`, `redact_for_transmission` до вызова провайдера | `gen_pool::tests::local_only_never_selects_a_remote_generator`, `policy_blocked_when_only_remote_entries_exist_under_local_only` | as-built, подтверждено |
+| Нормализация уступает консолидации, но не голодает | `MAX_CONSECUTIVE_YIELDS = 3` (поправка карточки `T21-17` по итогам живого прогона, записана и в 02 §4.3) | `a_running_consolidation_job_takes_the_inference_half_of_the_tick`, `an_insistent_tick_translates_even_while_consolidation_runs`, `the_worker_stops_yielding_after_the_bound_and_drains_the_backlog`, `the_deference_bound_stays_a_handful_of_ticks` | as-built, подтверждено |
+
+**Spec 08 §6 (Recall v0) `[FIXED pipeline]` — T21-15**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Стадия query-нормализации: детектор письменности, перевод не-английского | решение принимается **над** конвейером: `daemon/mcp/memory.rs:192` → `Translator::decide_query` (`boundary.rs:240`), тот же `normalize_for_write`, что у write-границы | `an_english_query_never_reaches_the_generator`, `a_russian_query_reaches_the_lexical_leg` (dense-нога намеренно недоступна — найти запись может только BM25) | as-built, подтверждено |
+| Английский запрос бесплатен, termless не доходит до переводчика | чистый детектор `script_class`, пустой запрос — ранний возврат в `decide_query` | `a_termless_recall_never_reaches_the_generator` | as-built, подтверждено |
+| Отказ перевода деградирует с явным маркером, а не падает | `query_degraded: Option<QueryNotNormalized>` в `RecallOutcome`; `QueryNotTranslated` типизирован, чтобы обе опоры не разошлись в формулировке | `a_refused_translation_searches_the_original_and_says_so`, `a_missing_model_is_reported_rather_than_hidden` | as-built, подтверждено |
+| Остальные стадии конвейера не менялись | `crates/memory/src/recall/pipeline.rs` — scope → candidates → RRF → lifecycle → budget → ordering; `[FIXED pipeline]` тронут ровно одной новой стадией, и она помечена `[FIXED, ADR-0011]` | — | инвариант сохранён |
+| Пустой recall ⇒ пустой `additionalContext` | `recall/format.rs:154` (early return до трейлера) | `tool_routing_trailer_follows_the_closing_tag_exactly_once` (G19) | инвариант сохранён |
+| Уточнение к as-built-заметке `T21-15` | заметка называет `spawn_blocking` в `mcp/memory.rs`; фактически хоп переехал на уровень ниже — в `Translator::decide_query`, общий шов с `T21-19` («так он живёт здесь один раз, а не на каждом месте вызова»). Существо заметки (решение над конвейером, одна точка) верно | `code.rs`'s `query_boundary_tests` пользуются тем же швом | наблюдение, поведение не расходится |
+
+**Spec 10 §3 (model spaces) — T21-02/T21-13**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| У memory-субъекта ровно один текст, и это `memory_entry.text` | `subject_memory_entry(memory_id, text)` (`domain.rs:241`); все четыре вывода читают одну и ту же колонку: `subjects.rs:273` и `:293`, `backfill.rs:811`, `dense.rs:207` — через `all_memory_entries_with_text` (`SELECT memory_id, text FROM memory_entry`), `memory_entry_by_id` и `recall_candidates_for_scope` (`SELECT … e.text …`), ни один не джойнит `memory_text_normalization` | `memory_backfill.rs::a_memory_only_pass_embeds_every_entry_and_then_reuses_them` (доказан красным мутацией, см. пункт 2 ниже) | as-built, подтверждено |
+| Memory-only проход не переписывает coverage | `run_memory_backfill` — coverage не пересчитывается из прохода, не видевшего `code_raw` | `a_memory_only_pass_leaves_coverage_untouched` | as-built, подтверждено |
+| Стор без memory-репрезентации деградирует, а не падает | `backfill.rs:430` — kind ищется, отсутствие обрабатывается | `a_store_without_a_memory_representation_degrades_rather_than_failing` | as-built, подтверждено |
+| Наблюдение: заметка `T15-07` «the `memory` half is still open» устарела | `crates/local-rag/src/cli/init.rs` регистрирует обе репрезентации (`OnnxEmbedder::open_for_memory`), заметки `D-037`/`T20-03` уже описывают обе как существующие | — | наблюдение; владелец текста — группы 14/15 (гейт `G17`), правка вне scope `G21` — так же, как `G20` поступила со spec 12 §1 |
+
+**Spec 12 §2 (redaction & caps) `[FIXED]`**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Редакция перед любой удалённой передачей | `gen_pool::generate` вызывает `redact_for_transmission(policy, entry.locality, &req)` до провайдера — единственная точка, через которую идут и роутер, и переводчик | `gen_pool::tests::local_only_never_selects_a_remote_generator`, `policy_blocked_when_only_remote_entries_exist_under_local_only` | as-built, подтверждено |
+| Группа не завела новой удалённой поверхности | `translate` (`crates/memory/src/normalize/translate.rs:227`) вызывает `pool.generate(policy, request)` — тот же центральный гард, своего сетевого пути нет | `translate.rs`'s тесты | инвариант сохранён |
+
+**Spec 12 §3 (retention/privacy surfaces) — два новых `[FIXED, ADR-0011]`-буллета группы**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Авторский текст остаётся видимым: `inspect`/`export` показывают его рядом с каноном | `cli/inspect.rs:189` печатает `source_text` (комментарий называет причину дословно); `privacy/export.rs:51` кладёт `normalization_for` в выгрузку | `crates/store/tests/privacy_inspect.rs`, `privacy_export.rs` | as-built, подтверждено |
+| `purge` удаляет и канон, и оригинал, и производный вектор | `privacy/purge.rs:85-93` — `delete_normalization`; `D-074` добавила удаление вектора отдельной транзакцией `cache.sqlite` **до** транзакции `state.sqlite` | `crates/store/tests/privacy_purge.rs`; `pragma_foreign_key_check` в `migrate_fixtures.rs` подтверждает, что `ON DELETE CASCADE` пережил перестройку таблицы миграцией 15 | as-built, подтверждено |
+| Наблюдения и evidence не переводятся никогда | в `crates/index`/`indexing`/спуле нет вызовов переводчика; роутер пишет по-английски независимо от языка наблюдений (ADR-0011 §Decision 7) | — | инвариант сохранён |
+
+**Spec 12 §4 (recalled memory is untrusted) `[FIXED]` — T21-04**:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Вход переводчика — данные структурно, а не конкатенация | `user_message` строит `serde_json`-объект `{"src": <текст записи>}`; `memory_id` в промпт не попадает | `every_adversarial_payload_stays_one_json_string` | as-built, подтверждено |
+| Выход валидируется до того, как его можно сохранить | `validate` — `FinishReason::Length` до парсинга, ровно один `{"en": …}` с `deny_unknown_fields`, пустой ответ = отказ, не-латиница = эхо, полоса длины, байтовый потолок отвергает, а не режет | второй тест по той же таблице | as-built, подтверждено |
+| Адверсарный набор — семь payload'ов, каждый с двумя утверждениями | `ADVERSARIAL` в `translate.rs:991` — 7 строк, совпадают со списком в 12 §4's `T21-04`-заметке | оба теста | код и спека согласны; **комментарий над таблицей говорил «Six» — исправлено в этом гейте** |
+| Каждый отказ классифицирован до того, как по нему действуют | `classify_translate_failure` — `Mechanical`/`Unavailable`/`Transient`; отсутствие генератора не помечает записи `failed` | `a_mechanical_failure_is_attempted_once_per_normalizer_version`, `a_transient_failure_backs_off_without_sleeping`, `an_unavailable_generator_aborts_the_tick_and_blames_no_entry` | as-built, подтверждено |
+| Текст записи не утекает в логи | — | `no_log_line_ever_carries_an_entry_text` | as-built, подтверждено |
+
+**Spec 14 §7 (memory-recall bench) — D-068/T21-09/T21-18** (не в перечне карточки, но группа
+меняла именно эту поверхность, и приёмка `T21-18` живёт здесь):
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Харнесс детерминирован: повтор даёт побайтово тот же отчёт | `crates/xtask/src/memory_recall_bench/run.rs:98-126` — сеяный `UuidSource` (`uuidv7_from(1_000_000 + n, [0xCD; 10])`) вместо `SystemUuidV7`, которым `D-068` объяснила расхождение `store_en`/`both_en` на байт-идентичном входе | `memory_recall_bench`'s собственные тесты (`run.rs:1447`'s комментарий называет ровно тот тай-брейк) | as-built, подтверждено |
+| Корпус способен различить конфигурации | `fixtures/memory-recall/corpus.json` — 200 записей / 60 запросов (проверено: `entries` 200, `queries` 60), `version` 2.0.0 | отчёты `fixtures/memory-recall/baseline/run-2026-08-21-t21-18-*.json` | as-built, подтверждено |
+| Вывод записан, а не подогнан | 14 §7's `T21-18`-заметка: приёмка «половина выполнена, вторая — доложена»: `ru-ru` 0.917 → 0.813 назван регрессией, а не сглажен | — | as-built, подтверждено; честность записи — то, чего гейт и требует |
+
+**Наблюдаемость и конфиг (T21-03/T21-08)** — не отдельная нормативная секция, но карточка группы
+их называет:
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Детектор письменности детерминирован и не тратит инференс | `crates/memory/src/normalize/detect.rs::script_class` — чистая функция, порог `NON_LATIN_RATIO`, класс `Undetermined` при слишком коротком тексте; ограничение (латиница ≠ английский) объявлено в доке | `crates/memory/tests/script_detect_corpus.rs` | as-built, подтверждено |
+| Отставание и дедлеттеры видны в `stats`/`doctor` | `normalization_backlog`, `normalization_counts`, `dead_lettered_normalizations` (`crates/store/src/memory/normalization.rs`), секция `NormalizationFinding` в `cli/doctor.rs:84-90` | `the_backlog_counts_exactly_what_the_queue_would_offer`, `a_row_at_the_attempt_ceiling_is_dead_letter_not_pending`, `a_failed_row_still_within_its_backoff_is_neither_pending_nor_dead_letter`, `counts_group_by_status_and_omit_empty_buckets` | as-built, подтверждено |
+| Приватность: перевод покрыт purge/export/inspect | `privacy/purge.rs:85-93` (`delete_normalization`, плюс `D-074`'s вектор), `privacy/export.rs:51` (`normalization_for`), `cli/inspect.rs:189` (`source_text` печатается: «durable memory is stored in English») | `crates/store/tests/privacy_purge.rs`, `privacy_export.rs`, `privacy_inspect.rs` | as-built, подтверждено |
+
+**ADR-0011's own границы, проверенные отдельно** (решения 5 и 6 задают, чего группа делать
+**не** должна была):
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| `code_raw` остаётся дословным: индексируемый исходник не переводится | `rg` по `crates/index/src` и `crates/local-rag/src/indexing` не находит ни одного вызова переводчика; нормализуются только **запросы** (`mcp/code.rs:78`) | `code.rs`'s `query_boundary_tests` | инвариант сохранён |
+| Описания кода (`structural_description`) — post-v0, правило записано, а не реализовано | ADR-0011 §Decision 6; в коде описаний нет | — | отложенный scope не реализован преждевременно (CLAUDE.md guardrail) |
+
+**Шесть обязательных пунктов проверки (карточка `G21`)**:
+
+| # | Пункт | Что показала проверка |
+| --- | --- | --- |
+| 1 | `subject_memory_entry` вызывается из непроверочного кода ровно в **двух** файлах | Буквально — **в трёх**: `crates/store/src/subjects.rs` (273, 293), `crates/embed/src/backfill.rs:811`, `crates/memory/src/recall/dense.rs:207`. Расхождение буквы — не дрейф, а снятая `T21-13` конструкция: линт, обёртка `memory_entry_subject_hash(EffectiveText)` и сам тип удалены вместе со вторым текстом, который они мирили (`domain.rs:234-241`, spec 10 §3's `T21-13`-заметка). Замещающая гарантия проверена и держится: у записи один текст, и все выводы читают одну колонку — `all_memory_entries_with_text` (`SELECT memory_id, text FROM memory_entry`) обслуживает **и** ожидаемое множество, **и** ридер backfill'а, `memory_subject_hash` берёт `memory_entry_by_id(...).text`, `recall_candidates_for_scope` — `e.text`; ни один не джойнит `memory_text_normalization`. Плюс `embed_and_write`'s `.ok_or(MissingSource)` ловит расхождение, если оно всё же возникнет |
+| 2 | parity-тест реально падает при искусственном расхождении ридеров | Тест `T21-02` ушёл вместе с конструкцией; смысл несёт `crates/embed/tests/memory_backfill.rs::a_memory_only_pass_embeds_every_entry_and_then_reuses_them`. **Доказано мутацией** (см. evidence-строку: точный текст падения), откат выполнен |
+| 3 | `build_best_effort_pool` вызывается ровно из одного места | Да: `crates/local-rag/src/daemon/lifecycle.rs:408`; `rg` по всему воркспейсу даёт кроме него только импорты, комментарии и тесты. Инвариант стережёт `memory_normalization_worker.rs::the_generator_pool_is_built_once_per_process` (считает непроверочные строки в `lifecycle.rs`) — **доказан красным мутацией**, откат выполнен. Граница теста названа явно: он смотрит только `lifecycle.rs`, второй вызов из другого файла он бы не увидел; сегодня такого нет |
+| 4 | `memory_entry.text` не меняется ни одной новой кодовой тропой | Держится. Единственный продовый `UPDATE … SET text` — в `apply_edit` (`op.rs:1085`), с `entry_version` в том же statement и `audit_event` в той же транзакции. `T21-14` нормализует **до** появления строки (write-граница выше `crates/store`), `T21-17` переписывает канон тем же `apply_edit` с `Actor::System` (`daemon/normalization/mod.rs:455-462`). Остальные `UPDATE memory_entry` — `state`/`confidence`/`entry_version`/`supersedes_id`; прочие вхождения `SET text` — тесты и bench-харнесс |
+| 5 | `D-067` и `D-068` в статусе `resolved` | Да; и все 23 девиации, зарегистрированные до гейта (`D-067…D-069`, `D-071…D-090`), — `resolved`; `D-091` заведена самим гейтом и закрыта в нём же. В журнале единственный не-`resolved` — `D-042` (`blocked`), группа 19, продуктовое решение владельца; `G21` он не держит |
+| 6 | Ни один тест группы не требует сети, реальной модели или wall-clock | Держится, с двумя названными исключениями. Сети нет нигде. Реальная модель — только `crates/local-rag/tests/memory_translate_real_model.rs`, и он **скипается** (печатает `SKIP` и возвращается) без `LOCAL_RAG_TEST_MODEL_HOME`/`LOCAL_RAG_TEST_STORE_HOME`, а `Instant::now()` в нём — только для отчёта о длительности. Единственный `sleep` в тестах группы — `memory_normalization_worker.rs:715-718`: опрос по 10 мс внутри `timeout(10s)`, то есть дедлайн ожидания реального фонового воркера, а не утверждение о времени |
+
+**Маркеры, тронутые группой.** `[FIXED]`, изменённые ADR-0011, изменены **амендментом с явной
+пометкой**, а не переписаны под реализацию: 08 §3 получил два новых `[FIXED]`-буллета
+(`system-edit`, «текст хранится по-английски») плюс `Amendment note (T21-12, [FIXED] change under
+ADR-0011)`; 08 §6's `[FIXED pipeline]` получил ровно одну новую стадию, помеченную
+`[FIXED, ADR-0011]`, остальные стадии не тронуты. `[SPEC]`-заметок группа добавила в 03 §2.5,
+08 §3/§4/§6, 10 §3, 12 §4, 14 §7. `[OPEN]`-пунктов группа не закрывала и не хардкодила: в
+названных секциях `[OPEN]` принадлежат другим группам (03 §2.1's O7, 10 §5's delivery, 08 §7's
+target-P/R — закрыт `T14-07`), 12 не содержит `[OPEN]` вовсе.
+
+**Четыре расхождения документации при корректном коде — найдены и закрыты в этом гейте**, без
+`D-NNN`, по прецеденту `G20` («пробел документации при уже корректном коде, не поведенческое
+расхождение»): (1) DDL-блок 03 §2.5 нёс схему v14 после миграции 15 — приведён к v15, история
+осталась в `T21-01`-заметке; (2) комментарий над `ADVERSARIAL` в `translate.rs` говорил «Six
+payloads» при семи в таблице и семи в 12 §4 — исправлен; (3) `prompt.rs` и 08 §7 говорили «42
+`memory.router.op.*` фикстуры», тогда как `D-080` (эта же группа) довела корпус до **43** и
+записала это только в 14 §7 — обе ссылки приведены к 43 с указанием на источник; (4) ADR-0010's
+`Status` говорил только «Accepted», хотя ADR-0011 сносит три его решения — добавлен forward-указатель
+(в самом ADR-0011 supersession назван, но читатель, попавший сначала в ADR-0010, узнать этого не мог).
+
+**Прогон гейтовой команды.** `cargo xtask ci` (все 18 job) **дошёл до конца за ~21 минуту** —
+впервые с `D-087`; на этой машине он раньше документировался как «не возвращается» (`D-036`).
+Результат: **17 job из 18 зелёные, один красный** — `root:test` (`nextest run --workspace`),
+единственный упавший тест `local-rag::cli_project::status_and_reindex_work_through_a_live_daemon`.
+
+Замер среды, сделанный по ходу прогона, уточняет `D-036` механизмом, а не диагнозом: при
+`nextest` работает **процесс на тест**, и на этой машине каждый запуск бинаря стоит порядка
+получаса секунд — 36 процессов `--list --format terse` одновременно, каждый по 28–40 с при
+**0.0 % CPU**, `sample` даёт **1256 из 1260** сэмплов на `_dyld_start` (процесс не доходит даже до
+конца динамической линковки), при `XprotectService` на **87.7 % CPU**. Процессы при этом
+сменяются — прогон идёт, просто дорого. То есть «зависание» — это не блокировка, а
+квадратичная плата за exec, и именно её платит `nextest`.
+
+**Единственный красный job гейта разобран и закрыт как `D-091`.** Тест
+`local-rag::cli_project::status_and_reindex_work_through_a_live_daemon` (группа 20, gated `PASS`)
+падает под `nextest` **каждый раз**, а не изредка: `xtask ci` job `root:test` — тест 372/576,
+`FAIL [2.084s]`; отдельный `nextest run -p local-rag` — тот же тест, тот же порядковый номер,
+`FAIL [2.079s]`; в одиночку он же проходит за **1.32 с**. Лопается продуктовый
+`ADMIN_CALL_TIMEOUT = 2s`, а падает утверждение на **первом** вызове внутри цикла, у которого уже
+есть дедлайн 120 с и собственный комментарий про медленный холодный старт вотчера. Починена
+хрупкость теста, не константа продукта (прецедент `D-031`); гипотеза о молчащем во время холодного
+старта акторе супервизора записана как гипотеза — CPU-голодание объясняет тот же симптом, и этот
+прогон их не различает.
+
+**Второй полный прогон нашёл вторую девиацию, и это главный результат гейта как процедуры.** После
+правки `D-091` тот же `cargo xtask ci` дал **3 job из 18 красных** — причём краснота сменилась:
+упал `local-rag-tui::concurrent_write_with_live_serve::tui_writes_and_a_live_daemons_mcp_writes_never_conflict`
+(группа 18, gated `PASS`), которого первый прогон не показал. Разбор дал `D-092`: очередь-писатель
+отдавала `SQLITE_BUSY` вызывающему **за 0.08–0.18 с** при собственном бюджете 5000 мс. Расширенный
+код снят замером и опроверг первую гипотезу — `extended_code: 5`, простой `SQLITE_BUSY`, а не
+`517 BUSY_SNAPSHOT`, про который крейт уже знает в трёх местах. Механизм документирован SQLite:
+busy-handler не зовётся при промоушене read-lock → write-lock, а обе очереди брали `BEGIN DEFERRED`
+и начинали с чтения. Правка — `BEGIN IMMEDIATE` в обеих очередях; замер до и после на одном бинаре:
+**11 падений из 12** параллельных копий → **0 из 12**, при **15 из 15** зелёных в одиночку и до
+правки тоже.
+
+**Что этот эпизод говорит про сам гейт, и ради чего он записан.** Оба дефекта — `D-091` и `D-092` —
+жили в тестах групп 20 и 18, обе с гейтом `PASS`. Ни один частичный прогон их не показывал:
+`D-091` требует параллельной нагрузки `nextest`, `D-092` — параллельной нагрузки **и** свежего
+соседнего бинаря. Замена гейта, установленная `D-076` и усиленная `D-087`
+(`cargo check --workspace --all-targets --all-features`), слепа к обоим по устройству: она не
+запускает ни одного теста. То есть цена «гейт не возвращается» (`D-036`) — не отложенный отчёт, а
+два незамеченных дефекта, один из которых продуктовый.
+
+**Поправка к собственному ходу разбора, записанная потому, что она меняет метод, а не только
+вывод.** Первый изолированный прогон tui-теста тоже упал, и это выглядело доказательством, что
+нагрузка ни при чём. Тест запускает **соседний** бинарь `target/debug/local-rag`, который
+`cargo test -p local-rag-tui` не пересобирает: тот прогон мерил устаревшего демона. Первая
+диагностическая правка «поправила» отказ ровно так же иллюзорно. После явной пересборки бинаря
+тест прошёл 15 раз подряд, и только тогда нагрузочный замер стал измерением, а не совпадением.
+
+**Третий прогон нашёл третью девиацию, и она уточняет вывод, а не повторяет его.** `root:test` упал на `indexing_supervisor::a_managed_worktree_is_indexed_at_startup_and_survives_a_daemon_restart` (T20-06): `restart: Lock(Locked { owner: … started_at: 1000, ready: true } })` — держатель лока это первый демон того же теста. `D-093` — регрессия, которую внесла **верная** правка `D-090`: при `WorkersDrained::No` лок намеренно удерживается до выхода процесса, а in-process рестарт единственный, кто до этого момента не доживает. Правка — инъектируемый бюджет, ровно как уже сделано с `StartOptions::lock_handover_budget` (`D-084`) и с параметром `stop_all` (`D-090`); замер до и после на 8 параллельных копиях: 4 падения из 8 → 0 из 8.
+
+**Итог по трём находкам, и он про метод.** Ни одна из трёх не про English normalization: `D-091` — группа 20, `D-092` — группа 18 (и продукт), `D-093` — снова группа 20. Сверка самой группы 21 расхождений нормативного уровня не нашла — нашёл их **прогон гейтовой команды целиком**, которого на этой машине не было с `D-036`. Причём каждая следующая пряталась за предыдущей: `nextest` останавливает прогон на первом падении (`Cancelling due to test failure`), поэтому одна краснота за раз — это не совпадение, а устройство. Отсюда практический вывод для будущих гейтов: усиленная замена `cargo check --workspace --all-targets --all-features` держит компиляцию, но не заменяет прогон тестов, и цена такой замены измерима — три дефекта.
+
+Gate results: `G21` — `PASS after D-091, D-092, D-093`.

@@ -682,7 +682,8 @@ numbers are set after the baseline run `[OPEN]`. Without this, the memory pillar
 only for plumbing — the gate exists to prevent that.
 
 As-built note (T14-07, `[SPEC]`, closing this section's `[OPEN]` target-P/R item): the fixture
-set is 42 `memory.router.op.*` cases inside `fixtures/memory/index.json` (GAP-04), not a new
+set is 42 `memory.router.op.*` cases inside `fixtures/memory/index.json` (GAP-04) — 43 since
+`D-080` added `supersede-existing-past-the-cap-en`, whose reason 14 §7's own note carries — not a new
 top-level family — `fixtures/schema/manifest.schema.json`'s `families` array is fixed-size and
 closed-enum, and GAP-04 already scoped this corpus under the existing `memory` family. The
 harness is `cargo xtask memory-bench` (`crates/xtask/src/memory_bench/`), split the same way

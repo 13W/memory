@@ -16,7 +16,7 @@
 //! What it *writes* is English, always (T21-11). That is a change from this
 //! module's original behaviour, which mirrored the observation's language
 //! into `text`. The `[FIXED]` bar in 14 §1 item 4 is about the input the
-//! router must cope with and the `op_kinds` it must emit — the 42
+//! router must cope with and the `op_kinds` it must emit — the 43
 //! `memory.router.op.*` fixtures assert `op_kinds` and never the language of
 //! `text` — so requiring English on the way out leaves it intact. Asking
 //! here costs nothing; translating afterwards costs a second of local GPU per

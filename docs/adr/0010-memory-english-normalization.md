@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted — 2026-08-18.
+Accepted — 2026-08-18. **Decisions 1, 3 and 6 superseded by
+[ADR-0011](0011-english-canon-for-durable-memory.md) — 2026-08-20**; the rest stays in force. The
+forward pointer was added at gate `G21`: ADR-0011's own header states the supersession, but a
+reader who lands here first had no way to learn it.
 
 Wholly new scope, like ADR-0008 and unlike ADR-0009: no `[FIXED]` decision, specification
 section, or plan card before this ADR says anything about what *language* durable memory is
