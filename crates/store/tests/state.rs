@@ -422,3 +422,54 @@ async fn the_writer_holds_the_write_lock_from_begin_not_from_its_first_write() {
          DEFERRED and left the door open until its first write"
     );
 }
+
+/// `D-094`: a `read_transaction` leaves `main`'s write lock free.
+///
+/// The exact mirror of the test above, inverted, because the two together are
+/// the invariant: work that writes must own the lock from `BEGIN` (`D-092`),
+/// and work that does not must not own it at all. Getting the second one wrong
+/// is not a missed optimisation — a 28-second read-only pass through this queue
+/// locked out every writer in every other process, measured on a live store as
+/// four failed daemon writes per `gc --dry-run`.
+///
+/// Deterministic by construction: the probe runs inside a transaction that has
+/// already opened, so under `IMMEDIATE` the foreign `BEGIN IMMEDIATE` would be
+/// refused outright, and `busy_timeout` is zero so the answer is immediate
+/// either way.
+#[tokio::test]
+async fn a_read_transaction_leaves_the_write_lock_free_for_a_foreign_writer() {
+    use std::time::Duration;
+
+    use local_rag_store::rusqlite::{Connection, Error};
+
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+    let path = layout.state_db();
+    let db = StateDb::open(path.clone()).expect("open state.sqlite");
+
+    let probe_path = path.clone();
+    let refused = db
+        .writer()
+        .read_transaction(move |_tx| {
+            let other = Connection::open(&probe_path)?;
+            other.busy_timeout(Duration::ZERO)?;
+            match other.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => {
+                    // Leave nothing open behind the probe.
+                    let _ = other.execute_batch("ROLLBACK");
+                    Ok(None)
+                }
+                Err(Error::SqliteFailure(e, _)) => Ok(Some((e.code, e.extended_code))),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .expect("the probe itself must run");
+
+    assert_eq!(
+        refused, None,
+        "a read-only pass must not hold `main`'s write lock (D-094); `Some(..)` means it opened \
+         IMMEDIATE and locked a foreign writer out for its whole duration"
+    );
+}

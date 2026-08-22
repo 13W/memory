@@ -999,3 +999,39 @@ async fn empty_sweep_is_a_noop() {
     assert_eq!(rows(&db, "generation"), 1);
     assert_eq!(rows(&db, "generation_file"), 1);
 }
+
+/// `D-094`: the sweep's scaffolding and its planning pass go through the
+/// read-only entry point; only the batched delete takes the write lock.
+///
+/// Structural, in the shape `D-054` established, because the alternative is
+/// invisible: routing a read-only pass back through `transaction()` compiles,
+/// passes every behavioural test, and only shows up as other processes failing
+/// to write — which is exactly how `D-094` reached a live store. Counting, not
+/// pattern-matching, so a renamed helper reads as a mismatch rather than as
+/// silence.
+#[test]
+fn only_the_batched_delete_takes_the_write_lock() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/retention.rs"))
+        .expect("read retention.rs");
+
+    let code: Vec<&str> = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+
+    let read_only = code
+        .iter()
+        .filter(|line| line.contains(".read_transaction("))
+        .count();
+    let writing = code
+        .iter()
+        .filter(|line| line.contains(".transaction(") && !line.contains(".read_transaction("))
+        .count();
+
+    assert_eq!(
+        (read_only, writing),
+        (3, 1),
+        "expected `plan_sweep`, `setup_scratch` and `drop_scratch` on the read-only path and only \
+         the batched delete on the writing one (D-094)"
+    );
+}

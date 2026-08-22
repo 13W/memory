@@ -113,7 +113,9 @@ PRAGMA busy_timeout=5000;
 As-built note (`D-092`, `[SPEC]`): `busy_timeout` binds only if the transaction asks for its write
 lock at `BEGIN`. The single writer queue therefore uses `BEGIN IMMEDIATE`, not SQLite's `DEFERRED`
 default — see spec 02 §5's `D-092` note for the mechanism and the measurement. The same holds for
-`cache.sqlite` (§4).
+`cache.sqlite` (§4). `D-094` bounds that: a pass that never writes `main` uses the queue's read-only
+entry point and opens `DEFERRED`, because holding the write lock across a long read starves every
+other process's writer — measured, four failed daemon writes per 28-second `gc --dry-run`.
 
 ### 2.1 Registry & settings
 

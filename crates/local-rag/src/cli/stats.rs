@@ -346,14 +346,20 @@ pub fn run(args: StatsArgs) -> ExitCode {
             "scope": scope_label,
             "worktree": worktree_json,
             "store_instance_uuid": store_instance_uuid_value,
+            // `longest_hold_ms` (D-094): how long one queued transaction has held
+            // the connection at most. Seconds here mean a caller is starving
+            // every other process's writer for that long — the shape D-094 had,
+            // which nothing reported at the time.
             "write_queues": {
                 "state": {
                     "capacity": state.writer().queue_capacity(),
                     "available": state.writer().available_slots(),
+                    "longest_hold_ms": state.writer().longest_hold_ms(),
                 },
                 "cache": {
                     "capacity": cache.writer().queue_capacity(),
                     "available": cache.writer().available_slots(),
+                    "longest_hold_ms": cache.writer().longest_hold_ms(),
                 },
             },
         });

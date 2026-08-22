@@ -154,6 +154,45 @@ async fn cache_pragmas_are_applied() {
     assert_eq!(busy_timeout, 5000);
 }
 
+/// `D-094`: and a `read_transaction` on the cache writer leaves it free.
+///
+/// Same pair, same reason as state's: work that writes owns the lock from
+/// `BEGIN`, work that does not must not own it at all. Deterministic by
+/// construction — the probe runs inside an already-open transaction with a zero
+/// `busy_timeout`, so the answer is immediate either way.
+#[tokio::test]
+async fn a_cache_read_transaction_leaves_the_write_lock_free_for_a_foreign_writer() {
+    use std::time::Duration;
+
+    let (_home, layout) = temp_store();
+    let db = open_cache(&layout, UUID_A, 8);
+    let probe_path = layout.cache_db();
+
+    let refused = db
+        .writer()
+        .read_transaction(move |_tx| {
+            let other = Connection::open(&probe_path)?;
+            other.busy_timeout(Duration::ZERO)?;
+            match other.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => {
+                    let _ = other.execute_batch("ROLLBACK");
+                    Ok(None)
+                }
+                Err(Error::SqliteFailure(e, _)) => Ok(Some((e.code, e.extended_code))),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .expect("the probe itself must run");
+
+    assert_eq!(
+        refused, None,
+        "a read-only pass must not hold `main`'s write lock (D-094)"
+    );
+
+    db.close();
+}
+
 /// `D-092`: the cache writer, like state's, owns the write lock from `BEGIN`.
 ///
 /// Same defect, same queue shape, so the same regression guards it — see

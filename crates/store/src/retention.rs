@@ -635,8 +635,11 @@ pub async fn plan_sweep(
     now_ms: i64,
 ) -> Result<SweepPlan, SweepError> {
     let (params, external) = (*params, external.clone());
+    // D-094: the whole planning pass reads `main` and writes only `temp.`, so
+    // it must not hold `main`'s write lock — on a live 60.9 GB store this one
+    // transaction ran 28 s and cost the daemon four failed writes.
     db.writer()
-        .transaction(move |tx| {
+        .read_transaction(move |tx| {
             setup_scratch(tx, &params, &external, now_ms)?;
 
             let mut candidate_generations = {
@@ -696,8 +699,9 @@ pub async fn run_sweep_with_batch(
     // Materialize the scratch sets on the writer's connection so every batch below
     // (same connection) sees them; committed here, they persist across batches.
     let (setup_params, setup_external) = (*params, external.clone());
+    // D-094: `temp.` tables only — no `main` write lock is needed or wanted.
     db.writer()
-        .transaction(move |tx| setup_scratch(tx, &setup_params, &setup_external, now_ms))
+        .read_transaction(move |tx| setup_scratch(tx, &setup_params, &setup_external, now_ms))
         .await
         .map_err(SweepError::Write)?;
 
@@ -711,8 +715,9 @@ pub async fn run_sweep_with_batch(
         record(&mut report, i, rows);
     }
 
+    // D-094: drops `temp.` tables only.
     db.writer()
-        .transaction(|tx| drop_scratch(tx))
+        .read_transaction(|tx| drop_scratch(tx))
         .await
         .map_err(SweepError::Write)?;
     Ok(report)
