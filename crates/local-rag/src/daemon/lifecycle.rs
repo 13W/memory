@@ -155,6 +155,11 @@ pub struct StartOptions {
     /// `recall`'s token budget (`config.memory.recall_token_budget`, spec 08
     /// §6 `[SPEC default 1500 tokens, config]`).
     pub recall_token_budget: u32,
+    /// `D-095`: how many tokens of existing memory entries the consolidation
+    /// router may show the model (`config.memory.router_conflict_token_budget`).
+    /// `MAX_PROMPT_CANDIDATES` bounds their count; this bounds their size, and
+    /// without it a store that remembered enough could not consolidate at all.
+    pub router_conflict_token_budget: u32,
     /// The continuous consolidation-trigger worker's window size
     /// (`config.memory.consolidation_batch_size`, D-024, spec 08 §4).
     pub consolidation_batch_size: i64,
@@ -319,6 +324,7 @@ impl DaemonHandle {
             query_embedder: query_embedder_override,
             memory_query_embedder: memory_query_embedder_override,
             recall_token_budget,
+            router_conflict_token_budget,
             consolidation_batch_size,
             consolidation_queue_threshold,
             consolidation_idle_checkpoint_hours,
@@ -626,6 +632,7 @@ impl DaemonHandle {
                     payload_ttl_hours,
                     consolidation_poll_interval,
                     data_policy,
+                    router_conflict_token_budget,
                     stop_rx,
                 ));
                 (Some(stop_tx), Some(join))
@@ -970,6 +977,7 @@ async fn spawn_consolidation_trigger(
     payload_ttl_hours: u64,
     poll_interval: Duration,
     data_policy: DataPolicy,
+    conflict_token_budget: u32,
     stop: oneshot::Receiver<()>,
 ) {
     let generate = {
@@ -980,8 +988,15 @@ async fn spawn_consolidation_trigger(
             let pool = Arc::clone(&pool);
             let uuids = Arc::clone(&uuids);
             async move {
-                let ops = local_rag_memory::router::route(&db, &pool, data_policy, &*uuids, window)
-                    .await?;
+                let ops = local_rag_memory::router::route(
+                    &db,
+                    &pool,
+                    data_policy,
+                    &*uuids,
+                    window,
+                    conflict_token_budget,
+                )
+                .await?;
                 // T21-14: the router's own output crosses the same write
                 // boundary. Since T21-11 its prompt asks for English, so the
                 // detector answers for free and this is a safety net — but it

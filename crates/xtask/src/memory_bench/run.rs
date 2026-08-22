@@ -118,7 +118,17 @@ pub async fn run(options: &Options) -> Result<MemoryBenchReport, String> {
         let window = build_window(case);
 
         let start = Instant::now();
-        let outcome = router::route(&state_db, &pool, DataPolicy::LocalOnly, &uuids, window).await;
+        // D-095: the bench measures the shipped router, so it must show the model
+        // the same amount of existing memory production does.
+        let outcome = router::route(
+            &state_db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window,
+            local_rag_core::config::MemoryConfig::default().router_conflict_token_budget,
+        )
+        .await;
         durations_ms.push(start.elapsed().as_secs_f64() * 1000.0);
 
         let (result, tally) = match outcome {

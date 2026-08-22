@@ -132,6 +132,7 @@ pub const MAX_PROMPT_CANDIDATES: usize = 50;
 pub fn candidate_conflict_set(
     conn: &Connection,
     observations: &[WindowObservation],
+    token_budget: u32,
 ) -> rusqlite::Result<Vec<MemoryEntrySummary>> {
     let mut repo_ids: BTreeSet<&str> = BTreeSet::new();
     let mut worktree_ids: BTreeSet<&str> = BTreeSet::new();
@@ -167,13 +168,51 @@ pub fn candidate_conflict_set(
     if out.len() > MAX_PROMPT_CANDIDATES {
         out = select_prompt_candidates(out, observations)?;
     }
-    Ok(out)
+    Ok(within_token_budget(out, token_budget))
 }
 
 /// D-080's selection, applied only when the union overflows
 /// [`MAX_PROMPT_CANDIDATES`]: lexical matches against the window's own text
 /// first, then the rest newest-first. `entries` arrives sorted by `memory_id`
 /// ascending and deduplicated.
+/// Cut the already-ordered set down to what fits `token_budget` (`D-095`).
+///
+/// `MAX_PROMPT_CANDIDATES` bounds how many entries are ranked; it does not
+/// bound how large they are, and that was the whole defect. Measured on a real
+/// store: 50 entries averaging 2501 characters are ≈31 892 tokens against a
+/// 32 768-token context, so the set alone consumed 97 % of the window it was
+/// supposed to be compared against and every consolidation for that session
+/// failed with a deterministic overflow — permanently, since the failure
+/// reproduces exactly on retry.
+///
+/// A prefix, not a filter, and that is the point: `D-080` already put the
+/// entries in the right order (lexically related to the window first, then
+/// newest-first), so the cheapest correct answer is to stop walking that order
+/// once the budget is spent. Same accounting as recall's own block —
+/// [`pipeline::estimate_tokens`] plus [`pipeline::ENTRY_OVERHEAD_TOKENS`] — so
+/// the two prompts cannot drift apart on what a token costs.
+///
+/// A single entry larger than the whole budget yields an empty set rather than
+/// one oversized entry: the router can route with no conflict set (it just
+/// creates instead of superseding), but it cannot route at all with a prompt
+/// that does not fit.
+fn within_token_budget(
+    entries: Vec<MemoryEntrySummary>,
+    token_budget: u32,
+) -> Vec<MemoryEntrySummary> {
+    let mut used: u32 = 0;
+    let mut chosen = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let cost = pipeline::estimate_tokens(&entry.text) + pipeline::ENTRY_OVERHEAD_TOKENS;
+        if used.saturating_add(cost) > token_budget {
+            break;
+        }
+        used += cost;
+        chosen.push(entry);
+    }
+    chosen
+}
+
 fn select_prompt_candidates(
     entries: Vec<MemoryEntrySummary>,
     observations: &[WindowObservation],
@@ -250,6 +289,10 @@ mod tests {
     use local_rag_test_support::TempHome;
 
     use super::*;
+
+    /// A budget no fixture here can reach, so a test that is not about `D-095`
+    /// keeps asserting exactly what it asserted before the budget existed.
+    const NO_BUDGET_LIMIT: u32 = u32::MAX;
 
     fn uuid(seed: u8) -> String {
         let mut rand = [0u8; 10];
@@ -381,7 +424,7 @@ mod tests {
 
         let read = db.open_read().expect("read conn");
         let observations = vec![window_observation(Some(&repo_id), None)];
-        let found = candidate_conflict_set(&read, &observations).expect("query");
+        let found = candidate_conflict_set(&read, &observations, NO_BUDGET_LIMIT).expect("query");
         let ids: Vec<&str> = found.iter().map(|e| e.memory_id.as_str()).collect();
         assert!(
             ids.contains(&uuid(20).as_str()),
@@ -402,7 +445,7 @@ mod tests {
     {
         let (_home, db) = open_state();
         let read = db.open_read().expect("read conn");
-        let found = candidate_conflict_set(&read, &[]).expect("query");
+        let found = candidate_conflict_set(&read, &[], NO_BUDGET_LIMIT).expect("query");
         assert!(found.is_empty());
     }
 
@@ -464,7 +507,8 @@ mod tests {
 
         let read = db.open_read().expect("read conn");
         let found =
-            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT)), NO_BUDGET_LIMIT)
+                .expect("query");
 
         assert_eq!(found.len(), MAX_PROMPT_CANDIDATES);
         let ids: Vec<&str> = found.iter().map(|e| e.memory_id.as_str()).collect();
@@ -485,7 +529,8 @@ mod tests {
 
         let read = db.open_read().expect("read conn");
         let found =
-            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT)), NO_BUDGET_LIMIT)
+                .expect("query");
         let ids: Vec<&str> = found.iter().map(|e| e.memory_id.as_str()).collect();
 
         assert!(
@@ -511,7 +556,8 @@ mod tests {
         seed_global_entries(&db, n, &[]).await;
 
         let read = db.open_read().expect("read conn");
-        let found = candidate_conflict_set(&read, &window_with_text(None)).expect("query");
+        let found =
+            candidate_conflict_set(&read, &window_with_text(None), NO_BUDGET_LIMIT).expect("query");
         let ids: Vec<&str> = found.iter().map(|e| e.memory_id.as_str()).collect();
 
         assert_eq!(found.len(), MAX_PROMPT_CANDIDATES);
@@ -530,7 +576,8 @@ mod tests {
 
         let read = db.open_read().expect("read conn");
         let found =
-            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT)), NO_BUDGET_LIMIT)
+                .expect("query");
 
         let ids: Vec<String> = found.into_iter().map(|e| e.memory_id).collect();
         let expected: Vec<String> = (0..10u16).map(uuid_at).collect();
@@ -550,7 +597,8 @@ mod tests {
 
         let read = db.open_read().expect("read conn");
         let found =
-            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT))).expect("query");
+            candidate_conflict_set(&read, &window_with_text(Some(WINDOW_TEXT)), NO_BUDGET_LIMIT)
+                .expect("query");
 
         assert_eq!(
             found[0].memory_id,
@@ -569,8 +617,8 @@ mod tests {
 
         let read = db.open_read().expect("read conn");
         let window = window_with_text(Some(WINDOW_TEXT));
-        let first = candidate_conflict_set(&read, &window).expect("query");
-        let second = candidate_conflict_set(&read, &window).expect("query");
+        let first = candidate_conflict_set(&read, &window, NO_BUDGET_LIMIT).expect("query");
+        let second = candidate_conflict_set(&read, &window, NO_BUDGET_LIMIT).expect("query");
         assert_eq!(first, second);
     }
 
@@ -622,5 +670,120 @@ mod tests {
         let (_home, db) = open_state();
         let read = db.open_read().expect("read conn");
         assert_eq!(resolve_target(&read, &uuid(32)).expect("query"), None);
+    }
+
+    /// `D-095`: the set is cut to what fits, not to a count.
+    ///
+    /// The defect this guards was measured, not imagined: 50 entries averaging
+    /// 2501 characters are ≈31 892 tokens against a 32 768-token context, so a
+    /// count-only cap let the conflict set consume the whole window it was
+    /// supposed to be compared against, and consolidation for that session
+    /// failed forever.
+    #[tokio::test]
+    async fn a_conflict_set_is_cut_to_the_token_budget_not_to_a_count() {
+        let (_home, db) = open_state();
+        let long = "x".repeat(4_000); // ≈1000 tokens each
+
+        for i in 0..6u8 {
+            create_memory_with_text(
+                &db,
+                &uuid(60 + i),
+                MemoryKind::Fact,
+                ScopeKind::Global,
+                GLOBAL_SCOPE_OWNER_ID,
+                &long,
+            )
+            .await;
+        }
+
+        let read = db.open_read().expect("read conn");
+        let observations = vec![window_observation(None, None)];
+
+        let unbounded =
+            candidate_conflict_set(&read, &observations, NO_BUDGET_LIMIT).expect("query");
+        assert_eq!(unbounded.len(), 6, "all six fit when nothing bounds them");
+
+        // Room for about three of them, plus each entry's own overhead.
+        let budget = 3 * (1_000 + 8);
+        let bounded = candidate_conflict_set(&read, &observations, budget).expect("query");
+        assert_eq!(
+            bounded.len(),
+            3,
+            "the budget, not the count cap, decides how many entries the model sees"
+        );
+
+        let spent: u32 = bounded
+            .iter()
+            .map(|e| pipeline::estimate_tokens(&e.text) + pipeline::ENTRY_OVERHEAD_TOKENS)
+            .sum();
+        assert!(
+            spent <= budget,
+            "the prefix must fit its budget: {spent} > {budget}"
+        );
+    }
+
+    /// `D-095`: the budget cuts a **prefix**, so `D-080`'s ordering survives it.
+    ///
+    /// Order is the whole reason a prefix is the right shape: the entries most
+    /// worth showing the model are already at the front, so stopping early
+    /// drops the least useful ones rather than an arbitrary subset.
+    #[tokio::test]
+    async fn the_budget_keeps_the_head_of_the_existing_order() {
+        let (_home, db) = open_state();
+        let long = "y".repeat(4_000);
+        for i in 0..5u8 {
+            create_memory_with_text(
+                &db,
+                &uuid(70 + i),
+                MemoryKind::Fact,
+                ScopeKind::Global,
+                GLOBAL_SCOPE_OWNER_ID,
+                &long,
+            )
+            .await;
+        }
+
+        let read = db.open_read().expect("read conn");
+        let observations = vec![window_observation(None, None)];
+        let full = candidate_conflict_set(&read, &observations, NO_BUDGET_LIMIT).expect("query");
+        let budget = 2 * (1_000 + 8);
+        let cut = candidate_conflict_set(&read, &observations, budget).expect("query");
+
+        assert_eq!(cut.len(), 2);
+        let full_ids: Vec<&str> = full.iter().map(|e| e.memory_id.as_str()).collect();
+        let cut_ids: Vec<&str> = cut.iter().map(|e| e.memory_id.as_str()).collect();
+        assert_eq!(
+            cut_ids,
+            full_ids[..2].to_vec(),
+            "the budget must keep the head of the order, not a reshuffled subset"
+        );
+    }
+
+    /// `D-095`: one entry larger than the whole budget yields an empty set.
+    ///
+    /// Deliberate, and the trade is worth naming: the router can route with no
+    /// conflict set at all — it creates instead of superseding — but it cannot
+    /// route at all with a prompt that does not fit, which is what the store
+    /// this defect was found on had been doing for days.
+    #[tokio::test]
+    async fn an_entry_larger_than_the_whole_budget_is_left_out_entirely() {
+        let (_home, db) = open_state();
+        create_memory_with_text(
+            &db,
+            &uuid(80),
+            MemoryKind::Fact,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            &"z".repeat(40_000),
+        )
+        .await;
+
+        let read = db.open_read().expect("read conn");
+        let observations = vec![window_observation(None, None)];
+        let found = candidate_conflict_set(&read, &observations, 100).expect("query");
+        assert!(
+            found.is_empty(),
+            "an entry that cannot fit must not be shown at all: {found:?}"
+        );
     }
 }

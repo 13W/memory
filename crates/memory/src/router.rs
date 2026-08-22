@@ -111,12 +111,14 @@ pub async fn route(
     global_policy: DataPolicy,
     uuids: &(dyn UuidSource + Send + Sync),
     window: ConsolidationWindow,
+    conflict_token_budget: u32,
 ) -> Result<Vec<GeneratedOp>, ClassifiedFailure> {
     let conn = state_db
         .open_read()
         .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
-    let existing = recall::candidate_conflict_set(&conn, &window.observations)
-        .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
+    let existing =
+        recall::candidate_conflict_set(&conn, &window.observations, conflict_token_budget)
+            .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
 
     let repo_ids: BTreeSet<&str> = window
         .observations
@@ -198,6 +200,10 @@ mod tests {
     use local_rag_test_support::TempHome;
 
     use super::*;
+
+    /// A budget no fixture here can reach — these tests predate `D-095` and are
+    /// about routing, not about how much memory the prompt may carry.
+    const NO_BUDGET_LIMIT: u32 = u32::MAX;
 
     struct SeqUuidV7 {
         counter: AtomicU64,
@@ -314,9 +320,16 @@ mod tests {
             r#"{"op":"create","kind":"decision","text":"use pnpm","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}"#,
         ]);
         let uuids = SeqUuidV7::new();
-        let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
-            .await
-            .expect("routes cleanly");
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await
+        .expect("routes cleanly");
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], GeneratedOp::Materialize { .. }));
     }
@@ -327,9 +340,16 @@ mod tests {
         seed_observation(&db, "o1").await;
         let pool = pool_with(vec!["not json at all", r#"{"op":"noop"}"#]);
         let uuids = SeqUuidV7::new();
-        let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
-            .await
-            .expect("recovers on the second attempt");
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await
+        .expect("recovers on the second attempt");
         assert_eq!(ops, vec![GeneratedOp::Noop]);
     }
 
@@ -345,7 +365,15 @@ mod tests {
         seed_observation(&db, "o1").await;
         let pool = pool_with(vec!["not json", "still not json"]);
         let uuids = SeqUuidV7::new();
-        let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
+        let result = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await;
         let failure = result.expect_err("still malformed after the corrective re-prompt");
         assert_eq!(
             failure.kind,
@@ -364,7 +392,15 @@ mod tests {
         seed_observation(&db, "o1").await;
         let pool = pool_with(vec![]);
         let uuids = SeqUuidV7::new();
-        let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
+        let result = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await;
         let failure = result.expect_err("no provider configured for an empty pool");
         assert_eq!(failure.kind, FailureKind::Transient);
     }
@@ -403,7 +439,15 @@ mod tests {
         seed_observation(&db, "o1").await;
         let pool = pool_with_context_overflow();
         let uuids = SeqUuidV7::new();
-        let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
+        let result = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await;
         let failure = result.expect_err("context overflow never succeeds");
         assert_eq!(
             failure.kind,
@@ -448,7 +492,15 @@ mod tests {
             }),
         )]);
         let uuids = SeqUuidV7::new();
-        let result = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1")).await;
+        let result = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await;
         let failure = result.expect_err("context overflow never succeeds");
         assert_eq!(failure.kind, FailureKind::Mechanical);
     }
@@ -459,9 +511,16 @@ mod tests {
         seed_observation(&db, "o1").await;
         let pool = pool_with(vec![""]);
         let uuids = SeqUuidV7::new();
-        let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
-            .await
-            .expect("empty is valid");
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await
+        .expect("empty is valid");
         assert!(ops.is_empty());
     }
 
@@ -477,9 +536,16 @@ mod tests {
         seed_observation(&db, "o1").await;
         let pool = pool_with(vec!["{\"op\":\"noop\"}\nnot valid json at all"]);
         let uuids = SeqUuidV7::new();
-        let ops = route(&db, &pool, DataPolicy::LocalOnly, &uuids, window_with("o1"))
-            .await
-            .expect("the valid prefix is accepted, not treated as a failure");
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+        )
+        .await
+        .expect("the valid prefix is accepted, not treated as a failure");
         assert_eq!(ops, vec![GeneratedOp::Noop]);
     }
 
@@ -533,7 +599,15 @@ mod tests {
 
         // Global policy is lax (would admit the remote generator on its own);
         // the repository's own stricter setting must still win.
-        let result = route(&db, &pool, DataPolicy::AllowRemoteFull, &uuids, window).await;
+        let result = route(
+            &db,
+            &pool,
+            DataPolicy::AllowRemoteFull,
+            &uuids,
+            window,
+            NO_BUDGET_LIMIT,
+        )
+        .await;
         assert!(
             result.is_err(),
             "the tightened effective policy must block the remote-only pool"
