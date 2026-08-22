@@ -84,6 +84,16 @@ pub struct SupervisorParams {
     /// directly — the same rationale `DaemonHandle`'s own
     /// `consolidation_poll_interval` already documents.
     pub backstop_poll_interval: Duration,
+    /// How long shutdown waits for the worktree tasks to actually stop before
+    /// reporting [`WorkersDrained::No`] (`D-093`). A field, not the constant
+    /// read in place, for the same reason `StartOptions::lock_handover_budget`
+    /// (`D-084`) and `stop_all`'s own `budget` (`D-090`) are injected: on a
+    /// loaded machine a fixed 3 s turns a test about *what shutdown reports*
+    /// into a test about how fast a thread happened to be scheduled — and
+    /// since `D-090`, a drain that reports `No` deliberately keeps the store
+    /// lock until the **process** exits, which an in-process restart never
+    /// does. Production passes [`SHUTDOWN_JOIN_BUDGET`].
+    pub shutdown_join_budget: Duration,
 }
 
 impl SupervisorParams {
@@ -345,7 +355,7 @@ async fn run_supervisor(params: SupervisorParams, mut commands: mpsc::Receiver<C
                         let _ = reply.send(result);
                     }
                     Some(Command::Shutdown(reply)) => {
-                        let drained = stop_all(tasks, SHUTDOWN_JOIN_BUDGET).await;
+                        let drained = stop_all(tasks, params.shutdown_join_budget).await;
                         let _ = reply.send(drained);
                         return;
                     }
@@ -353,7 +363,7 @@ async fn run_supervisor(params: SupervisorParams, mut commands: mpsc::Receiver<C
                         // Every `SupervisorHandle` was dropped without an
                         // explicit `shutdown()` — still leave no dangling
                         // tasks behind rather than leaking them.
-                        let _ = stop_all(tasks, SHUTDOWN_JOIN_BUDGET).await;
+                        let _ = stop_all(tasks, params.shutdown_join_budget).await;
                         return;
                     }
                 }
@@ -477,7 +487,7 @@ async fn reconcile(
 /// this bounds is only the first of shutdown's steps — the checkpoint, the
 /// cache close and the lock release all still have to happen before
 /// `local-rag stop` can report success.
-pub(crate) const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(3);
+pub const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(3);
 
 /// Cancel every task in `tasks`, then wait — bounded — for their threads
 /// (`D-077`).

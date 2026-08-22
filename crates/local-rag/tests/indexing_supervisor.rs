@@ -205,6 +205,16 @@ async fn a_managed_worktree_is_indexed_at_startup_and_survives_a_daemon_restart(
 
     let mut opts = start_options(layout.clone());
     opts.embedder_provider = ready_embedder_provider();
+    // D-093: this is the one test that restarts a daemon *in the same
+    // process*, so it is the one test that cannot rely on the production
+    // shutdown budget. Since D-090 a drain that does not finish inside it
+    // reports `WorkersDrained::No` and deliberately keeps the store lock until
+    // the process exits — correct for a real daemon, unreachable here, and the
+    // restart below would then refuse with `Lock(Locked { .. })` naming this
+    // very daemon. Under `nextest`'s process-per-test load the default 3 s is
+    // not enough for an indexing cycle to stop, which made this a test about
+    // thread scheduling rather than about cold-start recovery.
+    opts.indexing_shutdown_budget = Duration::from_secs(60);
     let handle = DaemonHandle::start(opts).await.expect("start");
 
     let state = StateDb::open(layout.state_db()).expect("reopen state.sqlite for polling");
@@ -423,4 +433,39 @@ async fn shutdown_leaves_no_dangling_task_and_no_orphaned_building_generation() 
             "shutdown must not leave an orphaned `Building` generation"
         );
     }
+}
+
+/// `D-093`: the supervisor must read its shutdown budget from its params, not
+/// from the constant.
+///
+/// Structural, in the shape `D-054`'s own guard already established for
+/// `lifecycle.rs`, because the failure mode is silent: an injected budget that
+/// something ignores looks exactly like an injected budget that works, until a
+/// loaded machine disagrees. The constant stays — it is the production
+/// default — but only as a definition and as prose; no code line may reach for
+/// it directly.
+#[test]
+fn the_supervisor_takes_its_shutdown_budget_from_its_params() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/daemon/indexing/supervisor.rs"
+    ))
+    .expect("read supervisor.rs");
+
+    let direct: Vec<&str> = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| {
+            !line
+                .trim_start()
+                .starts_with("pub const SHUTDOWN_JOIN_BUDGET")
+        })
+        .filter(|line| line.contains("SHUTDOWN_JOIN_BUDGET"))
+        .collect();
+
+    assert!(
+        direct.is_empty(),
+        "the supervisor must take its shutdown budget from `SupervisorParams` (D-093), but these \
+         lines read the constant directly: {direct:?}"
+    );
 }

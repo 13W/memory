@@ -10,8 +10,8 @@ pub mod supervisor;
 pub mod worktree_task;
 
 pub use supervisor::{
-    ProjectStatus, ReconcileNowError, ReloadOutcome, SupervisorClient, SupervisorHandle,
-    SupervisorParams, spawn_supervisor,
+    ProjectStatus, ReconcileNowError, ReloadOutcome, SHUTDOWN_JOIN_BUDGET, SupervisorClient,
+    SupervisorHandle, SupervisorParams, spawn_supervisor,
 };
 pub use worktree_task::{
     WorktreeTaskHandle, WorktreeTaskParams, WorktreeTaskStartError, WorktreeTaskStatus,

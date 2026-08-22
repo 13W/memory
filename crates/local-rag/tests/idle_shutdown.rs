@@ -58,6 +58,7 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         // No handover wait in tests: a store that is free must be acquirable
         // now, and one that is held must be refused now (D-084).
         lock_handover_budget: std::time::Duration::ZERO,
+        indexing_shutdown_budget: local_rag::daemon::indexing::SHUTDOWN_JOIN_BUDGET,
         uuids: Arc::new(SeqUuidV7::new()),
         write_queue_capacity: 8,
         payload_ttl_hours: 72,
