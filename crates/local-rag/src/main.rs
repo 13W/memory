@@ -195,6 +195,7 @@ async fn serve() -> ServeOutcome {
         lock_handover_budget: std::time::Duration::from_millis(
             local_rag::daemon::lock::LOCK_HANDOVER_BUDGET_MS,
         ),
+        indexing_shutdown_budget: local_rag::daemon::indexing::SHUTDOWN_JOIN_BUDGET,
         uuids: Arc::new(SystemUuidV7),
         write_queue_capacity: DEFAULT_WRITE_QUEUE_CAPACITY,
         payload_ttl_hours: config.storage.payload_ttl_hours,

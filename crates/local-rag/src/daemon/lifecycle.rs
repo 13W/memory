@@ -131,6 +131,13 @@ pub struct StartOptions {
     /// must be refused right now — waiting would only blur which of the two
     /// outcomes the test observed.
     pub lock_handover_budget: Duration,
+    /// How long shutdown waits for the indexing tasks to stop before reporting
+    /// `WorkersDrained::No` (`D-093`). Production passes
+    /// `indexing::SHUTDOWN_JOIN_BUDGET`; a test that restarts a daemon **in the
+    /// same process** must pass something a loaded machine can meet, because
+    /// `No` keeps the store lock until the process exits (`D-090`) and that
+    /// process is the test itself.
+    pub indexing_shutdown_budget: Duration,
     /// The MCP code-query tools' dense-leg query embedder. `None` — the
     /// production case — derives it from `embedder_provider` via
     /// `code_query_embedder`, so "one session per kind" holds by
@@ -298,6 +305,7 @@ impl DaemonHandle {
             daemon_version,
             now_ms,
             lock_handover_budget: handover_budget,
+            indexing_shutdown_budget,
             uuids,
             write_queue_capacity,
             payload_ttl_hours,
@@ -497,6 +505,7 @@ impl DaemonHandle {
                     data_policy,
                     classifier,
                     backstop_poll_interval: indexing_backstop_poll_interval,
+                    shutdown_join_budget: indexing_shutdown_budget,
                 }))
             }
             _ => None,
