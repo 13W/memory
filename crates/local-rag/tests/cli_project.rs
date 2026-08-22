@@ -44,6 +44,22 @@ fn run_cli(home: &TempHome, args: &[&str]) -> Output {
     cmd.output().expect("run local-rag")
 }
 
+/// Whether a CLI run failed *only* because the daemon did not answer inside
+/// `cli::project::ADMIN_CALL_TIMEOUT` (2 s).
+///
+/// D-091: under `nextest`'s process-per-test parallelism that budget is
+/// exceeded reliably on a loaded machine — the gate's own run failed here at
+/// `2.084s` while the same test alone finishes in `1.32s`. A daemon that has
+/// not answered yet is not a daemon that answered wrong, and the caller below
+/// already owns a 120 s deadline for exactly this kind of waiting.
+///
+/// Deliberately narrow: it matches this one message, so any other non-zero
+/// exit still fails on the spot instead of hiding until the deadline runs out.
+fn is_transient_admin_timeout(out: &Output) -> bool {
+    out.status.code() == Some(1)
+        && String::from_utf8_lossy(&out.stderr).contains("the daemon did not answer in time")
+}
+
 fn spawn_serve(home: &TempHome) -> Child {
     let mut cmd = home.command(env!("CARGO_BIN_EXE_local-rag"));
     cmd.arg("serve");
@@ -349,24 +365,48 @@ fn status_and_reindex_work_through_a_live_daemon() {
     // FSEvents contention can stretch well past a naive bound — T20-07's own
     // `admin_indexing.rs` precedent) before `task` turns non-null.
     let deadline = Instant::now() + Duration::from_secs(120);
+    // Declared without a value: every path through the loop body assigns it
+    // before the deadline check reads it, and seeding it with a `None` nobody
+    // reads is a warning under the workspace's `-D warnings`.
+    let mut last: String;
     let json = loop {
         let status = run_cli(&home, &["project", "status", "--json"]);
-        assert_eq!(status.status.code(), Some(0), "{status:?}");
-        let json: serde_json::Value =
-            serde_json::from_slice(&status.stdout).expect("valid json on stdout");
-        if json["daemon"] == "running" && !json["projects"][0]["task"].is_null() {
-            break json;
+        // D-091: a 2 s admin round trip that did not land yet is part of the
+        // cold start this loop exists to wait out, not a verdict about it.
+        if !is_transient_admin_timeout(&status) {
+            assert_eq!(status.status.code(), Some(0), "{status:?}");
+            let json: serde_json::Value =
+                serde_json::from_slice(&status.stdout).expect("valid json on stdout");
+            if json["daemon"] == "running" && !json["projects"][0]["task"].is_null() {
+                break json;
+            }
+            last = json.to_string();
+        } else {
+            last = format!("{status:?}");
         }
         if Instant::now() >= deadline {
             let _ = daemon.kill();
             let _ = daemon.wait();
-            panic!("project status never reported a live task within 120s: {json}");
+            panic!("project status never reported a live task within 120s: {last}");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(json["projects"][0]["worktree_id"].as_str().is_some());
 
-    let reindex = run_cli(&home, &["project", "reindex", path]);
+    // Same tolerance, same reason (D-091): this call had none at all, and it
+    // runs under the same 2 s budget the loop above just waited out.
+    let reindex = loop {
+        let out = run_cli(&home, &["project", "reindex", path]);
+        if !is_transient_admin_timeout(&out) {
+            break out;
+        }
+        if Instant::now() >= deadline {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!("project reindex never reached the daemon within the deadline: {out:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(reindex.status.code(), Some(0), "{reindex:?}");
     assert!(
         stdout(&reindex).contains("reconcile triggered"),
