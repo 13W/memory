@@ -110,6 +110,11 @@ PRAGMA synchronous=FULL;          -- memory durability is the budget priority [S
 PRAGMA busy_timeout=5000;
 ```
 
+As-built note (`D-092`, `[SPEC]`): `busy_timeout` binds only if the transaction asks for its write
+lock at `BEGIN`. The single writer queue therefore uses `BEGIN IMMEDIATE`, not SQLite's `DEFERRED`
+default — see spec 02 §5's `D-092` note for the mechanism and the measurement. The same holds for
+`cache.sqlite` (§4).
+
 ### 2.1 Registry & settings
 
 ```sql

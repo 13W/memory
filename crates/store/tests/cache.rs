@@ -154,6 +154,46 @@ async fn cache_pragmas_are_applied() {
     assert_eq!(busy_timeout, 5000);
 }
 
+/// `D-092`: the cache writer, like state's, owns the write lock from `BEGIN`.
+///
+/// Same defect, same queue shape, so the same regression guards it — see
+/// `crates/store/tests/state.rs`'s twin for the mechanism SQLite documents
+/// (no busy handler on a read-lock → write-lock promotion, so `busy_timeout`
+/// never gets to do its job). Deterministic by construction: the probe runs
+/// inside a transaction that has touched nothing, where a `DEFERRED` `BEGIN`
+/// would still be holding no lock at all.
+#[tokio::test]
+async fn the_cache_writer_holds_the_write_lock_from_begin_not_from_its_first_write() {
+    use std::time::Duration;
+
+    let (_home, layout) = temp_store();
+    let db = open_cache(&layout, UUID_A, 8);
+    let probe_path = layout.cache_db();
+
+    let refused = db
+        .writer()
+        .transaction(move |_tx| {
+            let other = Connection::open(&probe_path)?;
+            other.busy_timeout(Duration::ZERO)?;
+            match other.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => Ok(None),
+                Err(Error::SqliteFailure(e, _)) => Ok(Some((e.code, e.extended_code))),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .expect("the probe itself must run");
+
+    assert_eq!(
+        refused,
+        Some((ErrorCode::DatabaseBusy, 5)),
+        "a foreign writer must find the lock already held (D-092); `None` means the writer began \
+         DEFERRED and left the door open until its first write"
+    );
+
+    db.close();
+}
+
 /// D-027 (spec 12 §6 `[FIXED]` "files/segments 0600"): `cache.sqlite` itself is
 /// created at `0600`, not left at the process umask's default. Mirrors
 /// `crates/store/tests/state.rs`'s identical regression for `state.sqlite`.

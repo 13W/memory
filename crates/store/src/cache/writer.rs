@@ -11,7 +11,7 @@
 
 use std::io;
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
 /// A type-erased unit of work run on the cache writer thread against the owned
@@ -180,13 +180,30 @@ impl CacheWriter {
     }
 }
 
-/// Execute `f` in a fresh transaction: `BEGIN` → `f` → `COMMIT`, rolling back on
-/// any error (the [`Transaction`] rolls back on drop by default).
+/// Execute `f` in a fresh transaction: `BEGIN IMMEDIATE` → `f` → `COMMIT`,
+/// rolling back on any error (the [`Transaction`] rolls back on drop by
+/// default).
+///
+/// `IMMEDIATE`, not the `DEFERRED` default, and the difference is not a
+/// preference (`D-092`). A deferred transaction takes its write lock lazily, so
+/// a job that reads before it writes — which is the normal shape here;
+/// `apply_create` opens with `find_by_idempotency_key` — holds a read lock at
+/// the moment it asks to promote. SQLite refuses to invoke the busy handler on
+/// that promotion, because waiting there is how two connections deadlock each
+/// other (`sqlite3_busy_handler`: "If SQLite determines that invoking the busy
+/// handler could result in a deadlock, it will go ahead and return
+/// SQLITE_BUSY"). The caller then gets a bare `SQLITE_BUSY` — measured, extended
+/// code 5, not 517 `BUSY_SNAPSHOT` — in under a fifth of a second, with all
+/// 5000 ms of `busy_timeout` (spec 02 §5, 03 §2) unspent. Taking the write lock
+/// at `BEGIN`, before any read lock exists, is what puts that backstop back in
+/// play against a foreign writer such as the TUI or the CLI.
 fn run_transaction<F, R>(conn: &mut Connection, f: F) -> Result<R, CacheWriteError>
 where
     F: FnOnce(&Transaction<'_>) -> rusqlite::Result<R>,
 {
-    let txn = conn.transaction().map_err(CacheWriteError::Sqlite)?;
+    let txn = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(CacheWriteError::Sqlite)?;
     match f(&txn) {
         Ok(value) => {
             txn.commit().map_err(CacheWriteError::Sqlite)?;
