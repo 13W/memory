@@ -52,6 +52,7 @@ pub async fn resume_spool_import(
     for session_id in sessions {
         let _job = jobs.begin(JobKind::SpoolImport);
         super::test_resume_pause().await;
+        super::test_resume_blocking_stall();
         let outcome = import_session_tail(
             db,
             layout,

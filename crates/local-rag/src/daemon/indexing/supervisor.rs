@@ -41,6 +41,7 @@ use super::worktree_task::{
 };
 use crate::daemon::embedder_provider::LazyEmbedderProvider;
 use crate::daemon::jobs::JobRegistry;
+use crate::daemon::shutdown::WorkersDrained;
 
 /// How many worktree tasks the supervisor starts concurrently — during its
 /// own cold start and during any [`SupervisorHandle::reload`] that must bring
@@ -158,7 +159,7 @@ enum Command {
     Reload(oneshot::Sender<ReloadOutcome>),
     ListProjects(oneshot::Sender<Vec<ProjectStatus>>),
     TriggerNow(String, oneshot::Sender<Result<(), ReconcileNowError>>),
-    Shutdown(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<WorkersDrained>),
 }
 
 /// A cheap, `Clone`-able handle over the supervisor's command channel —
@@ -266,18 +267,29 @@ impl SupervisorHandle {
     /// no orphaned `building` generation — each stopped
     /// [`WorktreeTaskHandle::stop`] already flushes its own last successful
     /// generation before returning (T20-05's own contract).
-    pub async fn shutdown(self) {
+    ///
+    /// Reports whether the indexing threads actually exited, or were merely
+    /// cancelled and left running ([`stop_all`]'s budget) — the caller needs
+    /// that to decide whether releasing the store lock is honest (D-090).
+    pub async fn shutdown(self) -> WorkersDrained {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self
+        // Either half failing means the actor is already gone and took its
+        // `stop_all` with it, so its threads' fate is unobservable from here.
+        // Unobservable is not "drained": the whole point of D-090 is that
+        // "release the lock" must not be claimed on an unchecked premise.
+        let drained = if self
             .client
             .commands
             .send(Command::Shutdown(reply_tx))
             .await
             .is_ok()
         {
-            let _ = reply_rx.await;
-        }
+            reply_rx.await.unwrap_or(WorkersDrained::No)
+        } else {
+            WorkersDrained::No
+        };
         let _ = self.join.await;
+        drained
     }
 }
 
@@ -333,15 +345,15 @@ async fn run_supervisor(params: SupervisorParams, mut commands: mpsc::Receiver<C
                         let _ = reply.send(result);
                     }
                     Some(Command::Shutdown(reply)) => {
-                        stop_all(tasks).await;
-                        let _ = reply.send(());
+                        let drained = stop_all(tasks, SHUTDOWN_JOIN_BUDGET).await;
+                        let _ = reply.send(drained);
                         return;
                     }
                     None => {
                         // Every `SupervisorHandle` was dropped without an
                         // explicit `shutdown()` — still leave no dangling
                         // tasks behind rather than leaking them.
-                        stop_all(tasks).await;
+                        let _ = stop_all(tasks, SHUTDOWN_JOIN_BUDGET).await;
                         return;
                     }
                 }
@@ -494,15 +506,36 @@ pub(crate) const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(3);
 /// `occurrences_for_fts`, called straight from an `async fn`), and no cancel
 /// can preempt that. So the budget exists for the case where the thread is
 /// inside it. Abandoning the join there is safe by the spec's own next
-/// sentence — "Kill at any point is safe by construction (05, 07)" — and by
-/// what the stretch actually is: a read. The thread finishes it, unwinds at
-/// its next `.await`, and exits; the process simply does not wait.
+/// sentence — "Kill at any point is safe by construction (05, 07)".
+///
+/// **What abandoning the join is *not*** (D-090). This doc used to finish
+/// "the thread finishes it, unwinds at its next `.await`, and exits; the
+/// process simply does not wait". The read is real — `sample` on the live
+/// store puts 2235 of 2236 samples in `blob_index` → `sqlite3_step` — but a
+/// reader on `state.sqlite` pins WAL frames against the *successor's*
+/// checkpoint, from outside the lock, where that successor's own "no readers"
+/// test cannot see it. And the process does not stop waiting: `stop` joins
+/// the OS thread inside a `spawn_blocking`, and dropping the tokio runtime
+/// (`main.rs::run_serve`) waits, with no timeout, on every blocking task
+/// already running — `sample` puts the whole main thread in
+/// `BlockingPool::shutdown`. Hence the return value: shutdown keeps the store
+/// lock when this reports [`WorkersDrained::No`], and the process exits
+/// instead of waiting.
+///
+/// `budget` is [`SHUTDOWN_JOIN_BUDGET`] in production, a parameter only so a
+/// test can assert what this function *reports* without also asserting how
+/// fast a freshly spawned OS thread happens to be scheduled — the same reason
+/// `StartOptions::lock_handover_budget` (D-084) is injected rather than read
+/// from its constant.
 ///
 /// Deregistration is deliberately *not* routed through here: `reconcile`'s
 /// own `handle.stop().await` stays graceful, because a worktree leaving the
 /// registry is not a reason to throw away the projection it is halfway
 /// through.
-pub(crate) async fn stop_all(tasks: HashMap<String, WorktreeTaskHandle>) {
+pub(crate) async fn stop_all(
+    tasks: HashMap<String, WorktreeTaskHandle>,
+    budget: Duration,
+) -> WorkersDrained {
     let mut stopping = Vec::with_capacity(tasks.len());
     for (_, handle) in tasks {
         handle.abort();
@@ -513,16 +546,15 @@ pub(crate) async fn stop_all(tasks: HashMap<String, WorktreeTaskHandle>) {
             let _ = join.await;
         }
     };
-    if tokio::time::timeout(SHUTDOWN_JOIN_BUDGET, joined)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(budget, joined).await.is_err() {
         tracing::warn!(
-            "local-rag: an indexing task did not exit within {SHUTDOWN_JOIN_BUDGET:?} of being \
-             cancelled — it is inside a synchronous scan and will exit on its own; shutdown \
-             continues without it"
+            "local-rag: an indexing task did not exit within {budget:?} of being \
+             cancelled — it is inside a synchronous stretch; the store lock is held until this \
+             process exits, and it exits without waiting for it"
         );
+        return WorkersDrained::No;
     }
+    WorkersDrained::Yes
 }
 
 /// A synchronous registry read — the same "quick blocking `open_read` call

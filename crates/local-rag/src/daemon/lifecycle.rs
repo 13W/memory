@@ -38,7 +38,7 @@ use super::search::build_search_engine;
 use super::session::SessionRegistry;
 #[cfg(unix)]
 use super::shutdown::ShutdownSignal;
-use super::shutdown::drain_and_shutdown;
+use super::shutdown::{WorkersDrained, drain_and_shutdown};
 use super::telemetry::TelemetryState;
 use super::tool_calls::ToolCallCounters;
 
@@ -734,7 +734,16 @@ impl DaemonHandle {
     /// first and the waits happen afterwards. Nothing about the "must finish
     /// before the store closes" invariant changes: every join below still
     /// completes strictly before `drain_and_shutdown`.
-    pub async fn shutdown(mut self) {
+    ///
+    /// Returns whether every worker really stopped (`D-090`). Both budgets
+    /// below end in *cancellation*, which is not the same as stopping — the
+    /// case they exist for is a worker inside a synchronous stretch, and that
+    /// worker keeps the canonical store open after this returns. The caller
+    /// needs that answer twice over: `drain_and_shutdown` uses it to decide
+    /// whether releasing the store lock is honest, and `main.rs::run_serve`
+    /// uses it to end the process instead of unwinding into a runtime drop
+    /// that would wait for that very worker.
+    pub async fn shutdown(mut self) -> WorkersDrained {
         tracing::info!("daemon stopping");
 
         // Step 1, and it belongs first rather than last: every step below
@@ -770,9 +779,10 @@ impl DaemonHandle {
         // that starts minutes-long work on a timer. `SupervisorHandle::
         // shutdown` cancels every worktree task and is itself bounded
         // (`SHUTDOWN_JOIN_BUDGET`), so this is a short await, not a drain.
-        if let Some(supervisor) = self.indexing_supervisor.take() {
-            supervisor.shutdown().await;
-        }
+        let indexing_drained = match self.indexing_supervisor.take() {
+            Some(supervisor) => supervisor.shutdown().await,
+            None => WorkersDrained::Yes,
+        };
 
         // Step 3: now wait — under a budget (D-081). These three observe their
         // stop signal *between* units of work, so the wait is bounded by
@@ -795,7 +805,7 @@ impl DaemonHandle {
         // detaches its task, which would leave it running *while the store
         // closes* — strictly worse than waiting. So the handles are taken
         // first, their `AbortHandle`s kept, and the timeout path aborts them.
-        await_workers_bounded(
+        let workers_finished = await_workers_bounded(
             SHUTDOWN_WORKER_BUDGET,
             std::mem::take(&mut self.resume_handles),
             self.consolidation_trigger_join.take(),
@@ -803,6 +813,13 @@ impl DaemonHandle {
         )
         .await;
         tracing::debug!("background jobs stopped");
+        // D-090: this conjunction is the whole fix's premise, and both halves
+        // of it were already being computed and thrown away — `stop_all`
+        // returned `()` and `await_workers_bounded`'s `bool` was read by its
+        // own unit test and by nobody else. "Release the lock" is a claim
+        // that nothing here can write any more; it is now made only when
+        // that is true.
+        let drained = indexing_drained.and(WorkersDrained::from_finished(workers_finished));
         let lock_guard = self.lock_guard.take().expect("shutdown runs once");
         drain_and_shutdown(
             &self.layout,
@@ -810,9 +827,11 @@ impl DaemonHandle {
             self.cache_db.take(),
             lock_guard,
             self.handshake_stop.take(),
+            drained,
         )
         .await;
         tracing::info!("daemon stopped");
+        drained
     }
 }
 
@@ -1025,6 +1044,22 @@ pub enum ShutdownReason {
     UpgradeRequested,
 }
 
+/// What [`run`] observed on its way out: why it stopped waiting, and whether
+/// the shutdown drain actually finished.
+///
+/// The second field is not diagnostics — it decides how the process ends.
+/// [`WorkersDrained::No`] means a worker was cancelled rather than joined, so
+/// the store lock is deliberately still held (`drain_and_shutdown`) and the
+/// caller must end the process rather than unwind into a runtime drop that
+/// would wait for that very worker (`main.rs::run_serve`, D-090).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownOutcome {
+    /// Why the daemon stopped waiting.
+    pub reason: ShutdownReason,
+    /// Whether every background worker had really stopped by then.
+    pub workers_drained: WorkersDrained,
+}
+
 /// Wait for whichever comes first: an OS shutdown signal (already installed
 /// — see [`ShutdownSignal`]'s own doc for why installation must have
 /// happened before `start()`, not here), a proxy's `SHUTDOWN_REQUEST` (spec
@@ -1077,15 +1112,18 @@ pub async fn run(
     opts: StartOptions,
     idle_shutdown_secs: u64,
     idle_poll_interval: Duration,
-) -> Result<ShutdownReason, DaemonStartupError> {
+) -> Result<ShutdownOutcome, DaemonStartupError> {
     let mut signal = ShutdownSignal::install();
     let handle = DaemonHandle::start(opts).await?;
     let reason =
         wait_for_shutdown_trigger(&handle, &mut signal, idle_shutdown_secs, idle_poll_interval)
             .await;
     tracing::info!(?reason, "shutdown triggered");
-    handle.shutdown().await;
-    Ok(reason)
+    let workers_drained = handle.shutdown().await;
+    Ok(ShutdownOutcome {
+        reason,
+        workers_drained,
+    })
 }
 
 /// Windows has no local IPC transport implemented yet — see
@@ -1097,7 +1135,7 @@ pub async fn run(
     _opts: StartOptions,
     _idle_shutdown_secs: u64,
     _idle_poll_interval: Duration,
-) -> Result<ShutdownReason, DaemonStartupError> {
+) -> Result<ShutdownOutcome, DaemonStartupError> {
     Err(DaemonStartupError::Bind(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "local-rag daemon IPC is not yet implemented on Windows (named pipes; tracked separately)",

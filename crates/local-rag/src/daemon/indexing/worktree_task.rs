@@ -1317,6 +1317,7 @@ mod tests {
         use std::collections::HashMap;
 
         use crate::daemon::indexing::supervisor::{SHUTDOWN_JOIN_BUDGET, stop_all};
+        use crate::daemon::shutdown::WorkersDrained;
 
         let fx = Fixture::new("repo").await;
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
@@ -1341,13 +1342,60 @@ mod tests {
         // Generous against the budget itself: this asserts "shutdown is
         // bounded", not "the bound is tight". Unbounded is what it catches,
         // and unbounded never finishes.
-        tokio::time::timeout(SHUTDOWN_JOIN_BUDGET * 4, stop_all(tasks))
-            .await
-            .expect("a task stuck in synchronous work must not hold shutdown open");
+        let drained = tokio::time::timeout(
+            SHUTDOWN_JOIN_BUDGET * 4,
+            stop_all(tasks, SHUTDOWN_JOIN_BUDGET),
+        )
+        .await
+        .expect("a task stuck in synchronous work must not hold shutdown open");
+
+        // D-090: and it must *say* that it gave up. Being bounded is only half
+        // of it — the thread released here is still alive and still holds its
+        // own `Arc<StateDb>`, so a shutdown that goes on to release the store
+        // lock hands a live writer's store to the next daemon. That was the
+        // measured defect; this is the signal that prevents it, and it was
+        // being discarded (`stop_all` returned `()`).
+        assert_eq!(
+            drained,
+            WorkersDrained::No,
+            "a task that outlived the join budget has not stopped, and shutdown must be told so"
+        );
 
         // Let the stranded thread go, so the fixture's temp dir can be removed
         // without a live reader in it.
         let _ = release_tx.send(());
+    }
+
+    /// The other side of the same signal: a task that exits on its own must
+    /// not be reported as abandoned, or every ordinary shutdown would keep the
+    /// store lock and hard-exit for nothing.
+    #[tokio::test]
+    async fn a_task_that_exits_within_the_budget_reports_a_complete_drain() {
+        use std::collections::HashMap;
+
+        use std::time::Duration;
+
+        use crate::daemon::indexing::supervisor::stop_all;
+        use crate::daemon::shutdown::WorkersDrained;
+
+        let fx = Fixture::new("repo").await;
+        let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+        let mut tasks = HashMap::new();
+        tasks.insert(fx.worktree_id.to_string(), handle);
+
+        // Deliberately generous, and not a measurement: the claim is that a
+        // task which *does* exit is reported as drained, so the budget must
+        // not be the thing under test. At `SHUTDOWN_JOIN_BUDGET` this turned
+        // into a timing test and failed under the full 204-test parallel run
+        // while passing alone — exactly the wall-clock dependence CLAUDE.md
+        // rules out.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(60),
+            stop_all(tasks, Duration::from_secs(30)),
+        )
+        .await
+        .expect("an idle task must stop");
+        assert_eq!(drained, WorkersDrained::Yes);
     }
 
     /// The other half of `D-077`, and the half the test above does **not**

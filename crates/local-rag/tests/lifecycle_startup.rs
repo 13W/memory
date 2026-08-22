@@ -278,7 +278,11 @@ fn shutdown_signals_every_worker_before_it_waits_for_any_of_them() {
     ))
     .expect("read lifecycle.rs");
     let body = source
-        .split_once("pub async fn shutdown(mut self) {")
+        // D-085: anchor on the shortest text that still names the function.
+        // The needle used to carry the `{` and the empty return type, and
+        // D-090 gave `shutdown` a return value — the same way D-081 broke
+        // this file's other anchor by renaming what it named.
+        .split_once("pub async fn shutdown(mut self)")
         .expect("shutdown exists")
         .1;
     let body = body

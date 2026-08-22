@@ -40,3 +40,31 @@ pub(crate) async fn test_resume_pause() {
 
 #[cfg(not(feature = "failpoints"))]
 pub(crate) async fn test_resume_pause() {}
+
+/// The same test-only pause point, but **blocking** — a `std::thread::sleep`
+/// straight from an `async fn`, which no `abort()` can preempt.
+///
+/// [`test_resume_pause`] models a worker that shutdown can cancel; this one
+/// models the case both shutdown budgets actually exist for, and the only one
+/// that matters for exclusivity (D-090): a worker inside a *synchronous*
+/// stretch, which keeps running after it has been cancelled and after the
+/// daemon has logged `daemon stopped`. In production that stretch is
+/// `run_backfill`'s `blob_index` on a dedicated indexing thread; reproducing
+/// it through the real one would need a real ONNX model and a real repository
+/// (`tests/serve_subprocess_managed_indexing.rs`'s own opt-in problem), while
+/// the property under test — the store lock is not released while such a
+/// worker lives — is about the shutdown sequence, not about indexing.
+///
+/// Armed the same way and for the same reason as `LOCAL_RAG_TEST_RESUME_
+/// DELAY_MS`: an env-var hand-off, because the test lives in another process.
+#[cfg(feature = "failpoints")]
+pub(crate) fn test_resume_blocking_stall() {
+    if let Ok(raw) = std::env::var("LOCAL_RAG_TEST_RESUME_BLOCKING_STALL_MS")
+        && let Ok(ms) = raw.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+#[cfg(not(feature = "failpoints"))]
+pub(crate) fn test_resume_blocking_stall() {}
