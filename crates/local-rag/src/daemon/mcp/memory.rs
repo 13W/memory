@@ -631,6 +631,10 @@ struct ConsolidationStatsWire {
 struct WriteQueueWire {
     capacity: usize,
     available: usize,
+    /// `D-094`: the longest one queued transaction has held the connection.
+    /// Seconds here mean a caller is starving every other process's writer for
+    /// that long, which is the shape `D-094` had and which nothing reported.
+    longest_hold_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -867,10 +871,12 @@ pub async fn stats(
             state: WriteQueueWire {
                 capacity: ctx.state.writer().queue_capacity(),
                 available: ctx.state.writer().available_slots(),
+                longest_hold_ms: ctx.state.writer().longest_hold_ms(),
             },
             cache: WriteQueueWire {
                 capacity: ctx.cache.writer().queue_capacity(),
                 available: ctx.cache.writer().available_slots(),
+                longest_hold_ms: ctx.cache.writer().longest_hold_ms(),
             },
         },
         tool_calls: ToolCallCountsWire {

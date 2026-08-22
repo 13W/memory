@@ -7,8 +7,11 @@
 //! (dropping the future) frees its slot cleanly and never runs a partial write.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior, TransactionState};
 use tokio::sync::{mpsc, oneshot};
 
 /// A type-erased unit of work run on the writer thread against the owned
@@ -59,6 +62,10 @@ pub use crate::checkpoint::{CheckpointMode, CheckpointStats};
 #[derive(Debug, Clone)]
 pub struct StateWriter {
     sender: mpsc::Sender<Job>,
+    /// High-water mark of how long one queued transaction held the
+    /// connection, in milliseconds (`D-094`). Shared with every clone so the
+    /// number describes the queue, not a handle.
+    longest_hold_ms: Arc<AtomicU64>,
 }
 
 impl StateWriter {
@@ -82,7 +89,10 @@ impl StateWriter {
                 // Queue closed → drop the owned connection. Any in-flight
                 // transaction already committed or rolled back per job.
             })?;
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            longest_hold_ms: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// The maximum depth of the bounded write queue.
@@ -118,8 +128,11 @@ impl StateWriter {
     {
         crate::lock::checked_scope_async(crate::lock::LockLevel::L4a, async move {
             let (resp_tx, resp_rx) = oneshot::channel::<Result<R, WriteError>>();
+            let longest = Arc::clone(&self.longest_hold_ms);
             let job: Job = Box::new(move |conn: &mut Connection| {
-                let outcome = run_transaction(conn, f);
+                let started = Instant::now();
+                let outcome = run_transaction_with(conn, f, Access::Write);
+                record_hold(&longest, started.elapsed());
                 // The caller may have been cancelled (dropped `resp_rx`); ignore.
                 let _ = resp_tx.send(outcome);
             });
@@ -132,6 +145,57 @@ impl StateWriter {
             resp_rx.await.unwrap_or(Err(WriteError::WriterGone))
         })
         .await
+    }
+
+    /// Run `f` in a transaction that is **not** allowed to write `main`.
+    ///
+    /// The opt-in half of `D-094`. [`transaction`](Self::transaction) opens
+    /// `IMMEDIATE`, which is right for work that writes and wrong for work that
+    /// does not: an `IMMEDIATE` transaction owns `main`'s write lock from
+    /// `BEGIN` until commit, so a long read-only pass routed through this queue
+    /// locks out every writer in every other process for its whole duration.
+    /// That is not hypothetical — `retention::plan_sweep` is exactly such a
+    /// pass (its scratch tables live in `temp.`, which is a separate database
+    /// and takes no `main` lock), and on a live 60.9 GB store one 28-second
+    /// `gc --dry-run` cost the daemon four failed writes, spaced by the very
+    /// `busy_timeout` `D-092` had just made effective.
+    ///
+    /// Writing `temp.` is fine here; writing `main` is a bug, and a debug build
+    /// says so rather than letting it pass — see `run_transaction_with`.
+    /// `IMMEDIATE` stays the default precisely so that forgetting to opt in
+    /// costs a held lock rather than a lost `busy_timeout`.
+    pub async fn read_transaction<F, R>(&self, f: F) -> Result<R, WriteError>
+    where
+        F: FnOnce(&Transaction<'_>) -> rusqlite::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        crate::lock::checked_scope_async(crate::lock::LockLevel::L4a, async move {
+            let (resp_tx, resp_rx) = oneshot::channel::<Result<R, WriteError>>();
+            let longest = Arc::clone(&self.longest_hold_ms);
+            let job: Job = Box::new(move |conn: &mut Connection| {
+                let started = Instant::now();
+                let outcome = run_transaction_with(conn, f, Access::ReadOnly);
+                record_hold(&longest, started.elapsed());
+                let _ = resp_tx.send(outcome);
+            });
+            self.sender
+                .send(job)
+                .await
+                .map_err(|_| WriteError::WriterGone)?;
+            resp_rx.await.unwrap_or(Err(WriteError::WriterGone))
+        })
+        .await
+    }
+
+    /// The longest any single queued transaction has held this connection, in
+    /// milliseconds (`D-094`).
+    ///
+    /// A metric in the same spirit as [`available_slots`](Self::available_slots)
+    /// — spec 02 §5 already treats queue depth as one. Seconds here mean a
+    /// caller is holding the write lock long enough to starve other processes,
+    /// which is the shape `D-094` had and which nothing reported at the time.
+    pub fn longest_hold_ms(&self) -> u64 {
+        self.longest_hold_ms.load(Ordering::Relaxed)
     }
 
     /// Run a `PRAGMA wal_checkpoint` on the writer thread (spec 02 §4.3's
@@ -178,15 +242,25 @@ impl StateWriter {
 /// 5000 ms of `busy_timeout` (spec 02 §5, 03 §2) unspent. Taking the write lock
 /// at `BEGIN`, before any read lock exists, is what puts that backstop back in
 /// play against a foreign writer such as the TUI or the CLI.
-fn run_transaction<F, R>(conn: &mut Connection, f: F) -> Result<R, WriteError>
+fn run_transaction_with<F, R>(conn: &mut Connection, f: F, access: Access) -> Result<R, WriteError>
 where
     F: FnOnce(&Transaction<'_>) -> rusqlite::Result<R>,
 {
+    let behavior = match access {
+        Access::Write => TransactionBehavior::Immediate,
+        Access::ReadOnly => TransactionBehavior::Deferred,
+    };
     let txn = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .transaction_with_behavior(behavior)
         .map_err(WriteError::Sqlite)?;
     match f(&txn) {
         Ok(value) => {
+            debug_assert!(
+                access == Access::Write
+                    || txn.transaction_state(Some("main")) != Ok(TransactionState::Write),
+                "a read_transaction closure wrote `main`; it must take the \
+                 IMMEDIATE path or stop writing (D-094)"
+            );
             txn.commit().map_err(WriteError::Sqlite)?;
             Ok(value)
         }
@@ -210,4 +284,112 @@ fn run_checkpoint(
         })
     })
     .map_err(WriteError::Sqlite)
+}
+
+/// How a queued transaction opens, and what it is then allowed to touch.
+///
+/// `D-094`: the distinction is load-bearing, not stylistic. `Write` opens
+/// `IMMEDIATE` so `busy_timeout` actually applies (`D-092`); `ReadOnly` opens
+/// `DEFERRED`, because a pass that never writes `main` must not hold `main`'s
+/// write lock for its whole duration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Write,
+    ReadOnly,
+}
+
+/// Record one transaction's hold time as a high-water mark (`D-094`).
+///
+/// Dependency-free on purpose: this crate carries no logging at all, and the
+/// queue already publishes its occupancy as plain accessors.
+fn record_hold(longest: &AtomicU64, elapsed: std::time::Duration) {
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    longest.fetch_max(ms, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch("CREATE TABLE probe (x)").expect("seed");
+        conn
+    }
+
+    /// `D-094`: the guard is what keeps misclassification from being silent.
+    ///
+    /// A unit test rather than an integration one on purpose: the assertion
+    /// fires on the writer thread, where `#[should_panic]` cannot see it, so
+    /// the only place it can be observed directly is here, against the function
+    /// that carries it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "read_transaction closure wrote `main`")]
+    fn a_read_only_transaction_that_writes_main_trips_the_guard() {
+        let mut conn = open_conn();
+        let _ = run_transaction_with(
+            &mut conn,
+            |tx| tx.execute_batch("INSERT INTO probe (x) VALUES (1)"),
+            Access::ReadOnly,
+        );
+    }
+
+    /// The same closure on the write path is exactly what the queue is for, so
+    /// it must pass — the guard has to be about access, not about writing.
+    #[test]
+    fn the_same_write_on_the_write_path_is_fine() {
+        let mut conn = open_conn();
+        run_transaction_with(
+            &mut conn,
+            |tx| tx.execute_batch("INSERT INTO probe (x) VALUES (1)"),
+            Access::Write,
+        )
+        .expect("a write on the write path commits");
+    }
+
+    /// A read-only pass that only reads is the case the opt-in exists for.
+    #[test]
+    fn a_read_only_transaction_that_only_reads_is_accepted() {
+        let mut conn = open_conn();
+        let count: i64 = run_transaction_with(
+            &mut conn,
+            |tx| tx.query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0)),
+            Access::ReadOnly,
+        )
+        .expect("a read on the read-only path commits");
+        assert_eq!(count, 0);
+    }
+
+    /// Writing `temp.` from a read-only pass is explicitly allowed — that is
+    /// what `retention::setup_scratch` does, and `temp` is a separate database
+    /// that takes no `main` lock.
+    #[test]
+    fn a_read_only_transaction_may_write_temp() {
+        let mut conn = open_conn();
+        run_transaction_with(
+            &mut conn,
+            |tx| {
+                tx.execute_batch(
+                    "CREATE TEMP TABLE scratch (x);\
+                     INSERT INTO scratch (x) VALUES (1);",
+                )
+            },
+            Access::ReadOnly,
+        )
+        .expect("temp writes take no `main` lock");
+    }
+
+    /// `D-094`'s metric: the high-water mark only ever grows.
+    #[test]
+    fn the_hold_metric_keeps_the_maximum() {
+        let longest = AtomicU64::new(0);
+        record_hold(&longest, std::time::Duration::from_millis(40));
+        record_hold(&longest, std::time::Duration::from_millis(7));
+        assert_eq!(
+            longest.load(Ordering::Relaxed),
+            40,
+            "a later shorter hold must not lower it"
+        );
+    }
 }

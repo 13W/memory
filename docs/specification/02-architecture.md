@@ -917,6 +917,17 @@ deadlock. The measured result was a bare `SQLITE_BUSY` (extended code 5, not 517
 writer — the TUI, the CLI — could take a write away from the daemon. Taking the lock at `BEGIN`,
 before any read lock exists, is what makes the documented number mean what it says.
 
+As-built note (`D-094`, `[SPEC]`): "at `BEGIN`" is right for work that writes and wrong for work
+that does not, and the second half had to be learned the expensive way. An `IMMEDIATE` transaction
+owns `main`'s write lock from `BEGIN` until commit, so a long *read-only* pass routed through a
+write queue locks out every writer in every other process for its whole duration. `retention::
+plan_sweep` is exactly such a pass — its scratch tables live in `temp.`, a separate database that
+takes no `main` lock — and on a live 60.9 GB store one 28-second `gc --dry-run` cost the daemon four
+failed writes, spaced by the very `busy_timeout` the note above had just made effective. Both queues
+therefore carry a second, opt-in entry point that opens `DEFERRED` for passes that never write
+`main`; `IMMEDIATE` stays the default so a forgotten call site costs a held lock rather than a lost
+timeout, and a debug build asserts that a read-only pass did not in fact write `main`.
+
 As-built note (T09-01, `[SPEC]`): the hierarchy's typed primitive is `local_rag_store::lock`
 (`crates/store/src/lock/`). `LockLevel` has seven variants (`L0`…`L4b`); ordering always goes
 through `LockLevel::rank()`, never a derived `Ord` on the enum, because `L2Read`/`L2Write` and
