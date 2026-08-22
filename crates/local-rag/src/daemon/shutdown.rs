@@ -72,6 +72,73 @@ impl ShutdownSignal {
     }
 }
 
+/// Whether every background worker had actually stopped by the time the
+/// store closes — the precondition spec 02 §4.3's fourth step ("release
+/// lock") always had and never checked (D-090).
+///
+/// [`DaemonHandle::shutdown`](super::lifecycle::DaemonHandle::shutdown) waits
+/// for its workers under two budgets (`SHUTDOWN_JOIN_BUDGET` for the indexing
+/// threads, `SHUTDOWN_WORKER_BUDGET` for the rest) and cancels whatever
+/// overruns them. Cancelling is not stopping: an `abort()` lands on the next
+/// `.await`, and the one case both budgets exist for is a *synchronous*
+/// stretch no cancel can preempt. So "the budget elapsed" means precisely
+/// "someone in this process may still be running", and a worker that is still
+/// running still has the canonical store open: `sample` catches it inside
+/// `blob_index`'s `sqlite3_step`, a read — which pins WAL frames against the
+/// successor's checkpoint from outside the lock, where the successor cannot
+/// see it — and it still holds its own `Arc<StateDb>`, whose writer thread is
+/// alive beside it.
+///
+/// Live capture (2026-08-22, on the pre-fix binary, mid-cycle):
+/// `daemon stopping` 10:26:38.755, the supervisor's "did not exit within 3s"
+/// warning 10:26:41.758, `daemon stopped` 10:26:44.117, and
+/// `store lock acquired pid=31725` 302 ms after that — with the old pid still
+/// running and still holding 11 `state.sqlite` descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkersDrained {
+    /// Every worker this shutdown tracks returned on its own, inside its
+    /// budget — the two the supervisor owns and the three
+    /// `await_workers_bounded` joins. Nothing that was cancelled is left
+    /// behind.
+    Yes,
+    /// At least one worker was cancelled rather than joined, and may still be
+    /// running.
+    No,
+}
+
+impl WorkersDrained {
+    /// [`WorkersDrained::Yes`] only when *both* halves of the shutdown drain
+    /// finished — the supervisor's indexing threads and the tokio workers.
+    /// One unfinished worker is enough to keep the store open, so this is an
+    /// `AND`, deliberately not a "most of them" judgement.
+    pub fn and(self, other: WorkersDrained) -> WorkersDrained {
+        match (self, other) {
+            (WorkersDrained::Yes, WorkersDrained::Yes) => WorkersDrained::Yes,
+            _ => WorkersDrained::No,
+        }
+    }
+
+    /// Adapt the `bool` the two bounded waits already return ("did everything
+    /// finish on its own?").
+    pub fn from_finished(finished: bool) -> WorkersDrained {
+        if finished {
+            WorkersDrained::Yes
+        } else {
+            WorkersDrained::No
+        }
+    }
+
+    /// Whether the process must end now rather than unwind (D-090). See
+    /// `main.rs::run_serve`: dropping the tokio runtime joins every blocking
+    /// task that is already running, and one of those is
+    /// `WorktreeTaskHandle::stop`'s `spawn_blocking(thread.join())` — so an
+    /// abandoned indexing thread is waited for *after* shutdown declared
+    /// itself finished, for as long as its cycle takes.
+    pub fn must_exit_now(self) -> bool {
+        self == WorkersDrained::No
+    }
+}
+
 /// Drain and release the store (spec 02 §4.3's four ordered steps).
 ///
 /// 1. **Stop accepting**: signal the accept loop to return, then
@@ -96,7 +163,14 @@ impl ShutdownSignal {
 ///    and why that is still safe. `state.sqlite`'s writer thread stays
 ///    detached (`StateDb`'s own doc: safe by construction once nothing is
 ///    mid-transaction, which step 2 already guarantees).
-/// 4. **Release lock**: [`StoreLockGuard::release`].
+/// 4. **Release lock**: [`StoreLockGuard::release`] — but only when
+///    `drained` is [`WorkersDrained::Yes`]. Releasing it is a claim that
+///    nothing in this process can write the store any more, and D-090 is
+///    what happens when that claim is made without checking: the outgoing
+///    daemon handed the lock to its successor and went on writing for
+///    another five minutes. When a worker was cancelled rather than joined,
+///    the guard is deliberately leaked instead, and the kernel releases the
+///    `flock` at process exit.
 ///
 /// Every step is best-effort past the first failure — a checkpoint error, for
 /// instance, must not skip releasing the lock afterward.
@@ -130,6 +204,7 @@ pub async fn drain_and_shutdown(
     cache_db: Option<Arc<CacheDb>>,
     lock_guard: StoreLockGuard,
     handshake_stop: Option<oneshot::Sender<()>>,
+    drained: WorkersDrained,
 ) {
     if let Some(stop) = handshake_stop {
         let _ = stop.send(());
@@ -146,5 +221,66 @@ pub async fn drain_and_shutdown(
         cache_db.close();
     }
 
-    lock_guard.release(layout);
+    match drained {
+        WorkersDrained::Yes => lock_guard.release(layout),
+        WorkersDrained::No => {
+            tracing::warn!(
+                "a background worker outlived the shutdown budget; keeping the store lock until \
+                 this process exits, so no second daemon can open the store while it is still \
+                 running (spec 02 §4.4)"
+            );
+            // Deliberately neither released nor dropped: closing the descriptor
+            // releases the `flock`, and there is still a worker in this process
+            // that can write. The kernel releases it at process exit, which is
+            // the only moment we can prove no writer is left — `main.rs::run_serve`
+            // makes that moment arrive immediately (D-090). `store.lock` stays
+            // on disk on purpose: the record has to keep naming the inode this
+            // guard holds, or the next `acquire` creates a *new* file at the
+            // path and locks that instead (the path/description split
+            // `daemon::lock`'s own `release` doc explains).
+            std::mem::forget(lock_guard);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkersDrained;
+
+    /// The conjunction is the fix's whole decision, and it has to be an
+    /// `AND`: the two halves watch different workers (the supervisor's
+    /// indexing threads, and the tokio workers `await_workers_bounded`
+    /// joins), and either one still running is enough to make releasing the
+    /// lock a false claim.
+    #[test]
+    fn a_drain_is_complete_only_when_both_halves_are() {
+        let cases = [
+            (
+                WorkersDrained::Yes,
+                WorkersDrained::Yes,
+                WorkersDrained::Yes,
+            ),
+            (WorkersDrained::Yes, WorkersDrained::No, WorkersDrained::No),
+            (WorkersDrained::No, WorkersDrained::Yes, WorkersDrained::No),
+            (WorkersDrained::No, WorkersDrained::No, WorkersDrained::No),
+        ];
+        for (indexing, workers, expected) in cases {
+            assert_eq!(
+                indexing.and(workers),
+                expected,
+                "{indexing:?} and {workers:?}"
+            );
+        }
+    }
+
+    /// `await_workers_bounded` already answered this question as a `bool` and
+    /// nothing read it (D-090). The adapter keeps the two vocabularies from
+    /// drifting apart: `true` there means "everything finished on its own".
+    #[test]
+    fn finished_means_drained_and_nothing_else() {
+        assert_eq!(WorkersDrained::from_finished(true), WorkersDrained::Yes);
+        assert_eq!(WorkersDrained::from_finished(false), WorkersDrained::No);
+        assert!(!WorkersDrained::Yes.must_exit_now());
+        assert!(WorkersDrained::No.must_exit_now());
+    }
 }

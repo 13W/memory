@@ -964,6 +964,13 @@ therefore at its default) **is** the opportunistic half, and on a quiet store it
 up — measured 2026-08-21, `state.sqlite-wal` flat at 9 747 952 bytes across four consecutive
 one-minute samples while the consolidation trigger wrote on every 15 s tick.
 
+Live acceptance, deferred to `D-090` at the time and carried out with it (with two writers on the
+store, any measurement of this driver measures something else): a daemon brought up on a store
+whose indexing was disabled, with a 321 096 352-byte `-wal` left behind by a `kill -9`'d cycle,
+took the file to **0** thirty-eight seconds after startup — no indexing cycle, no restart, nothing
+else that could have done it. Before this note's change there was no driver that could: the only
+one was the cycle boundary, and there were no cycles.
+
 What this does **not** claim: that the threshold would have prevented D-083's 324 GB. It would not.
 That growth happened *under* the indexing cycle's own reader, where this clause correctly declines
 to truncate — measured again on 2026-08-21, one 2.8-minute cycle (`duration_ms=169732`) took the

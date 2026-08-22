@@ -73,7 +73,9 @@ pub use indexing::{
 pub use jobs::{JobGuard, JobKind, JobRegistry};
 #[cfg(unix)]
 pub use lifecycle::wait_for_shutdown_trigger;
-pub use lifecycle::{DaemonHandle, DaemonStartupError, ShutdownReason, StartOptions, run};
+pub use lifecycle::{
+    DaemonHandle, DaemonStartupError, ShutdownOutcome, ShutdownReason, StartOptions, run,
+};
 pub use lock::{
     StoreLockError, StoreLockFileState, StoreLockGuard, StoreLockInfo, acquire,
     read_store_lock_file,
@@ -94,4 +96,4 @@ pub use resume::{
 };
 pub use search::{NoRebuildVectorSource, build_search_engine};
 pub use session::{SessionGuard, SessionRegistry};
-pub use shutdown::{ShutdownSignal, drain_and_shutdown};
+pub use shutdown::{ShutdownSignal, WorkersDrained, drain_and_shutdown};

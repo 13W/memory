@@ -591,9 +591,10 @@ is exactly the safe point this section names. The join is additionally **bounded
 (`SHUTDOWN_JOIN_BUDGET`, 3 s, well inside `cli::service::STOP_TIMEOUT`) for the one case
 cancellation cannot reach: `run_backfill` calls `blob_index` synchronously from an `async fn`
 before its first `.await`, and no cancel preempts a synchronous stretch. Abandoning that join is
-safe by this section's own next sentence — "Kill at any point is safe by construction (05, 07)" —
-and by what the stretch is: a read. The thread finishes it and exits on its own; the process just
-stops waiting.
+safe by this section's own next sentence — "Kill at any point is safe by construction (05, 07)".
+The rest of what this paragraph used to say — "by what the stretch is: a read. The thread finishes
+it and exits on its own; the process just stops waiting" — was measured false on both counts and
+is corrected by `D-090`'s note below.
 
 Deregistration is deliberately unchanged: `reconcile`'s `handle.stop().await` stays graceful,
 because a worktree leaving the registry is not a reason to discard the projection it is halfway
@@ -614,6 +615,62 @@ Measured on the owner's store, indexing active: **110 s and `did not stop within
 a tick in flight runs to its own run boundary, which *is* a safe point in this section's sense.
 It has not been measured to exceed the budget; if a shutdown ever does again, that is where to
 look first.
+
+As-built note (`D-090`, `[SPEC]`): "release lock" is the *last* of the four steps for a reason
+this section stated and the code did not check — releasing it claims that nothing in this process
+can write the store any more. Two sentences of `D-077`'s note above asserted that claim instead of
+establishing it, and both were wrong.
+
+*"By what the stretch is: a read."* The read is real — `sample` on the outgoing pid puts 2235 of
+2236 samples in `blob_index` → `occurrences_for_generations` → `sqlite3_step` — but a read is not
+harmless, and this is the wrong store to hold one open on. A long-lived reader pins WAL frames,
+which is precisely what stops `wal_checkpoint` from returning disk (03 §3, `D-083`, `D-086`), and
+it does so from *outside* the lock, where the successor's own "no readers" test (a `JobRegistry`
+lookup, `D-086`) cannot see it. The thread also holds its own `Arc<StateDb>` whose writer thread
+is alive beside it, so writes stay possible until it unwinds.
+
+*"The process just stops waiting."* It does not, and this is measured rather than argued.
+`WorktreeTaskHandle::stop` joins the OS thread inside a `spawn_blocking`, and dropping the tokio
+runtime waits — with no timeout — for every blocking task already running. `sample` puts every one
+of 2236 samples of the outgoing daemon's main thread in
+`BlockingPool::shutdown` → `shutdown::Receiver::wait` → `park` → `_pthread_cond_wait`: the process
+was waiting out exactly the work shutdown had given up on.
+
+Live capture (2026-08-22, reproduced deliberately on the pre-fix binary mid-cycle):
+`daemon stopping` 10:26:38.755 → the supervisor's "did not exit within 3s of being cancelled"
+warning 10:26:41.758 → `daemon stopped` 10:26:44.117 → `store lock acquired pid=31725` 10:26:44.419,
+302 ms later. The old pid was still running with 11 open `state.sqlite` descriptors throughout,
+and `local-rag stop` printed `stopped` while it ran — the stop wait ends on `store.lock` being
+gone. Reproduced in-repo by `tests/serve_subprocess.rs::a_worker_that_outlives_the_shutdown_budget_
+keeps_the_lock_until_the_process_exits`: on the pre-fix code the store is handed over 3.0 s after
+SIGTERM (`SHUTDOWN_WORKER_BUDGET`) while the daemon is still running, and with only the early exit
+removed the process does not leave within 25 s of a 60 s stalled worker.
+
+What is *not* claimed: that the outgoing daemon wrote. The first registration recorded the WAL
+growing ~1.3 GB/min across that window, but a successor daemon was running its own indexing cycle
+at the same time and authorship was never established. Two processes with the canonical store open,
+one of them without the lock, is the violation; the reader pinning the successor's WAL is its
+measured cost.
+
+Live acceptance of the fix, same store, same shape of moment (mid-cycle): `daemon stopping`
+10:40:49.741 → the supervisor's warning 10:40:52.744 → `keeping the store lock until this process
+exits` and `daemon stopped` in the same millisecond, 10:41:06.709 → the process is gone by
+10:41:07, with `lsof state.sqlite` empty. The lock stayed with the outgoing process to its last
+second, no second daemon appeared, and the record it left behind naming a dead pid did not stop
+the next daemon from acquiring in 6 ms.
+
+The fix is a pair, and neither half works alone. `drain_and_shutdown` takes a `WorkersDrained`
+argument — the conjunction of `stop_all`'s result and `await_workers_bounded`'s, both of which were
+already computed and discarded — and on `No` it does **not** release: the guard is leaked, so the
+`flock` outlives the function and the kernel drops it at process exit, the first instant at which
+no writer is left. `store.lock` is deliberately left on disk, because a record that no longer names
+the inode the descriptor holds is the exact path/description split D-084's second half fixed: the
+next `acquire` would create a *new* file at the path and lock that instead. And `run_serve` ends
+the process immediately rather than unwinding, so a held lock never costs more than a handover:
+without that, `local-rag stop` followed by a restart would refuse for the length of an indexing
+cycle (~150 s after `D-088`). Ending the process there is what this section already sanctions
+("Kill at any point"), it happens after the checkpoint, and `state.sqlite` is crash-safe while
+`cache.sqlite`/`projection/` are rebuildable caches.
 
 As-built note (D-084, `[SPEC]`): "release lock" is now conditional on still owning the record.
 `StoreLockGuard::release` unlinks `store.lock` only when the path still resolves to the very file
@@ -801,6 +858,18 @@ release — and both are closed above. Note what is *not* the mechanism: the sto
 `LOCAL_RAG_HOME`/`XDG_DATA_HOME` and never from the binary's own path, so two installations of
 the same version contend for one lock by construction; D-084's third daemon arriving from a third
 install path was a symptom of the unlinking, not a separate route around the lock.
+
+As-built note (`D-090`, `[SPEC]`): the same `[FIXED]` invariant has now been broken by a third
+route through `store.lock`, and this one did not touch the file at all. §4.1's reclaim and §4.3's
+unconditional unlink were both about *who owns the record*; this was about *when the owner stops
+writing*. An outgoing daemon released the lock while an indexing thread it had cancelled but not
+joined was still alive, so a successor took the store and ran alongside it for minutes. The
+rule the mechanism now encodes: exclusivity is bounded by the **process lifetime**, not by the
+shutdown sequence — the lock is released by `StoreLockGuard::release` only when the drain actually
+completed, and otherwise by the kernel at process exit (§4.3's `D-090` note). Consequence worth
+stating, because it is a deliberate trade: after such a shutdown `store.lock` is left on disk
+naming a pid that no longer exists. That is the same state a `SIGKILL`ed daemon leaves, it is what
+`acquire`'s success path overwrites, and `pid_exists` is what `status`/`doctor` already judge it by.
 
 As-built note (T15-01, `[SPEC]`): of this list, T15-01 cleans the stale socket and stale lock
 classes, both at startup (§4.1's as-built note above) and, for the socket, again as part of an

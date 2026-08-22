@@ -183,6 +183,13 @@ fn wait_until_ready(layout: &StoreLayout, timeout: Duration) -> bool {
         if let Ok(bytes) = std::fs::read(layout.store_lock())
             && let Ok(info) = serde_json::from_slice::<StoreLockInfo>(&bytes)
             && info.ready
+            // D-090: a `ready` record can outlive its daemon. A shutdown that
+            // had to abandon a worker keeps the lock and ends the process, so
+            // the record is left behind naming a dead pid — exactly the state
+            // `stop_running_daemon` above already judges by `pid_exists`, and
+            // without the same check here `restart` would report the *old*
+            // daemon's record as its replacement's readiness.
+            && pid_exists(info.pid)
         {
             return true;
         }

@@ -275,11 +275,19 @@ fn sigterm_during_a_resume_job_lets_it_finish_before_exiting() {
     let (home, layout) = open_layout();
     write_spool_segment(&layout, "sess-mid-resume");
 
-    let mut child = spawn_serve(&home, &[("LOCAL_RAG_TEST_RESUME_DELAY_MS", "3000")]);
+    // 500 ms, and the margin runs both ways on purpose. Upward: the SIGTERM
+    // below is sent within milliseconds of readiness, so the job is provably
+    // still inside this pause when the signal arrives. Downward: it must end
+    // well inside `SHUTDOWN_WORKER_BUDGET` (3 s), because since D-090 a
+    // worker that overruns that budget makes shutdown *keep* the store lock —
+    // which the final assertion here would read as a failure. This used to be
+    // 3000 ms against a 3000 ms budget, i.e. two racing timers with a
+    // milliseconds-wide head start.
+    let mut child = spawn_serve(&home, &[("LOCAL_RAG_TEST_RESUME_DELAY_MS", "500")]);
     wait_until_ready(&layout, Duration::from_secs(20));
 
     // The resume pass starts right after readiness; sending SIGTERM
-    // immediately gives a wide margin before the 3s artificial pause would
+    // immediately gives a wide margin before the artificial pause would
     // naturally elapse on its own.
     send_sigterm(child.id());
 
@@ -304,4 +312,101 @@ fn sigterm_during_a_resume_job_lets_it_finish_before_exiting() {
         !pending,
         "the in-flight import must have been allowed to finish before shutdown"
     );
+}
+
+/// D-090: a worker that shutdown could only cancel, never join, must not be
+/// able to outlive the store lock.
+///
+/// The real one is an indexing thread inside `run_backfill`'s synchronous
+/// `blob_index` stretch; reproducing *that* needs a real ONNX model and a
+/// real repository (`serve_subprocess_managed_indexing.rs` is opt-in for
+/// exactly that reason). `LOCAL_RAG_TEST_RESUME_BLOCKING_STALL_MS` stages the
+/// same class in the resume pass — a `std::thread::sleep` straight from an
+/// `async fn`, which `abort()` cannot preempt either — because the property
+/// under test belongs to the shutdown sequence, not to indexing.
+///
+/// Two independent assertions, and the pre-fix code fails both: the lock was
+/// released about three seconds in (`SHUTDOWN_WORKER_BUDGET`), and the
+/// process then sat in its runtime drop for the whole remaining stall,
+/// because `WorktreeTaskHandle::stop`/the resume join run on blocking threads
+/// that `Drop for Runtime` waits out. On the owner's store that was five
+/// minutes of a second daemon writing the same `state.sqlite`.
+#[test]
+#[cfg(feature = "failpoints")]
+fn a_worker_that_outlives_the_shutdown_budget_keeps_the_lock_until_the_process_exits() {
+    /// Far longer than every budget in the shutdown path put together, so
+    /// "the stall ended on its own" can never be the reason the process left.
+    const STALL_MS: u64 = 60_000;
+    /// Generous against `cli::service::STOP_TIMEOUT` (10 s) but nowhere near
+    /// `STALL_MS`: this is "the process does not wait for the stalled
+    /// worker", not a measurement of how fast it is.
+    const EXIT_BUDGET: Duration = Duration::from_secs(25);
+
+    let (home, layout) = open_layout();
+    write_spool_segment(&layout, "sess-blocking-stall");
+
+    let mut child = spawn_serve(
+        &home,
+        &[(
+            "LOCAL_RAG_TEST_RESUME_BLOCKING_STALL_MS",
+            &STALL_MS.to_string(),
+        )],
+    );
+    wait_until_ready(&layout, Duration::from_secs(20));
+    let daemon_pid = child.id();
+    send_sigterm(daemon_pid);
+
+    // While the child is alive, the store must stay refused. Zero handover
+    // budget: D-084's rule is that a held lock is refused *now*, and a retry
+    // here would hide exactly the window this test exists for.
+    let started = Instant::now();
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        match local_rag::daemon::acquire(&layout, "successor", 999, "0.0.0", 5_000, Duration::ZERO)
+        {
+            Err(local_rag::daemon::StoreLockError::Locked { .. }) => {}
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "the store was handed over {:?} after SIGTERM while the daemon process was \
+                     still running: {other:?}",
+                    started.elapsed()
+                );
+            }
+        }
+        if started.elapsed() >= EXIT_BUDGET {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the daemon did not exit within {EXIT_BUDGET:?} — it is waiting out the \
+                 {STALL_MS} ms stall it had already given up on"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let status = child.wait().expect("wait");
+    assert!(
+        status.success(),
+        "ending the process is a deliberate step of shutdown, not a crash: {status:?} \
+         (signal: {:?})",
+        status.signal()
+    );
+
+    // And once it is gone, the store is free again with no recovery branch:
+    // the `flock` died with the process, and the record left behind names a
+    // pid that no longer exists (the same state a `SIGKILL`ed daemon leaves,
+    // which `acquire`'s success path overwrites).
+    let reacquired =
+        local_rag::daemon::acquire(&layout, "successor", 999, "0.0.0", 6_000, Duration::ZERO);
+    assert!(
+        reacquired.is_ok(),
+        "the lock must be free the moment the process is gone: {reacquired:?}"
+    );
+    if let Ok(guard) = reacquired {
+        guard.release(&layout);
+    }
 }

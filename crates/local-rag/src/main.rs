@@ -94,27 +94,84 @@ fn run_serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    rt.block_on(serve())
+    let outcome = rt.block_on(serve());
+    if outcome.exit_immediately {
+        // D-090. Returning from here drops `rt`, and `Drop for Runtime` waits
+        // — with no timeout — for every blocking task already running. One of
+        // those is `WorktreeTaskHandle::stop`'s `spawn_blocking(thread.join())`
+        // on a worktree thread that shutdown just gave up on, so the wait is
+        // however long that indexing cycle still has to run: measured twice on
+        // the owner's store at 49 s and at over four minutes past the
+        // process's own `daemon stopped`, at 90-100% CPU, with the canonical
+        // store still open throughout. The store is already checkpointed
+        // and the lock is deliberately still held (`drain_and_shutdown`), so
+        // ending the process here is both the fastest correct move and the
+        // one spec 02 §4.3 already sanctions — "Kill at any point is safe by
+        // construction (05, 07)". The lock goes with us: the kernel releases
+        // the `flock` on exit, which is the first instant at which no writer
+        // is left. Log lines are safe: `logging`'s file layer is a blocking
+        // appender, so `daemon stopped` is already on disk.
+        std::process::exit(outcome.code);
+    }
+    exit_code(outcome.code)
 }
 
-async fn serve() -> ExitCode {
+/// How `serve` ended: the process's exit status, and whether the process must
+/// end *now* rather than unwind through the runtime drop (D-090).
+struct ServeOutcome {
+    code: i32,
+    exit_immediately: bool,
+}
+
+impl ServeOutcome {
+    /// A daemon that never started: nothing was drained because nothing ran,
+    /// so the ordinary return path is right.
+    fn failed() -> ServeOutcome {
+        ServeOutcome {
+            code: EXIT_FAILURE,
+            exit_immediately: false,
+        }
+    }
+}
+
+const EXIT_OK: i32 = 0;
+const EXIT_FAILURE: i32 = 1;
+
+fn exit_code(code: i32) -> ExitCode {
+    if code == EXIT_OK {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Whether a finished daemon run must end the process immediately.
+///
+/// Split out as a function of the drain result alone so the rule is testable
+/// without a process to kill: an abandoned worker is exactly the case where
+/// unwinding means waiting for it.
+fn exit_immediately(workers_drained: local_rag::daemon::WorkersDrained) -> bool {
+    workers_drained.must_exit_now()
+}
+
+async fn serve() -> ServeOutcome {
     let env = SystemEnv;
     let layout = match StoreLayout::resolve(&env) {
         Ok(layout) => layout,
         Err(e) => {
             eprintln!("{BIN}: could not resolve the store directory: {e}");
-            return ExitCode::FAILURE;
+            return ServeOutcome::failed();
         }
     };
     let config = match config_dir(&env).map(|dir| local_rag_core::config::Config::load(&dir)) {
         Ok(Ok(config)) => config,
         Ok(Err(e)) => {
             eprintln!("{BIN}: could not load config.toml: {e}");
-            return ExitCode::FAILURE;
+            return ServeOutcome::failed();
         }
         Err(e) => {
             eprintln!("{BIN}: could not resolve the config directory: {e}");
-            return ExitCode::FAILURE;
+            return ServeOutcome::failed();
         }
     };
     let _ = data_dir(&env); // resolved via `layout`; kept for a clearer error above if it fails
@@ -177,9 +234,17 @@ async fn serve() -> ExitCode {
     let idle_shutdown_secs = config.daemon.idle_shutdown_secs;
 
     match local_rag::daemon::run(opts, idle_shutdown_secs, IDLE_POLL_INTERVAL).await {
-        Ok(ShutdownReason::Signal) => ExitCode::SUCCESS,
-        Ok(ShutdownReason::Idle) => ExitCode::SUCCESS,
-        Ok(ShutdownReason::UpgradeRequested) => ExitCode::SUCCESS,
+        Ok(outcome) => {
+            let code = match outcome.reason {
+                ShutdownReason::Signal
+                | ShutdownReason::Idle
+                | ShutdownReason::UpgradeRequested => EXIT_OK,
+            };
+            ServeOutcome {
+                code,
+                exit_immediately: exit_immediately(outcome.workers_drained),
+            }
+        }
         Err(e) => {
             let message = startup_error_message(&e);
             // Both, and not by accident (D-084). `eprintln!` is for a human
@@ -193,7 +258,7 @@ async fn serve() -> ExitCode {
             // degrades silently.
             tracing::warn!(reason = %message, "daemon startup refused");
             eprintln!("{BIN}: {message}");
-            ExitCode::FAILURE
+            ServeOutcome::failed()
         }
     }
 }
@@ -264,6 +329,18 @@ fn startup_error_message(e: &DaemonStartupError) -> String {
 mod tests {
     use super::*;
     use local_rag::daemon::StoreLockInfo;
+
+    /// D-090: the process must end itself exactly when a worker was
+    /// abandoned, and never otherwise — a hard exit on an ordinary shutdown
+    /// would skip the runtime drop that reclaims live MCP connections, and no
+    /// exit on an abandoned one is the defect itself.
+    #[test]
+    fn only_an_abandoned_worker_ends_the_process_early() {
+        use local_rag::daemon::WorkersDrained;
+
+        assert!(exit_immediately(WorkersDrained::No));
+        assert!(!exit_immediately(WorkersDrained::Yes));
+    }
 
     fn owner(ready: bool) -> StoreLockInfo {
         StoreLockInfo {
