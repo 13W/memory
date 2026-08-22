@@ -984,7 +984,7 @@ mod tests {
 
     // ---- adversarial set (spec 12 §4 п.5) ----------------------------------
 
-    /// Six payloads, each named for the thing it tries to do. Two assertions
+    /// Seven payloads, each named for the thing it tries to do. Two assertions
     /// per payload: the message the model receives is still one JSON object
     /// with exactly one `src` key (nothing escaped into prompt structure), and
     /// a "compromised" answer to that payload is rejected by the validator.

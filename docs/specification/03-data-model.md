@@ -778,21 +778,21 @@ CREATE TABLE spool_import_cursor (                    -- durable import progress
   updated_at        INTEGER NOT NULL
 );
 
-CREATE TABLE memory_text_normalization (              -- migration 14; T21-01 (ADR-0010)
+CREATE TABLE memory_text_normalization (              -- migration 15; T21-13 (ADR-0011)
   memory_id           TEXT PRIMARY KEY REFERENCES memory_entry(memory_id) ON DELETE CASCADE,
-  status              TEXT NOT NULL CHECK (status IN ('ready','skipped','failed')),
-  source_text_sha256  TEXT NOT NULL,                  -- the text this row was derived from
-  normalized_text     TEXT,                           -- NULL unless status='ready'
+  status              TEXT NOT NULL CHECK (status IN ('translated','english','failed')),
+  canon_text_sha256   TEXT NOT NULL,                  -- memory_entry.text as this row saw it
+  source_text         TEXT,                           -- the author's words; NULL unless 'translated'
   source_language     TEXT,                           -- detector's answer, advisory
-  normalizer_model_id TEXT,                           -- provenance: which model produced it
+  normalizer_model_id TEXT,                           -- provenance: which model produced the canon
   prompt_version      INTEGER,                        -- provenance: which prompt
-  normalizer_version  INTEGER NOT NULL,               -- bump re-normalizes every row
+  normalizer_version  INTEGER NOT NULL,               -- bump re-examines every row
   attempt_count       INTEGER NOT NULL DEFAULT 0,
   last_error          TEXT,
   next_attempt_at     INTEGER,                        -- transient backoff gate, epoch ms
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL,
-  CHECK ((status = 'ready') = (normalized_text IS NOT NULL))
+  CHECK ((status = 'translated') = (source_text IS NOT NULL))
 );
 CREATE INDEX memory_normalization_queue
   ON memory_text_normalization(status, next_attempt_at);
@@ -852,7 +852,10 @@ not this migration's concern.
 
 
 As-built note (T21-13, `[SPEC]`, [ADR-0011](../adr/0011-english-canon-for-durable-memory.md)):
-migration **15** inverts the table the next note describes, which is kept as history. English is
+migration **15** inverts the table the next note describes, which is kept as history. The block
+above shows v15 — brought to as-built at gate `G21`, which found it still carrying v14's columns
+while every other migration in this section (8, 14) had updated it; the v14 shape is preserved in
+the T21-01 note below, which is where the history belongs. English is
 the canon (08 §3), so `memory_entry.text` holds the English text and this table holds the author's
 own words: `normalized_text` → `source_text`, `source_text_sha256` → `canon_text_sha256` (the hash
 of `memory_entry.text` as the row last saw it), `ready`/`skipped`/`failed` →
