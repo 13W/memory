@@ -209,6 +209,7 @@ async fn serve() -> ServeOutcome {
         query_embedder: None,
         memory_query_embedder: None,
         recall_token_budget: config.memory.recall_token_budget,
+        router_conflict_token_budget: config.memory.router_conflict_token_budget,
         consolidation_batch_size: config.memory.consolidation_batch_size,
         consolidation_queue_threshold: config.memory.consolidation_queue_threshold,
         consolidation_idle_checkpoint_hours: config.memory.consolidation_idle_checkpoint_hours,

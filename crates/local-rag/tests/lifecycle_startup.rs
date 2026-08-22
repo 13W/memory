@@ -66,6 +66,8 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         query_embedder: None,
         memory_query_embedder: None,
         recall_token_budget: 1500,
+        router_conflict_token_budget: local_rag_core::config::MemoryConfig::default()
+            .router_conflict_token_budget,
         consolidation_batch_size: 20,
         consolidation_queue_threshold: 50,
         consolidation_idle_checkpoint_hours: 24,

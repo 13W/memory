@@ -225,6 +225,19 @@ That is the mechanism behind D-078's 136 copies of one sentence. Measured on the
 day D-080 was written: 56 active entries in one repository scope plus 12 global = 68 against a cap
 of 50, so the 18 newest were being discarded on every consolidation.
 
+As-built note (`D-095`, `[SPEC]`): the cap `D-080` kept is a count, and step 3's "bounded" is about
+size. The two are not the same bound, and on a real store the difference is the whole product: 50
+entries averaging 2501 characters are ≈31 892 tokens against a 32 768-token context, so the
+conflict set alone consumed 97 % of the window it exists to be compared against, and every
+consolidation for that session failed with a deterministic overflow — permanently, since the
+failure reproduces exactly on retry. Three sessions were stuck, backlog 1829 and rising, throughput
+zero. Stated plainly, the defect was that **the more the product remembered, the less it could
+consolidate**. The set is therefore cut by a token budget
+(`config.memory.router_conflict_token_budget`, accounted with recall's own `estimate_tokens`) taken
+as a **prefix** of `D-080`'s order, so the entries most worth showing survive and the rest are
+dropped rather than the prompt failing whole. An entry larger than the entire budget is left out
+completely: the router can route with no conflict set, but not with a prompt that does not fit.
+
 The cap stays; **which** entries survive it is now a rule rather than a byproduct of the sort:
 lexical matches against the window's own excerpt text first (best match first), then the remaining
 entries newest-first to fill the budget — and above the cap they are presented in that same order.

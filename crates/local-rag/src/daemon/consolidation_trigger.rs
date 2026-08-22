@@ -73,6 +73,7 @@
 //! observation is at least `idle_checkpoint_hours` old as an implicit
 //! `Stop` — consolidated as-is, not silently dropped.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -344,6 +345,9 @@ pub async fn run_consolidation_trigger<G, Fut>(
     G: Fn(ConsolidationWindow) -> Fut,
     Fut: Future<Output = Result<Vec<GeneratedOp>, ClassifiedFailure>>,
 {
+    // D-095: which floor-case runs this worker has already reported, so a
+    // terminal state is announced on transition rather than on every tick.
+    let mut reported_unconsolidatable: HashSet<String> = HashSet::new();
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -352,7 +356,7 @@ pub async fn run_consolidation_trigger<G, Fut>(
             _ = ticker.tick() => {
                 let now_ms = system_now_ms();
                 let results = consolidation_trigger_tick(&db, &layout, &*uuids, &jobs, &params, now_ms, build_id, &generate).await;
-                log_session_tick_outcomes(&results);
+                log_session_tick_outcomes(&results, &mut reported_unconsolidatable);
                 maybe_truncate_wal(&db, &jobs, params.wal_truncate_threshold_bytes).await;
             }
         }
@@ -422,7 +426,10 @@ async fn maybe_truncate_wal(db: &StateDb, jobs: &JobRegistry, threshold_bytes: u
 /// directly. Routine outcomes stay silent — this runs on every tick, so
 /// logging `NoCheckpoint`/`SkippedExisting`/`NothingPending`/a successful
 /// `Applied` would be pure noise.
-fn log_session_tick_outcomes(results: &[(String, SessionTickOutcome)]) {
+fn log_session_tick_outcomes(
+    results: &[(String, SessionTickOutcome)],
+    reported_unconsolidatable: &mut HashSet<String>,
+) {
     for (session_id, outcome) in results {
         match outcome {
             SessionTickOutcome::Ran(RunOutcome::Failed(reason)) => {
@@ -445,11 +452,20 @@ fn log_session_tick_outcomes(results: &[(String, SessionTickOutcome)]) {
                 to_received_seq,
                 dead_letter_run_id,
             } => {
-                tracing::error!(
-                    "local-rag: consolidation unconsolidatable for session {session_id}, \
-                     received_seq {from_received_seq}..={to_received_seq} (D-058 floor case, \
-                     needs manual review — dead-letter run {dead_letter_run_id})"
-                );
+                // D-095: once per blocking run, not once per tick. The
+                // state is terminal until a human acts, so re-reporting it
+                // every 15 s says nothing new and says it forever: measured
+                // on a live store, this one line was 10 707 of 11 134 lines
+                // in a day's log — 96.2 % — drowning the surface D-088 was
+                // diagnosed from. Durable visibility does not depend on this
+                // line: `stats` and `doctor` both carry the state (D-071).
+                if reported_unconsolidatable.insert(dead_letter_run_id.clone()) {
+                    tracing::error!(
+                        "local-rag: consolidation unconsolidatable for session {session_id}, \
+                         received_seq {from_received_seq}..={to_received_seq} (D-058 floor case, \
+                         needs manual review — dead-letter run {dead_letter_run_id})"
+                    );
+                }
             }
             SessionTickOutcome::NoCheckpoint
             | SessionTickOutcome::SkippedExisting
@@ -1419,7 +1435,7 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            log_session_tick_outcomes(&results);
+            log_session_tick_outcomes(&results, &mut HashSet::new());
         });
 
         let logged = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
@@ -1512,6 +1528,54 @@ mod tests {
         assert!(
             logged.contains("no generation provider configured"),
             "{logged}"
+        );
+    }
+
+    /// `D-095`: a terminal floor case is announced on transition, not on every
+    /// tick.
+    ///
+    /// The state is terminal until a human acts, so repeating it says nothing
+    /// new and says it forever — measured on a live store, this one line was
+    /// 10 707 of 11 134 lines in a day's log (96.2 %), drowning the surface
+    /// `D-088` was diagnosed from. Nothing is lost by reporting once: `stats`
+    /// and `doctor` both carry the state durably (`D-071`).
+    #[tokio::test]
+    async fn an_unconsolidatable_session_is_reported_once_not_every_tick() {
+        let results = vec![(
+            "sess-floor".to_string(),
+            SessionTickOutcome::Unconsolidatable {
+                from_received_seq: 7,
+                to_received_seq: 7,
+                dead_letter_run_id: "run-floor".to_string(),
+            },
+        )];
+
+        let buf = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .with_ansi(false)
+            .finish();
+
+        let mut reported = HashSet::new();
+        tracing::subscriber::with_default(subscriber, || {
+            // Three ticks in a row, exactly as the worker would produce them.
+            log_session_tick_outcomes(&results, &mut reported);
+            log_session_tick_outcomes(&results, &mut reported);
+            log_session_tick_outcomes(&results, &mut reported);
+        });
+
+        let logged = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        let lines = logged.matches("consolidation unconsolidatable").count();
+        assert_eq!(
+            lines, 1,
+            "a terminal state belongs in the log once per blocking run, not once per tick:\n{logged}"
+        );
+        assert!(
+            logged.contains("run-floor"),
+            "the one line must still name the run that needs review:\n{logged}"
         );
     }
 }

@@ -89,7 +89,7 @@ pub fn estimate_tokens(text: &str) -> u32 {
 /// A small, fixed per-entry allowance for the numbered-line structure itself
 /// (`"N. [kind|state|c=X.XX|len=NNNN] "` plus the trailing newline) — the
 /// budget bounds the *whole block*, not just the concatenated entry texts.
-const ENTRY_OVERHEAD_TOKENS: u32 = 8;
+pub(crate) const ENTRY_OVERHEAD_TOKENS: u32 = 8;
 
 /// One recall request: the caller's already-probed root (mirrors
 /// `local_rag_search::pipeline`'s own `RequestRoot` input — worktree

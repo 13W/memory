@@ -262,6 +262,23 @@ pub struct SpoolConfig {
 pub struct MemoryConfig {
     /// Recall's `additionalContext` token budget (spec 08 §6, 11 §5).
     pub recall_token_budget: u32,
+    /// How many tokens of *existing memory entries* the consolidation router
+    /// may put in front of the model (`D-095`).
+    ///
+    /// `MAX_PROMPT_CANDIDATES` bounds how many entries are ranked; this bounds
+    /// how large they are allowed to be, which is the half that was missing.
+    /// Measured on a real store: 50 entries averaging 2501 characters are
+    /// ≈31 892 tokens against a 32 768-token context, so the set alone left no
+    /// room for the window it was supposed to be compared against, and every
+    /// consolidation for that session failed with a deterministic overflow.
+    ///
+    /// The default is arithmetic, not taste: 32 768 context − 1024 reserved for
+    /// the answer (`MAX_GENERATION_TOKENS`) − roughly 1500 for the system
+    /// prompt and JSON schema leaves ≈30 000 for the user prompt, and a window
+    /// is `consolidation_batch_size` (20) short excerpts. 12 000 for the
+    /// entries keeps the set generous while leaving the window more room than
+    /// it can use.
+    pub router_conflict_token_budget: u32,
     /// The continuous consolidation-trigger worker's window size
     /// (`open_next_run`'s `batch`, D-024, spec 08 §4) — no default is
     /// specified anywhere normative, so this is a `[SPEC]`-chosen value, not
@@ -328,6 +345,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         MemoryConfig {
             recall_token_budget: 1500,
+            router_conflict_token_budget: 12_000,
             consolidation_batch_size: 20,
             consolidation_queue_threshold: 50,
             consolidation_idle_checkpoint_hours: 24,
@@ -619,6 +637,7 @@ deny_tools = []
 
 [memory]
 recall_token_budget = 1500
+router_conflict_token_budget = 12000
 consolidation_batch_size = 20
 consolidation_queue_threshold = 50
 consolidation_idle_checkpoint_hours = 24
@@ -802,6 +821,24 @@ normalization_batch = 4
         // Every other section still defaults.
         assert_eq!(cfg.daemon, DaemonConfig::default());
         assert_eq!(cfg.spool, SpoolConfig::default());
+    }
+
+    /// `D-095`: the router's conflict-set budget is a real, overridable knob.
+    ///
+    /// The default is arithmetic, not taste — 32 768 context, 1024 reserved for
+    /// the answer, ~1500 for system prompt and schema — and it exists because a
+    /// count-only cap let 50 entries averaging 2501 characters fill 97 % of the
+    /// model's context on a real store, which stopped consolidation entirely.
+    #[test]
+    fn memory_config_defaults_and_overrides_the_router_conflict_budget() {
+        assert_eq!(MemoryConfig::default().router_conflict_token_budget, 12_000);
+        let cfg = Config::parse_toml("[memory]\nrouter_conflict_token_budget = 4000\n").unwrap();
+        assert_eq!(cfg.memory.router_conflict_token_budget, 4000);
+        // The neighbouring budget is untouched by the new one.
+        assert_eq!(
+            cfg.memory.recall_token_budget,
+            MemoryConfig::default().recall_token_budget
+        );
     }
 
     // ---- `[memory]` consolidation-trigger fields (D-024) --------------------
