@@ -371,3 +371,54 @@ async fn a_cancelled_caller_does_not_cancel_its_queued_transaction() {
          must not lose a committed write"
     );
 }
+
+/// `D-092`: the writer's transaction owns the write lock from `BEGIN`, not from
+/// whichever statement first writes.
+///
+/// The distinction is the whole defect. Under the `DEFERRED` default a job that
+/// reads first — the normal shape; `apply_create` opens with
+/// `find_by_idempotency_key` — is holding a read lock when it finally asks to
+/// write, and SQLite answers that promotion with a bare `SQLITE_BUSY` rather
+/// than calling the busy handler, because waiting there is how two connections
+/// deadlock. All 5000 ms of `busy_timeout` go unspent and a foreign writer (the
+/// TUI, the CLI) takes the write away from the daemon.
+///
+/// Deterministic by construction, not by load: the probe runs *inside* a
+/// transaction that has touched nothing at all, so under `DEFERRED` there is no
+/// lock yet and the foreign `BEGIN IMMEDIATE` sails through. `busy_timeout` on
+/// the probe is zero so it answers now instead of waiting out the real
+/// transaction.
+#[tokio::test]
+async fn the_writer_holds_the_write_lock_from_begin_not_from_its_first_write() {
+    use std::time::Duration;
+
+    use local_rag_store::rusqlite::{Connection, Error, ErrorCode};
+
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+    let path = layout.state_db();
+    let db = StateDb::open(path.clone()).expect("open state.sqlite");
+
+    let probe_path = path.clone();
+    let refused = db
+        .writer()
+        .transaction(move |_tx| {
+            let other = Connection::open(&probe_path)?;
+            other.busy_timeout(Duration::ZERO)?;
+            match other.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => Ok(None),
+                Err(Error::SqliteFailure(e, _)) => Ok(Some((e.code, e.extended_code))),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .expect("the probe itself must run");
+
+    assert_eq!(
+        refused,
+        Some((ErrorCode::DatabaseBusy, 5)),
+        "a foreign writer must find the lock already held (D-092); `None` means the writer began \
+         DEFERRED and left the door open until its first write"
+    );
+}

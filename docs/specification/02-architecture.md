@@ -907,6 +907,16 @@ Rules:
 - `busy_timeout` is a backstop, not the design: within the daemon all writes go through the
   queues; direct write connections outside the queues are forbidden.
 
+As-built note (`D-092`, `[SPEC]`): the backstop only *is* one because both queues open their
+transactions with `BEGIN IMMEDIATE` (`state/writer.rs`, `cache/writer.rs`). Under the `DEFERRED`
+default a job that reads before it writes — the ordinary shape; `apply_create` opens with
+`find_by_idempotency_key` — holds a read lock when it asks to promote, and SQLite deliberately
+declines to call the busy handler there, since waiting on a promotion is how two connections
+deadlock. The measured result was a bare `SQLITE_BUSY` (extended code 5, not 517
+`BUSY_SNAPSHOT`) returned to the caller in under 0.2 s with all 5000 ms unspent, so a foreign
+writer — the TUI, the CLI — could take a write away from the daemon. Taking the lock at `BEGIN`,
+before any read lock exists, is what makes the documented number mean what it says.
+
 As-built note (T09-01, `[SPEC]`): the hierarchy's typed primitive is `local_rag_store::lock`
 (`crates/store/src/lock/`). `LockLevel` has seven variants (`L0`…`L4b`); ordering always goes
 through `LockLevel::rank()`, never a derived `Ord` on the enum, because `L2Read`/`L2Write` and
