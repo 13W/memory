@@ -45,6 +45,7 @@ pub mod repo;
 pub mod service;
 pub mod stats;
 pub mod status;
+pub mod vacuum;
 pub mod watch;
 pub mod worktree;
 
@@ -121,6 +122,8 @@ pub enum Command {
     },
     /// Run retention/GC sweeps.
     Gc(gc::GcArgs),
+    /// Reclaim the free space GC left inside the database file.
+    Vacuum(vacuum::VacuumArgs),
     /// Report store-wide counts and queue occupancy.
     Stats(stats::StatsArgs),
     /// Read one observation/memory/generation row as JSON.

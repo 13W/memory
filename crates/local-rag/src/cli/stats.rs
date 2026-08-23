@@ -276,6 +276,22 @@ pub fn run(args: StatsArgs) -> ExitCode {
         Resolution::GlobalOnly | Resolution::Ambiguous { .. } => None,
     };
 
+    // X-012: three O(1) pragmas, never `dbstat` — that one walks the whole
+    // file, which on a large store is minutes.
+    let space_json = match local_rag_store::db_space(&conn) {
+        Ok(sp) => serde_json::json!({
+            "file_bytes": sp.file_bytes(),
+            "free_bytes": sp.free_bytes(),
+            "free_ratio": sp.free_ratio(),
+            "auto_vacuum": sp.auto_vacuum.as_str(),
+            "reclaim_advised": local_rag_store::should_reclaim(
+                &sp,
+                local_rag_store::RECLAIM_MIN_FILE_BYTES,
+                local_rag_store::RECLAIM_FREE_RATIO,
+            ),
+        }),
+        Err(_) => serde_json::Value::Null,
+    };
     let store_instance_uuid_value = match store_instance_uuid(&conn) {
         Ok(v) => v,
         Err(e) => return fail(BIN, &format!("could not read store instance id: {e}")),
@@ -350,6 +366,9 @@ pub fn run(args: StatsArgs) -> ExitCode {
             // the connection at most. Seconds here mean a caller is starving
             // every other process's writer for that long — the shape D-094 had,
             // which nothing reported at the time.
+            // X-012: how much of the file is dead space GC freed inside it but
+            // SQLite never returned. `local-rag vacuum` is what reclaims it.
+            "space": space_json,
             "write_queues": {
                 "state": {
                     "capacity": state.writer().queue_capacity(),
@@ -488,6 +507,25 @@ pub fn run(args: StatsArgs) -> ExitCode {
         "store_instance_uuid: {}",
         store_instance_uuid_value.as_deref().unwrap_or("(none)")
     );
+    // X-012: the same numbers `doctor` reports, so an operator reading either
+    // surface sees the same store.
+    if let Ok(sp) = local_rag_store::db_space(&conn) {
+        println!(
+            "space: {:.1} GiB on disk, {:.1} % of it free, auto_vacuum={}{}",
+            sp.file_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+            sp.free_ratio() * 100.0,
+            sp.auto_vacuum.as_str(),
+            if local_rag_store::should_reclaim(
+                &sp,
+                local_rag_store::RECLAIM_MIN_FILE_BYTES,
+                local_rag_store::RECLAIM_FREE_RATIO,
+            ) {
+                " — run `local-rag vacuum` with the daemon stopped to reclaim it"
+            } else {
+                ""
+            }
+        );
+    }
     println!(
         "write queues: state {}/{} available, cache {}/{} available",
         state.writer().available_slots(),

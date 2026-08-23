@@ -198,6 +198,64 @@ impl StateWriter {
         self.longest_hold_ms.load(Ordering::Relaxed)
     }
 
+    /// Rewrite the database, returning every free page to the filesystem and
+    /// converting the store to `auto_vacuum = INCREMENTAL` on the way
+    /// (`X-012`).
+    ///
+    /// Heavy and exclusive: SQLite copies the live data into a fresh file, so
+    /// this needs free disk for a second copy and, on a large store, many
+    /// minutes. That is precisely why no background worker calls it — only
+    /// `local-rag vacuum`, and only with no daemon holding the store.
+    ///
+    /// The pragma and the rewrite must share one connection: `auto_vacuum` can
+    /// only change *during* a `VACUUM`, so the conversion is a side effect of
+    /// this call and not a separate step a caller could forget.
+    pub async fn vacuum(&self) -> Result<(), WriteError> {
+        crate::lock::checked_scope_async(crate::lock::LockLevel::L4a, async move {
+            let (resp_tx, resp_rx) = oneshot::channel::<Result<(), WriteError>>();
+            let job: Job = Box::new(move |conn: &mut Connection| {
+                let outcome = conn
+                    .execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")
+                    .map_err(WriteError::Sqlite);
+                let _ = resp_tx.send(outcome);
+            });
+            self.sender
+                .send(job)
+                .await
+                .map_err(|_| WriteError::WriterGone)?;
+            resp_rx.await.unwrap_or(Err(WriteError::WriterGone))
+        })
+        .await
+    }
+
+    /// Return at most `pages` free pages to the filesystem on the writer
+    /// thread (`X-012`).
+    ///
+    /// Same shape and the same reason as [`checkpoint`](Self::checkpoint): the
+    /// pragma refuses to run inside a transaction, and the only writable
+    /// connection lives on this thread. Being one job on the same FIFO queue is
+    /// what makes it safe to call from an idle poll — it can never interleave
+    /// with a write, only follow one.
+    ///
+    /// Bounded by construction: `pages` is what caps a chunk, so this is a
+    /// short job and never the multi-minute freeze a full `VACUUM` would be.
+    pub async fn incremental_vacuum(&self, pages: u32) -> Result<u64, WriteError> {
+        crate::lock::checked_scope_async(crate::lock::LockLevel::L4a, async move {
+            let (resp_tx, resp_rx) = oneshot::channel::<Result<u64, WriteError>>();
+            let job: Job = Box::new(move |conn: &mut Connection| {
+                let outcome =
+                    crate::vacuum::incremental_vacuum(conn, pages).map_err(WriteError::Sqlite);
+                let _ = resp_tx.send(outcome);
+            });
+            self.sender
+                .send(job)
+                .await
+                .map_err(|_| WriteError::WriterGone)?;
+            resp_rx.await.unwrap_or(Err(WriteError::WriterGone))
+        })
+        .await
+    }
+
     /// Run a `PRAGMA wal_checkpoint` on the writer thread (spec 02 §4.3's
     /// shutdown-time "flush WAL checkpoint"; spec 03 §3's checkpoint policy).
     ///

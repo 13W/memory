@@ -722,9 +722,19 @@ local-rag memory list|approve|reject|edit|retract|confirm|refute|merge|rescope|e
 local-rag inspect <observation|memory|generation> <id>
 local-rag export [--scope …] | purge [--memory <id>|--session <id>|--all]
 local-rag gc [--dry-run]
+local-rag vacuum [--dry-run]  # X-012: reclaim the space gc freed inside the file
 local-rag doctor            # store lock, versions, heads, orphan artifacts
 local-rag stats
 ```
+
+As-built note (`X-012`, `[SPEC]`). `gc` and `vacuum` are different jobs and the split is
+deliberate: `gc` deletes rows, `vacuum` gives the resulting holes back to the filesystem, and
+SQLite never does the second on its own. `vacuum` refuses to run while a daemon holds the store —
+the rewrite needs exclusive access and, on a large store, many minutes — so the daemon's own
+contribution is the bounded `PRAGMA incremental_vacuum` chunk it takes while idle (spec 02 §4.3),
+which only becomes possible after this command has converted the store to
+`auto_vacuum = INCREMENTAL` (03 §2). `doctor` and `stats` report the ratio and name this command
+when it is worth running.
 
 As-built note (T11-06, `[SPEC]`). `init --download-models` exists as a **typed library API**
 (`local_rag_models::install_model`, 10 §5): pinned-digest atomic install, license notice written to

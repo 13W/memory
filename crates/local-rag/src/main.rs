@@ -71,6 +71,7 @@ fn main() -> ExitCode {
         cli::Command::Rebuild(args) => cli::rebuild::run(args),
         cli::Command::Memory { command } => cli::memory::run(command),
         cli::Command::Gc(args) => cli::gc::run(args),
+        cli::Command::Vacuum(args) => cli::vacuum::run(args),
         cli::Command::Stats(args) => cli::stats::run(args),
         cli::Command::Inspect(args) => cli::inspect::run(args),
         cli::Command::Export(args) => cli::export::run(args),

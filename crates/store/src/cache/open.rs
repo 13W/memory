@@ -277,6 +277,11 @@ pub(super) fn open_cache_read_only(path: &Path) -> Result<Connection, CacheOpenE
 /// database; internal integrity is via heads) and `synchronous=NORMAL` (a loss
 /// just rebuilds, so full durability is not the budget priority `[SPEC]`).
 fn apply_cache_pragmas(conn: &Connection) -> Result<(), CacheOpenError> {
+    // `auto_vacuum` before `journal_mode`, for the reason `state::open`'s twin
+    // spells out (`X-012`): set after WAL it is silently ignored. The cache is
+    // rebuildable, so it gets no bloat report of its own — but a cache born
+    // able to return its own pages costs nothing.
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
     // `journal_mode` returns the resulting mode, so set-and-verify via a query.
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {

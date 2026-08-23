@@ -700,6 +700,12 @@ impl DaemonHandle {
         })
     }
 
+    /// This daemon's `state.sqlite`, or `None` in
+    /// [`DaemonMode::MigrationOnly`] where there is no usable one (`X-012`).
+    pub fn state_db(&self) -> Option<&Arc<StateDb>> {
+        self.state_db.as_ref()
+    }
+
     /// The idle-shutdown gate's current inputs (spec 02 §4.3).
     pub fn idle_inputs(&self) -> IdleGateInputs {
         let pending_spool_bytes = match &self.state_db {
@@ -1110,6 +1116,14 @@ pub async fn wait_for_shutdown_trigger(
             _ = handle.shutdown_requested.notified() => return ShutdownReason::UpgradeRequested,
             _ = ticker.tick() => {
                 if handle.is_idle_eligible() {
+                    // X-012: idle time is the only time reclaiming free pages
+                    // costs nobody anything, so this is where it happens — one
+                    // bounded chunk per poll, never a full `VACUUM`. A daemon
+                    // that froze the store for twenty minutes while holding
+                    // `store.lock` would be a worse defect than the bloat.
+                    // Interruptible for free: the next arriving session flips
+                    // the gate and no further chunk is asked for.
+                    reclaim_one_chunk(handle).await;
                     let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);
                     if since.elapsed() >= idle_budget {
                         return ShutdownReason::Idle;
@@ -1119,6 +1133,29 @@ pub async fn wait_for_shutdown_trigger(
                 }
             }
         }
+    }
+}
+
+/// Give one bounded chunk of free pages back to the filesystem (`X-012`).
+///
+/// Deliberately quiet about every outcome that is not progress. On a store
+/// predating the `auto_vacuum = INCREMENTAL` conversion the pragma is a
+/// documented no-op, and on a store with nothing to reclaim it moves nothing —
+/// neither is a fault, and an idle daemon that logged either every poll would
+/// repeat the mistake `D-095` had to undo.
+#[cfg(unix)]
+async fn reclaim_one_chunk(handle: &DaemonHandle) {
+    let Some(db) = handle.state_db() else {
+        return; // MigrationOnly: no usable store to reclaim from.
+    };
+    match db
+        .writer()
+        .incremental_vacuum(local_rag_store::INCREMENTAL_VACUUM_PAGES)
+        .await
+    {
+        Ok(0) => {}
+        Ok(pages) => tracing::debug!(pages, "reclaimed free pages while idle"),
+        Err(e) => tracing::debug!(error = %e, "idle page reclamation did not run"),
     }
 }
 

@@ -1357,3 +1357,48 @@ fn the_generator_section_answers_even_on_an_uninitialized_store() {
     );
     assert_eq!(json["clean"], serde_json::json!(true));
 }
+
+// ---------------------------------------------------------------------------
+// Space section (X-012)
+// ---------------------------------------------------------------------------
+
+/// `X-012`: a small store reports its space and is **not** called bloated.
+///
+/// This is the floor under test, and the floor is what makes the signal worth
+/// reading: a freshly created store is mostly empty by construction, so a
+/// report that flagged it would train its reader to skip the line. The
+/// firing side is proved where it can be proved cheaply — the store crate's
+/// `should_reclaim` table, against the real numbers measured on the 57 GB
+/// store that motivated this section.
+#[test]
+fn space_is_reported_and_a_small_store_is_not_called_bloated() {
+    let (home, layout) = open_layout();
+    // The section reads a real database, so the store has to exist.
+    StateDb::open(layout.state_db()).expect("open state.sqlite");
+    // Exit code is deliberately not asserted: this fixture is unclean for an
+    // unrelated reason (its cache was never bound), and the claim under test is
+    // about the space section alone.
+    let output = run_cli(&home, &["doctor"]);
+    let text = stdout(&output);
+    assert!(text.contains("space:"), "{text}");
+    assert!(
+        !text.contains("local-rag vacuum"),
+        "a fresh store must not be advised to vacuum:\n{text}"
+    );
+}
+
+/// The JSON surface carries the same numbers, including the advice flag the
+/// human line derives its suffix from — one predicate, two renderings.
+#[test]
+fn space_appears_in_the_json_report() {
+    let (home, layout) = open_layout();
+    StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let output = run_cli(&home, &["doctor", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert!(value["space"]["file_bytes"].is_u64(), "{value}");
+    assert_eq!(value["space"]["reclaim_advised"], serde_json::json!(false));
+    assert_eq!(
+        value["space"]["auto_vacuum"],
+        serde_json::json!("incremental")
+    );
+}

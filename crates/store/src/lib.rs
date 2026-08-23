@@ -381,6 +381,7 @@ pub mod retention;
 pub mod spool;
 mod state;
 pub mod subjects;
+mod vacuum;
 
 pub use cache::{
     BM25_DEFAULT_WEIGHTS, BatchingLastUsed, BatchingLastUsedEmbeddings, CACHE_SCHEMA_VERSION,
@@ -541,4 +542,8 @@ pub use state::{
 pub use subjects::{
     SubjectSet, expected_subject_keys, memory_entry_subject_keys, memory_subject_hash,
     pinned_generations, protected_model_space_ids, protected_subject_keys,
+};
+pub use vacuum::{
+    AutoVacuum, DbSpace, INCREMENTAL_VACUUM_PAGES, RECLAIM_FREE_RATIO, RECLAIM_MIN_FILE_BYTES,
+    db_space, incremental_vacuum, should_reclaim,
 };
