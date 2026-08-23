@@ -113,6 +113,15 @@ pub(super) fn open_state_read_only(path: &Path) -> Result<Connection, OpenError>
 
 /// Apply the normative `state.sqlite` pragmas (spec 03 §2) to `conn`.
 fn apply_state_pragmas(conn: &Connection) -> Result<(), OpenError> {
+    // `auto_vacuum` FIRST, and the order is measured rather than stylistic
+    // (`X-012`). SQLite only adopts it while the database is still empty, and
+    // `journal_mode = WAL` already writes the header: reproduced against this
+    // crate's pinned SQLite, setting WAL first and this second leaves
+    // `PRAGMA auto_vacuum` reading `0` — silently, with no error to notice. On
+    // a store that already has tables the pragma is a documented no-op, which
+    // is why it is safe on every open and why converting an existing store
+    // needs the full `VACUUM` that `local-rag vacuum` runs.
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
     // `journal_mode` returns the resulting mode, so set-and-verify via a query
     // rather than `pragma_update` (which is for non-returning pragmas).
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;

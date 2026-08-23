@@ -473,3 +473,87 @@ async fn a_read_transaction_leaves_the_write_lock_free_for_a_foreign_writer() {
          IMMEDIATE and locked a foreign writer out for its whole duration"
     );
 }
+
+/// `X-012`: a new store is born able to return its own pages, and the pragma
+/// order that makes that true is the thing under test.
+///
+/// SQLite adopts `auto_vacuum` only while the database is still empty, and
+/// `journal_mode = WAL` already writes the header — so setting the two in the
+/// wrong order leaves `PRAGMA auto_vacuum` reading `0` with no error anywhere.
+/// That failure is invisible until, months later, a swept store is 66 % holes
+/// and nothing short of a full rewrite can shrink it. Measured, not assumed:
+/// the reversed order was reproduced against this crate's pinned SQLite before
+/// the code was written.
+#[tokio::test]
+async fn a_new_state_store_is_created_with_incremental_auto_vacuum() {
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+    let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+
+    let space = db
+        .writer()
+        .read_transaction(|tx| local_rag_store::db_space(tx))
+        .await
+        .expect("read db space");
+
+    assert_eq!(
+        space.auto_vacuum,
+        local_rag_store::AutoVacuum::Incremental,
+        "a store created after X-012 must be able to reclaim without a full VACUUM"
+    );
+}
+
+/// `X-012`: the writer's bounded chunk gives pages back, and is a quiet no-op
+/// on a store that predates the conversion.
+///
+/// Both halves matter. The first is the whole point of the idle path; the
+/// second is what lets that path run unconditionally against any store without
+/// special-casing, which is what keeps it from being a source of log noise or
+/// spurious errors on every poll.
+#[tokio::test]
+async fn a_bounded_chunk_reclaims_pages_and_never_faults_on_an_unconverted_store() {
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+    let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+
+    db.writer()
+        .transaction(|tx| {
+            tx.execute_batch("CREATE TABLE x012 (blob BLOB);")?;
+            for _ in 0..600 {
+                tx.execute("INSERT INTO x012 (blob) VALUES (randomblob(2000))", [])?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed");
+    db.writer()
+        .transaction(|tx| tx.execute_batch("DELETE FROM x012;"))
+        .await
+        .expect("delete");
+
+    let before = db
+        .writer()
+        .read_transaction(|tx| local_rag_store::db_space(tx))
+        .await
+        .expect("space before");
+    assert!(before.freelist_count > 0, "the delete must leave holes");
+
+    let freed = db
+        .writer()
+        .incremental_vacuum(64)
+        .await
+        .expect("chunk runs");
+    assert!(freed > 0, "a converted store must return pages: {before:?}");
+
+    let after = db
+        .writer()
+        .read_transaction(|tx| local_rag_store::db_space(tx))
+        .await
+        .expect("space after");
+    assert!(
+        after.page_count < before.page_count,
+        "the file must actually shrink: {before:?} -> {after:?}"
+    );
+}

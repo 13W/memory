@@ -637,6 +637,18 @@ struct WriteQueueWire {
     longest_hold_ms: u64,
 }
 
+/// `X-012`: how much of `state.sqlite` is dead space GC freed inside the file
+/// but SQLite never returned to the filesystem. `reclaim_advised` is the same
+/// predicate `doctor` uses, so the two surfaces cannot disagree.
+#[derive(Debug, Serialize)]
+struct SpaceWire {
+    file_bytes: u64,
+    free_bytes: u64,
+    free_ratio: f64,
+    auto_vacuum: String,
+    reclaim_advised: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct WriteQueuesWire {
     state: WriteQueueWire,
@@ -686,6 +698,7 @@ struct StatsResult {
     worktree: Option<WorktreeStatsWire>,
     store_instance_uuid: Option<String>,
     write_queues: WriteQueuesWire,
+    space: Option<SpaceWire>,
     tool_calls: ToolCallCountsWire,
 }
 
@@ -867,6 +880,19 @@ pub async fn stats(
         scope: scope_label,
         worktree,
         store_instance_uuid: store_instance_uuid_value,
+        space: local_rag_store::db_space(&state_read)
+            .ok()
+            .map(|sp| SpaceWire {
+                file_bytes: sp.file_bytes(),
+                free_bytes: sp.free_bytes(),
+                free_ratio: sp.free_ratio(),
+                auto_vacuum: sp.auto_vacuum.as_str().to_string(),
+                reclaim_advised: local_rag_store::should_reclaim(
+                    &sp,
+                    local_rag_store::RECLAIM_MIN_FILE_BYTES,
+                    local_rag_store::RECLAIM_FREE_RATIO,
+                ),
+            }),
         write_queues: WriteQueuesWire {
             state: WriteQueueWire {
                 capacity: ctx.state.writer().queue_capacity(),

@@ -85,6 +85,17 @@ pub struct DoctorReport {
     /// T21-08: whether the local generative model both consolidation and
     /// normalization need is installed at all — a **file** check, never a load.
     pub generator: GeneratorFinding,
+    /// `X-012`: how much of the database file is dead space GC freed inside it
+    /// but SQLite never returned to the filesystem.
+    pub space: SpaceFinding,
+}
+
+/// `X-012`: the free-space section.
+pub enum SpaceFinding {
+    /// No readable store yet — the same bootstrap silence every other section
+    /// keeps in that case.
+    Skipped,
+    Checked(local_rag_store::DbSpace),
 }
 
 /// T21-08: the English-normalization section (ADR-0010).
@@ -303,6 +314,18 @@ impl DoctorReport {
             &self.normalization,
             NormalizationFinding::Checked(health) if health.backlog.dead_letter == 0
         );
+        // X-012: bloat is a fault in the same sense a stuck generation is —
+        // real disk the operator is paying for and nothing else will reclaim.
+        // The floor inside `should_reclaim` is what keeps this from firing on
+        // every fresh store, which is half empty by construction.
+        let space_ok = match &self.space {
+            SpaceFinding::Skipped => true,
+            SpaceFinding::Checked(space) => !local_rag_store::should_reclaim(
+                space,
+                local_rag_store::RECLAIM_MIN_FILE_BYTES,
+                local_rag_store::RECLAIM_FREE_RATIO,
+            ),
+        };
         lock_ok
             && permissions_ok
             && versions_ok
@@ -313,6 +336,7 @@ impl DoctorReport {
             && indexing_ok
             && consolidation_ok
             && normalization_ok
+            && space_ok
     }
 }
 
@@ -406,6 +430,7 @@ fn build_report(
             },
             normalization: NormalizationFinding::Skipped { reason },
             generator,
+            space: SpaceFinding::Skipped,
         };
     }
 
@@ -435,6 +460,7 @@ fn build_report(
                 },
                 normalization: NormalizationFinding::Skipped { reason },
                 generator,
+                space: SpaceFinding::Skipped,
             };
         }
     };
@@ -464,6 +490,7 @@ fn build_report(
                 },
                 normalization: NormalizationFinding::Skipped { reason },
                 generator,
+                space: SpaceFinding::Skipped,
             };
         }
     };
@@ -480,6 +507,10 @@ fn build_report(
     let indexing = build_indexing(&read, worktree_filter);
     let consolidation = build_consolidation(&read);
     let normalization = build_normalization(&read, normalize_to_english);
+    let space = match local_rag_store::db_space(&read) {
+        Ok(v) => SpaceFinding::Checked(v),
+        Err(_) => SpaceFinding::Skipped,
+    };
 
     DoctorReport {
         lock,
@@ -493,6 +524,7 @@ fn build_report(
         consolidation,
         normalization,
         generator,
+        space,
     }
 }
 
@@ -985,6 +1017,20 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         "consolidation": consolidation,
         "normalization": normalization,
         "generator": generator,
+        "space": match &report.space {
+            SpaceFinding::Skipped => serde_json::Value::Null,
+            SpaceFinding::Checked(sp) => serde_json::json!({
+                "file_bytes": sp.file_bytes(),
+                "free_bytes": sp.free_bytes(),
+                "free_ratio": sp.free_ratio(),
+                "auto_vacuum": sp.auto_vacuum.as_str(),
+                "reclaim_advised": local_rag_store::should_reclaim(
+                    sp,
+                    local_rag_store::RECLAIM_MIN_FILE_BYTES,
+                    local_rag_store::RECLAIM_FREE_RATIO,
+                ),
+            }),
+        },
     })
 }
 
@@ -1117,6 +1163,7 @@ fn print_human(report: &DoctorReport) {
     print_consolidation(&report.consolidation);
     print_normalization(&report.normalization);
     print_generator(&report.generator);
+    print_space(&report.space);
 }
 
 /// T21-08's `normalization:` section — how much of durable memory speaks
@@ -1190,6 +1237,34 @@ fn print_generator(finding: &GeneratorFinding) {
             finding.model_id, finding.expected_path,
         );
     }
+}
+
+/// `X-012`'s `space:` section — how much of the file is dead weight.
+///
+/// Loud only when it is worth an operator's time: the floor inside
+/// `should_reclaim` is what keeps a half-empty fresh store from producing a
+/// line nobody should act on. When it does fire it names the command, because
+/// a diagnosis whose remedy the reader has to go look up is half a diagnosis.
+fn print_space(finding: &SpaceFinding) {
+    let SpaceFinding::Checked(space) = finding else {
+        return;
+    };
+    let advised = local_rag_store::should_reclaim(
+        space,
+        local_rag_store::RECLAIM_MIN_FILE_BYTES,
+        local_rag_store::RECLAIM_FREE_RATIO,
+    );
+    println!(
+        "space: {:.1} GiB on disk, {:.1} % of it free, auto_vacuum={}{}",
+        space.file_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+        space.free_ratio() * 100.0,
+        space.auto_vacuum.as_str(),
+        if advised {
+            " — run `local-rag vacuum` with the daemon stopped to reclaim it"
+        } else {
+            ""
+        }
+    );
 }
 
 /// D-071's `consolidation:` section — the memory pillar's own "is anything

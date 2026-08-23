@@ -104,11 +104,22 @@ permitted. The cache is an independently validated materialized view with its ow
 ## 2. `state.sqlite` — source of truth
 
 ```sql
+PRAGMA auto_vacuum=INCREMENTAL;   -- X-012; MUST precede journal_mode, see the note below
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 PRAGMA synchronous=FULL;          -- memory durability is the budget priority [SPEC]
 PRAGMA busy_timeout=5000;
 ```
+
+As-built note (`X-012`, `[SPEC]`): `auto_vacuum` is listed **first**, and the order is normative
+rather than cosmetic. SQLite adopts the setting only while the database still has no tables, and
+`journal_mode = WAL` already writes the header — reproduced against the pinned SQLite, setting WAL
+first leaves `PRAGMA auto_vacuum` reading `0` silently, with no error anywhere to notice. Without
+`INCREMENTAL` a store can only return free pages through a full `VACUUM`, which is exclusive and
+rewrites the whole file: measured on a real store, 57 GB on disk over ~19.5 GB of live data, 66 % of
+it holes left by swept generations. On a store that already has tables the pragma is a documented
+no-op, so it is safe on every open, and an existing store gains the setting during the one rewrite
+`local-rag vacuum` performs.
 
 As-built note (`D-092`, `[SPEC]`): `busy_timeout` binds only if the transaction asks for its write
 lock at `BEGIN`. The single writer queue therefore uses `BEGIN IMMEDIATE`, not SQLite's `DEFERRED`
