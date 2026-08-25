@@ -1425,8 +1425,6 @@ mod tests {
     async fn a_task_that_exits_within_the_budget_reports_a_complete_drain() {
         use std::collections::HashMap;
 
-        use std::time::Duration;
-
         use crate::daemon::indexing::supervisor::stop_all;
         use crate::daemon::shutdown::WorkersDrained;
 
