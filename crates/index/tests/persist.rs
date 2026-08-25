@@ -9,8 +9,8 @@
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
-    LanguageId, LanguageParser, ParseOutput, ParsedUnitDraft, PersistOutcome, TypeScriptParser,
-    persist_parse_output,
+    LanguageId, LanguageParser, ParseOutput, ParsedUnitDraft, PersistOutcome, SourceDialect,
+    TypeScriptParser, persist_parse_output,
 };
 use local_rag_store::rusqlite::Connection;
 use local_rag_store::{StateDb, UnitKind, create_or_reuse_file_revision, prepare_source};
@@ -60,7 +60,15 @@ async fn persist(
         .transaction(move |tx| {
             let rev = create_or_reuse_file_revision(tx, &prepared, &fp, &rid, NOW)?;
             let rev_id = rev.id().to_string();
-            persist_parse_output(tx, &rev_id, LanguageId::TypeScript, &src, &out, &idv, NOW)
+            persist_parse_output(
+                tx,
+                &rev_id,
+                SourceDialect::Language(LanguageId::TypeScript),
+                &src,
+                &out,
+                &idv,
+                NOW,
+            )
         })
         .await
         .expect("persist parse output");
@@ -270,7 +278,7 @@ async fn rollback_leaves_no_partial_graph() {
             persist_parse_output(
                 tx,
                 &rid2,
-                LanguageId::TypeScript,
+                SourceDialect::Language(LanguageId::TypeScript),
                 NESTED.as_bytes(),
                 &out2,
                 &idv,

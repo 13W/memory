@@ -72,9 +72,20 @@ Scope boundary. This set names the languages that get **tree-sitter symbol
 parsers**. Structured non-code text (YAML, JSON) and plain text are handled by the
 language-agnostic unit kinds `config_section | text_section | fallback_chunk`
 ([spec 06 §2.1](../specification/06-reconcile-and-fts.md)); they are **not** part
-of the O4 language set and are specified later (T04-06 / groups 05 and 08). The v1
-parser's YAML/JSON handling (referenced in corpus queries `sc-22`/`sc-23`) belongs
-to that later, universal path — not to this decision.
+of the O4 language set. The v1 parser's YAML/JSON handling (referenced in corpus
+queries `sc-22`/`sc-23`) belongs to that universal path — not to this decision.
+
+> **Amended 2026-08-25 by [ADR-0012](0012-universal-file-indexing-path.md)
+> (D-098).** The sentence above originally said that path was "specified later
+> (T04-06 / groups 05 and 08)". Every one of those addresses was wrong: T04-06 is
+> deterministic parsed-unit persistence, and groups 05 and 08 both closed `PASS`
+> having deferred the path by design. The pointer dangled, so a `[FIXED]`
+> requirement of spec 06 §2.1 had no owner in any card until D-098 — and while it
+> had none, a file with no v0 language was written **nowhere**, which cost 3 455
+> of one real repository's files and all 119 `.md` files of this one. ADR-0012
+> owns the universal path now. This decision's language *set* is unchanged by it:
+> `UniversalKind` is a sibling of `LanguageId`, deliberately not three more
+> variants of it, precisely so the set fixed here stays closed.
 
 Known, accepted limitation. There is **no benchmark corpus for JavaScript or
 Rust** in v0, so retrieval quality on those languages is not measured; the

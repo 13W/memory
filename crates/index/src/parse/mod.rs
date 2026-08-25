@@ -33,16 +33,20 @@ pub mod output;
 pub mod parser;
 pub mod persist;
 pub mod signature;
+pub mod universal;
 
 pub use adapter::javascript::JavaScriptParser;
 pub use adapter::rust::RustParser;
 pub use adapter::typescript::TypeScriptParser;
 pub use fingerprint::{
     BOUNDARY_NORM_VERSION, CHUNK_POLICY_VERSION, FingerprintComponents, LanguageDescriptor,
-    canonical_kv, descriptor, parser_fingerprint,
+    UNIVERSAL_POLICY_VERSION, canonical_kv, descriptor, dialect_fingerprint, parser_fingerprint,
 };
-pub use language::{LanguageId, select_language};
+pub use language::{
+    LanguageId, SourceDialect, UniversalKind, select_dialect, select_language, universal_kind,
+};
 pub use locator::{LocatorParseError, SyntaxAnchor, SyntaxLocator, SyntaxLocatorDraft};
 pub use output::{ByteSpan, ParseOutput, ParsedUnitDraft, ReferenceKind, UnresolvedRef};
 pub use parser::{LanguageParser, parser_for};
 pub use persist::{PersistOutcome, persist_parse_output};
+pub use universal::{MAX_SECTION_BYTES, chunk as chunk_universal};

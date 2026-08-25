@@ -28,7 +28,7 @@
 //! `version_constants_and_descriptors_are_pinned` are the tripwire. JavaScript
 //! and Rust grammars are not linked until T04-04/T04-05.
 
-use crate::parse::language::LanguageId;
+use crate::parse::language::{LanguageId, SourceDialect};
 
 /// The chunking-policy version — how oversized/opaque content is split into
 /// `fallback_chunk` units. The `chunk=` fingerprint field.
@@ -148,16 +148,50 @@ impl FingerprintComponents<'_> {
 /// The canonical `parser_fingerprint` for a language (spec 03 §2.3.1), assembled
 /// from the shared version constants and the language [`descriptor`].
 pub fn parser_fingerprint(language: LanguageId) -> String {
-    let d = descriptor(language);
-    FingerprintComponents {
-        chunk_policy_version: CHUNK_POLICY_VERSION,
-        grammar_name: d.grammar_name,
-        grammar_version: d.grammar_version,
-        language_id: language.as_str(),
-        boundary_norm_version: BOUNDARY_NORM_VERSION,
-        query_version: d.query_version,
+    dialect_fingerprint(SourceDialect::Language(language))
+}
+
+/// The universal chunker's boundary-version counter — how the language-agnostic
+/// path splits a file into sections (D-098). The `grammar=universal@<ver>` field.
+///
+/// Named `grammar` because it occupies the grammar slot of the `[SPEC]` format,
+/// which this task does not change; semantically it versions a **chunking policy**,
+/// not a parser. Bumping it moves unit boundaries ⇒ new
+/// `(content_hash, parser_fingerprint)` keys ⇒ a rebuild of every universally
+/// indexed file, on exactly the same terms as a grammar bump.
+pub const UNIVERSAL_POLICY_VERSION: u32 = 1;
+
+/// The `parser_fingerprint` for any dialect — a v0 language or a universal
+/// chunking policy (D-098).
+///
+/// The format is unchanged (spec 03 §2.3.1 `[SPEC]`): the universal side fills the
+/// same five keys, with `grammar=universal@1` and `queries=0` — zero because the
+/// universal path runs no tree-sitter query set at all, and saying so is more
+/// honest than borrowing `1` from a query file that does not exist.
+pub fn dialect_fingerprint(dialect: SourceDialect) -> String {
+    match dialect {
+        SourceDialect::Language(language) => {
+            let d = descriptor(language);
+            FingerprintComponents {
+                chunk_policy_version: CHUNK_POLICY_VERSION,
+                grammar_name: d.grammar_name,
+                grammar_version: d.grammar_version,
+                language_id: language.as_str(),
+                boundary_norm_version: BOUNDARY_NORM_VERSION,
+                query_version: d.query_version,
+            }
+            .to_canonical_string()
+        }
+        SourceDialect::Universal(kind) => FingerprintComponents {
+            chunk_policy_version: CHUNK_POLICY_VERSION,
+            grammar_name: "universal",
+            grammar_version: UNIVERSAL_POLICY_VERSION,
+            language_id: kind.as_str(),
+            boundary_norm_version: BOUNDARY_NORM_VERSION,
+            query_version: 0,
+        }
+        .to_canonical_string(),
     }
-    .to_canonical_string()
 }
 
 #[cfg(test)]
@@ -302,6 +336,52 @@ mod tests {
             assert_eq!(d.grammar_name, name);
             assert_eq!(d.grammar_version, 1);
             assert_eq!(d.query_version, 1);
+        }
+    }
+
+    #[test]
+    fn universal_fingerprints_are_exact_goldens_and_distinct() {
+        use crate::parse::language::UniversalKind;
+        // The same five keys, ASCII-sorted, no trailing separator — the format is
+        // untouched by D-098; only the values are new.
+        assert_eq!(
+            dialect_fingerprint(SourceDialect::Universal(UniversalKind::Config)),
+            "chunk=1;grammar=universal@1;lang=config;norm=1;queries=0"
+        );
+        assert_eq!(
+            dialect_fingerprint(SourceDialect::Universal(UniversalKind::Text)),
+            "chunk=1;grammar=universal@1;lang=text;norm=1;queries=0"
+        );
+        assert_eq!(
+            dialect_fingerprint(SourceDialect::Universal(UniversalKind::Fallback)),
+            "chunk=1;grammar=universal@1;lang=fallback;norm=1;queries=0"
+        );
+
+        // Every dialect, language and universal alike, has its own fingerprint —
+        // the property structural sharing depends on: identical bytes indexed
+        // under two policies must be two revisions, not one.
+        let mut all: Vec<String> = LanguageId::ALL
+            .iter()
+            .map(|&l| dialect_fingerprint(SourceDialect::Language(l)))
+            .chain(
+                UniversalKind::ALL
+                    .iter()
+                    .map(|&u| dialect_fingerprint(SourceDialect::Universal(u))),
+            )
+            .collect();
+        let total = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), total, "two dialects share a fingerprint");
+    }
+
+    #[test]
+    fn the_language_wrapper_agrees_with_the_dialect_builder() {
+        for l in LanguageId::ALL {
+            assert_eq!(
+                parser_fingerprint(l),
+                dialect_fingerprint(SourceDialect::Language(l)),
+            );
         }
     }
 

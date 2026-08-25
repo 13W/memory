@@ -20,7 +20,7 @@
 //! at persistence (T04-06). The **graph** half of O7 remains `[OPEN]`.
 
 use crate::parse::fingerprint::canonical_kv;
-use crate::parse::language::LanguageId;
+use crate::parse::language::SourceDialect;
 
 /// The `syntax_path | local_ordinal` alternative of a [`SyntaxLocator`] (spec 03
 /// §2.4).
@@ -43,8 +43,9 @@ pub enum SyntaxAnchor {
 /// [`parse`](Self::parse) rejects any path-like or unknown key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxLocator {
-    /// The language of the unit ([`LanguageId`]; the `lang` key).
-    pub language: LanguageId,
+    /// The dialect of the unit ([`SourceDialect`]; the `lang` key) — a v0
+    /// language, or a universal chunking policy (D-098).
+    pub language: SourceDialect,
     /// The structural anchor ([`SyntaxAnchor`]; the `anchor` key).
     pub anchor: SyntaxAnchor,
     /// A fingerprint of the unit's signature (the `sig` key). Derivation is
@@ -65,8 +66,8 @@ pub struct SyntaxLocator {
 /// it once the `blob_id` is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxLocatorDraft {
-    /// The language of the unit ([`LanguageId`]).
-    pub language: LanguageId,
+    /// The dialect of the unit ([`SourceDialect`]).
+    pub language: SourceDialect,
     /// The structural anchor ([`SyntaxAnchor`]).
     pub anchor: SyntaxAnchor,
     /// A fingerprint of the unit's signature (ADR-0002).
@@ -85,7 +86,7 @@ pub enum LocatorParseError {
     MissingField(&'static str),
     /// A segment had no `key=value` shape.
     MalformedSegment(String),
-    /// The `lang` value was not a known [`LanguageId`].
+    /// The `lang` value named neither a v0 language nor a universal dialect.
     UnknownLanguage(String),
     /// The `anchor` ordinal was not a valid `u32`.
     InvalidOrdinal(String),
@@ -187,7 +188,7 @@ impl SyntaxLocator {
     pub fn parse(s: &str) -> Result<SyntaxLocator, LocatorParseError> {
         let mut anchor: Option<SyntaxAnchor> = None;
         let mut blob: Option<String> = None;
-        let mut lang: Option<LanguageId> = None;
+        let mut lang: Option<SourceDialect> = None;
         let mut sig: Option<String> = None;
 
         for segment in s.split(';') {
@@ -207,7 +208,7 @@ impl SyntaxLocator {
                 "blob" => blob = Some(value.to_string()),
                 "lang" => {
                     lang =
-                        Some(LanguageId::from_str_value(value).ok_or_else(|| {
+                        Some(SourceDialect::from_str_value(value).ok_or_else(|| {
                             LocatorParseError::UnknownLanguage(value.to_string())
                         })?);
                 }
@@ -243,10 +244,11 @@ fn parse_anchor(value: &str) -> Result<SyntaxAnchor, LocatorParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::language::LanguageId;
 
     fn ordinal_locator() -> SyntaxLocator {
         SyntaxLocator {
-            language: LanguageId::Rust,
+            language: SourceDialect::Language(LanguageId::Rust),
             anchor: SyntaxAnchor::LocalOrdinal(3),
             signature_fingerprint: "ab12".to_string(),
             blob_id: "deadbeef".to_string(),
@@ -255,7 +257,7 @@ mod tests {
 
     fn path_locator() -> SyntaxLocator {
         SyntaxLocator {
-            language: LanguageId::TypeScript,
+            language: SourceDialect::Language(LanguageId::TypeScript),
             anchor: SyntaxAnchor::Path("module/Foo/method".to_string()),
             signature_fingerprint: "cafe".to_string(),
             blob_id: "0011".to_string(),

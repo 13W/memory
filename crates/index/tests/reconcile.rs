@@ -386,31 +386,103 @@ async fn complete_build_reaches_projection_ready_without_activating() {
     );
 }
 
+/// D-098 inverts the old `unsupported_language_file_is_deferred`: a file whose
+/// extension selects no v0 language is now **indexed** by the universal path, not
+/// dropped without a record.
 #[tokio::test]
-async fn unsupported_language_file_is_deferred() {
+async fn a_file_with_no_v0_language_is_indexed_universally() {
     let fx = fixture().await;
     let uuids = SeqUuidV7::new();
     write(&fx.root, "a.rs", b"fn a() {}\n");
-    write(&fx.root, "notes.md", b"# hello\n");
-    write(&fx.root, "data.json", b"{}\n");
+    write(&fx.root, "notes.md", b"# hello\n\nbody\n");
+    write(&fx.root, "data.json", b"{\n  \"k\": 1\n}\n");
 
     let genr = scan_and_build(&fx, &uuids).await;
-    assert_eq!(genr.files_indexed, 1, "only a.rs is indexed");
-    assert_eq!(
-        genr.files_deferred, 2,
-        "notes.md and data.json are deferred"
-    );
+    assert_eq!(genr.files_indexed, 3, "all three are indexed");
     assert_eq!(genr.files_skipped, 0);
 
     let read = fx.db.open_read().expect("read");
     assert_eq!(
         members(&read, &genr.generation_id),
-        vec!["a.rs".to_string()]
+        vec![
+            "a.rs".to_string(),
+            "data.json".to_string(),
+            "notes.md".to_string(),
+        ]
     );
-    assert!(
-        skips(&read, &genr.generation_id).is_empty(),
-        "deferred files are NOT recorded as skipped",
+    assert!(skips(&read, &genr.generation_id).is_empty());
+
+    // Each landed under its own dialect, so identical bytes under two policies
+    // stay two revisions — the property structural sharing keys on.
+    let fingerprints = revision_fingerprints(&read, &genr.generation_id);
+    assert_eq!(
+        fingerprints.get("notes.md").map(String::as_str),
+        Some("chunk=1;grammar=universal@1;lang=text;norm=1;queries=0")
     );
+    assert_eq!(
+        fingerprints.get("data.json").map(String::as_str),
+        Some("chunk=1;grammar=universal@1;lang=config;norm=1;queries=0")
+    );
+    assert_eq!(
+        fingerprints.get("a.rs").map(String::as_str),
+        Some("chunk=1;grammar=tree-sitter-rust@1;lang=rust;norm=1;queries=1")
+    );
+
+    // And each produced real, searchable units — a file unit plus its sections.
+    for path in ["a.rs", "notes.md", "data.json"] {
+        assert!(
+            occurrences(&read, &genr.generation_id)
+                .iter()
+                .any(|(_, p, _)| p == path),
+            "{path} has no occurrence",
+        );
+    }
+}
+
+/// The invariant D-098 exists to establish: every file the scan produced is in
+/// exactly one of the two membership tables. No third state, on any tree.
+#[tokio::test]
+async fn every_scanned_file_is_either_indexed_or_skipped() {
+    let fx = fixture().await;
+    let uuids = SeqUuidV7::new();
+    // One file per route the builder can take.
+    write(&fx.root, "code.rs", b"fn a() {}\n"); // language
+    write(&fx.root, "conf/values.yaml", b"image: x\nport: 8080\n"); // config
+    write(&fx.root, "docs/readme.md", b"# Title\n\nprose\n"); // text
+    write(&fx.root, "query.gql", b"query Q { a }\n"); // fallback
+    write(&fx.root, "logo.svg", b"<svg></svg>\n"); // binary by extension
+    write(&fx.root, "blob.rs", b"fn a() {}\0x"); // binary by content
+    write(&fx.root, "creds.env", b"AWS=\"AKIAIOSFODNN7EXAMPLE\"\n"); // secret
+    write(&fx.root, "empty.txt", b""); // empty, still a file
+
+    let manifest = scan_tree(&fx.root);
+    let genr = build(&fx, &manifest, &uuids).await;
+
+    assert_eq!(
+        genr.files_indexed + genr.files_skipped,
+        manifest.entries.len(),
+        "every scanned candidate is accounted for exactly once",
+    );
+
+    let read = fx.db.open_read().expect("read");
+    let accounted = generation_accounted_paths(&read, &genr.generation_id).expect("accounted");
+    let candidates: std::collections::BTreeSet<String> = manifest
+        .entries
+        .iter()
+        .map(|e| e.normalized_path.clone())
+        .collect();
+    assert_eq!(
+        accounted, candidates,
+        "the two membership tables tile the scan's candidate set exactly",
+    );
+
+    // The refusals are refusals on purpose, each with its own reason.
+    let by_path: std::collections::BTreeMap<String, String> =
+        skips(&read, &genr.generation_id).into_iter().collect();
+    assert_eq!(by_path.get("logo.svg").map(String::as_str), Some("binary"));
+    assert_eq!(by_path.get("blob.rs").map(String::as_str), Some("binary"));
+    assert_eq!(by_path.get("creds.env").map(String::as_str), Some("secret"));
+    assert_eq!(by_path.len(), 3, "nothing else was refused: {by_path:?}");
 }
 
 #[tokio::test]
@@ -633,28 +705,34 @@ async fn the_unread_huge_skip_is_in_the_breakdown_too() {
     );
 }
 
-/// The accounted set is exactly indexed ∪ skipped, and a deferred file is in
-/// neither — which is the whole measurement `project coverage` reports.
+/// The accounted set is exactly indexed ∪ skipped, and after D-098 that set is
+/// the whole tree — which is why `project coverage` now reports zero.
 #[tokio::test]
-async fn a_deferred_file_is_absent_from_the_accounted_set() {
+async fn the_accounted_set_covers_the_whole_tree() {
     let fx = fixture().await;
     let uuids = SeqUuidV7::new();
     write(&fx.root, "a.rs", b"fn a() {}\n");
     write(&fx.root, "blob.rs", b"fn a() {}\0more"); // skipped: binary
-    write(&fx.root, "notes.md", b"# hello\n"); // deferred
-    write(&fx.root, "deploy/values.yaml", b"image: x\n"); // deferred
+    write(&fx.root, "notes.md", b"# hello\n"); // universal: text
+    write(&fx.root, "deploy/values.yaml", b"image: x\n"); // universal: config
 
     let genr = scan_and_build(&fx, &uuids).await;
-    assert_eq!(genr.files_deferred, 2);
+    assert_eq!(genr.files_indexed, 3);
+    assert_eq!(genr.files_skipped, 1);
 
     let read = fx.db.open_read().expect("read");
     let accounted = generation_accounted_paths(&read, &genr.generation_id).expect("accounted");
     assert_eq!(
         accounted,
-        ["a.rs".to_string(), "blob.rs".to_string()]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>(),
-        "the accounted set is the union of both membership tables, nothing more",
+        [
+            "a.rs".to_string(),
+            "blob.rs".to_string(),
+            "deploy/values.yaml".to_string(),
+            "notes.md".to_string(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
+        "the accounted set is the union of both membership tables, and covers the tree",
     );
 
     // The difference against the scan's own candidate list is the report.
@@ -669,10 +747,30 @@ async fn a_deferred_file_is_absent_from_the_accounted_set() {
         .iter()
         .filter(|p| !accounted.contains(*p))
         .collect();
-    assert_eq!(
-        missing,
-        vec![&"deploy/values.yaml".to_string(), &"notes.md".to_string()],
+    assert!(
+        missing.is_empty(),
+        "D-098's invariant: nothing the scan saw is unaccounted for, got {missing:?}",
     );
+}
+
+/// `revision_fingerprints`'s own contract, and the reason it exists: the dialect
+/// a file was indexed under is readable back off the row.
+fn revision_fingerprints(
+    conn: &Connection,
+    generation_id: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT gf.normalized_path, fr.parser_fingerprint \
+             FROM generation_file gf \
+             JOIN file_revision fr ON fr.file_revision_id = gf.file_revision_id \
+             WHERE gf.generation_id = ?1",
+        )
+        .expect("prepare");
+    stmt.query_map([generation_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("collect")
 }
 
 /// `scan_paths` and `scan` must see the same candidates, because the coverage

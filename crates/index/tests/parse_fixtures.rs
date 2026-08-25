@@ -19,8 +19,8 @@ use serde::Deserialize;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
-    JavaScriptParser, LanguageId, LanguageParser, RustParser, SyntaxAnchor, TypeScriptParser,
-    parser_fingerprint, persist_parse_output,
+    JavaScriptParser, LanguageId, LanguageParser, RustParser, SourceDialect, SyntaxAnchor,
+    TypeScriptParser, parser_fingerprint, persist_parse_output,
 };
 use local_rag_store::StateDb;
 use local_rag_store::code::{
@@ -343,7 +343,7 @@ async fn every_produced_unit_kind_is_searchable() {
             let persisted = persist_parse_output(
                 tx,
                 &rev_id,
-                LanguageId::TypeScript,
+                SourceDialect::Language(LanguageId::TypeScript),
                 &src_bytes,
                 &out_c,
                 &candidate_ids,
