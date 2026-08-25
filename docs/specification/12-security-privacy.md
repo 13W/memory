@@ -126,6 +126,57 @@ do not trip). The set is intentionally conservative and expected to grow; any ch
 `redaction_version`. The classifier consumes a boolean verdict; scan spans (for payload redaction
 in spool/remote flows) are exposed for later groups.
 
+**Scanner rule set v2 (D-097, `[SPEC]`).** `redaction_version = 2`. The v1 set above promised "a
+low false-positive rate on real source" and did not deliver one, and because a flagged file is
+dropped whole (§5 `[FIXED]`) every false positive silently deleted working source from the code
+index. Measured on the owner's store: of **43** files skipped `reason='secret'` in one real
+repository, **32 were false** — 13 from a URL in a comment, 3 from a long camelCase identifier, 16
+from the assignment rule firing on test fixtures and enum values, 1 from a file holding
+`'-----BEGIN PRIVATE KEY-----'` as a detector constant. A support-article URL in a JSDoc block cost
+the whole of that repository's iManage integration client.
+
+Four narrowings, each chosen against that corpus rather than reasoned about:
+
+1. **The PEM rule requires the header to begin the line** (leading whitespace allowed, so an
+   indented key in YAML still matches). Naming a header is not holding a key; a key actually pasted
+   into a string literal is still caught by its base64 body under rule 4.
+2. **The entropy rule requires mixed character classes** — at least one digit, one lowercase and
+   one uppercase. Base64 of random bytes has all three with overwhelming probability at 40
+   characters; a 40+ character run missing an entire class is a name or a path. This is what clears
+   a long camelCase identifier (no digits) and a dated path literal (no uppercase).
+3. **The entropy rule does not apply inside a URL.** URL spans are located by `://` and end at
+   whitespace, a quote, a backtick or a bracket. A URL's path segments are opaque high-entropy
+   strings by design — a document id, an article slug, a commit sha. The exemption is for the
+   entropy rule **only**: rule 2's credential formats still fire inside a URL, because a leaked
+   token is leaked wherever it sits. Subresource-integrity digests (`sha512-…`, `sha384-…`,
+   `sha256-…`, `sha1-…`) are likewise exempt from rule 4 — a published content digest is base64 of a
+   hash and indistinguishable from key material by shape alone.
+4. **The assignment rule rejects a value that is evidently a label rather than a secret**: it
+   equals its key modulo case and separators (`CLIENT_SECRET = 'clientSecret'`); it carries a
+   placeholder marker (`test`, `example`, `dummy`, `fake`, `sample`, `placeholder`, `changeme`,
+   `xxx`); it carries a secret-vocabulary word (`secret`, `password`, `passwd`, `token`, `apikey`,
+   `api_key`, `api-key`, `credential`) — real credential material does not contain the word
+   "secret", so a value that names itself is documentation, a fixture, or an enum member; or it
+   reads as prose (a space **and** an initial capital, e.g. `errors.password = 'Password is
+   required'`). Both halves of the prose test are load-bearing: a lowercase multi-word value is a
+   passphrase, not a message. `key` is deliberately **absent** from the vocabulary — it is a
+   substring of ordinary words (`monkey`), and rejecting `password = "monkey123"` would lose a real
+   secret to save a rare false positive.
+
+Every narrowing is one-directional: nothing that was previously indexed can become skipped, so the
+change cannot hide a file. Measured result on the same corpus: **43 → 11**, and ten of the eleven
+are genuine base64 blobs (embedded PNG/PDF/certificate fixtures, base64 fonts, a base64 PEM, KMS
+key material). The eleventh is one test fixture whose value (`token: 'tok-reclaimed'`) escapes the
+vocabulary by abbreviation; it is recorded rather than chased, because the rule that would catch it
+would be overfitted to one line. The named victims are released: the iManage client, the SAML
+collection, the admin config and the files epic are indexed again.
+
+The corpus is versioned as `adversarial.redaction.*` in `fixtures/adversarial/index.json` — both
+directions in one file, because a scanner can be made quiet by weakening it and loud by tightening
+it, and only a two-sided corpus catches either mistake. `crates/core/tests/redaction_corpus.rs`
+loads it at runtime and gates on it. Case texts are minimal reconstructions of the measured
+mechanisms, never copies of the source they were measured on.
+
 ## 3. Retention `[FIXED]`
 
 - `observation_payload` under real TTL (`payload_ttl_hours`), enforced by a sweeper; envelopes

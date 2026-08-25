@@ -261,7 +261,11 @@ first match wins; a file matching none is indexed:
 4. `binary` — a NUL byte within the first 8 KiB, or a path with a built-in binary extension.
 5. `encoding` — content is not valid UTF-8 (v0 supports only UTF-8; full `source_encoding` /
    `newline_style` detection for accepted files is a separate step, spec 03 §2.3).
-6. `secret` — the shared redaction scanner (12 §2) flags the decoded UTF-8 text.
+6. `secret` — the shared redaction scanner (12 §2) flags the decoded UTF-8 text. Its precision is
+   this step's precision: because a flagged file is dropped whole, a false positive here deletes
+   working source from the index. D-097 narrowed four of the scanner's rules against a measured
+   corpus for exactly that reason (12 §2's rule-set v2 note); the precedence chain above is
+   unchanged.
 
 Each step is a precondition for the next (the secret scan runs only on valid decoded text). Because
 every outcome is a skip, short-circuiting a cheaper reason never lets a secret-bearing file be
