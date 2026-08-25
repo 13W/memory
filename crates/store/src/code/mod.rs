@@ -50,10 +50,11 @@ pub use context::{
 };
 pub use membership::{
     EdgeResolution, FtsSourceRow, NewOccurrence, NewResolvedEdge, NewUnresolvedReference,
-    OccurrenceMetadata, SkipReason, content_blob_ids_for_generation,
+    OccurrenceMetadata, SkipReason, SkipTally, content_blob_ids_for_generation,
     content_blob_ids_for_generations, delete_unresolved_references_for_revision,
-    generation_file_occurrence_counts, insert_generation_file, insert_occurrence,
-    insert_resolved_edge, insert_skipped_file, insert_unresolved_reference, member_file_revision,
+    generation_accounted_paths, generation_file_count, generation_file_occurrence_counts,
+    generation_skip_tally, insert_generation_file, insert_occurrence, insert_resolved_edge,
+    insert_skipped_file, insert_unresolved_reference, member_file_revision,
     occurrence_count_for_generation, occurrence_id, occurrence_ids_for_generation,
     occurrences_by_id, occurrences_for_fts, occurrences_for_generations, occurrences_for_path,
     skip_reason, top_imports_for_generation,

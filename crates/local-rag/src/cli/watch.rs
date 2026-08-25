@@ -31,6 +31,7 @@ use local_rag_index::reconcile::{
 };
 use local_rag_store::Resolution;
 
+use super::coverage::GenerationCoverage;
 use super::index::print_ambiguous;
 use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
@@ -207,9 +208,20 @@ async fn project_and_report(ctx: &IndexCtx, worktree_id: Uuid, generation_id: Op
         return;
     };
     let now_ms = system_now_ms();
+    // D-096: the same durable coverage the daemon's cycle log carries. `watch`
+    // projects generations the reconciler built, so it never sees `BuildOutcome`
+    // either; a failed read costs the clause, never the line.
+    let coverage = ctx
+        .state
+        .open_read()
+        .ok()
+        .and_then(|conn| GenerationCoverage::read(&conn, &generation_id).ok());
     match project_generation(ctx, worktree_id, gid, now_ms).await {
         Ok(outcome) => println!(
-            "{BIN}: generation {generation_id} ready — embedded {} ({} reused); dense +{}/-{}; fts {} occurrences",
+            "{BIN}: generation {generation_id} ready — {}; embedded {} ({} reused); dense +{}/-{}; fts {} occurrences",
+            coverage
+                .map(|c| c.render())
+                .unwrap_or_else(|| "coverage unavailable".to_string()),
             outcome.backfill.embedded,
             outcome.backfill.reused,
             outcome.switch.upserted,

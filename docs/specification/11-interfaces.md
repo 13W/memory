@@ -715,7 +715,7 @@ the same disposition this group already uses for `T19-06`.
 local-rag serve|status|stop|restart
 local-rag init [--download-models]
 local-rag index <path> | reindex | watch          # watch: standalone process, see the T15-07 note
-local-rag project add|remove|enable|disable|list|status|reindex <path>   # daemon-managed, see §8
+local-rag project add|remove|enable|disable|list|status|reindex|coverage <path>  # daemon-managed, see §8
 local-rag repo list | repo attach <repo_id> [--path P] [--worktree <id>] | worktree list
 local-rag rebuild --worktree <id> [--fts] [--dense]
 local-rag memory list|approve|reject|edit|retract|confirm|refute|merge|rescope|evidence …
@@ -921,6 +921,34 @@ built before D-062, `created_at` is always used.
   same `gitroot::probe` → `resolve_facts` pair the write verbs use: enrolled, known but not
   enrolled (`background indexing is OFF for this worktree`, with `local-rag project add .`), or
   not a registered worktree at all. Under `--json` that is the `current_directory` object.
+- **`project coverage [<path>] [--json]` (`D-096`, `[SPEC]`)** — the answer index age cannot give:
+  of the files present in the worktree, which ones did the active generation never account for? A
+  file the build examined is in `generation_file` **or** in `skipped_file`; one in neither was
+  dropped without a record. The command prints the durable coverage of the active generation, then
+  the count of unaccounted files with an extension histogram and the first ten paths, and exits `0`
+  either way — it is a report, not a gate. Read-only and daemon-independent like every other
+  durable-state verb in this family: it walks the tree through
+  `local_rag_index::scan::scan_paths`, which **shares its walk with the real scan** and reads no
+  file content, and issues two `SELECT`s. Sharing the walk is load-bearing, not tidiness: two
+  enumerations that disagreed about gitignore, pruning or case folding would invent a gap or hide
+  one, which is the pairwise disagreement `D-089` already paid for once. A worktree with no active
+  generation prints `no active generation — nothing is indexed yet` and still exits `0`.
+
+  Why it was needed: on the owner's store, 3446 of firefly's 13728 tracked files were in neither
+  table and **no command said so**, because a file whose extension selects no v0 language is
+  counted `BuildOutcome::files_deferred` and written nowhere (spec 06 §2's own deferral note) and
+  no production command read `skipped_file` either. The gap was found by hand-written SQL; this
+  command is that query.
+- **`project list` / `doctor` coverage (`D-096`, `[SPEC]`)** — both gain the **durable** half on
+  every run: `10247 indexed, 46 skipped (43 secret, 3 huge)` for the active generation, from
+  `generation_file_count` + `generation_skip_tally`. One rendering (`SkipTally::render`) serves the
+  builder, both commands and the daemon's cycle log, so they cannot word it differently. The
+  measured half stays behind `project coverage` because it walks a tree, which is the wrong cost
+  for a report that runs over every registered worktree on every invocation; `doctor` names the
+  command instead. `local-rag index` and `local-rag watch` print the same coverage, and `index`
+  additionally prints `deferred N (no v0 language)` — the counter that previously existed only in
+  memory. Coverage is never a verdict: a gap does not make `doctor` unclean, for the same reason
+  "never indexed" does not.
 - **`doctor`** — a new `indexing:` section, per worktree: enrollment (enrolled / paused / not
   enrolled), the age of the served generation, X-006's last-cycle outcome, and every stuck
   generation. **Verdict rule, an explicit owner decision:** only a *stuck* generation makes
@@ -1714,6 +1742,7 @@ local-rag project enable|disable <path>
 local-rag project list [--json]
 local-rag project status [--json]     # durable state + live supervisor status; "daemon not running" is explicit
 local-rag project reindex [<path>]    # admin/reconcile_now; without a daemon, points at `local-rag reindex`
+local-rag project coverage [<path>] [--json]   # D-096: files the active generation never accounted for
 ```
 
 Persisted state, decided by ADR-0009: a new `managed_worktree` table in `state.sqlite` (schema

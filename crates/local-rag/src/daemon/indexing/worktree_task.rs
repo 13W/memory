@@ -626,10 +626,21 @@ async fn project_one(
 
     let finished_ms = system_now_ms();
     let duration_ms = finished_ms.saturating_sub(now_ms);
+    // D-096: what the cycle actually served. Read back durably rather than
+    // carried from the builder, because the build and the projection are
+    // different tasks here — the reconciler owns `BuildOutcome` and the `index`
+    // crate deliberately carries no `tracing` dependency, so the number that
+    // reaches the log is the one a later investigator would query anyway.
+    let coverage = result
+        .is_ok()
+        .then(|| read_coverage(&params.state, &generation_id))
+        .flatten();
     match (&result, &failure) {
         (Ok(outcome), _) => tracing::info!(
             worktree_id = %worktree_id_str,
             generation_id = %generation_id,
+            indexed = coverage.map(|(indexed, _)| indexed),
+            skipped = coverage.map(|(_, skipped)| skipped),
             embedded = outcome.backfill.embedded,
             reused = outcome.backfill.reused,
             embed_failed = outcome.backfill.failed,
@@ -719,6 +730,21 @@ async fn project_one(
     }
 
     // `_job` drops here — before control returns to the outer `select!`.
+}
+
+/// `(indexed, skipped)` for `generation_id`, or `None` if the read failed
+/// (`D-096`).
+///
+/// Best-effort by design, like every other observability channel in this
+/// function: the generation is projected either way, and a log line that cannot
+/// name the counts must not turn a healthy cycle into a failed one.
+fn read_coverage(state: &StateDb, generation_id: &str) -> Option<(usize, usize)> {
+    let conn = state.open_read().ok()?;
+    let indexed = local_rag_store::generation_file_count(&conn, generation_id).ok()?;
+    let skipped = local_rag_store::generation_skip_tally(&conn, generation_id)
+        .ok()?
+        .total();
+    Some((indexed, skipped))
 }
 
 /// The current wall-clock time as Unix milliseconds — mirrors

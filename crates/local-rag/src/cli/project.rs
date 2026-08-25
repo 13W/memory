@@ -21,17 +21,25 @@ use local_rag::daemon::gitroot;
 use local_rag::indexing::{open_state, register_new_managed_worktree, resolve_facts};
 use local_rag_core::identity::{SystemUuidV7, Uuid, UuidSource};
 use local_rag_core::paths::StoreLayout;
+use local_rag_index::reconcile::load_worktree_meta;
 use local_rag_store::{
     Resolution, StateDb, WorktreeIndexingStatus, WorktreeRootFacts, all_worktree_ids,
     current_worktree_path, generation_meta_for_worktree, indexing_status, managed_worktrees,
     register_managed_worktree, set_managed_enabled, unregister_managed_worktree,
 };
 
+use super::coverage::{GenerationCoverage, UnaccountedFiles};
 use super::freshness::{IndexFreshness, humanize_age};
 use super::index::print_ambiguous;
 use super::{block_on, fail, resolve_layout_and_config, system_now_ms};
 
 const BIN: &str = "local-rag";
+
+/// How many extension groups `project coverage` prints on its one-line
+/// histogram before collapsing the tail into `+N more`. Chosen, not derived:
+/// the cause of a coverage gap is visible in the top few groups (on the store
+/// this defect was found on, `yaml`/`gql`/`svg` already told the whole story).
+const EXTENSION_HISTOGRAM_CAP: usize = 8;
 
 /// How long a `project status`/`project reindex` waits for the daemon's
 /// `admin/*` answer. Chosen, not derived — the same class of one-shot admin
@@ -80,6 +88,15 @@ pub enum ProjectCommand {
         /// Directory to reconcile (defaults to the current directory).
         path: Option<String>,
     },
+    /// Report which files of a worktree the active generation never accounted
+    /// for — read-only, no daemon required.
+    Coverage {
+        /// Directory to check (defaults to the current directory).
+        path: Option<String>,
+        /// Print the report as JSON instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(command: ProjectCommand) -> ExitCode {
@@ -91,6 +108,7 @@ pub fn run(command: ProjectCommand) -> ExitCode {
         ProjectCommand::List { json } => run_list(json),
         ProjectCommand::Status { json } => run_status(json),
         ProjectCommand::Reindex { path } => run_reindex(path),
+        ProjectCommand::Coverage { path, json } => run_coverage(path, json),
     }
 }
 
@@ -284,6 +302,10 @@ struct ProjectRow {
     /// X-008: the durable outcome of the last background cycle (X-006). Present
     /// even with no daemon running, which is the whole point of persisting it.
     indexing: Option<WorktreeIndexingStatus>,
+    /// D-096: what the *active* generation actually holds — how many files are
+    /// searchable and how many were skipped, per reason. `None` when there is no
+    /// active generation yet (nothing indexed), which the age field already says.
+    coverage: Option<GenerationCoverage>,
 }
 
 impl ProjectRow {
@@ -296,6 +318,11 @@ impl ProjectRow {
                 out.push_str(&format!("  active=#{number}"));
                 if let Some(ms) = created_ms {
                     out.push_str(&format!(" built {}", humanize_age(now_ms, *ms)));
+                }
+                // D-096: the age of the index answers "is it current", never
+                // "is it complete". This is the second half of that question.
+                if let Some(c) = &self.coverage {
+                    out.push_str(&format!("  {}", c.render()));
                 }
             }
             None => out.push_str("  active=(none — nothing indexed yet)"),
@@ -362,14 +389,20 @@ fn durable_rows(conn: &rusqlite::Connection) -> Result<Vec<ProjectRow>, String> 
             let indexing = indexing_status(conn, &row.worktree_id).map_err(|e| {
                 format!("could not read {}'s indexing status: {e}", row.worktree_id)
             })?;
+            let freshness = IndexFreshness::from_generations(&generations);
+            let coverage = match &freshness.active {
+                Some((generation_id, _, _)) => Some(GenerationCoverage::read(conn, generation_id)?),
+                None => None,
+            };
             Ok(ProjectRow {
                 worktree_id: row.worktree_id,
                 enabled: row.enabled,
                 registered_at: row.registered_at,
                 updated_at: row.updated_at,
                 path,
-                freshness: IndexFreshness::from_generations(&generations),
+                freshness,
                 indexing,
+                coverage,
             })
         })
         .collect()
@@ -445,6 +478,9 @@ fn row_json(r: &ProjectRow) -> serde_json::Value {
         "last_attempt_at": r.indexing.as_ref().and_then(|s| s.last_attempt_at),
         "consecutive_failures": r.indexing.as_ref().map(|s| s.consecutive_failures),
         "last_error": r.indexing.as_ref().and_then(|s| s.last_error.clone()),
+        "indexed_files": r.coverage.map(|c| c.indexed),
+        "skipped_files": r.coverage.map(|c| c.skipped.total()),
+        "skipped_by_reason": r.coverage.map(|c| skip_json(&c.skipped)),
         "stuck_generations": r
             .freshness
             .stuck_newer
@@ -632,6 +668,159 @@ fn current_directory_enrollment(layout: &StoreLayout, rows: &[ProjectRow]) -> Cu
     } else {
         CurrentDirectory::KnownButUnmanaged { worktree_id }
     }
+}
+
+/// The non-zero half of a skip tally as JSON — `{"secret": 43, "huge": 3}`.
+///
+/// Only the reasons that fired: a wall of zeroes reads as "measured and nothing
+/// happened" for five reasons that were never in play, which is noise, not data.
+fn skip_json(tally: &local_rag_store::SkipTally) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (reason, n) in tally.nonzero() {
+        map.insert(reason.as_str().to_string(), serde_json::json!(n));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// `local-rag project coverage [path]` — D-096.
+///
+/// Answers the question that had no command: of the files in this worktree,
+/// which ones did the active generation never account for? A file the build
+/// examined is in `generation_file` or in `skipped_file`; one in neither was
+/// dropped silently, and until this command the only way to see that was
+/// hand-written SQL against `state.sqlite`.
+///
+/// Read-only and daemon-independent, like every other durable-state verb in this
+/// module: it walks the tree without reading file content
+/// ([`scan_paths`](local_rag_index::scan::scan_paths)) and issues two `SELECT`s.
+fn run_coverage(path: Option<String>, json: bool) -> ExitCode {
+    let (layout, _config) = match resolve_layout_and_config() {
+        Ok(v) => v,
+        Err(e) => return fail(BIN, &e),
+    };
+    let target = match path {
+        Some(p) => p,
+        None => match std::env::current_dir() {
+            Ok(cwd) => cwd.display().to_string(),
+            Err(e) => {
+                return fail(
+                    BIN,
+                    &format!("could not determine the current directory: {e}"),
+                );
+            }
+        },
+    };
+    let (state, _facts, resolution) = match probe_and_resolve(&layout, &target) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let worktree_id = match resolution {
+        Resolution::Resolved { worktree_id, .. } => worktree_id,
+        Resolution::GlobalOnly => {
+            return fail(
+                BIN,
+                &format!("{target}: not indexed yet; run `local-rag index {target}` first"),
+            );
+        }
+        Resolution::Ambiguous { candidates } => {
+            print_ambiguous(&candidates);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let conn = match state.open_read() {
+        Ok(c) => c,
+        Err(e) => return fail(BIN, &format!("could not open state.sqlite: {e}")),
+    };
+    let generations = match generation_meta_for_worktree(&conn, &worktree_id) {
+        Ok(g) => g,
+        Err(e) => return fail(BIN, &format!("could not read generations: {e}")),
+    };
+    let freshness = IndexFreshness::from_generations(&generations);
+    let Some((generation_id, generation_number, _)) = freshness.active.clone() else {
+        // Not a failure: a registered-but-never-indexed worktree is a legitimate
+        // bootstrap state, the same one `doctor` refuses to call a fault.
+        println!("{BIN}: {target}: no active generation — nothing is indexed yet");
+        return ExitCode::SUCCESS;
+    };
+
+    let coverage = match GenerationCoverage::read(&conn, &generation_id) {
+        Ok(c) => c,
+        Err(e) => return fail(BIN, &e),
+    };
+
+    let case = gitroot::case_sensitivity();
+    let meta = match load_worktree_meta(&state, &worktree_id, case) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return fail(
+                BIN,
+                &format!("{target}: worktree {worktree_id} has no path"),
+            );
+        }
+        Err(e) => return fail(BIN, &format!("could not load worktree metadata: {e}")),
+    };
+    let unaccounted = match UnaccountedFiles::measure(
+        &conn,
+        &generation_id,
+        &meta.root,
+        meta.kind,
+        meta.case,
+        &meta.prune_roots,
+    ) {
+        Ok(u) => u,
+        Err(e) => return fail(BIN, &e),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "worktree_id": worktree_id,
+                "path": meta.root.display().to_string(),
+                "active_generation_id": generation_id,
+                "active_generation_number": generation_number,
+                "indexed_files": coverage.indexed,
+                "skipped_files": coverage.skipped.total(),
+                "skipped_by_reason": skip_json(&coverage.skipped),
+                "unaccounted_files": unaccounted.total,
+                "unaccounted_by_extension": unaccounted
+                    .by_extension
+                    .iter()
+                    .map(|(ext, n)| serde_json::json!({"extension": ext, "files": n}))
+                    .collect::<Vec<_>>(),
+                "unaccounted_examples": unaccounted.examples,
+            }))
+            .expect("project coverage always serializes")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    println!(
+        "{BIN}: {} — generation #{generation_number}: {}",
+        meta.root.display(),
+        coverage.render()
+    );
+    if unaccounted.total == 0 {
+        println!("{BIN}: every file in the tree is accounted for");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{BIN}: {} file(s) in the tree are in NEITHER table — never indexed and never \
+         recorded as skipped: {}",
+        unaccounted.total,
+        unaccounted.render_extensions(EXTENSION_HISTOGRAM_CAP),
+    );
+    for p in &unaccounted.examples {
+        println!("  {p}");
+    }
+    if unaccounted.total > unaccounted.examples.len() {
+        println!(
+            "  … and {} more",
+            unaccounted.total - unaccounted.examples.len()
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_reindex(path: Option<String>) -> ExitCode {

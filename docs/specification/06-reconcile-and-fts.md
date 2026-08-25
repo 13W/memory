@@ -209,7 +209,21 @@ retry allocates a fresh generation and de-duplicates content via `create_or_reus
 no duplicate rows. **Deferral:** a file whose extension selects no v0 language
 (`select_language` → `None`) is neither indexed nor recorded as a skip — the language-agnostic
 `config_section | text_section | fallback_chunk` path (§2.1) is a later task, and there is no
-`skipped_file` reason for "unsupported"; the builder counts these as `files_deferred`. T05-03
+`skipped_file` reason for "unsupported"; the builder counts these as `files_deferred`.
+
+**Reporting the tally (D-096, `[SPEC]`).** `BuildOutcome` carries `skipped_by_reason: SkipTally`
+beside `files_skipped`, so a skip is reportable as *what* it was, not only *how many*; both are
+kept because every existing caller reads the total and a breakdown that must be re-summed to be
+checked is a breakdown that can silently disagree. The same shape is produced by the read path
+(`generation_skip_tally`), so the live number and the durable one cannot drift in presentation.
+Why this was needed: until D-096 `files_deferred` was written **nowhere** and read by nobody, and
+no production command read `skipped_file` either, so a build that dropped a quarter of the tree
+printed exactly the line a build that dropped nothing printed. Measured on the owner's store:
+3446 of firefly's 13728 tracked files were in neither membership table, and the loss was
+discoverable only by hand-written SQL. The surfaces are spec 11 §6/§8 (`local-rag index`,
+`project list`, `project coverage`, `doctor`) and the daemon's own `indexing cycle finished`
+record, which reads the counts back durably rather than carrying them — the build and the
+projection are different tasks, and this crate deliberately has no `tracing` dependency. T05-03
 **stops at `projection_ready`**: activation, `worktree.current_generation_id`, and
 `worktree_projection_state` are the projection switch (05 §5, a later group). `occurrence`
 `qualified_name`/`context_hash` are left `NULL` (enrichment is search/§4, a later task).

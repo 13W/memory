@@ -575,3 +575,337 @@ async fn list_json_carries_both_the_original_and_the_new_fields() {
         "X-008's fields must be present even when empty/null: {json}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// D-096 — `project coverage`
+// ---------------------------------------------------------------------------
+
+/// Seed an `active` generation over `worktree_id` holding exactly the given
+/// members and skips.
+///
+/// Direct seeding rather than a real `local-rag index` run on purpose: the whole
+/// pipeline needs an installed embedding model (`cli_index.rs` gates on one),
+/// while what `D-096` added is the arithmetic between the tree and the two
+/// membership tables — which is fully determined by those rows. One
+/// `file_revision` is minted per member because `generation_file` has a foreign
+/// key to it; `skipped_file` deliberately has none (a skipped file never gets a
+/// `source_blob`, spec 12 §5).
+async fn seed_active_generation(
+    layout: &StoreLayout,
+    worktree_id: &str,
+    generation_id: &str,
+    members: &[&str],
+    skips: &[(&str, local_rag_store::SkipReason)],
+) {
+    use local_rag_store::{
+        GenerationState, NewFileRevision, NewlineStyle, SourceCompression, allocate_generation,
+        insert_file_revision, insert_generation_file, insert_skipped_file, transition_generation,
+    };
+
+    let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (worktree_id, generation_id) = (worktree_id.to_string(), generation_id.to_string());
+    let members: Vec<String> = members.iter().map(|m| (*m).to_string()).collect();
+    let skips: Vec<(String, local_rag_store::SkipReason)> =
+        skips.iter().map(|(p, r)| ((*p).to_string(), *r)).collect();
+
+    db.writer()
+        .transaction(move |tx| {
+            allocate_generation(tx, &worktree_id, &generation_id, 1_800_000_000_000)?;
+            for (i, path) in members.iter().enumerate() {
+                let revision_id = format!("019f0000-0000-7000-8000-00000000{i:04}");
+                let content_hash = format!("hash{i:060}");
+                insert_file_revision(
+                    tx,
+                    &NewFileRevision {
+                        file_revision_id: &revision_id,
+                        content_hash: &content_hash,
+                        parser_fingerprint: "chunk=1;grammar=t@1;lang=rust;norm=1;queries=1",
+                        source_blob: b"fn a() {}\n",
+                        compression: SourceCompression::None,
+                        source_encoding: "utf-8",
+                        newline_style: NewlineStyle::Lf,
+                        source_size: 10,
+                    },
+                    1_800_000_000_000,
+                )?;
+                insert_generation_file(tx, &generation_id, path, path, &revision_id)?;
+            }
+            for (path, reason) in &skips {
+                insert_skipped_file(tx, &generation_id, path, *reason, None)?;
+            }
+            transition_generation(tx, &generation_id, GenerationState::ProjectionReady)?
+                .expect("building → projection_ready");
+            transition_generation(tx, &generation_id, GenerationState::Active)?
+                .expect("projection_ready → active");
+            Ok(())
+        })
+        .await
+        .expect("seed active generation")
+}
+
+/// The live-store measurement that found `D-096`, reproduced as a test: a tree
+/// holding files the generation put in neither membership table, and a command
+/// that says so with a number and an extension histogram.
+#[test]
+fn coverage_names_the_files_the_generation_accounted_for_and_the_ones_it_did_not() {
+    let (home, layout) = open_layout();
+    let target = home.join("repo");
+    std::fs::create_dir_all(target.join("docs")).expect("create docs");
+    std::fs::create_dir_all(target.join("deploy")).expect("create deploy");
+    // Two indexed, one skipped, four the generation never saw.
+    std::fs::write(target.join("a.rs"), b"fn a() {}\n").expect("write a.rs");
+    std::fs::write(target.join("b.rs"), b"fn b() {}\n").expect("write b.rs");
+    std::fs::write(target.join("blob.rs"), b"fn c() {}\0").expect("write blob.rs");
+    std::fs::write(target.join("docs/one.md"), b"# one\n").expect("write one.md");
+    std::fs::write(target.join("docs/two.md"), b"# two\n").expect("write two.md");
+    std::fs::write(target.join("deploy/values.yaml"), b"image: x\n").expect("write values.yaml");
+    std::fs::write(target.join("Makefile"), b"all:\n").expect("write Makefile");
+
+    let add = run_cli(&home, &["project", "add", target.to_str().unwrap()]);
+    assert_eq!(add.status.code(), Some(0), "{add:?}");
+
+    let worktree_id = {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let conn = db.open_read().expect("read");
+        local_rag_store::all_worktree_ids(&conn).expect("ids")[0].clone()
+    };
+    tokio_test_block_on(seed_active_generation(
+        &layout,
+        &worktree_id,
+        "019f1111-1111-7111-8111-111111111111",
+        &["a.rs", "b.rs"],
+        &[("blob.rs", local_rag_store::SkipReason::Binary)],
+    ));
+
+    let out = run_cli(&home, &["project", "coverage", target.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = stdout(&out);
+
+    // The durable half, in the one wording every command shares.
+    assert!(text.contains("2 indexed, 1 skipped (1 binary)"), "{text}");
+    // The measured half: four files in neither table, grouped by extension.
+    assert!(
+        text.contains("4 file(s) in the tree are in NEITHER table"),
+        "{text}"
+    );
+    assert!(text.contains("md 2"), "{text}");
+    assert!(text.contains("yaml 1"), "{text}");
+    assert!(text.contains("(none) 1"), "{text}");
+    // Examples name actual paths, so the diagnosis is actionable.
+    assert!(text.contains("docs/one.md"), "{text}");
+    assert!(text.contains("deploy/values.yaml"), "{text}");
+}
+
+/// A tree whose every file is accounted for says so plainly — the state
+/// `D-098` is required to make permanent, and the one a passing report must not
+/// confuse with "I did not look".
+#[test]
+fn coverage_on_a_fully_accounted_tree_says_so() {
+    let (home, layout) = open_layout();
+    let target = home.join("repo");
+    std::fs::create_dir_all(&target).expect("create target");
+    std::fs::write(target.join("a.rs"), b"fn a() {}\n").expect("write a.rs");
+    std::fs::write(target.join("blob.rs"), b"fn c() {}\0").expect("write blob.rs");
+
+    let add = run_cli(&home, &["project", "add", target.to_str().unwrap()]);
+    assert_eq!(add.status.code(), Some(0), "{add:?}");
+    let worktree_id = {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let conn = db.open_read().expect("read");
+        local_rag_store::all_worktree_ids(&conn).expect("ids")[0].clone()
+    };
+    tokio_test_block_on(seed_active_generation(
+        &layout,
+        &worktree_id,
+        "019f2222-2222-7222-8222-222222222222",
+        &["a.rs"],
+        &[("blob.rs", local_rag_store::SkipReason::Binary)],
+    ));
+
+    let out = run_cli(&home, &["project", "coverage", target.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        text.contains("every file in the tree is accounted for"),
+        "{text}"
+    );
+    assert!(!text.contains("NEITHER table"), "{text}");
+}
+
+/// `coverage` is a diagnostic, and a diagnostic that mutates what it measures
+/// is worthless. Asserted against the tables it reports on rather than
+/// `PRAGMA data_version`: **every** command in this family moves that counter,
+/// because `StateDb::open` runs the migration framework (spec 02 §4.1's
+/// open → migrate → serve) and its bookkeeping is a write — measured, not
+/// assumed, by watching `project list` move it too.
+#[test]
+fn coverage_writes_nothing() {
+    let (home, layout) = open_layout();
+    let target = home.join("repo");
+    std::fs::create_dir_all(&target).expect("create target");
+    std::fs::write(target.join("a.rs"), b"fn a() {}\n").expect("write a.rs");
+    std::fs::write(target.join("notes.md"), b"# hi\n").expect("write notes.md");
+
+    let add = run_cli(&home, &["project", "add", target.to_str().unwrap()]);
+    assert_eq!(add.status.code(), Some(0), "{add:?}");
+    let worktree_id = {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let conn = db.open_read().expect("read");
+        local_rag_store::all_worktree_ids(&conn).expect("ids")[0].clone()
+    };
+    tokio_test_block_on(seed_active_generation(
+        &layout,
+        &worktree_id,
+        "019f3333-3333-7333-8333-333333333333",
+        &["a.rs"],
+        &[],
+    ));
+
+    let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let before = index_state_digest(&db);
+
+    let out = run_cli(&home, &["project", "coverage", target.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(stdout(&out).contains("NEITHER table"), "{out:?}");
+
+    let after = index_state_digest(&db);
+    assert_eq!(
+        before, after,
+        "`project coverage` changed the index state it reports on"
+    );
+}
+
+/// Every row of the tables a coverage report reads, as one comparable string.
+fn index_state_digest(db: &StateDb) -> String {
+    let conn = db.open_read().expect("read");
+    let mut out = String::new();
+    for sql in [
+        "SELECT generation_id, worktree_id, generation_number, state FROM generation \
+         ORDER BY generation_id",
+        "SELECT generation_id, normalized_path, display_path, file_revision_id \
+         FROM generation_file ORDER BY generation_id, normalized_path",
+        "SELECT generation_id, normalized_path, reason FROM skipped_file \
+         ORDER BY generation_id, normalized_path",
+        "SELECT worktree_id, enabled FROM managed_worktree ORDER BY worktree_id",
+    ] {
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        let mut rows = stmt.query([]).expect("query");
+        while let Some(row) = rows.next().expect("row") {
+            for i in 0..row.as_ref().column_count() {
+                out.push_str(&format!("{:?}|", row.get_ref(i).expect("column")));
+            }
+            out.push('\n');
+        }
+        out.push_str("--\n");
+    }
+    out
+}
+
+/// A registered-but-never-indexed worktree is a bootstrap state, not a fault:
+/// the command says what is true and exits zero, the same way `doctor` refuses
+/// to call "never indexed" a problem.
+#[test]
+fn coverage_without_an_active_generation_is_not_an_error() {
+    let (home, _layout) = open_layout();
+    let target = home.join("repo");
+    std::fs::create_dir_all(&target).expect("create target");
+    std::fs::write(target.join("a.rs"), b"fn a() {}\n").expect("write a.rs");
+
+    let add = run_cli(&home, &["project", "add", target.to_str().unwrap()]);
+    assert_eq!(add.status.code(), Some(0), "{add:?}");
+
+    let out = run_cli(&home, &["project", "coverage", target.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        stdout(&out).contains("no active generation — nothing is indexed yet"),
+        "{out:?}"
+    );
+}
+
+/// The JSON shape is machine-readable and carries both halves, so a script can
+/// gate on the gap rather than grepping prose.
+#[test]
+fn coverage_json_carries_both_halves() {
+    let (home, layout) = open_layout();
+    let target = home.join("repo");
+    std::fs::create_dir_all(&target).expect("create target");
+    std::fs::write(target.join("a.rs"), b"fn a() {}\n").expect("write a.rs");
+    std::fs::write(target.join("notes.md"), b"# hi\n").expect("write notes.md");
+    std::fs::write(target.join("more.md"), b"# hi\n").expect("write more.md");
+
+    let add = run_cli(&home, &["project", "add", target.to_str().unwrap()]);
+    assert_eq!(add.status.code(), Some(0), "{add:?}");
+    let worktree_id = {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let conn = db.open_read().expect("read");
+        local_rag_store::all_worktree_ids(&conn).expect("ids")[0].clone()
+    };
+    tokio_test_block_on(seed_active_generation(
+        &layout,
+        &worktree_id,
+        "019f4444-4444-7444-8444-444444444444",
+        &["a.rs"],
+        &[],
+    ));
+
+    let out = run_cli(
+        &home,
+        &["project", "coverage", target.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(v["indexed_files"], 1);
+    assert_eq!(v["skipped_files"], 0);
+    assert_eq!(v["unaccounted_files"], 2);
+    assert_eq!(v["unaccounted_by_extension"][0]["extension"], "md");
+    assert_eq!(v["unaccounted_by_extension"][0]["files"], 2);
+    assert_eq!(v["active_generation_number"], 1);
+}
+
+/// `project list` is the command a user runs when they suspect indexing is
+/// wrong, and until `D-096` it answered only "how old". Now the same line
+/// answers "how much", in the wording `doctor` and `coverage` share.
+#[test]
+fn list_reports_the_coverage_of_the_generation_it_serves() {
+    let (home, layout) = open_layout();
+    let target = home.join("repo");
+    std::fs::create_dir_all(&target).expect("create target");
+    std::fs::write(target.join("a.rs"), b"fn a() {}\n").expect("write a.rs");
+
+    let add = run_cli(&home, &["project", "add", target.to_str().unwrap()]);
+    assert_eq!(add.status.code(), Some(0), "{add:?}");
+    let worktree_id = {
+        let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        let conn = db.open_read().expect("read");
+        local_rag_store::all_worktree_ids(&conn).expect("ids")[0].clone()
+    };
+    tokio_test_block_on(seed_active_generation(
+        &layout,
+        &worktree_id,
+        "019f5555-5555-7555-8555-555555555555",
+        &["a.rs", "b.rs"],
+        &[
+            ("c.rs", local_rag_store::SkipReason::Secret),
+            ("d.rs", local_rag_store::SkipReason::Secret),
+            ("e.png", local_rag_store::SkipReason::Binary),
+        ],
+    ));
+
+    let list = run_cli(&home, &["project", "list"]);
+    assert_eq!(list.status.code(), Some(0), "{list:?}");
+    let text = stdout(&list);
+    assert!(text.contains("active=#1"), "{text}");
+    assert!(
+        text.contains("2 indexed, 3 skipped (2 secret, 1 binary)"),
+        "{text}"
+    );
+
+    let json_out = run_cli(&home, &["project", "list", "--json"]);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&json_out)).expect("list --json is valid JSON");
+    let row = &json["projects"][0];
+    assert_eq!(row["indexed_files"], 2);
+    assert_eq!(row["skipped_files"], 3);
+    assert_eq!(row["skipped_by_reason"]["secret"], 2);
+    assert_eq!(row["skipped_by_reason"]["binary"], 1);
+}
