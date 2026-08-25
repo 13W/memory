@@ -1,23 +1,27 @@
-# local-rag v2 — design (rev 6)
+# local-rag v2 — design (rev 7)
 
-> Ревизия после внешнего ревью rev 5. rev 5 закрыла crash-корректность projection switch
-> и класс бага «context/path в content-addressed артефакте»; rev 6 закрывает
-> **durable-семантику проекции** (validate-on-open вместо недоказуемого durable barrier),
-> **двухосевой projection state** (generation × model space), **stable worktree identity**
-> (тот же класс path-протечки, но на уровне durable ID), упрощает ingestion до
-> **spool-only** и добавляет **quality-гейты памяти** (до rev 6 все memory-гейты были
-> про plumbing). Schema-констрейнты и dedup приведены к реальной семантике SQLite.
+> Ревизия по решению владельца, а не по внешнему ревью: глава 11 обещала канал доставки,
+> который так и не был реализован, а работающий канал не был описан — расхождение
+> зарегистрировано как `D-102` и решено в ADR-0013. rev 6 закрыла durable-семантику
+> проекции, stable worktree identity и spool-only ingestion; rev 7 меняет **канал доставки
+> бинарников** (релизные ассеты CI вместо пер-платформенных npm-пакетов), **модель резолва**
+> (ищется исполняемый файл, а не npm-пакет) и **место ONNX Runtime** (установщик первого
+> запуска, рядом с весами моделей). Набор из пяти таргетов, отложенный `win32-arm64` и
+> правило «веса не в npm» не меняются. Это первая ревизия этого документа: прежние
+> пост-`G17` решения намеренно шли через ADR, не трогая `idea.md`, — здесь так нельзя,
+> потому что опровергается его собственный текст.
 
 ---
 
 ## TL;DR
 
 Локальный co-located MCP-сервис для Claude Code: **persistent memory**, **semantic
-code search**, **observations**. Rust, npm-дистрибуция, без обязательных внешних
-демонов. `state.sqlite` — источник истины; `cache.sqlite` и dense-проекция —
-перестраиваемые, **независимо валидируемые при открытии** кэши. Известные проблемы v1
-(identity / projection / hook consistency) имеют явные invariants и acceptance tests
-(§15) — формулировка «все проблемы решены» заменена на проверяемую.
+code search**, **observations**. Rust, установка через npm, нативные бинарники — из
+релизных ассетов, без обязательных внешних демонов. `state.sqlite` — источник истины;
+`cache.sqlite` и dense-проекция — перестраиваемые, **независимо валидируемые при
+открытии** кэши. Известные проблемы v1 (identity / projection / hook consistency)
+имеют явные invariants и acceptance tests (§15) — формулировка «все проблемы решены»
+заменена на проверяемую.
 
 ---
 
@@ -596,12 +600,13 @@ lifecycle закрывается на своём этапе (§17).
 ## 11. Дистрибуция
 > один native service binary без обязательных внешних демонов; model assets — отдельно.
 
-Пер-платформенные npm `optionalDependencies` + тонкий launcher. Targets явно (см.
-Scope; `win32-arm64` — после проверки выбранного dense backend/ORT/fastembed/SQLite/
-tree-sitter/local generator/npm detection/CI smoke). Проверить: signal forwarding +
-завершение stdio child; CTRL-C/SIGTERM; orphan cleanup; резолв pnpm/npm/yarn; понятная
-ошибка при отсутствии platform-пакета; offline после `local-rag init --download-models`;
-checksum/manifest + атомарная загрузка весов; ORT bundling до финальной CI-матрицы.
+Один npm-пакет-установщик; нативные бинарники — из релизных ассетов CI (rev 7, ADR-0013).
+Targets явно (см. Scope; `win32-arm64` — после проверки выбранного dense backend/ORT/
+fastembed/SQLite/tree-sitter/local generator/npm detection/CI smoke). Резолвится
+**исполняемый файл, а не npm-пакет**: `PATH` плюс известные каталоги глобальных bin, с
+явным override для офлайна. Проверить: signal forwarding + завершение stdio child;
+CTRL-C/SIGTERM; orphan cleanup; внятная ошибка, когда сервер не установлен; offline после
+`local-rag init --download-models`; checksum/manifest + атомарная загрузка весов и ORT.
 Веса не в npm.
 
 ---
@@ -724,7 +729,13 @@ multi-harness; FreeBSD; win32-arm64.
 
 ## 18. Решения
 
-**Решено (rev 6):** stable worktree UUID + `worktree_path` (path hash — только lookup);
+**Решено (rev 7):** доставка нативных бинарников релизными ассетами CI вместо
+пер-платформенных npm-пакетов; в npm остаётся один пакет-установщик; резолв **исполняемого
+файла** вместо резолва npm-пакета (`PATH` + известные каталоги глобальных bin + явный
+override); ONNX Runtime — артефакт первого запуска рядом с весами моделей. Цена канала
+`latest` названа явно в ADR-0013. Отклонения `D-102`…`D-107`.
+
+**Решено ранее (rev 6, в силе):** stable worktree UUID + `worktree_path` (path hash — только lookup);
 двухосевой `worktree_projection_state` (generation × model space × schema version);
 **validate-on-open вместо durable barrier** (проекция = недоверенный кэш);
 desired-set reconciliation, full rebuild = recovery default; **spool-only ingestion**
@@ -782,11 +793,20 @@ Memory/observations implementation-ready, когда дополнительно 
 
 ## Финал
 
-rev 6 не меняет parse identity — цепочка `file_revision → parsed_unit → occurrence`
-подтверждена третьим ревью и внешним аудитом. Ревизия заменяет недоказуемое
-(durability стороннего движка, dual-path identity) на детектируемое (validate-on-open,
-spool-only), закрывает schema-констрейнты (worktree UUID, scope uniqueness,
-deterministic IDs, source-blob invariant) и добавляет качественные гейты памяти.
-Бюджет корректности распределён явно: строгие транзакции — памяти, detect+rebuild —
-код-индексу. Шаги 1–7 стартуют немедленно и не зависят от открытых вопросов; выбор
-dense backend вынесен в сравнительный спайк шага 11 и до него ничего не блокирует.
+rev 7 не меняет ни одну идентичность и ни один инвариант хранилища: она меняет только то,
+как продуктовые бинарники попадают на машину и как их находят. Причина — не новая идея, а
+расхождение: объявленный канал доставки не был реализован, а реализованный не был описан.
+Цена нового канала названа прямо в ADR-0013, а не спрятана за словом «checksum-verified»:
+при `latest` сверка идёт с `.sha256` из того же релиза, то есть защищает от повреждения
+при передаче и от подмены на транспорте, но не от скомпрометированного релиза.
+
+Закрывающий абзац rev 6, сохранён дословно:
+
+> rev 6 не меняет parse identity — цепочка `file_revision → parsed_unit → occurrence`
+> подтверждена третьим ревью и внешним аудитом. Ревизия заменяет недоказуемое
+> (durability стороннего движка, dual-path identity) на детектируемое (validate-on-open,
+> spool-only), закрывает schema-констрейнты (worktree UUID, scope uniqueness,
+> deterministic IDs, source-blob invariant) и добавляет качественные гейты памяти.
+> Бюджет корректности распределён явно: строгие транзакции — памяти, detect+rebuild —
+> код-индексу. Шаги 1–7 стартуют немедленно и не зависят от открытых вопросов; выбор
+> dense backend вынесен в сравнительный спайк шага 11 и до него ничего не блокирует.

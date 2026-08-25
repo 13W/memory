@@ -12,14 +12,15 @@ The product is a local, co-located MCP service for Claude Code with three pillar
 - hybrid semantic code search;
 - spool-only capture of Claude Code observations.
 
-The implementation language is Rust. Distribution is through npm platform packages. There
-must be no mandatory external daemon.
+The implementation language is Rust. Installation is through a single npm package; the
+native binaries come from the project's own GitHub release assets. There must be no
+mandatory external daemon.
 
 ## Sources of truth
 
 Use this precedence order:
 
-1. `docs/idea.md` rev 6 — design rationale and `[FIXED]` decisions.
+1. `docs/idea.md` rev 7 — design rationale and `[FIXED]` decisions.
 2. `docs/specification/README.md` and `docs/specification/01-*.md` … `15-*.md` — normative,
    executable-level behavior.
 3. `docs/implementation-plan/README.md` — execution workflow and Definition of Done.
