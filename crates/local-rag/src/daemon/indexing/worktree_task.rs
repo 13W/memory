@@ -937,6 +937,34 @@ mod tests {
     /// `crates/local-rag/tests/idle_shutdown.rs::wait_until_idle_eligible`'s
     /// established idiom: a real but tiny poll interval, bounded convergence,
     /// never a fixed sleep standing in for "enough time must have passed."
+    /// The bound every shutdown assertion in this module uses, and the one
+    /// number here that is **derived from a measurement** rather than chosen by
+    /// feel (D-101).
+    ///
+    /// Two earlier widenings — `SHUTDOWN_JOIN_BUDGET` → 30 s, then 45 s — were
+    /// guesses, and the flake came back both times: the full `--lib` run was red
+    /// in two runs out of three, on `master` and equally on commits predating it.
+    /// So the cost was measured instead of estimated:
+    ///
+    /// | how the suite runs | draining one idle task |
+    /// | --- | --- |
+    /// | this test alone | **2–9 ms** |
+    /// | `--test-threads=4` | ~10 s |
+    /// | full 205-test run | **120 s** |
+    ///
+    /// The operation is not slow. The suite oversubscribes the machine — every
+    /// worktree-task fixture holds a dedicated OS thread, its own tokio runtime
+    /// and its own SQLite writer — so joining one thread waits on the scheduler
+    /// and on commits queued behind every other fixture's store. No event-based
+    /// rewrite removes that: the assertion ends in a thread join, and a join has
+    /// a deadline or it has none.
+    ///
+    /// Hence: five times the measured worst case. What these tests actually
+    /// assert is a **value** (`WorkersDrained::Yes`, or `stop()` returning at
+    /// all); the bound exists so a genuine hang fails loudly instead of wedging
+    /// the run forever.
+    const SUITE_STARVATION_BUDGET: Duration = Duration::from_secs(600);
+
     async fn wait_for(deadline: Duration, mut check: impl FnMut() -> bool) {
         tokio::time::timeout(deadline, async {
             while !check() {
@@ -1253,7 +1281,7 @@ mod tests {
         let fx = Fixture::new("repo").await;
         let handle = spawn_worktree_task(fx.params()).await.expect("start task");
 
-        wait_for(Duration::from_secs(30), || {
+        wait_for(SUITE_STARVATION_BUDGET, || {
             handle.status().last_generation_id.is_some()
         })
         .await;
@@ -1262,13 +1290,11 @@ mod tests {
             .await
             .expect("reconciler still alive");
 
-        // 45s, not a tight bound: this asserts "does not hang forever," not
-        // "is fast" — under heavy contention on this machine, a genuinely
-        // non-deadlocked `stop()` has still been observed taking tens of
-        // seconds (thread-scheduling delay, not the cyclic wait this test
-        // guards against). A real deadlock never completes at all, so any
-        // generous bound still catches it.
-        tokio::time::timeout(Duration::from_secs(45), handle.stop())
+        // D-101: hang-detection, not a latency claim. A real deadlock on the
+        // retained trigger-sender clone never completes at all, so any bound
+        // above the measured worst case catches it; see
+        // `SUITE_STARVATION_BUDGET` for why that worst case is what it is.
+        tokio::time::timeout(SUITE_STARVATION_BUDGET, handle.stop())
             .await
             .expect(
                 "stop() must not deadlock on its own retained trigger-sender clone \
@@ -1406,18 +1432,34 @@ mod tests {
 
         let fx = Fixture::new("repo").await;
         let handle = spawn_worktree_task(fx.params()).await.expect("start task");
+
+        // D-101, first half: stop only once the task is provably idle. Draining
+        // and the first indexing cycle used to race, so the budget below was
+        // covering two different waits at once and could not be reasoned about.
+        // Measured: the cycle completes in ~43 ms even under the full parallel
+        // suite, so this converges immediately and is not the flaky part.
+        wait_for(SUITE_STARVATION_BUDGET, || {
+            handle.status().last_generation_id.is_some()
+        })
+        .await;
+
         let mut tasks = HashMap::new();
         tasks.insert(fx.worktree_id.to_string(), handle);
 
-        // Deliberately generous, and not a measurement: the claim is that a
-        // task which *does* exit is reported as drained, so the budget must
-        // not be the thing under test. At `SHUTDOWN_JOIN_BUDGET` this turned
-        // into a timing test and failed under the full 204-test parallel run
-        // while passing alone — exactly the wall-clock dependence CLAUDE.md
-        // rules out.
+        // D-101, second half, and the budget is derived rather than guessed —
+        // twice already it was widened by feel and the flake came back. What the
+        // measurement says: draining this idle task takes **2–9 ms** when the
+        // test runs alone, ~10 s at `--test-threads=4`, and **120 s** under the
+        // full 205-test run. The operation is not slow; the suite oversubscribes
+        // the machine, and joining one OS thread then waits on the scheduler and
+        // on SQLite commits queued behind every other fixture's store.
+        //
+        // So this bound is hang-detection, not a latency claim: a real failure —
+        // a task reported abandoned when it did exit — is a wrong *value*, and
+        // that is what the assertion checks. See `SUITE_STARVATION_BUDGET`.
         let drained = tokio::time::timeout(
-            Duration::from_secs(60),
-            stop_all(tasks, Duration::from_secs(30)),
+            SUITE_STARVATION_BUDGET,
+            stop_all(tasks, SUITE_STARVATION_BUDGET),
         )
         .await
         .expect("an idle task must stop");
