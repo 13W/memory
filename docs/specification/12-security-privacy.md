@@ -189,6 +189,42 @@ apart. It applies to rule 2 **only** — feeding the parts to rule 4 would split
 `/` and `=` and manufacture exactly the false positives D-097 measured away. Re-measured on the
 same 43-file corpus: still 11, unchanged, so the widening cost no precision.
 
+
+**Scanner rule set v4 (D-100, `[SPEC]`).** `redaction_version = 4`. Rule 4 now judges the
+**`=`-separated parts** of a token rather than the token as a whole. D-098 made the indexer
+classify files it had never reached — `.env`, `.yaml`, `.sh`, `.md`, `.pem` — and secret skips on
+the owner's store went 11 → 68. Most of the new ones are **true**, which is the strongest argument
+for the universal path there is: `mongodb.pem`, `jwt-private.key`, `local.legatics.com.key`, `.env`
+files, kustomize secret literals, a real `COOKIE_SECRET` in `pm2.ecosystem.yml`, a KMS-encrypted
+secret in a bootstrap script, an X.509 certificate in a design document. Secrets live exactly in the
+files that used to be invisible.
+
+But a new false class came with them. `is_token_byte` accepts `=`, `-` and `_`, so an ordinary
+environment-variable assignment — `S3_REDIS_BACKUP_BUCKET=legatics-dev-redis-backup` — is **one**
+48-character token carrying a digit, lowercase and uppercase: it clears the length bar, the
+mixed-class rule and the entropy threshold alike, and cost whole files (`kustomization.yaml` across
+fifteen overlays, `.env.example`, `.sh`, `.md`). Splitting on `=` is safe precisely because in
+base64 `=` occurs only as trailing padding, so a real secret keeps one part at full length — a
+secret assigned to an env var, and base64 ending in `=`, both stay flagged. The length bar and the
+shape bars apply to the same substring; measuring one on the token while judging the other on a
+part is the same mistake one level down, and a corpus case pins it.
+
+Two things D-100 deliberately did **not** do, both settled by measurement:
+
+- `ENTROPY_MIN_BITS` was **not** raised. The measured entropies overlap — a false positive
+  (`CollatePackDocumentPageIdsWithNumbersMapV2`, an identifier whose `V2` suffix supplied the single
+  digit the mixed-class rule wanted) scores **4.565**, while a true positive (an X.509 body) scores
+  **4.501**. A higher bar loses true positives before it clears false ones.
+- No split on `/` was added. It would tear apart real base64 containing a slash — a case the corpus
+  pins on purpose (`adversarial.redaction.base64-with-slash-and-plus`).
+
+Measured result on the same repository: **68 → 49**, with every named true positive verified present
+**by path**, not inferred from the count. Two individual false positives remain — the `…MapV2`
+identifier and a scratchpad path quoted in a markdown file — and are recorded rather than chased, on
+the same reasoning D-097 applied to `tok-reclaimed`: a rule written for one line is a rule overfitted
+to it. Both are now visible in `local-rag project coverage` rather than invisible, which is the
+difference D-096 bought.
+
 ## 3. Retention `[FIXED]`
 
 - `observation_payload` under real TTL (`payload_ttl_hours`), enforced by a sweeper; envelopes

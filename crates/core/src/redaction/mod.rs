@@ -22,7 +22,7 @@
 //! record it in envelopes (spec 12 §2 `[SPEC]`) so a verdict is auditable against
 //! the exact rules that produced it. Bumping the rule set MUST bump the version.
 //!
-//! # Rule set v3 (`[SPEC]`, conservative and dependency-free)
+//! # Rule set v4 (`[SPEC]`, conservative and dependency-free)
 //!
 //! Detection is deterministic byte/line scanning — no regex engine — so the crate
 //! takes on no new dependency and every verdict is stable across platforms:
@@ -38,9 +38,10 @@
 //!    as `let token = get()` is not flagged, keeping ordinary code quiet) whose
 //!    value is not self-evidently a label rather than a secret (see
 //!    [`assigned_value_is_secret`]).
-//! 4. **High-entropy strings** — a long token (≥ [`ENTROPY_MIN_LEN`]) whose Shannon
-//!    entropy per character is ≥ [`ENTROPY_MIN_BITS`], which mixes character
-//!    classes, is not inside a URL, and is not a subresource-integrity digest. The
+//! 4. **High-entropy strings** — a long **`=`-separated part** of a token
+//!    (≥ [`ENTROPY_MIN_LEN`], D-100) whose Shannon entropy per character is
+//!    ≥ [`ENTROPY_MIN_BITS`], which mixes character classes, is not inside a URL,
+//!    and is not a subresource-integrity digest. The
 //!    threshold sits above a hex digest's ceiling (log2 16 = 4.0) so git SHAs and
 //!    hex checksums do **not** trip it, while base64-encoded key material
 //!    (≈5.5–6.0 bits/char) does.
@@ -70,6 +71,25 @@
 //! corpus is lost — `adversarial.redaction.*` in `fixtures/adversarial/index.json`
 //! holds both halves, and `crates/core/tests/redaction_corpus.rs` gates on them.
 //!
+//! # What D-098 exposed, and D-100 fixed
+//!
+//! D-098 made the indexer classify files it had never reached — `.env`, `.yaml`,
+//! `.sh`, `.md`, `.pem` — and secret skips went 11 to 68 on the same repository.
+//! Most of the new ones are **true**: `mongodb.pem`, `jwt-private.key`, `.env`
+//! files, kustomize secrets, a real `COOKIE_SECRET`, a KMS secret, an X.509
+//! certificate in a design doc. Secrets live exactly in the files that used to be
+//! invisible, which is the strongest argument for the universal path there is.
+//!
+//! But a new false class came with them: `NAME=value`. Rule 4 now judges the
+//! `=`-separated parts (see [`classify_token`]).
+//!
+//! Two things D-100 deliberately did **not** do, both settled by measurement
+//! rather than left implicit: [`ENTROPY_MIN_BITS`] was not raised, because the
+//! measured entropies overlap — a false `…MapV2` scores 4.565 and a true X.509
+//! scores 4.501, so a higher bar loses true positives before it clears false
+//! ones; and no split on `/` was added, because it would tear apart real base64
+//! containing a slash, a case the corpus pins on purpose.
+//!
 //! The set stays intentionally conservative: it aims to catch obvious committed
 //! secrets with a low false-positive rate on real source, and is expected to grow
 //! (each growth bumps [`REDACTION_VERSION`]).
@@ -79,7 +99,7 @@
 /// Recorded by spool/remote flows in their envelopes so a redaction verdict is
 /// reproducible against the rules that produced it. Any change to the rule set
 /// below MUST increment this.
-pub const REDACTION_VERSION: u32 = 3;
+pub const REDACTION_VERSION: u32 = 4;
 
 /// Minimum token length considered by the high-entropy rule.
 pub const ENTROPY_MIN_LEN: usize = 40;
@@ -537,14 +557,31 @@ fn classify_token(token: &str, inside_url: bool) -> Option<FindingKind> {
     if INTEGRITY_PREFIXES.iter().any(|p| token.starts_with(p)) {
         return None;
     }
-    if token.len() >= ENTROPY_MIN_LEN
-        && looks_base64ish(token)
-        && has_mixed_character_classes(token)
-        && shannon_entropy_bits(token) >= ENTROPY_MIN_BITS
+    // D-100: judge the `=`-separated PARTS, not the whole token. `is_token_byte`
+    // accepts `= - _`, so `S3_REDIS_BACKUP_BUCKET=legatics-dev-redis-backup` is
+    // one 48-character token with all three character classes — an ordinary
+    // environment-variable assignment that cleared every bar and cost whole files.
+    // Splitting on `=` is safe precisely because in base64 `=` occurs only as
+    // trailing padding, so a real secret keeps one part at full length.
+    if token
+        .split('=')
+        .any(|part| part.len() >= ENTROPY_MIN_LEN && is_entropic_material(part))
     {
         return Some(FindingKind::HighEntropy);
     }
     None
+}
+
+/// Whether `part` looks like encoded key material rather than a name or a path.
+///
+/// Split out from [`classify_token`] so the length bar and the shape bars are
+/// applied to the same substring — judging the shape of a whole token while
+/// measuring the length of a part would be the same class of mistake D-100
+/// exists to fix.
+fn is_entropic_material(part: &str) -> bool {
+    looks_base64ish(part)
+        && has_mixed_character_classes(part)
+        && shannon_entropy_bits(part) >= ENTROPY_MIN_BITS
 }
 
 /// Bytes that may glue a credential to something else inside one scanned token
@@ -666,6 +703,38 @@ mod tests {
     // -----------------------------------------------------------------
     // D-097: one unit case per narrowing, against the helper it narrowed
     // -----------------------------------------------------------------
+
+    #[test]
+    fn an_env_assignment_is_judged_part_by_part() {
+        let s = Scanner::new();
+        // The class D-098's live acceptance exposed: `=` glues a name to a value
+        // and the pair clears every bar the halves would fail.
+        assert!(!s.has_secret("S3_REDIS_BACKUP_BUCKET=legatics-dev-redis-backup"));
+        assert!(!s.has_secret("export S3_CUSTOMERS_BUCKET=legatics-development-customers"));
+        assert!(!s.has_secret("      - S3_MONGO_BACKUP_BUCKET=legatics-production-mongo-backup"));
+
+        // The half that must survive: a real secret assigned to an env var keeps
+        // one part at full length.
+        assert!(s.has_secret(
+            "env MIRI_ROOT_CUSTOMER_SECRET=AQIDAHgUKAdXUQ893Kgcn5VWOTowFgXi5CbaL96g1wNgcEgkQgEQnxgmQLpW"
+        ));
+        // And base64 whose only `=` is trailing padding is untouched by the split
+        // — which is exactly why splitting on `=` is safe.
+        assert!(s.has_secret("  COOKIE_SECRET: o4vC/jBDibEuA1jBf+5+FM6tEpYBtmV847wJjeDUNTg="));
+        assert!(s.has_secret("COOKIE_SECRET=dGVzdC1jb29raWUtc2VjcmV0LTMyLWJ5dGVzLWxvbmc="));
+    }
+
+    #[test]
+    fn the_length_bar_and_the_shape_bars_apply_to_the_same_substring() {
+        // Both halves of `NAME=value` are short; neither is material. Judging the
+        // shape of the whole token while measuring the length of a part would be
+        // the same mistake, one level down.
+        assert!(!is_entropic_material("S3_REDIS_BACKUP_BUCKET"));
+        assert!(!is_entropic_material("legatics-dev-redis-backup"));
+        assert!(is_entropic_material(
+            "AQIDAHgUKAdXUQ893Kgcn5VWOTowFgXi5CbaL96g1wNgcEgkQgEQnxgmQLpW"
+        ));
+    }
 
     #[test]
     fn a_credential_is_found_however_it_is_glued_to_its_neighbour() {
@@ -843,7 +912,7 @@ mod tests {
         // verdict must move —
         // consumers record it precisely so an old verdict stays auditable against
         // the rules that produced it (spec 12 §2 `[SPEC]`).
-        assert_eq!(REDACTION_VERSION, 3);
+        assert_eq!(REDACTION_VERSION, 4);
         assert_eq!(Scanner::new().version(), REDACTION_VERSION);
         assert_eq!(Scanner::default().version(), REDACTION_VERSION);
     }

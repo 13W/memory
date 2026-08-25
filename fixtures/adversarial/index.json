@@ -1113,6 +1113,132 @@
       "expected": {
         "has_secret": true
       }
+    },
+    {
+      "id": "adversarial.redaction.env-assignment-is-not-a-secret",
+      "title": "A plain environment-variable assignment is not a secret",
+      "status": "active",
+      "tags": [
+        "redaction",
+        "secrets",
+        "D-100"
+      ],
+      "provenance": {
+        "source": "D-100, found by D-098's live acceptance",
+        "ref": "crates/core/tests/redaction_corpus.rs::the_labelled_corpus_holds",
+        "note": "is_token_byte accepts = - _, so this is ONE 48-character token with a digit, lowercase and uppercase: it clears the length bar, D-097's mixed-class rule and the entropy threshold alike. It cost cronjob/redis-backup/docs/monitoring-and-restore.md its whole file"
+      },
+      "input": {
+        "text": "S3_REDIS_BACKUP_BUCKET=legatics-dev-redis-backup\n"
+      },
+      "expected": {
+        "has_secret": false
+      }
+    },
+    {
+      "id": "adversarial.redaction.shell-export-is-not-a-secret",
+      "title": "A shell export of a bucket name is not a secret",
+      "status": "active",
+      "tags": [
+        "redaction",
+        "secrets",
+        "D-100"
+      ],
+      "provenance": {
+        "source": "D-100, found by D-098's live acceptance",
+        "ref": "crates/core/tests/redaction_corpus.rs::the_labelled_corpus_holds",
+        "note": "the same shape in .sh and .env.example files"
+      },
+      "input": {
+        "text": "export S3_CUSTOMERS_BUCKET=legatics-development-customers\n"
+      },
+      "expected": {
+        "has_secret": false
+      }
+    },
+    {
+      "id": "adversarial.redaction.kustomize-literal-is-not-a-secret",
+      "title": "A kustomize literal naming a bucket is not a secret",
+      "status": "active",
+      "tags": [
+        "redaction",
+        "secrets",
+        "D-100"
+      ],
+      "provenance": {
+        "source": "D-100, found by D-098's live acceptance",
+        "ref": "crates/core/tests/redaction_corpus.rs::the_labelled_corpus_holds",
+        "note": "the same shape in kustomization.yaml, where it cost fifteen overlay files at once"
+      },
+      "input": {
+        "text": "      - S3_MONGO_BACKUP_BUCKET=legatics-production-mongo-backup\n"
+      },
+      "expected": {
+        "has_secret": false
+      }
+    },
+    {
+      "id": "adversarial.redaction.secret-assigned-to-an-env-var",
+      "title": "A real secret assigned to an environment variable is still a secret",
+      "status": "active",
+      "tags": [
+        "redaction",
+        "secrets",
+        "D-100"
+      ],
+      "provenance": {
+        "source": "D-100, found by D-098's live acceptance",
+        "ref": "crates/core/tests/redaction_corpus.rs::the_labelled_corpus_holds",
+        "note": "the half that must survive the fix: splitting on = leaves a 60-character part that is still key material. Measured on the owner's store in scripts/prepare-scratch-db.sh"
+      },
+      "input": {
+        "text": "env MIRI_ROOT_CUSTOMER_SECRET=AQIDAHgUKAdXUQ893Kgcn5VWOTowFgXi5CbaL96g1wNgcEgkQgEQnxgmQLpW\n"
+      },
+      "expected": {
+        "has_secret": true
+      }
+    },
+    {
+      "id": "adversarial.redaction.base64-with-trailing-padding",
+      "title": "Base64 whose only = is trailing padding is a secret",
+      "status": "active",
+      "tags": [
+        "redaction",
+        "secrets",
+        "D-100"
+      ],
+      "provenance": {
+        "source": "D-100, found by D-098's live acceptance",
+        "ref": "crates/core/tests/redaction_corpus.rs::the_labelled_corpus_holds",
+        "note": "why splitting on = is safe: in base64, = occurs only as padding at the tail, so the part before it is the whole key. A real secret, measured in pm2.ecosystem.yml"
+      },
+      "input": {
+        "text": "  COOKIE_SECRET: o4vC/jBDibEuA1jBf+5+FM6tEpYBtmV847wJjeDUNTg=\n"
+      },
+      "expected": {
+        "has_secret": true
+      }
+    },
+    {
+      "id": "adversarial.redaction.short-part-behind-a-long-token",
+      "title": "A token long enough only because of its name is not a secret",
+      "status": "active",
+      "tags": [
+        "redaction",
+        "secrets",
+        "D-100"
+      ],
+      "provenance": {
+        "source": "D-100 mutation testing",
+        "ref": "crates/core/tests/redaction_corpus.rs::the_labelled_corpus_holds",
+        "note": "the whole token is 47 characters but its value part is 32 -- below ENTROPY_MIN_LEN, which is the bar for a plausible key. Measuring the length on the token while judging the shape on the part survived mutation until this case existed"
+      },
+      "input": {
+        "text": "SESSION_PREFIX=Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv\n"
+      },
+      "expected": {
+        "has_secret": false
+      }
     }
   ]
 }
