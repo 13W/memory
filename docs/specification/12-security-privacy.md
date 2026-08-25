@@ -177,6 +177,18 @@ it, and only a two-sided corpus catches either mistake. `crates/core/tests/redac
 loads it at runtime and gates on it. Case texts are minimal reconstructions of the measured
 mechanisms, never copies of the source they were measured on.
 
+**Scanner rule set v3 (D-099, `[SPEC]`).** `redaction_version = 3`. Rule 2 now tests a token **and
+each of its `= + /`-separated parts**. `is_token_byte` accepts those three bytes, so
+`https://x/callback?k=ghp_…` produced a *single* token `k=ghp_…` whose prefix check was false: a
+credential in a URL query string — the most ordinary shape of a leaked token — matched no rule at
+all. The defect is not new; rule set v1 behaved identically. It surfaced because D-097 was the
+first change to carry a corpus of **true** positives, written to prove its narrowings cost no
+recall, and one case of that corpus failed on both rule sets. Splitting is safe by construction:
+every format in `CREDENTIAL_RULES` is drawn from `[A-Za-z0-9_-]`, so no separator can tear a prefix
+apart. It applies to rule 2 **only** — feeding the parts to rule 4 would split base64 on its own
+`/` and `=` and manufacture exactly the false positives D-097 measured away. Re-measured on the
+same 43-file corpus: still 11, unchanged, so the widening cost no precision.
+
 ## 3. Retention `[FIXED]`
 
 - `observation_payload` under real TTL (`payload_ttl_hours`), enforced by a sweeper; envelopes
