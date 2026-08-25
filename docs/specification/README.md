@@ -1,6 +1,6 @@
 # local-rag v2 — Specification
 
-Executable-level specification for the rewrite of `local-rag` (design baseline: **idea.md rev 6**).
+Executable-level specification for the rewrite of `local-rag` (design baseline: **idea.md rev 7**).
 This document set replaces the v1 `specification.md`, which is renamed to `specification-v1.md`
 and kept as **behavioral archaeology only** (non-normative).
 
@@ -10,9 +10,9 @@ Every normative statement carries one of three markers where provenance matters:
 
 | Marker | Meaning |
 | --- | --- |
-| `[FIXED]` | Decided in design rev 5/6. Changing it requires a new design revision. |
+| `[FIXED]` | Decided in a design revision (rev 5/6/7). Changing it requires a new design revision. |
 | `[SPEC]` | Concretization introduced by this specification (the design left it at principle level). Review before implementation; changing it requires only a spec edit. |
-| `[OPEN]` | Explicitly open in rev 6 (§18). Resolved by spike/benchmark, not by this document. Implementation MUST NOT hard-code assumptions that pre-empt the resolution. |
+| `[OPEN]` | Explicitly open in the design (§18). Resolved by spike/benchmark, not by this document. Implementation MUST NOT hard-code assumptions that pre-empt the resolution. |
 
 Conformance keywords **MUST / MUST NOT / SHOULD / MAY** follow RFC 2119 semantics.
 
@@ -43,7 +43,8 @@ Projection work (steps 8–11): 05 → 10. Memory work (steps 14–15): 07 → 0
 
 ## Relationship to the design document
 
-`idea.md` (rev 6) remains the **design rationale**: it explains *why*. This spec states *what*,
-in testable form. On conflict, rev 6 decisions win until a rev 7 exists; report conflicts as
-spec bugs. Sections of this spec covering roadmap steps not yet started are expected to gain
-detail as those steps begin (per rev 6 §18 the spec is grown incrementally, not frozen).
+`idea.md` (rev 7) remains the **design rationale**: it explains *why*. This spec states *what*,
+in testable form. On conflict, the current revision of `idea.md` wins until a newer one
+supersedes it; report conflicts as spec bugs. Sections of this spec covering roadmap steps
+not yet started are expected to gain detail as those steps begin (per §18 the spec is grown
+incrementally, not frozen).
