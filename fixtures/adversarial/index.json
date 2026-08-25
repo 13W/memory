@@ -1092,6 +1092,27 @@
       "expected": {
         "has_secret": true
       }
+    },
+    {
+      "id": "adversarial.redaction.credential-in-a-url-query",
+      "title": "A credential in a URL query string is a secret",
+      "status": "active",
+      "tags": [
+        "redaction",
+        "secrets",
+        "D-099"
+      ],
+      "provenance": {
+        "source": "D-099, found by D-097's true-positive corpus",
+        "ref": "crates/core/tests/redaction_corpus.rs::the_labelled_corpus_holds",
+        "note": "is_token_byte counts = + / as token bytes, so `?k=ghp_...` is ONE token whose prefix check fails; the most ordinary shape of a leaked token was undetected in rule set v1 as much as in v2"
+      },
+      "input": {
+        "text": "const u = \"https://x.example/callback?k=ghp_012345678901234567890123456789012345\";\n"
+      },
+      "expected": {
+        "has_secret": true
+      }
     }
   ]
 }

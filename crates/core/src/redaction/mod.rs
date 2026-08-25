@@ -22,14 +22,15 @@
 //! record it in envelopes (spec 12 §2 `[SPEC]`) so a verdict is auditable against
 //! the exact rules that produced it. Bumping the rule set MUST bump the version.
 //!
-//! # Rule set v2 (`[SPEC]`, conservative and dependency-free)
+//! # Rule set v3 (`[SPEC]`, conservative and dependency-free)
 //!
 //! Detection is deterministic byte/line scanning — no regex engine — so the crate
 //! takes on no new dependency and every verdict is stable across platforms:
 //!
 //! 1. **PEM private keys** — a line that **begins** with `-----BEGIN` (after
 //!    leading whitespace) and also bears `PRIVATE KEY`.
-//! 2. **Known credential formats** — tokens with a recognized prefix and a
+//! 2. **Known credential formats** — a token, **or any of its `= + /`-separated
+//!    parts** ([`CREDENTIAL_GLUE`], D-099), with a recognized prefix and a
 //!    plausible minimum length (AWS `AKIA`/`ASIA`, GitHub `ghp_`/`gho_`/`ghs_`/
 //!    `github_pat_`, Slack `xox[bpas]-`, OpenAI-style `sk-`).
 //! 3. **Assigned secrets** — a `password`/`secret`/`api_key`/`token`/… key
@@ -78,7 +79,7 @@
 /// Recorded by spool/remote flows in their envelopes so a redaction verdict is
 /// reproducible against the rules that produced it. Any change to the rule set
 /// below MUST increment this.
-pub const REDACTION_VERSION: u32 = 2;
+pub const REDACTION_VERSION: u32 = 3;
 
 /// Minimum token length considered by the high-entropy rule.
 pub const ENTROPY_MIN_LEN: usize = 40;
@@ -527,10 +528,8 @@ const INTEGRITY_PREFIXES: &[&str] = &["sha512-", "sha384-", "sha256-", "sha1-"];
 /// largest false-positive source measured in D-097, while a `ghp_…` token pasted
 /// into a URL is exactly as leaked as one pasted anywhere else.
 fn classify_token(token: &str, inside_url: bool) -> Option<FindingKind> {
-    for (prefix, min_len) in CREDENTIAL_RULES {
-        if token.len() >= *min_len && token.starts_with(prefix) {
-            return Some(FindingKind::CredentialToken);
-        }
+    if has_credential_prefix(token) {
+        return Some(FindingKind::CredentialToken);
     }
     if inside_url {
         return None;
@@ -546,6 +545,30 @@ fn classify_token(token: &str, inside_url: bool) -> Option<FindingKind> {
         return Some(FindingKind::HighEntropy);
     }
     None
+}
+
+/// Bytes that may glue a credential to something else inside one scanned token
+/// (D-099).
+///
+/// [`is_token_byte`] accepts `= + /`, so `?k=ghp_…` in a URL query string is a
+/// **single** token whose prefix check fails — the most ordinary shape of a
+/// leaked token went undetected by every rule. Splitting on exactly these three
+/// is safe by construction: every format in [`CREDENTIAL_RULES`] is drawn from
+/// `[A-Za-z0-9_-]`, so none of them can be torn apart by the split.
+///
+/// Deliberately applied to the credential rule **only**. Feeding the parts to the
+/// entropy rule would split base64 on its own `/` and `=` and manufacture exactly
+/// the false positives D-097 had to measure away.
+const CREDENTIAL_GLUE: &[char] = &['=', '+', '/'];
+
+/// Whether `token`, or any of its [`CREDENTIAL_GLUE`]-separated parts, is a known
+/// credential format at a plausible length (D-099).
+fn has_credential_prefix(token: &str) -> bool {
+    token.split(CREDENTIAL_GLUE).any(|part| {
+        CREDENTIAL_RULES
+            .iter()
+            .any(|(prefix, min_len)| part.len() >= *min_len && part.starts_with(prefix))
+    })
 }
 
 /// Whether `token` mixes digits, lowercase and uppercase (D-097).
@@ -643,6 +666,31 @@ mod tests {
     // -----------------------------------------------------------------
     // D-097: one unit case per narrowing, against the helper it narrowed
     // -----------------------------------------------------------------
+
+    #[test]
+    fn a_credential_is_found_however_it_is_glued_to_its_neighbour() {
+        let s = Scanner::new();
+        let token = "ghp_012345678901234567890123456789012345";
+
+        // The shape that had no detection at all: a query-string parameter.
+        assert!(s.has_secret(&format!("const u = \"https://x.example/cb?k={token}\";")));
+        assert!(s.has_secret(&format!("fetch(`/api?token={token}&page=2`)")));
+        // The other two glue bytes `is_token_byte` accepts.
+        assert!(s.has_secret(&format!("const u = \"https://x.example/{token}\";")));
+        assert!(s.has_secret(&format!("const u = \"a+{token}\";")));
+        // And still, unglued.
+        assert!(s.has_secret(&format!("token = \"{token}\"")));
+
+        // Splitting is for the credential rule only: a base64 blob must not be
+        // chopped on its own `/` and `=` and re-judged part by part, which is how
+        // the entropy false positives D-097 measured away would come back.
+        assert!(!has_credential_prefix(
+            "w+YQ0eVUHNzQ2zp/u8Ip1aRsaJQ2sgWzAS5umnXA7JA="
+        ));
+        // A prefix below its plausible length is still not a credential.
+        assert!(!has_credential_prefix("?k=ghp_short"));
+        assert!(!has_credential_prefix("sk-"));
+    }
 
     #[test]
     fn the_pem_rule_needs_the_header_to_begin_the_line() {
@@ -791,10 +839,11 @@ mod tests {
 
     #[test]
     fn version_is_stable_and_exposed() {
-        // D-097 narrowed four rules, so the stamp on every verdict must move —
+        // D-097 narrowed four rules and D-099 widened one, so the stamp on every
+        // verdict must move —
         // consumers record it precisely so an old verdict stays auditable against
         // the rules that produced it (spec 12 §2 `[SPEC]`).
-        assert_eq!(REDACTION_VERSION, 2);
+        assert_eq!(REDACTION_VERSION, 3);
         assert_eq!(Scanner::new().version(), REDACTION_VERSION);
         assert_eq!(Scanner::default().version(), REDACTION_VERSION);
     }
