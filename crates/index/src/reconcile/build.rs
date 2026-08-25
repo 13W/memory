@@ -50,7 +50,8 @@ use local_rag_store::{
 
 use crate::classify::{Classification, ClassifierConfig, GitignoreSet, classify};
 use crate::parse::{
-    LanguageId, ParseOutput, parser_fingerprint, parser_for, persist_parse_output, select_language,
+    ParseOutput, SourceDialect, chunk_universal, dialect_fingerprint, parser_for,
+    persist_parse_output, select_dialect,
 };
 use crate::scan::ScanManifest;
 
@@ -71,9 +72,6 @@ pub struct BuildOutcome {
     /// every existing caller reads the total and a breakdown that has to be
     /// re-summed to check it is a breakdown that can silently disagree.
     pub skipped_by_reason: SkipTally,
-    /// Files deferred to the (later) language-agnostic path — no recognized v0
-    /// language, so neither indexed nor skipped.
-    pub files_deferred: usize,
     /// Total `generation_unit_occurrence` rows written.
     pub occurrences: usize,
     /// `file_revision` rows newly created (changed/new content).
@@ -253,7 +251,6 @@ async fn run_build(
         files_indexed: 0,
         files_skipped: 0,
         skipped_by_reason: SkipTally::default(),
-        files_deferred: 0,
         occurrences: 0,
         revisions_created: 0,
         revisions_reused: 0,
@@ -285,13 +282,13 @@ async fn run_build(
             continue;
         };
 
-        // Language is chosen by extension; `None` defers to the language-agnostic
-        // path (a later task) — neither indexed nor skipped.
-        let Some(language) = select_language(Path::new(normalized_path)) else {
-            out.files_deferred += 1;
-            continue;
-        };
-        let fingerprint = parser_fingerprint(language);
+        // D-098: the dialect is total. An extension that selects a v0 language gets
+        // its tree-sitter adapter; everything else gets a universal chunking
+        // policy. There is no third outcome any more — the `files_deferred`
+        // short-circuit that used to sit here returned before `classify` ever ran,
+        // which is why a `.png` was as invisible as a `.md`.
+        let dialect = select_dialect(Path::new(normalized_path));
+        let fingerprint = dialect_fingerprint(dialect);
 
         // Structural-sharing pre-check: content already ingested under this
         // parser fingerprint ⇒ reuse the revision + its units, no read/parse.
@@ -343,7 +340,10 @@ async fn run_build(
             }
             Classification::Indexed => {
                 let prepared = prepare_source(&bytes);
-                let parse_output = parser_for(language).parse(&bytes);
+                let parse_output = match dialect {
+                    SourceDialect::Language(language) => parser_for(language).parse(&bytes),
+                    SourceDialect::Universal(kind) => chunk_universal(kind, &bytes),
+                };
                 let new_revision_id = uuids.next_uuid().to_string();
                 let candidate_unit_ids: Vec<String> = (0..parse_output.units.len())
                     .map(|_| uuids.next_uuid().to_string())
@@ -354,7 +354,7 @@ async fn run_build(
                     generation_id,
                     normalized_path,
                     &entry.display_path,
-                    language,
+                    dialect,
                     fingerprint,
                     new_revision_id,
                     prepared,
@@ -405,7 +405,7 @@ async fn persist_indexed_file(
     generation_id: &str,
     normalized_path: &str,
     display_path: &str,
-    language: LanguageId,
+    dialect: SourceDialect,
     fingerprint: String,
     new_revision_id: String,
     prepared: PreparedSource,
@@ -433,7 +433,7 @@ async fn persist_indexed_file(
                 let persisted = persist_parse_output(
                     tx,
                     &revision_id,
-                    language,
+                    dialect,
                     &source_blob,
                     &parse_output,
                     &candidate_unit_ids,

@@ -211,6 +211,7 @@ fn has_visibility_modifier(node: Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::language::SourceDialect;
     use crate::parse::locator::SyntaxAnchor;
 
     fn parse(src: &str) -> ParseOutput {
@@ -413,8 +414,10 @@ mod tests {
             foo.signature_fingerprint,
             "2e25289b78331871a4e4f216d8f00356d7ff2749f88ca57dbd8f8b3dda08330f"
         );
-        let locator =
-            SyntaxLocator::from_draft(foo.locator_draft(LanguageId::Rust), "b10b1d".to_string());
+        let locator = SyntaxLocator::from_draft(
+            foo.locator_draft(SourceDialect::Language(LanguageId::Rust)),
+            "b10b1d".to_string(),
+        );
         assert_eq!(
             locator.serialize(),
             "anchor=p:function:foo;blob=b10b1d;lang=rust;\

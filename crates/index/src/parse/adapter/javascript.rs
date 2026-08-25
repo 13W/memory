@@ -157,6 +157,7 @@ impl LanguageSpec for JavaScriptParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::language::SourceDialect;
     use crate::parse::locator::SyntaxAnchor;
 
     fn parse(src: &str) -> ParseOutput {
@@ -357,7 +358,7 @@ mod tests {
             "ef7dab787bf7f0827f1e8cefac975d9e32c3f341c3b292ccdd84256bbd694a60"
         );
         let locator = SyntaxLocator::from_draft(
-            foo.locator_draft(LanguageId::JavaScript),
+            foo.locator_draft(SourceDialect::Language(LanguageId::JavaScript)),
             "b10b1d".to_string(),
         );
         assert_eq!(

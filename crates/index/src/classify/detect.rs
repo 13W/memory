@@ -13,6 +13,9 @@ pub const BINARY_SNIFF_LEN: usize = 8192;
 ///
 /// Curated and intentionally conservative; extends over time. Matched against the
 /// final `.`-delimited suffix of the path's last component.
+///
+/// The list is a **built-in constant, not config** (spec 06 §2.2): only the size
+/// cap is configurable in v0.
 pub const BINARY_EXTENSIONS: &[&str] = &[
     // images
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "tif", "heic", "avif",
@@ -25,6 +28,16 @@ pub const BINARY_EXTENSIONS: &[&str] = &[
     "exe", "dll", "so", "dylib", "a", "o", "obj", "lib", "class", "jar", "wasm", "pyc", "pyd",
     // data stores / blobs
     "sqlite", "db", "bin", "dat", "pack", "idx",
+    // D-098: text that is not source text. `svg` is XML and `ipynb`/`drawio` are
+    // JSON, so no NUL sniff will ever catch them, yet each is a serialized
+    // *artifact* — a picture, a notebook's outputs, a diagram — whose bytes are
+    // machine-written and searchable only as noise. Before D-098 they were
+    // invisible for the wrong reason (no v0 language ⇒ written nowhere); now that
+    // every accepted file is chunked, they have to be refused on purpose. The
+    // `binary` reason is the one spec 06 §2.2 provides, and its meaning is
+    // widened to "content that is not source text" rather than "contains a NUL"
+    // (see that section's own D-098 note).
+    "svg", "ipynb", "drawio", "map",
 ];
 
 /// Whether `content` looks binary: a NUL byte in the first [`BINARY_SNIFF_LEN`]

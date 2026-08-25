@@ -24,7 +24,7 @@
 //! guarantees `parent < child` by index — the property T04-06 relies on for
 //! deterministic persistence.
 
-use crate::parse::language::LanguageId;
+use crate::parse::language::SourceDialect;
 use crate::parse::locator::{SyntaxAnchor, SyntaxLocatorDraft};
 use local_rag_store::code::UnitKind;
 
@@ -125,9 +125,9 @@ pub struct ParsedUnitDraft {
 impl ParsedUnitDraft {
     /// Assemble the path-free, blob-free [`SyntaxLocatorDraft`] for this unit.
     /// T04-06 completes it into a full `SyntaxLocator` with the derived `blob_id`.
-    pub fn locator_draft(&self, language: LanguageId) -> SyntaxLocatorDraft {
+    pub fn locator_draft(&self, dialect: SourceDialect) -> SyntaxLocatorDraft {
         SyntaxLocatorDraft {
-            language,
+            language: dialect,
             anchor: self.anchor.clone(),
             signature_fingerprint: self.signature_fingerprint.clone(),
         }

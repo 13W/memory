@@ -183,6 +183,7 @@ fn has_type_token(stmt: Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::language::SourceDialect;
     use crate::parse::locator::SyntaxAnchor;
 
     fn parse(src: &str) -> ParseOutput {
@@ -403,7 +404,7 @@ mod tests {
             "120e9865e8347d390dfc37e67dd1d75882d5348a2d0891cf01ca58deaf4ea8b4"
         );
         let locator = SyntaxLocator::from_draft(
-            foo.locator_draft(LanguageId::TypeScript),
+            foo.locator_draft(SourceDialect::Language(LanguageId::TypeScript)),
             "b10b1d".to_string(),
         );
         assert_eq!(

@@ -228,12 +228,70 @@ projection are different tasks, and this crate deliberately has no `tracing` dep
 `worktree_projection_state` are the projection switch (05 §5, a later group). `occurrence`
 `qualified_name`/`context_hash` are left `NULL` (enrichment is search/§4, a later task).
 
+**Deferral removed (D-098, ADR-0012, `[SPEC]`).** The paragraph above described a third outcome —
+a file whose extension selects no v0 language was "neither indexed nor recorded as a skip", counted
+`files_deferred` and written nowhere. That outcome no longer exists. `select_dialect` is **total**:
+an extension that selects a v0 language routes to its tree-sitter adapter, and everything else
+routes to a universal chunking policy (§2.1). `BuildOutcome::files_deferred` is deleted with it.
+
+The invariant this establishes, and the reason it was worth a deviation: **every file the scan
+produced is in `generation_file` or in `skipped_file`, and in exactly one of them.** It is asserted
+directly (`crates/index/tests/reconcile.rs::every_scanned_file_is_either_indexed_or_skipped`
+compares the two tables against the manifest's own candidate set) and reported live by
+`local-rag project coverage` (11 §8, D-096). Before it, a quarter of a real repository — 3 455 of
+firefly's files, and all 119 `.md` files of this project, its whole specification included — was
+absent from the index with no command able to say so.
+
+One ordering consequence worth naming: the deferral short-circuited **before** `classify` ran, so a
+`.png` was as invisible as a `.md` — never sniffed, never skipped, never counted. With the dialect
+total, classification runs for every candidate, which is why refusing non-source content is now an
+explicit act (§2.2's own D-098 note) rather than a side effect of having no grammar for it.
+
 ### 2.1 Parsing rules
 
 - tree-sitter; language chosen by extension/path (consequence: same bytes as `.c` vs `.cpp` are
   different file revisions) `[FIXED]`.
 - Unit kinds: `symbol | file | config_section | text_section | fallback_chunk` — **all kinds
   are indexed** (v1 parity requirement) `[FIXED]`.
+
+**The universal path (D-098, ADR-0012, `[SPEC]`).** The three non-symbol kinds had no producer
+until D-098; ADR-0001's scope boundary pointed at "T04-06 / groups 05 and 08" and every one of
+those addresses was wrong, so the `[FIXED]` requirement above had no owner in any card. It does
+now.
+
+`UniversalKind = {Config, Text, Fallback}` is a **sibling** of `LanguageId`, not three more
+variants of it — ADR-0001's language set stays closed and true. The two meet in
+`SourceDialect`, which occupies the single `lang=` field of a `parser_fingerprint` (03 §2.3.1) and
+of a `SyntaxLocator` (03 §2.4). Selection is by extension, case-insensitively, the same rule
+`select_language` applies; `Fallback` is the default rather than a listed set, and that totality is
+the point — a selector that can answer "none" reintroduces the state D-098 removed.
+
+Chunking takes on **no dependency** — no YAML, JSON or Markdown parser. Beyond the T10 guardrail,
+the binding reason is 03 §2.3.1: spans must address the exact `source_blob`, and a real parser
+returns a value tree rather than byte offsets into the text it consumed. Line-oriented scanning
+returns them directly:
+
+- **Text** — sections are ATX headings (`#`…`######` followed by whitespace, which separates a
+  heading from a `#!` shebang or a `#region` marker), named by the heading **trail**
+  (`Install/From source`) so a nested heading is never confused with a top-level one of the same
+  text; content before the first heading is an unnamed preamble section.
+- **Config** — sections are top-level keys, where "top level" is the **minimum indentation among
+  the file's own key lines**, not column zero. One rule then serves YAML (column 0), pretty-printed
+  JSON (column 2 inside the root object) and INI/`.env` alike.
+- **Fallback** — line-aligned windows of at most `MAX_SECTION_BYTES = 2048`.
+
+Every universal file also yields a `file` unit spanning the whole content, the same shape the
+tree-sitter adapters produce, so an accepted file is never indexed with nothing searchable in it. A
+section over the cap is split on line boundaries; a single line over the cap is its own section,
+because splitting mid-line would put a span boundary inside a token for no benefit. Anchors stay
+path-free (ADR-0002): a heading trail or a key when the section has structure, a `LocalOrdinal`
+when it does not; a repeated name becomes `Name#2`, so two sections never share an anchor.
+
+The fingerprint format is untouched: `chunk=1;grammar=universal@1;lang=<config|text|fallback>;
+norm=1;queries=0`. `queries=0` because this path runs no tree-sitter query set at all, which is
+more honest than borrowing `1` from a query file that does not exist;
+`UNIVERSAL_POLICY_VERSION` is a rebuild-gated boundary counter on the same terms as a grammar
+version.
 - Spans: byte offsets into the exact `source_blob`. Unsupported encodings → `skipped_file
   (reason='encoding')`; no transcoding without an offset mapping `[FIXED]`.
 - Parser output MUST be deterministic for a given `(content_hash, parser_fingerprint)`;
@@ -259,6 +317,12 @@ first match wins; a file matching none is indexed:
 3. `lfs` — a Git-LFS pointer file (first line the LFS v1 version line, with `oid sha256:` and a
    numeric `size`), detected by format so it is caught even at a binary extension.
 4. `binary` — a NUL byte within the first 8 KiB, or a path with a built-in binary extension.
+   **D-098 `[SPEC]`:** the reason now means "content that is not source text", not "contains a NUL".
+   Once every accepted file is chunked (§2.1), refusing an artifact has to be an explicit act, so
+   `svg`, `ipynb`, `drawio` and `map` join the built-in extension list — each is XML or JSON, so no
+   NUL sniff would ever catch it, and each is a serialized picture, notebook output, diagram or
+   source map rather than something a reader would search. A seventh `skipped_file.reason` was
+   rejected: it would need a migration to carry a distinction no consumer acts on.
 5. `encoding` — content is not valid UTF-8 (v0 supports only UTF-8; full `source_encoding` /
    `newline_style` detection for accepted files is a separate step, spec 03 §2.3).
 6. `secret` — the shared redaction scanner (12 §2) flags the decoded UTF-8 text. Its precision is

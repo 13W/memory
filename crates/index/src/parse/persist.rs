@@ -31,7 +31,7 @@ use local_rag_store::{
     insert_unresolved_reference,
 };
 
-use crate::parse::language::LanguageId;
+use crate::parse::language::SourceDialect;
 use crate::parse::locator::SyntaxLocator;
 use crate::parse::output::ParseOutput;
 
@@ -61,7 +61,7 @@ pub struct PersistOutcome {
 pub fn persist_parse_output(
     tx: &Transaction<'_>,
     file_revision_id: &str,
-    language: LanguageId,
+    dialect: SourceDialect,
     source_blob: &[u8],
     output: &ParseOutput,
     candidate_unit_ids: &[String],
@@ -79,7 +79,7 @@ pub fn persist_parse_output(
     let source = std::str::from_utf8(source_blob)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-    let lang = language.as_str();
+    let lang = dialect.as_str();
     let mut unit_ids: Vec<String> = Vec::with_capacity(output.units.len());
     let mut created_units = 0usize;
     let mut reused_units = 0usize;
@@ -92,7 +92,7 @@ pub fn persist_parse_output(
         create_or_reuse_content_blob(tx, &derived, lang, now_ms)?;
 
         let locator =
-            SyntaxLocator::from_draft(unit.locator_draft(language), derived.blob_id.clone())
+            SyntaxLocator::from_draft(unit.locator_draft(dialect), derived.blob_id.clone())
                 .serialize();
         let parent_unit_id = unit.parent.map(|p| unit_ids[p].clone());
 

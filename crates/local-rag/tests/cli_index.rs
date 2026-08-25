@@ -353,10 +353,11 @@ mod with_real_model {
             "fn parse_config(path: &str) -> String { path.to_string() }",
         )
         .expect("seed file");
-        // D-096: one file of each fate, so the summary line has to name all
-        // three. Before D-096 this tree printed the same "indexed 1 files" as a
-        // tree with nothing else in it.
-        std::fs::write(target.join("notes.md"), "# notes\n").expect("seed a deferred file");
+        // D-096: one file of each fate, so the summary line has to name them.
+        // Before D-096 this tree printed the same "indexed 1 files" as a tree with
+        // nothing else in it. After D-098 `notes.md` is indexed too, by the
+        // universal path — there is no third outcome left to print.
+        std::fs::write(target.join("notes.md"), "# notes\n").expect("seed a universal file");
         std::fs::write(target.join("blob.rs"), b"fn a() {}\0x").expect("seed a skipped file");
 
         let first = run_cli_with_ort(
@@ -367,14 +368,13 @@ mod with_real_model {
         );
         assert_eq!(first.status.code(), Some(0), "{first:?}");
         let summary = String::from_utf8_lossy(&first.stdout).to_string();
-        assert!(summary.contains("indexed 1 files"), "{summary}");
+        assert!(
+            summary.contains("indexed 2 files"),
+            "main.rs by its grammar and notes.md by the universal path: {summary}"
+        );
         assert!(
             summary.contains("skipped 1 (1 binary)"),
             "the skip and its reason are named: {summary}"
-        );
-        assert!(
-            summary.contains("deferred 1 (no v0 language)"),
-            "the file no report used to mention is named: {summary}"
         );
 
         // A second `index` of the same path must resolve to the *same*
