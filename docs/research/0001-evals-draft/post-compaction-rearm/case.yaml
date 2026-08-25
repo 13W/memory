@@ -1,0 +1,8 @@
+schema_version: "1.1"
+name: post-compaction-rearm
+context:
+  # A recorded transcript whose final records are a compact_boundary and the
+  # isCompactSummary user turn that follows it. The harness replays it and grades
+  # the next turn only — which is exactly the stretch measured at 0-3% adherence
+  # in the retrospective scan.
+  history_file: fixtures/post-compaction-boundary.jsonl
