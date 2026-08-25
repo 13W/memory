@@ -30,6 +30,7 @@
 //! construction (concurrent indexers of the *same* worktree are wasteful,
 //! never unsafe).
 
+pub mod coverage;
 pub mod doctor;
 pub mod export;
 pub mod freshness;

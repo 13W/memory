@@ -71,13 +71,22 @@ async fn run_pipeline(ctx: &IndexCtx, worktree_id: Uuid, now_ms: i64) -> ExitCod
     .await
     {
         Ok(outcome) => {
+            let built = outcome.reconcile.expect_built();
+            // D-096: every file the build examined is named here. `skipped` and
+            // `deferred` used to be computed and thrown away, so a run that
+            // dropped a quarter of the tree printed exactly the same line as one
+            // that dropped nothing.
             println!(
                 "{BIN}: indexed {} files ({} occurrences) into generation {}; \
+                 skipped {} ({}); deferred {} (no v0 language); \
                  embedded {} subjects ({} reused, {} repaired, {} failed); \
                  dense +{}/-{}; fts {} occurrences",
-                outcome.reconcile.expect_built().files_indexed,
-                outcome.reconcile.expect_built().occurrences,
-                outcome.reconcile.expect_built().generation_id,
+                built.files_indexed,
+                built.occurrences,
+                built.generation_id,
+                built.files_skipped,
+                built.skipped_by_reason.render(),
+                built.files_deferred,
                 outcome.project.backfill.embedded,
                 outcome.project.backfill.reused,
                 outcome.project.backfill.repaired,

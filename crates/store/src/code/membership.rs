@@ -17,7 +17,7 @@
 //! that mints and persists occurrences with it is T05-03. Write operations take a
 //! [`Transaction`]; reads take a [`Connection`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use local_rag_core::identity::Domain;
 use local_rag_core::identity::domain::hash;
@@ -70,6 +70,33 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Every reason in the closed `CHECK` domain, in a stable order (`D-096`).
+    ///
+    /// The same convention `LanguageId::ALL` sets: a closed set gets a listed
+    /// order so every tally and every rendering of it is deterministic without a
+    /// sort key, and adding a reason is a compile error at each site rather than
+    /// a silently missing line.
+    pub const ALL: [SkipReason; 6] = [
+        SkipReason::Binary,
+        SkipReason::Lfs,
+        SkipReason::Huge,
+        SkipReason::Secret,
+        SkipReason::Ignored,
+        SkipReason::Encoding,
+    ];
+
+    /// This reason's position in [`SkipReason::ALL`] — the [`SkipTally`] slot.
+    const fn index(self) -> usize {
+        match self {
+            SkipReason::Binary => 0,
+            SkipReason::Lfs => 1,
+            SkipReason::Huge => 2,
+            SkipReason::Secret => 3,
+            SkipReason::Ignored => 4,
+            SkipReason::Encoding => 5,
+        }
+    }
+
     /// The stored `skipped_file.reason` value.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -93,6 +120,73 @@ impl SkipReason {
             "encoding" => Some(SkipReason::Encoding),
             _ => None,
         }
+    }
+}
+
+/// How many files were skipped, per reason (`D-096`).
+///
+/// A fixed-size tally over the closed [`SkipReason`] set rather than a map: the
+/// reasons are a `CHECK` domain, so the order is fixed by
+/// [`SkipReason::ALL`] and every renderer agrees without sorting.
+///
+/// Produced both by the generation builder as it writes the rows and by
+/// [`generation_skip_tally`] reading them back, so the live number and the
+/// durable one are the same shape and cannot drift in presentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkipTally {
+    counts: [usize; SkipReason::ALL.len()],
+}
+
+impl SkipTally {
+    /// Count one more skip for `reason`.
+    pub fn add(&mut self, reason: SkipReason) {
+        self.counts[reason.index()] += 1;
+    }
+
+    /// Set `reason`'s count outright (the read path, which counts in SQL).
+    pub fn set(&mut self, reason: SkipReason, count: usize) {
+        self.counts[reason.index()] = count;
+    }
+
+    /// How many files were skipped for `reason`.
+    pub fn get(&self, reason: SkipReason) -> usize {
+        self.counts[reason.index()]
+    }
+
+    /// How many files were skipped for any reason.
+    pub fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    /// Whether nothing was skipped at all.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// The reasons that actually fired, largest first; ties keep
+    /// [`SkipReason::ALL`] order so the rendering is deterministic.
+    pub fn nonzero(&self) -> Vec<(SkipReason, usize)> {
+        let mut out: Vec<(SkipReason, usize)> = SkipReason::ALL
+            .iter()
+            .map(|&r| (r, self.get(r)))
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        out.sort_by_key(|&(r, n)| (std::cmp::Reverse(n), r.index()));
+        out
+    }
+
+    /// `43 secret, 3 huge` — the one rendering of a tally, so `index`,
+    /// `project list`, `project coverage` and `doctor` cannot word it
+    /// differently. Empty tally renders as `none`.
+    pub fn render(&self) -> String {
+        if self.is_empty() {
+            return "none".to_string();
+        }
+        self.nonzero()
+            .into_iter()
+            .map(|(r, n)| format!("{n} {}", r.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -773,6 +867,70 @@ pub fn occurrence_count_for_generation(
         params![generation_id],
         |r| r.get(0),
     )
+}
+
+/// How many files `generation_id` indexed — its `generation_file` membership
+/// count (`D-096`).
+pub fn generation_file_count(conn: &Connection, generation_id: &str) -> rusqlite::Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM generation_file WHERE generation_id = ?1",
+        params![generation_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+/// What `generation_id` skipped, per reason (`D-096`).
+///
+/// A stored value outside the CHECK domain surfaces as a conversion failure, the
+/// same idiom [`skip_reason`] uses — a corrupt row is never counted as some
+/// silently chosen default.
+pub fn generation_skip_tally(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<SkipTally> {
+    let mut stmt = conn.prepare(
+        "SELECT reason, COUNT(*) FROM skipped_file WHERE generation_id = ?1 GROUP BY reason",
+    )?;
+    let rows = stmt.query_map(params![generation_id], |r| {
+        let raw: String = r.get(0)?;
+        let reason = SkipReason::from_db(&raw).ok_or_else(|| {
+            Error::FromSqlConversionFailure(
+                0,
+                Type::Text,
+                format!("invalid skipped_file.reason {raw:?}").into(),
+            )
+        })?;
+        Ok((reason, r.get::<_, i64>(1)? as usize))
+    })?;
+    let mut tally = SkipTally::default();
+    for row in rows {
+        let (reason, n) = row?;
+        tally.set(reason, n);
+    }
+    Ok(tally)
+}
+
+/// Every path `generation_id` accounted for — indexed **or** skipped (`D-096`).
+///
+/// The union is the point: a file the build examined is in exactly one of the two
+/// tables, so a path in the worktree that is in neither was never accounted for at
+/// all. `project coverage` subtracts this set from the scan's own candidate list.
+pub fn generation_accounted_paths(
+    conn: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT normalized_path FROM generation_file WHERE generation_id = ?1 \
+         UNION ALL \
+         SELECT normalized_path FROM skipped_file WHERE generation_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![generation_id], |r| r.get::<_, String>(0))?;
+    let mut out = BTreeSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
 }
 
 /// The skip reason recorded for `normalized_path` in `generation_id`, if the file

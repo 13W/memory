@@ -56,6 +56,7 @@ use local_rag_store::{
 
 use local_rag::daemon::{StoreLockFileState, read_store_lock_file};
 
+use super::coverage::GenerationCoverage;
 use super::freshness::{IndexFreshness, humanize_age};
 use super::{fail, resolve_layout_and_config, system_now_ms};
 
@@ -180,6 +181,16 @@ pub struct WorktreeIndexing {
     pub freshness: IndexFreshness,
     /// The durable outcome of the last background cycle (X-006), if one ran.
     pub status: Option<WorktreeIndexingStatus>,
+    /// `D-096`: what the active generation actually holds — files indexed and
+    /// files skipped, per reason. `None` with no active generation.
+    ///
+    /// Only the **durable** half of coverage lives here. The measured half (files
+    /// present in the tree that the generation put in neither table) needs a walk
+    /// of the worktree, which is the wrong cost for a report that runs on every
+    /// invocation and covers every registered worktree; it is
+    /// `local-rag project coverage`, an explicit one-worktree command, and this
+    /// section points at it.
+    pub coverage: Option<GenerationCoverage>,
 }
 
 /// D-030: every known spool session's stalled-import diagnostic (spec 11 §4
@@ -633,12 +644,18 @@ fn build_indexing(read: &rusqlite::Connection, worktree_filter: Option<Uuid>) ->
         .map(|worktree_id| {
             let enrollment = managed.iter().find(|m| m.worktree_id == worktree_id);
             let generations = generation_meta_for_worktree(read, &worktree_id).unwrap_or_default();
+            let freshness = IndexFreshness::from_generations(&generations);
+            let coverage = freshness
+                .active
+                .as_ref()
+                .and_then(|(gid, _, _)| GenerationCoverage::read(read, gid).ok());
             WorktreeIndexing {
                 path: current_worktree_path(read, &worktree_id).ok().flatten(),
                 managed: enrollment.is_some(),
                 enabled: enrollment.is_some_and(|m| m.enabled),
-                freshness: IndexFreshness::from_generations(&generations),
+                freshness,
                 status: indexing_status(read, &worktree_id).ok().flatten(),
+                coverage,
                 worktree_id,
             }
         })
@@ -998,6 +1015,15 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
                         "last_attempt_at": w.status.as_ref().and_then(|s| s.last_attempt_at),
                         "consecutive_failures": w.status.as_ref().map(|s| s.consecutive_failures),
                         "last_error": w.status.as_ref().and_then(|s| s.last_error.clone()),
+                        "indexed_files": w.coverage.map(|c| c.indexed),
+                        "skipped_files": w.coverage.map(|c| c.skipped.total()),
+                        "skipped_by_reason": w.coverage.map(|c| {
+                            let mut map = serde_json::Map::new();
+                            for (reason, n) in c.skipped.nonzero() {
+                                map.insert(reason.as_str().to_string(), serde_json::json!(n));
+                            }
+                            serde_json::Value::Object(map)
+                        }),
                     })
                 })
                 .collect(),
@@ -1332,6 +1358,18 @@ fn print_indexing(finding: &IndexingFinding) {
                             .map(|ms| humanize_age(now_ms, ms))
                             .unwrap_or_else(|| "age unknown".to_string());
                         println!("  serving generation #{number}, built {age}");
+                        // D-096: age answers "is it current"; this answers "is it
+                        // complete". The measured half needs a tree walk, so the
+                        // report names the command that does it rather than
+                        // paying for one per worktree per `doctor` run.
+                        if let Some(c) = &w.coverage {
+                            println!(
+                                "  {} ({} file(s) accounted for; \
+                                 `local-rag project coverage` checks the tree for the rest)",
+                                c.render(),
+                                c.accounted(),
+                            );
+                        }
                     }
                     None if w.freshness.total == 0 => {
                         println!("  never indexed — nothing is being served")

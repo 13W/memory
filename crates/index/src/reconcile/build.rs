@@ -42,7 +42,7 @@ use local_rag_core::identity::UuidSource;
 use local_rag_core::redaction::Scanner;
 use local_rag_store::{
     GenerationState, GenerationTransitionError, NewOccurrence, OpenError, PreparedSource,
-    SkipReason, StateDb, WriteError, allocate_generation, create_or_reuse_file_revision,
+    SkipReason, SkipTally, StateDb, WriteError, allocate_generation, create_or_reuse_file_revision,
     file_revision_id_by_content_key, insert_generation_file, insert_occurrence,
     insert_skipped_file, occurrence_id, parsed_units_for_revision, prepare_source,
     transition_generation,
@@ -65,6 +65,12 @@ pub struct BuildOutcome {
     pub files_indexed: usize,
     /// Files recorded as `skipped_file`.
     pub files_skipped: usize,
+    /// The same skips, broken down by reason (`D-096`).
+    ///
+    /// `files_skipped` is `skipped_by_reason.total()`; both are kept because
+    /// every existing caller reads the total and a breakdown that has to be
+    /// re-summed to check it is a breakdown that can silently disagree.
+    pub skipped_by_reason: SkipTally,
     /// Files deferred to the (later) language-agnostic path — no recognized v0
     /// language, so neither indexed nor skipped.
     pub files_deferred: usize,
@@ -246,6 +252,7 @@ async fn run_build(
         generation_number,
         files_indexed: 0,
         files_skipped: 0,
+        skipped_by_reason: SkipTally::default(),
         files_deferred: 0,
         occurrences: 0,
         revisions_created: 0,
@@ -274,6 +281,7 @@ async fn run_build(
         let Some(content_hash) = entry.content_hash.as_deref() else {
             write_skipped(db, generation_id, normalized_path, SkipReason::Huge, None).await?;
             out.files_skipped += 1;
+            out.skipped_by_reason.add(SkipReason::Huge);
             continue;
         };
 
@@ -331,6 +339,7 @@ async fn run_build(
                 )
                 .await?;
                 out.files_skipped += 1;
+                out.skipped_by_reason.add(reason);
             }
             Classification::Indexed => {
                 let prepared = prepare_source(&bytes);

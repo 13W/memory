@@ -132,6 +132,104 @@ pub fn scan(
     prune_roots: &[String],
     cache: &mut StatCache,
 ) -> io::Result<(ScanManifest, ScanStats)> {
+    let mut stats = ScanStats::default();
+    let mut entries = Vec::new();
+
+    for candidate in walk_candidates(root, kind, case, prune_roots)? {
+        let size = candidate.metadata.len();
+        let content_hash = if size > max_file_size_bytes {
+            // `huge`: stat-only, bytes never read (spec 06 §2.2 reason 2).
+            None
+        } else {
+            Some(resolve_content_hash(
+                &candidate.path,
+                &candidate.normalized_path,
+                &candidate.metadata,
+                mode,
+                cache,
+                &mut stats,
+            )?)
+        };
+
+        entries.push(ManifestEntry {
+            normalized_path: candidate.normalized_path,
+            display_path: candidate.display_path,
+            size,
+            content_hash,
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        (a.normalized_path.as_str(), a.display_path.as_str())
+            .cmp(&(b.normalized_path.as_str(), b.display_path.as_str()))
+    });
+    debug_assert!(
+        entries
+            .windows(2)
+            .all(|w| w[0].normalized_path != w[1].normalized_path),
+        "two candidates share a normalized_path (wrong CaseSensitivity?)",
+    );
+
+    Ok((ScanManifest { entries }, stats))
+}
+
+/// Every candidate path this worktree's scan would consider, without reading one
+/// byte (`D-096`).
+///
+/// The coverage report (`local-rag project coverage`) needs the *set* of files a
+/// build would examine, not their identities, and hashing a whole worktree to
+/// learn a set of names is the wrong price for a diagnostic. Sharing the private
+/// `walk_candidates` enumerator with [`scan`] is what makes the answer
+/// trustworthy: the two cannot disagree about gitignore rules, pruning, case
+/// folding or the regular-file filter, because there is one enumerator and two
+/// consumers of it.
+/// That is the exact class of pairwise disagreement `D-089` had to pay for once
+/// already (a gitignore-aware scan against a watcher that filtered nothing).
+///
+/// Returns normalized paths, sorted and deduplicated.
+///
+/// # Errors
+///
+/// Same as [`scan`]: a missing/non-directory root, or a failed walk/stat.
+pub fn scan_paths(
+    root: &Path,
+    kind: WorktreeKind,
+    case: CaseSensitivity,
+    prune_roots: &[String],
+) -> io::Result<Vec<String>> {
+    let mut paths: Vec<String> = walk_candidates(root, kind, case, prune_roots)?
+        .into_iter()
+        .map(|c| c.normalized_path)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// One file the walk found, before any decision about its content is made.
+struct Candidate {
+    /// Absolute path on disk, for reading.
+    path: std::path::PathBuf,
+    /// Worktree-relative canonical path.
+    normalized_path: String,
+    /// The path's preserved original spelling.
+    display_path: String,
+    /// The stat already taken during the walk (never taken twice).
+    metadata: std::fs::Metadata,
+}
+
+/// The candidate enumeration shared by [`scan`] and [`scan_paths`] — the walk
+/// configuration, the prune set, the regular-file filter and path normalization,
+/// with no content decision of any kind.
+///
+/// Extracted so the two callers provably apply the same rules; see
+/// [`scan_paths`] for why that matters.
+fn walk_candidates(
+    root: &Path,
+    kind: WorktreeKind,
+    case: CaseSensitivity,
+    prune_roots: &[String],
+) -> io::Result<Vec<Candidate>> {
     // Fail fast on a non-existent or non-directory root (rather than yielding an
     // empty manifest that masks a bad request).
     let root_meta = std::fs::metadata(root)?;
@@ -171,8 +269,7 @@ pub fn scan(
         .require_git(git_aware)
         .filter_entry(move |entry| prunes.keep(entry));
 
-    let mut entries = Vec::new();
-    let mut stats = ScanStats::default();
+    let mut candidates = Vec::new();
 
     for result in builder.build() {
         let entry = result.map_err(io::Error::other)?;
@@ -192,42 +289,16 @@ pub fn scan(
         let canonical = normalize_relative(&rel.to_string_lossy(), case);
 
         let metadata = entry.metadata().map_err(io::Error::other)?;
-        let size = metadata.len();
 
-        let content_hash = if size > max_file_size_bytes {
-            // `huge`: stat-only, bytes never read (spec 06 §2.2 reason 2).
-            None
-        } else {
-            Some(resolve_content_hash(
-                path,
-                &canonical.canonical,
-                &metadata,
-                mode,
-                cache,
-                &mut stats,
-            )?)
-        };
-
-        entries.push(ManifestEntry {
+        candidates.push(Candidate {
+            path: path.to_path_buf(),
             normalized_path: canonical.canonical,
             display_path: canonical.display,
-            size,
-            content_hash,
+            metadata,
         });
     }
 
-    entries.sort_by(|a, b| {
-        (a.normalized_path.as_str(), a.display_path.as_str())
-            .cmp(&(b.normalized_path.as_str(), b.display_path.as_str()))
-    });
-    debug_assert!(
-        entries
-            .windows(2)
-            .all(|w| w[0].normalized_path != w[1].normalized_path),
-        "two candidates share a normalized_path (wrong CaseSensitivity?)",
-    );
-
-    Ok((ScanManifest { entries }, stats))
+    Ok(candidates)
 }
 
 /// Resolve a candidate's `content_hash`, using the advisory cache in

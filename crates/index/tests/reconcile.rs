@@ -19,13 +19,16 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_core::redaction::Scanner;
 use local_rag_index::classify::ClassifierConfig;
 use local_rag_index::reconcile::{BuildError, BuildOutcome, build_generation};
-use local_rag_index::scan::{ScanManifest, ScanMode, StatCache, scan};
+use local_rag_index::scan::{ScanManifest, ScanMode, StatCache, scan, scan_paths};
 use local_rag_store::registry::{
     GenerationState, WorktreeKind, create_repository, create_worktree, current_generation,
     generation_state,
 };
 use local_rag_store::rusqlite::Connection;
-use local_rag_store::{StateDb, active_generations};
+use local_rag_store::{
+    SkipReason, StateDb, active_generations, generation_accounted_paths, generation_file_count,
+    generation_skip_tally,
+};
 use local_rag_test_support::TempHome;
 
 /// A seeded, deterministic [`UuidSource`]: each call embeds a distinct
@@ -546,4 +549,169 @@ async fn a_symlink_escaping_the_worktree_root_produces_no_member_or_occurrence()
         members(&read, &genr.generation_id),
         vec!["ok.rs".to_string()]
     );
+}
+
+// ---------------------------------------------------------------------------
+// D-096 — the build's own tally, the durable rows, and the scan agree
+// ---------------------------------------------------------------------------
+
+/// The breakdown must be the same number the rows are, per reason — a tally
+/// that is merely *near* the truth is worse than no tally, because it is
+/// believed.
+#[tokio::test]
+async fn the_skip_breakdown_matches_the_rows_it_wrote() {
+    let fx = fixture().await;
+    let uuids = SeqUuidV7::new();
+    write(&fx.root, "ok.rs", b"fn ok() {}\n");
+    write(&fx.root, "blob.rs", b"fn a() {}\0more"); // binary
+    write(
+        &fx.root,
+        "creds.rs",
+        b"let aws = \"AKIAIOSFODNN7EXAMPLE\";\n",
+    ); // secret
+    write(
+        &fx.root,
+        "keys.rs",
+        b"let gh = \"ghp_0123456789012345678901234567890123456\";\n",
+    ); // secret
+
+    let genr = scan_and_build(&fx, &uuids).await;
+    assert_eq!(genr.files_indexed, 1);
+    assert_eq!(genr.files_skipped, 3);
+    assert_eq!(genr.skipped_by_reason.total(), genr.files_skipped);
+    assert_eq!(genr.skipped_by_reason.get(SkipReason::Binary), 1);
+    assert_eq!(genr.skipped_by_reason.get(SkipReason::Secret), 2);
+    assert_eq!(genr.skipped_by_reason.get(SkipReason::Huge), 0);
+    // Largest first, so the rendering leads with what actually dominates.
+    // `secret` sorts *after* `binary` in `SkipReason::ALL`, so this string is
+    // only reachable when the count is the sort key — the fixture is chosen to
+    // tell the two orders apart rather than agree with both.
+    assert_eq!(genr.skipped_by_reason.render(), "2 secret, 1 binary");
+
+    // The durable read path must produce the identical tally: `project list`,
+    // `doctor` and the daemon's cycle log all read it back rather than
+    // remembering it, so a divergence here would be a lie in three commands.
+    let read = fx.db.open_read().expect("read");
+    let durable = generation_skip_tally(&read, &genr.generation_id).expect("tally");
+    assert_eq!(durable, genr.skipped_by_reason);
+    assert_eq!(
+        generation_file_count(&read, &genr.generation_id).expect("count"),
+        genr.files_indexed
+    );
+}
+
+/// A `huge` file is skipped before its bytes are ever read, and it lands in the
+/// same tally as the classified skips (it is written on a different branch of
+/// the builder, which is exactly how a breakdown loses a category).
+#[tokio::test]
+async fn the_unread_huge_skip_is_in_the_breakdown_too() {
+    let fx = fixture().await;
+    let uuids = SeqUuidV7::new();
+    write(&fx.root, "ok.rs", b"fn ok() {}\n");
+    write(&fx.root, "big.rs", &[b'x'; 100]);
+
+    let mut cache = StatCache::new();
+    let manifest = scan(
+        &fx.root,
+        WorktreeKind::Main,
+        CaseSensitivity::Sensitive,
+        16,
+        ScanMode::Strict,
+        &[],
+        &mut cache,
+    )
+    .expect("scan")
+    .0;
+    let genr = build(&fx, &manifest, &uuids).await;
+
+    assert_eq!(genr.skipped_by_reason.get(SkipReason::Huge), 1);
+    assert_eq!(genr.skipped_by_reason.total(), 1);
+    let read = fx.db.open_read().expect("read");
+    assert_eq!(
+        generation_skip_tally(&read, &genr.generation_id).expect("tally"),
+        genr.skipped_by_reason
+    );
+}
+
+/// The accounted set is exactly indexed ∪ skipped, and a deferred file is in
+/// neither — which is the whole measurement `project coverage` reports.
+#[tokio::test]
+async fn a_deferred_file_is_absent_from_the_accounted_set() {
+    let fx = fixture().await;
+    let uuids = SeqUuidV7::new();
+    write(&fx.root, "a.rs", b"fn a() {}\n");
+    write(&fx.root, "blob.rs", b"fn a() {}\0more"); // skipped: binary
+    write(&fx.root, "notes.md", b"# hello\n"); // deferred
+    write(&fx.root, "deploy/values.yaml", b"image: x\n"); // deferred
+
+    let genr = scan_and_build(&fx, &uuids).await;
+    assert_eq!(genr.files_deferred, 2);
+
+    let read = fx.db.open_read().expect("read");
+    let accounted = generation_accounted_paths(&read, &genr.generation_id).expect("accounted");
+    assert_eq!(
+        accounted,
+        ["a.rs".to_string(), "blob.rs".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the accounted set is the union of both membership tables, nothing more",
+    );
+
+    // The difference against the scan's own candidate list is the report.
+    let candidates = scan_paths(
+        &fx.root,
+        WorktreeKind::Main,
+        CaseSensitivity::Sensitive,
+        &[],
+    )
+    .expect("scan_paths");
+    let missing: Vec<&String> = candidates
+        .iter()
+        .filter(|p| !accounted.contains(*p))
+        .collect();
+    assert_eq!(
+        missing,
+        vec![&"deploy/values.yaml".to_string(), &"notes.md".to_string()],
+    );
+}
+
+/// `scan_paths` and `scan` must see the same candidates, because the coverage
+/// report subtracts one from a set built by the other. Two walks that disagree
+/// about gitignore or pruning would invent a gap or hide one — the pairwise
+/// disagreement `D-089` already paid for once.
+#[tokio::test]
+async fn scan_paths_sees_exactly_what_the_manifest_sees() {
+    let fx = fixture().await;
+    write(&fx.root, "a.rs", b"fn a() {}\n");
+    write(&fx.root, "docs/notes.md", b"# hi\n");
+    write(&fx.root, ".hidden.rs", b"fn h() {}\n");
+    write(&fx.root, "build/out.rs", b"fn o() {}\n");
+    write(&fx.root, ".gitignore", b"build/\n");
+    // `.git` must be pruned by both, not just by one of them.
+    write(&fx.root, ".git/config", b"[core]\n");
+
+    let manifest = scan_tree(&fx.root);
+    let from_manifest: Vec<String> = manifest
+        .entries
+        .iter()
+        .map(|e| e.normalized_path.clone())
+        .collect();
+    let from_paths = scan_paths(
+        &fx.root,
+        WorktreeKind::Main,
+        CaseSensitivity::Sensitive,
+        &[],
+    )
+    .expect("scan_paths");
+
+    assert_eq!(from_paths, from_manifest);
+    assert!(
+        !from_paths.iter().any(|p| p.starts_with(".git/")),
+        "`.git` is pruned: {from_paths:?}",
+    );
+    assert!(
+        !from_paths.iter().any(|p| p.starts_with("build/")),
+        "gitignore is honored: {from_paths:?}",
+    );
+    assert!(from_paths.contains(&".gitignore".to_string()));
 }

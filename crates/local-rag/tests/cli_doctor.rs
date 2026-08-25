@@ -43,9 +43,9 @@ use local_rag_store::{
     UnitKind, UpsertOutcome, WorktreeKind, allocate_generation, create_consolidation_run,
     create_memory_entry, create_repository, create_worktree, derive_content_blob,
     ensure_store_instance_uuid, insert_content_blob, insert_file_revision, insert_generation_file,
-    insert_occurrence, insert_parsed_unit, insert_projection_state, materialize_fts, occurrence_id,
-    record_run_failure, register_representation, retry_run, set_model_space_representation,
-    transition_generation, transition_run, upsert_normalization,
+    insert_occurrence, insert_parsed_unit, insert_projection_state, insert_skipped_file,
+    materialize_fts, occurrence_id, record_run_failure, register_representation, retry_run,
+    set_model_space_representation, transition_generation, transition_run, upsert_normalization,
 };
 use local_rag_test_support::TempHome;
 
@@ -1400,5 +1400,98 @@ fn space_appears_in_the_json_report() {
     assert_eq!(
         value["space"]["auto_vacuum"],
         serde_json::json!("incremental")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-096: the indexing section says what the active generation actually holds
+// ---------------------------------------------------------------------------
+
+/// Freshness answers "is the index current"; it never answered "is it
+/// complete". Until `D-096` no command did, which is how 3446 of firefly's
+/// 13728 files stayed missing without a single report saying so.
+#[tokio::test]
+async fn the_indexing_section_reports_what_the_active_generation_holds() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (wt, _) = seed_indexed_worktree(&state, &layout, 60).await;
+    drop(state);
+
+    let out = run_cli(&home, &["doctor"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(
+        text.contains(&format!("indexing: {wt}")),
+        "the worktree is in the section: {text}"
+    );
+    assert!(
+        text.contains("1 indexed, 0 skipped"),
+        "coverage of the served generation, never silent about the zero: {text}"
+    );
+    // Coverage is a report, not a verdict: a complete index is still clean, and
+    // the section points at the command that measures the tree itself.
+    assert!(text.contains("doctor: clean"), "{text}");
+    assert!(
+        text.contains("`local-rag project coverage`"),
+        "the measured half is named, since `doctor` does not walk trees: {text}"
+    );
+}
+
+/// The breakdown by reason reaches `doctor`, in the same wording the builder
+/// and `project list` use — a file the index dropped for a *reason* is a
+/// different diagnosis than one it never saw, and the report must not blur them.
+#[tokio::test]
+async fn the_indexing_section_breaks_skips_down_by_reason() {
+    let (home, layout) = open_layout();
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let (wt, _) = seed_indexed_worktree(&state, &layout, 64).await;
+
+    // Two secrets and one binary alongside the single indexed file.
+    let genr = uuid(64u8.wrapping_add(2)).to_string();
+    let g = genr.clone();
+    state
+        .writer()
+        .transaction(move |tx| {
+            insert_skipped_file(
+                tx,
+                &g,
+                "creds.rs",
+                local_rag_store::SkipReason::Secret,
+                None,
+            )?;
+            insert_skipped_file(tx, &g, "keys.rs", local_rag_store::SkipReason::Secret, None)?;
+            insert_skipped_file(tx, &g, "blob.rs", local_rag_store::SkipReason::Binary, None)
+        })
+        .await
+        .expect("seed skips");
+    drop(state);
+
+    let out = run_cli(&home, &["doctor"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("1 indexed, 3 skipped (2 secret, 1 binary)"),
+        "largest reason first, every reason named: {text}"
+    );
+    assert!(
+        text.contains("4 file(s) accounted for"),
+        "indexed + skipped is the denominator the tree is compared against: {text}"
+    );
+
+    let json_out = run_cli(&home, &["doctor", "--json"]);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&json_out)).expect("doctor --json is valid JSON");
+    let entry = json["indexing"]
+        .as_array()
+        .expect("indexing is an array of worktrees")
+        .iter()
+        .find(|e| e["worktree_id"] == wt.to_string())
+        .expect("the seeded worktree is present");
+    assert_eq!(entry["indexed_files"], 1);
+    assert_eq!(entry["skipped_files"], 3);
+    assert_eq!(entry["skipped_by_reason"]["secret"], 2);
+    assert_eq!(entry["skipped_by_reason"]["binary"], 1);
+    assert!(
+        entry["skipped_by_reason"].get("huge").is_none(),
+        "reasons that never fired are absent, not zero-filled: {entry}"
     );
 }
