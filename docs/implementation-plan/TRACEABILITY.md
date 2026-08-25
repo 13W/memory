@@ -5,7 +5,7 @@
 
 | Спецификация | Основные группы/gates | End-to-end повторная проверка | Report-артефакт |
 | --- | --- | --- | --- |
-| 01 Overview, correctness budget, identity ladders | G00, G02, G03 | G17 | — |
+| 01 Overview, correctness budget, identity ladders | G00, G02, G03 | G17, G22 | — |
 | 02 Architecture/lifecycle/locking | G01, G09, G15 | G17, G20 | — |
 | 03 Data model/DDL/hash rules | G01–G04, G07, G08, G11, G13, G14 | G17 schema lint, G21 | — |
 | 04 State machines | G05, G07, G11, G14 | G15, G17 | — |
@@ -14,10 +14,10 @@
 | 07 Observation spool | G13 | G15, G17 | — |
 | 08 Memory | G14 | G15, G16, G17, G21 | `fixtures/memory/baseline/run-2026-07-29-g14-verify.json` |
 | 09 Search | G12 | G15, G17, G21 | `fixtures/search/baseline/run-v2-2026-07-27-g12-verify.{json,report.md}` |
-| 10 Models/embeddings | G10, G11 | G12, G17, G21 | ADR-0004/0005/0006 |
-| 11 Interfaces | G15 | G17 | — |
-| 12 Security/privacy | G03, G13, G14, G16 | G17, G21 | — |
-| 13 Distribution/migrations | G01, G17 | G17 | `fixtures/release/run-2026-08-05.{json,report.md}`; release tag `0.0.0` CI matrix run (D-029) |
+| 10 Models/embeddings | G10, G11 | G12, G17, G21, G22 | ADR-0004/0005/0006 |
+| 11 Interfaces | G15 | G17, G22 | — |
+| 12 Security/privacy | G03, G13, G14, G16 | G17, G21, G22 | — |
+| 13 Distribution/migrations | G01, G17, G22 | G17, G22 | `fixtures/release/run-2026-08-05.{json,report.md}`; release tag `0.0.0` CI matrix run (D-029) |
 | 14 Acceptance/testing | каждый GNN | G17 | `fixtures/release/run-2026-08-05.{json,report.md}` (O2 numbers) |
 | 15 Roadmap/MVP/open questions | G00 и каждый GNN | G17 | см. «Open questions» ниже |
 
