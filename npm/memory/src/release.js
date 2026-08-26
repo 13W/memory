@@ -29,13 +29,17 @@ function releaseBaseUrl(env = process.env) {
 /**
  * The archive `cargo-dist` publishes for one binary on one platform.
  *
- * The extension is `.tar.gz` ahead of the producer: `dist-workspace.toml` still
- * emits `.tar.xz` until T22-07 sets `unix-archive`, so between these two cards
- * this function names an asset that the *current* tag does not carry. That is
- * safe because nothing downloads before T22-08 and T22-17 cuts the new tag, and
- * it is deliberate rather than an oversight — Node has gzip and inflate built in
- * and will never have xz, so the format has to move for the installer to work
- * without shelling out.
+ * The two extensions are `dist-workspace.toml`'s `unix-archive` and
+ * `windows-archive` (T22-07), the only two formats `src/archive.js` can open
+ * with Node's built-ins — the release moved off `.tar.xz` because `node:zlib`
+ * has gzip and inflate and will never have xz. Producer and consumer are held
+ * together by a test rather than by this sentence: `release-urls.test.js` reads
+ * those two keys out of `dist-workspace.toml` and compares them with what this
+ * function returns.
+ *
+ * Tags cut before T22-07 still carry `.tar.xz`, so this names an asset that
+ * release `0.0.0` does not have. That is the old tag being stale, not this
+ * being wrong; `archive.js` recognises xz bytes and says so by name.
  *
  * @param {string} binary e.g. "local-rag-proxy"
  * @param {string} key e.g. "darwin-arm64"
@@ -65,7 +69,7 @@ function pinnedAssetUrl(tag, asset, env = process.env) {
   return `${releaseBaseUrl(env)}/download/${tag}/${asset}`;
 }
 
-/** @param {string} binary @param {string} asset @returns {string} */
+/** @param {string} asset @returns {string} */
 function sidecarName(asset) {
   return `${asset}.sha256`;
 }

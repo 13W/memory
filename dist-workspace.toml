@@ -11,3 +11,16 @@ ci = "github"
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# The archive format for non-Windows targets (T22-07, ADR-0013). `.tar.gz` and not
+# the `.tar.xz` default because `node:zlib` has gzip and inflate and will never
+# have xz: `npm/memory/src/archive.js` must unpack this with built-ins alone, on
+# minimal images where GNU tar's external `xz` helper is not installed.
+unix-archive = ".tar.gz"
+# Windows keeps `.zip`, which was already the default — stated rather than implied
+# so both extensions live in one place next to the consumer that assumes them.
+windows-archive = ".zip"
+# No README/LICENSE/CHANGELOG alongside the executable. `archive.js` rejects an
+# archive with more than one member, and without this that rule would hold only
+# because this repository happens to have no such files at its root: adding one
+# would silently put a second member into every release archive.
+auto-includes = false
