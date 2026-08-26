@@ -94,7 +94,13 @@ function parseTagFromLocation(location) {
     throw new Error("local-rag: redirect carried no Location header");
   }
   const withoutQuery = location.split("?")[0].split("#")[0];
-  const m = /\/releases\/download\/([^/]+)\//.exec(withoutQuery);
+  // `/download/<tag>/<asset>` — the shape `pinnedAssetUrl` builds. The
+  // `/releases` segment belongs to the *base* URL, not to this shape: on
+  // github.com the base already ends with it, and a mirror pointed at by
+  // `LOCAL_RAG_RELEASE_BASE_URL` need not be GitHub-shaped at all. Requiring
+  // it here would have made the documented mirror and air-gapped paths
+  // unusable, which is what `D-109` records.
+  const m = /\/download\/([^/]+)\/[^/]+$/.exec(withoutQuery);
   if (m === null || m[1].length === 0) {
     throw new Error(
       `local-rag: redirect Location is not a release download URL: ${location}`,

@@ -381,8 +381,9 @@ Run the suite: `cd npm/memory && node --test test/*.test.js` — **not** bare `n
 test file, which would try to run `test/helpers/fake-binary.js` itself and hang forever in its
 own `setInterval`; the explicit glob scopes discovery to the top-level `*.test.js` files only).
 Zero `dependencies`/`devDependencies` — only `node:test`/`node:assert`/`node:child_process`/
-`node:module`/`node:path`/`node:os`/`node:fs` built-ins, the same "built-ins over an external
-dependency" stance the Rust "Dependency policy" section above takes; `npm` itself (bundled with
+`node:module`/`node:path`/`node:os`/`node:fs` built-ins, plus `node:http`/`node:https`/`node:crypto`
+in `src/http.js` and the fixture server that tests it (T22-06, ADR-0013) — the same "built-ins over
+an external dependency" stance the Rust "Dependency policy" section above takes; `npm` itself (bundled with
 Node) is the one host tool `test/package-contents.test.js` needs, purely locally (`npm pack
 --dry-run`), no registry contact. Requires Node.js ≥20.
 

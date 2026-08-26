@@ -78,6 +78,24 @@ test("the resolved tag is recovered from a real redirect Location", () => {
   );
 });
 
+test("a mirror's Location parses too, not just github.com's (D-109)", () => {
+  // The `/releases` segment belongs to the base URL, not to the URL shape
+  // `pinnedAssetUrl` builds. Requiring it made every non-GitHub base — the
+  // documented mirror and air-gapped paths — unparseable; the loopback fixture
+  // server in `http-fetch.test.js` is the first caller that proved it.
+  assert.equal(
+    parseTagFromLocation("http://127.0.0.1:65094/download/2.3.4/a.tar.gz"),
+    "2.3.4",
+  );
+  assert.equal(
+    parseTagFromLocation(pinnedAssetUrl("9.9.9", "a.tar.gz", {
+      LOCAL_RAG_RELEASE_BASE_URL: "https://mirror.example.test/lr",
+    })),
+    "9.9.9",
+    "the parser must agree with the builder for any base",
+  );
+});
+
 test("a Location that is not a release download is an error, never a silent null", () => {
   for (const bad of [
     "https://github.com/13W/memory/releases/tag/0.0.0",
