@@ -40,6 +40,33 @@ this task proves the guard's correctness against a fake/test remote provider
 (`crates/embed/tests/{policy,gen_policy}.rs`), the same "mechanism real, remote unreachable until a
 provider is registered" shape D-026 already documented for `POLICY_BLOCKED_REMOTE` itself.
 
+As-built note (T22-04, `[SPEC]`, [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)).
+**Downloading the product binaries and the ONNX Runtime is not subject to `data_policy` either.**
+The reasoning is the T11-06 note's, applied to two further artifact classes: the guard above
+governs repository content *leaving* the machine, while an `npm install` of `@13w/memory` and a
+first run of `local-rag` pull public bytes **in**, and no user content is sent in either. Gating
+them would make a `local_only` installation — the default — unable to obtain the very binary that
+enforces the policy.
+
+The exemption is narrow in a way the reader must be able to check, and here the two classes differ,
+so they are stated separately rather than lumped together. The ONNX Runtime keeps the T11-06
+standard exactly: its source URL and per-platform SHA-256 are pinned in the binary
+(`crates/xtask/src/dist_ort.rs::ORT_ASSETS`, 10 §5), so "fetch the runtime" cannot become "fetch
+arbitrary bytes". The product binaries **cannot** keep it. The owner chose to track the newest
+release rather than a pinned tag (ADR-0013 §Decision 2), and no digest of an unreleased artifact
+can be compiled in, so verification is against the checksum sidecar published **in the same
+release** as the asset. That defends against corruption in transit and tampering on the wire; it
+does **not** defend against a compromised release, because whoever can publish the asset can
+publish its checksum. Calling that "checksum-verified" without this sentence would advertise a
+property the channel does not have. The mitigation is GitHub artifact attestation, verified in
+addition to the checksum; the residual risk is trust in the release pipeline, accepted
+deliberately and recorded here rather than left for a reader to discover.
+
+Two limits keep this from widening. Only these three classes are exempt — model weights (T11-06),
+the ONNX Runtime, and the product binaries — and the exemption is about *fetching*, never about
+sending: embedding or generating *through* a remote provider stays gated exactly as fixed above.
+And the plugin is not a party to any of it: it downloads nothing, ever (13 §2).
+
 ## 2. Redaction & caps `[FIXED]`
 
 - Secret redaction runs **before** anything is written to the spool `[FIXED]` and again before

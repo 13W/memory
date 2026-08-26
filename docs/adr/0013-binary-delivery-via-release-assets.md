@@ -43,7 +43,14 @@ Decision 2 states what replaces it and what that costs.
 [01 §1](../specification/01-overview.md) (the distribution sentence),
 [13 §1](../specification/13-distribution-and-migrations.md) (the channel, the build tooling and the
 per-asset binary list), [10 §5](../specification/10-models-and-embeddings.md) (the ONNX Runtime
-becomes a first-run artifact) — all by `T22-03`. Each amendment points back here.
+becomes a first-run artifact) — all by `T22-03`;
+[13 §2](../specification/13-distribution-and-migrations.md) (the launcher requirements: an
+executable is resolved rather than a package, and what happens when the server is not installed),
+[13 §4](../specification/13-distribution-and-migrations.md) (the upgrade trigger and the
+co-location invariant), [12 §1](../specification/12-security-privacy.md) (the network exemption
+for binaries and the runtime, with its trust model),
+[11 §3.2](../specification/11-interfaces.md) (the hook's not-installed case) — all by `T22-04`.
+Each amendment points back here.
 
 Convention (`docs/adr/NNNN-title.md`, Nygard sections, English) is
 [ADR-0001](0001-first-release-language-set.md)'s.

@@ -47,6 +47,31 @@ names. Historical evidence in `docs/implementation-plan/PROGRESS.md` for T17-01/
 `@13w/local-rag*`, correctly, as that was the real name at the time those tasks executed — it is
 not rewritten (`CLAUDE.md`: prior evidence is never edited after the fact).
 
+As-built note (T22-04, `[SPEC]`, [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)).
+**The next two notes are superseded and kept as history**, but not wholly, and the difference
+matters because part of what they recorded is the reason the replacement has the shape it does.
+
+What is superseded: the three-tier ladder in its entirety, including the `npx` last resort and the
+`${CLAUDE_PLUGIN_DATA}/bin` cache tier; the p50 ≈ 39 ms / p95 ≈ 42 ms measurement, which timed
+that cache tier specifically and therefore no longer measures anything that exists; and, from the
+D-055 note, the whole `require.resolve` mechanism — the two anchors, `npmGlobalNodeModules()`, the
+accepted miss for a custom npm prefix, and the `LOCAL_RAG_TEST_GLOBAL_NODE_MODULES` seam. §2 above
+states what replaces them.
+
+What still holds, and is load-bearing for `T22-12`/`T22-13`. `.mcp.json` keeps `"node"` +
+`${CLAUDE_PLUGIN_ROOT}/…` rather than a bare shebanged path, for the reason that note gives: a
+shell-less direct spawn does not consult shebangs, so a bare path would not work on `win32` at
+all. And the MCP budget is structurally larger than the hook's for the reason it gives too —
+`.mcp.json` has no shell in which to chain a fallback, so Node startup is unavoidable there, while
+the hook can exec a native binary directly with no Node at all. Those two facts are precisely why
+the replacement keeps a Node launcher on the MCP path and gives the hook a POSIX `sh` resolver.
+`${CLAUDE_PLUGIN_DATA}` remains real, documented Claude Code behaviour, as that note's audit
+established; only this project's use of it as a binary cache ends.
+
+D-055's finding is not overturned either — it is carried out. It established that "installed on
+this machine" is what a user actually has, and that a single global install is the only route to a
+network-free cold start. This change removes the last path that contradicted it.
+
 As-built note (T19-03, `[SPEC]`, group 19 plan). Two changes to the plugin's own launch path,
 distinct from the npm launcher T17-01/T17-03 already cover above:
 
@@ -137,11 +162,41 @@ never write into a user's project on install/uninstall — no new test needed fo
 
 - signal forwarding + reliable termination of the stdio child; CTRL-C / SIGTERM correctness;
   orphan cleanup;
-- resolution under pnpm / npm / yarn layouts (hoisting differences);
-- a clear, actionable error when the platform package is missing;
-- fully offline operation after `local-rag init --download-models`;
-- checksum/manifest + atomic model download (10 §5);
-- ORT bundling settled before the final CI matrix.
+- resolution of an **executable**, not an npm package `[FIXED, ADR-0013]`: an explicit
+  `LOCAL_RAG_BIN_DIR` override first, then the elements of `PATH` in order, then a list of
+  well-known global-bin directories. The plugin **never downloads anything** — obtaining the
+  binaries is the npm package's job (§1) and never the plugin's, the same way the recall RPC never
+  spawns a daemon (11 §3.2). Package-manager layouts stop mattering once a file rather than a
+  package is resolved; the failure axes that replace them are lifecycle-script suppression
+  (`npm ci --ignore-scripts`, pnpm's default policy for dependency scripts, Yarn PnP) and a `PATH`
+  a GUI-launched client does not inherit — which is exactly why the well-known-directories rung and
+  the override both exist;
+- a clear, actionable error when **the server is not installed** `[FIXED, ADR-0013]`, stated
+  per channel because their contracts differ. MCP: stdout stays **byte-empty** — it is the
+  JSON-RPC stream (11 §4) and any stray write corrupts framing — the diagnostic goes to stderr and
+  names both the install command and `LOCAL_RAG_BIN_DIR`, and the process exits non-zero so the
+  client shows a failed server rather than a silent one. Hooks: exit 0 always (11 §3.1 `[FIXED]`,
+  unchanged), `SessionStart` says so through `additionalContext` (11 §3.2), and the other six
+  events stay silent;
+- fully offline operation after `local-rag init --download-models` `[FIXED]`, with the
+  install-time/runtime split made explicit: obtaining the binaries and the runtime needs the
+  network once (12 §1); nothing after that does;
+- checksum/manifest + atomic download, for the ONNX Runtime on the same terms as model weights
+  (10 §5);
+- the ONNX Runtime is an artifact of first run, installed beside the weights rather than bundled
+  into a package `[FIXED, ADR-0013]` (10 §5).
+
+Amendment note (T22-04, `[FIXED]` change under
+[ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)). Four of the six requirements above
+are this ADR's; the first and the checksum one are untouched in substance. Two of them replace
+requirements that had become unanswerable rather than merely wrong: there is no package layout to
+resolve under, and no platform package that can be missing. The actionable-error requirement is
+**strengthened**, not relaxed — it used to cover a missing sub-package and now covers the case a
+real user actually hits, no server at all, with a stated contract on each channel instead of the
+silent "MCP server not connected" that prompted this group. The resolution order itself is new
+normative text: §1 points here for it, and `T22-12`/`T22-13` implement it. What is deliberately
+*not* here: how the binaries are obtained (§1), what the download is trusted on (12 §1), and what
+triggers an upgrade (§4).
 
 As-built note (T22-03, `[SPEC]`, [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)).
 The next note is superseded in the one part that names *where* the runtime lives, and kept as
@@ -247,10 +302,26 @@ store off the upgrade path).
 
 ## 4. Upgrade flow `[SPEC]`
 
-New binary via npm → next proxy spawn detects version mismatch → `SHUTDOWN_REQUEST` to old
-daemon (02 §4.2) → old daemon drains and exits → new daemon migrates (if needed) → serves.
-Spool format compatibility is part of the handshake (11 §4): a daemon MUST be able to import
-all spool `format_version`s ≤ its own.
+A new `local-rag` binary on disk `[SPEC, ADR-0013]` → next proxy spawn detects version mismatch →
+`SHUTDOWN_REQUEST` to old daemon (02 §4.2) → old daemon drains and exits → new daemon migrates
+(if needed) → serves. Spool format compatibility is part of the handshake (11 §4): a daemon MUST
+be able to import all spool `format_version`s ≤ its own.
+
+The daemon binary MUST sit beside the proxy that spawns it `[SPEC, ADR-0013]`. That co-location
+is what makes "the version comes from whichever binary is found next to this proxy" a definition
+rather than a coincidence, and it is the reason the upgrade needs no separate detect-and-spawn
+step. Under the previous channel it fell out of how npm laid packages out; it is now a
+requirement on the layout, bought structurally by the installer placing all product binaries in
+one flat directory (`T22-10`).
+
+Amendment note (T22-04, `[SPEC]` change under
+[ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)). Only the trigger and the
+co-location clause are this ADR's. The mechanism is unchanged in every other respect — the
+handshake retry loop, `SHUTDOWN_REQUEST`, the drain, the migration, and `MAX_UPGRADE_ROUNDS = 2`
+all behave exactly as the T15-02 note below describes. What changed is what makes the on-disk
+binary new: npm no longer swaps a package directory, the installer replaces the files in place
+(§1), so the trigger is stated in terms of the binary rather than the package manager. The next
+note is otherwise still accurate and is kept.
 
 As-built note (T15-02, `[SPEC]`): "next proxy spawn detects version mismatch" is
 `local-rag-proxy::handshake::establish_session`'s retry loop — after a compatible `WELCOME` whose
