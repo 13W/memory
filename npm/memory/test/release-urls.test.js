@@ -48,6 +48,39 @@ test("every supported platform names an asset, and only win32 uses .zip", () => 
   assert.equal(assetName("local-rag", "freebsd-x64"), null);
 });
 
+// The producer's own archive formats, read rather than retyped, for the same
+// reason `platform.test.js`'s sibling reader reads the target list: a hand-typed
+// pair would only prove this file agrees with itself. If the two ever want a
+// shared helper, that is where its twin lives.
+function distWorkspaceArchiveFormats() {
+  const toml = require("node:fs").readFileSync(
+    require("node:path").join(__dirname, "..", "..", "..", "dist-workspace.toml"),
+    "utf8",
+  );
+  const read = (key) => {
+    const line = toml.split("\n").find((l) => l.trimStart().startsWith(key));
+    assert.ok(line, `dist-workspace.toml must declare ${key}`);
+    return /"([^"]+)"/.exec(line)[1];
+  };
+  return { unix: read("unix-archive"), windows: read("windows-archive") };
+}
+
+test("assetName's extensions are exactly dist-workspace.toml's archive formats", () => {
+  // The producer and the consumer of these names are two files apart, and they
+  // were deliberately out of step between T22-05 and T22-07. This is what keeps
+  // them from drifting again — silently, and only noticed by a download that
+  // 404s on a user's machine.
+  const { unix, windows } = distWorkspaceArchiveFormats();
+  for (const key of SUPPORTED_PLATFORMS) {
+    const name = assetName("local-rag", key);
+    const expected = key.startsWith("win32-") ? windows : unix;
+    assert.ok(name.endsWith(expected), `${key} -> ${name} must end with ${expected}`);
+  }
+  // Both formats have to be ones `archive.js` can actually open.
+  assert.equal(unix, ".tar.gz");
+  assert.equal(windows, ".zip");
+});
+
 test("asset, sidecar and executable names agree with each other", () => {
   const name = assetName("local-rag-proxy", "darwin-arm64");
   assert.equal(name, "local-rag-proxy-aarch64-apple-darwin.tar.gz");

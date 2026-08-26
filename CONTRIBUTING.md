@@ -382,10 +382,12 @@ test file, which would try to run `test/helpers/fake-binary.js` itself and hang 
 own `setInterval`; the explicit glob scopes discovery to the top-level `*.test.js` files only).
 Zero `dependencies`/`devDependencies` — only `node:test`/`node:assert`/`node:child_process`/
 `node:module`/`node:path`/`node:os`/`node:fs` built-ins, plus `node:http`/`node:https`/`node:crypto`
-in `src/http.js` and the fixture server that tests it (T22-06, ADR-0013) — the same "built-ins over
+in `src/http.js` and the fixture server that tests it (T22-06, ADR-0013) and `node:zlib` in
+`src/archive.js` and its fixtures (T22-07) — the same "built-ins over
 an external dependency" stance the Rust "Dependency policy" section above takes; `npm` itself (bundled with
 Node) is the one host tool `test/package-contents.test.js` needs, purely locally (`npm pack
---dry-run`), no registry contact. Requires Node.js ≥20.
+--dry-run`), no registry contact. Requires Node.js ≥20.15, the floor at which `zlib.crc32` exists —
+`archive.js` needs it because raw deflate, unlike a gzip stream, carries no checksum of its own.
 
 Not yet wired into `cargo xtask ci` / `.github/workflows/ci.yml` — that file's own comment already
 earmarks "additional platform targets are added by the distribution work (T17)"; running the npm
