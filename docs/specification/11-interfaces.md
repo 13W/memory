@@ -1207,8 +1207,8 @@ Data access per screen, decided by ADR-0008:
   daemon is reachable, both screens show an explicit "daemon not running" state rather than stale
   or fabricated numbers.
 
-Distribution follows §6's own npm/platform-package convention (`local-rag-tui` alongside
-`local-rag`/`local-rag-proxy`/`local-rag-hook`) — `T18-01`'s own card.
+Distribution follows 13 §1's channel (`local-rag-tui` alongside
+`local-rag`/`local-rag-proxy`/`local-rag-hook`, one release asset each) — `T18-01`'s own card.
 
 As-built note (T18-01, `[SPEC]`). The skeleton above is real: `crates/local-rag-tui` (workspace
 member, `default-members`, `[package.metadata.dist] dist = true` — the fourth product binary

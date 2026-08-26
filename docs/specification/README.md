@@ -32,7 +32,7 @@ Conformance keywords **MUST / MUST NOT / SHOULD / MAY** follow RFC 2119 semantic
 | [10-models-and-embeddings.md](10-models-and-embeddings.md) | Representations registry, model spaces, per-worktree activation, double-buffer migration, provider pool |
 | [11-interfaces.md](11-interfaces.md) | MCP tool contracts, hook contracts, proxy↔daemon protocol, CLI surface, `additionalContext` format |
 | [12-security-privacy.md](12-security-privacy.md) | Redaction, data policy, TTL, source-blob policy, untrusted-recall encoding, filesystem permissions |
-| [13-distribution-and-migrations.md](13-distribution-and-migrations.md) | npm packaging, platform matrix, model asset delivery, migration framework |
+| [13-distribution-and-migrations.md](13-distribution-and-migrations.md) | Binary delivery and the npm installer package, platform matrix, model asset delivery, migration framework |
 | [14-acceptance-and-testing.md](14-acceptance-and-testing.md) | Acceptance gates, fault-injection suites, fixture strategy, benchmarks |
 | [15-roadmap.md](15-roadmap.md) | Implementation order, MVP (v0) scope, deferred features, open-questions register |
 

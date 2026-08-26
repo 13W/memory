@@ -8,9 +8,21 @@
 2. **Semantic code search** — hybrid lexical + dense retrieval over a parsed, generation-versioned code index.
 3. **Observations** — durable capture of agent-session events feeding memory consolidation.
 
-Implementation language is **Rust** `[FIXED]`. Distribution is **npm** with per-platform native
-binaries `[FIXED]`. There are **no mandatory external daemons** (no Qdrant, no Ollama as
-prerequisites) `[FIXED]` — this is the headline break from v1.
+Implementation language is **Rust** `[FIXED]`. Installation is a single **npm** package; the
+native binaries are the project's own **GitHub release assets** `[FIXED, ADR-0013]`. There are
+**no mandatory external daemons** (no Qdrant, no Ollama as prerequisites) `[FIXED]` — this is the
+headline break from v1.
+
+Amendment note (T22-03, `[FIXED]` change under
+[ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)): the distribution sentence above is
+this ADR's, and what did not change matters as much as what did. The target set (§2) is the same
+five, there are still no mandatory external daemons, and model weights are still never in npm
+(10 §5). What changed is where the native binaries come from. The per-platform npm packages the
+old sentence promised were never built — their `bin/` is gitignored and was filled by hand, no
+script, xtask subcommand or CI step ever populated it, and nothing was published to the registry
+(`D-102`) — while the tagged CI release has been producing those binaries for all five targets,
+Windows included (`D-108`). npm stays the installation entry point; it is no longer the transport.
+13 §1 states the channel, 13 §2 the resolution contract.
 
 ## 2. Scope
 
