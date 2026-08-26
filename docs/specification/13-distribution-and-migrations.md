@@ -4,19 +4,34 @@
 
 One native service binary, no mandatory external daemons; model assets delivered separately.
 
-- npm: `@13w/local-rag` (thin JS launcher) + per-platform packages as `optionalDependencies`
-  (`@13w/local-rag-darwin-arm64`, `…-darwin-x64`, `…-linux-x64`, `…-linux-arm64`,
-  `…-win32-x64`). `win32-arm64` deferred until the chosen dense backend / ORT / fastembed /
-  SQLite / tree-sitter / local generator / npm platform detection / CI smoke all pass on it
-  `[FIXED]`.
-- Build tooling: `cargo-dist`, `cargo-zigbuild` `[FIXED]`.
-- Binaries per platform package `[SPEC]`: `local-rag` (daemon+CLI multiplexed), `local-rag-proxy`
-  (stdio MCP proxy), `local-rag-hook` (spool writer). Single binary with argv0/subcommand
-  multiplexing is acceptable; hooks path must be exec-fast (<50 ms cold `[SPEC]`). The Claude Code
-  plugin's own MCP server entry point resolves through a three-tier fallback (`@13w/memory`
-  installed on this machine — project-local override or machine-global, D-055 — a known-path
-  cache, `npx` last resort — not a bare, uncached `npx` invocation) and its cached-tier
-  launcher-only overhead must stay under a p95 < 100 ms cold budget `[SPEC]`.
+- npm: one package, `@13w/memory`, whose job is to obtain and expose the binaries rather than to
+  contain them; the native binaries themselves are the project's own GitHub release assets,
+  produced by the tagged CI release `[FIXED, ADR-0013]`. `win32-arm64` deferred until the chosen
+  dense backend / ORT / fastembed / SQLite / tree-sitter / local generator / npm platform
+  detection / CI smoke all pass on it `[FIXED]`.
+- Build tooling: `cargo-dist` `[FIXED, ADR-0013]`.
+- Binaries per release asset `[SPEC, ADR-0013]`: `local-rag` (daemon+CLI multiplexed),
+  `local-rag-proxy` (stdio MCP proxy), `local-rag-hook` (spool writer) and `local-rag-tui`
+  (11 §7) — one archive per binary per target, each with its own checksum sidecar. Single binary
+  with argv0/subcommand multiplexing is acceptable; hooks path must be exec-fast (<50 ms cold
+  `[SPEC]`). The Claude Code plugin's own MCP server entry point resolves an **executable**, not an
+  npm package — the ordered contract is §2's — and the launcher-only overhead of that resolution
+  must stay under a p95 < 100 ms cold budget `[SPEC]`.
+
+Amendment note (T22-03, `[FIXED]` change under
+[ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)). The three bullets above are this
+ADR's. The channel the first one used to describe — five per-platform npm packages selected by
+`optionalDependencies` — was never built: their `bin/` is gitignored and was populated by hand, no
+script, xtask subcommand or CI step ever did it, and nothing was ever published to the registry
+(`D-102`). The channel replacing it was already running: `cargo-dist` emits one archive per binary
+per target on a tag, each with a `.sha256` sidecar, alongside a `dist-manifest.json`.
+`cargo-zigbuild` leaves the `[FIXED]` tooling list with that ritual — its only role was the by-hand
+cross-build that filled those packages, and it appears in neither `.github/workflows/release.yml`
+nor `dist-workspace.toml`; `T22-17` confirms the pipeline needs nothing further. `local-rag-tui` is
+listed because `[package.metadata.dist] dist = true` makes it the fourth product binary `dist plan`
+emits (11 §7); tag `0.0.0` predates that crate and carries only three. Deliberately **not** settled
+here: how a client finds the binary, what it trusts, and what triggers an upgrade — §2 and §4,
+amended separately.
 
 As-built note (T17-03, `[SPEC]`). The npm scope stays `@13w`, but the launcher and platform
 package **names** are `@13w/memory` / `@13w/memory-{darwin-arm64,darwin-x64,linux-x64,
@@ -127,6 +142,27 @@ never write into a user's project on install/uninstall — no new test needed fo
 - fully offline operation after `local-rag init --download-models`;
 - checksum/manifest + atomic model download (10 §5);
 - ORT bundling settled before the final CI matrix.
+
+As-built note (T22-03, `[SPEC]`, [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)).
+The next note is superseded in the one part that names *where* the runtime lives, and kept as
+history for everything else. `libonnxruntime` is no longer bundled into a platform package's
+`bin/`: it becomes an artifact of first run, installed into the store beside the model weights by
+the same verify-before-trust machinery those weights already use (10 §5), which is `T22-15`'s.
+
+Everything else in that note still holds, and that is why it is kept rather than rewritten: the
+resolution order at process start, the prohibition on ever falling through to `ort`'s own implicit
+search (`D-028`, which showed it can hang the calling thread instead of erroring), the pinned URL
+and SHA-256 per platform in `crates/xtask/src/dist_ort.rs::ORT_ASSETS`, the per-platform runtime
+versions with the reason `darwin-x64` pins the older one, and the record of what was actually
+verified end to end versus only structurally. The pinned table in particular is untouched — under
+`latest` the product binaries lose the compiled-in-digest standard (ADR-0013 §Decision 2), and the
+runtime deliberately does not.
+
+One consequence inverts that note's last sentence and is worth naming here. The stated reason
+`win32` ships no bundled runtime is `cargo-zigbuild`, which has no role at all after this change;
+a Windows ONNX Runtime therefore becomes obtainable. `D-108` separately established that Windows
+*product* binaries have been shipping all along — release `0.0.0` carries all three. Acting on
+either is `T22-15`'s, not this note's.
 
 As-built note (T17-03, `[SPEC]`). "Settled" resolved to: each platform package's `bin/` directory
 carries one extra flat file, `libonnxruntime.dylib`/`libonnxruntime.so` (no `win32` entry — see

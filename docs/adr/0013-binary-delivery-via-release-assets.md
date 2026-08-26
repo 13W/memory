@@ -39,6 +39,12 @@ pinned by URL and digest in code. It cannot hold for product binaries once the o
 track `latest`, because the digest of a future release cannot be compiled into today's package.
 Decision 2 states what replaces it and what that costs.
 
+`[FIXED]` text amended under this ADR:
+[01 §1](../specification/01-overview.md) (the distribution sentence),
+[13 §1](../specification/13-distribution-and-migrations.md) (the channel, the build tooling and the
+per-asset binary list), [10 §5](../specification/10-models-and-embeddings.md) (the ONNX Runtime
+becomes a first-run artifact) — all by `T22-03`. Each amendment points back here.
+
 Convention (`docs/adr/NNNN-title.md`, Nygard sections, English) is
 [ADR-0001](0001-first-release-language-set.md)'s.
 

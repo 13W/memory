@@ -73,4 +73,4 @@ multiple generators; cross-generation matching; LSP graph; multi-harness; FreeBS
 Per rev 6 §18, this spec is grown per implementation step, not frozen: each step lands with
 its section updated to as-built precision (DDL diffs via migrations, protocol clarifications
 as `[SPEC]` amendments). `[SPEC]` items are the review queue for step kick-offs; `[FIXED]`
-changes require a design rev 7.
+changes require a new design revision.

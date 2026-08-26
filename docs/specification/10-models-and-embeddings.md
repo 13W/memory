@@ -408,7 +408,19 @@ closed in the store.
 Weights are **not** in npm. `local-rag init --download-models`: checksum-verified manifest,
 atomic download (`.part` → fsync → rename → `.ok` marker), offline operation afterwards.
 `models/<model_id>/manifest.json` records source, size, sha256, license. Default model choice
-and delivery details `[OPEN]`. ORT bundling verified before the final CI matrix `[FIXED]`.
+and delivery details `[OPEN]`. The ONNX Runtime is installed at first run beside the weights, by
+the same verified path `[FIXED, ADR-0013]`.
+
+Amendment note (T22-03, `[FIXED]` change under
+[ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)): the ORT sentence above is this
+ADR's; "Weights are **not** in npm" is untouched and stays true. The old wording — "ORT bundling
+verified before the final CI matrix" — assumed the library would ride inside a per-platform npm
+package, and those packages are gone (13 §1). It now travels the route this section already
+describes for weights, because a release archive carries only its executable and the library has
+nowhere else to be. This is the one artifact class where the compiled-in-catalog standard below
+survives intact: `crates/xtask/src/dist_ort.rs::ORT_ASSETS` keeps its pinned URL and SHA-256 per
+platform, unlike the product binaries, which track `latest` and pay for it (ADR-0013 §Decision 2).
+The runtime resolution order and `D-028`'s prohibition are unchanged; the code is `T22-15`'s.
 
 As-built note (T11-03, `[SPEC]`): the **default model choice** half of that `[OPEN]` is resolved —
 **`embeddinggemma-300m`, 768 dimensions, cosine** (ADR-0004, which records the measured candidate
@@ -430,8 +442,8 @@ contract:
 * **Runtime**: ONNX Runtime through `ort` with `load-dynamic` — nothing is downloaded or linked at
   build time, `libonnxruntime` is resolved at runtime (`ORT_DYLIB_PATH` or the loader path), and its
   absence is a typed error. This is what keeps a clean build and the whole quality gate offline;
-  bundling the library per platform package stays the "ORT bundling verified before the final CI
-  matrix" `[FIXED]` item above, owned by T17-03.
+  installing the library at first run beside the weights is the `[FIXED, ADR-0013]` item above,
+  owned by `T22-15` (it was T17-03's per-platform-package bundling until ADR-0013).
 * **Quantization**: q8 (`model_quantized`) — three files totalling 314.5 MiB
   (`model_quantized.onnx`, `model_quantized.onnx_data`, `tokenizer.json`). Still a delivery choice:
   it does not appear in `RepresentationKey`.
@@ -457,8 +469,8 @@ contract:
 * Permissions follow 02 §2.1: `models/<model_id>/` is 0700 and every installed file is 0600 on unix.
 
 `local-rag init --download-models` as a **command** is T15-07's CLI surface (`serve/status/stop/
-restart/init`); T11-06 delivers the typed API it calls. Excluding weights from the npm packages is
-T17-01's packaging test.
+restart/init`); T11-06 delivers the typed API it calls. Excluding weights from the npm package is
+`T22-10`'s packaging test (T17-01's until the platform packages were removed).
 
 ## 6. Memory relevance backend
 
