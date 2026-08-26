@@ -513,11 +513,32 @@ daemon over the endpoint with a hard budget of 1500 ms `[SPEC]` (300 ms before T
 see the amendment note below):
 
 - daemon reachable → prints `additionalContext` JSON (format §5) to stdout;
-- daemon unreachable / timeout / any error → prints nothing, exit 0.
+- daemon unreachable / timeout / any error → prints nothing, exit 0;
+- **the hook binary itself cannot be resolved** → nothing above runs at all. `SessionStart`
+  states the situation through `additionalContext`; the other six events stay silent; the exit
+  code is 0 in every case `[SPEC, ADR-0013]`.
 
 This preserves both constraints simultaneously: ingestion durability never depends on the
 daemon (spool append happens first and unconditionally), and recall-via-additionalContext from
-v1 is kept. The recall RPC MUST NOT trigger daemon startup `[SPEC]` (no spawn from hooks).
+v1 is kept. The recall RPC MUST NOT trigger daemon startup `[SPEC]` (no spawn from hooks), and
+the plugin MUST NOT download anything to resolve the binary `[SPEC, ADR-0013]` (13 §2) — both are
+the same rule: a hook does work that is already possible, or it does nothing.
+
+Amendment note (T22-04, `[SPEC]` change under
+[ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)): the third case and the second
+`MUST NOT` are this ADR's. The third case is genuinely distinct from "daemon unreachable" — there
+is no binary to run, so there is no RPC to time out — and until now the specification had no
+account of it at all; in practice it surfaced as a silent "MCP server not connected", which is
+what group 22 exists to fix (13 §2 states the matching contract for the MCP channel).
+
+That notice is **not** recall output, so §5's `[FIXED]` "Empty recall ⇒ no output at all" is not
+engaged. It is neither an entry inside the `<memory>` tag nor a product of
+`format_additional_context`: it is this plugin's own trusted, hardcoded text, and it therefore
+stands exactly where `TOOL_ROUTING_TRAILER` stands (§5's T19-02 note) — outside the untrusted-content
+tag, not sanitized/escaped/capped, because it has no attacker-influenced input. §5's rule governs
+what a *recall* with no results may print, and here there is nothing to recall with. §3.1's
+`[FIXED]` contract — the seven events, always exit 0, the ≤ 200 ms append budget — is unchanged in
+every respect.
 
 As-built note (T15-06, `[SPEC]`): `local_rag_hook::recall::recall_and_print` is the
 implementation — called from `spool_write_pipeline` immediately after `segment::append_frame`
