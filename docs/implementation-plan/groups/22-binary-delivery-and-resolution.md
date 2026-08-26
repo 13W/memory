@@ -188,10 +188,18 @@ ORT/релиз (`T22-15`…`T22-17`). Ветки не зависят друг о
 - **Результат:** модули без ввода-вывода, полностью покрытые тестами, до того как что-либо
   открывает сокет.
 - **В scope:** `npm/memory/src/platform.js` — сохранить пять поддерживаемых ключей и
-  `win32-arm64` в deferred, удалить `platformPackageName`, добавить `exeSuffix(platform)` и
-  `TARGET_TRIPLES` ровно по `dist-workspace.toml`; новый `src/release.js`; переписанный
-  `src/errors.js` (`formatNotInstalledError`, `formatSourceCheckoutNotBuiltError`,
+  `win32-arm64` в deferred, добавить `exeSuffix(platform)`, `TARGET_TRIPLES` и `targetTriple(key)`
+  ровно по `dist-workspace.toml`; новый `src/release.js`; расширенный `src/errors.js`
+  (`formatNotInstalledError`, `formatSourceCheckoutNotBuiltError`,
   `formatChecksumMismatchError`, `formatAssetAbsentError` и прочие).
+  **Исправлено при выполнении: карточка говорила «удалить `platformPackageName`» и «переписать
+  `errors.js`» — на этой позиции в очереди это означает «сломать».** `platformPackageName`
+  вызывается из `src/resolve.js:45,:51` (уходит в `T22-09`) и из
+  `plugin/test/mcp-launcher-tiers.test.js:119` (уходит в `T22-12`), а `formatMissingPlatformError`
+  — из всех трёх bin-шимов (уходят в `T22-10`), причём `subprocess.test.js` проверяет их stderr
+  на реальном процессе. Удаление положило бы ~6 файлов **собственного** набора карточки плюс
+  плагинный. Поэтому карточка **добавляет**, а устаревающие символы получают `@deprecated` с
+  именем карточки, которая их снимет.
 - **Не в scope:** сеть, файловая система, удаление platform-пакетов.
 - **Тесты:** `platform.test.js` (пять таргетов, deferred, round-trip триплетов против литерального
   списка из `dist-workspace.toml`); `release-urls.test.js` — `parseSha256Sidecar` на реальной форме
@@ -199,8 +207,10 @@ ORT/релиз (`T22-15`…`T22-17`). Ветки не зависят друг о
   63 символах и не-hex; `parseTagFromLocation` на реальной строке `Location`, на строке с query и
   на несовпадающей; `errors.test.js` — каждое сообщение называет ключ/ассет/оба дайджеста и даёт
   одну исполняемую команду.
-- **Приёмка:** `cd npm/memory && node --test test/*.test.js` зелёный; ни один новый модуль не
-  требует сети.
+- **Приёмка:** `cd npm/memory && node --test test/*.test.js` зелёный; `node --test
+  plugin/test/*.test.js` **тоже** зелёный (именно он ловит удаление `platformPackageName`); ни
+  один новый модуль не требует сети.
+- **Evidence:** строка `T22-05` в «Task evidence» (`PROGRESS.md`).
 
 ## T22-06 — Сетевой шов
 
