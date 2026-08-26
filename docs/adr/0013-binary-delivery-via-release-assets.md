@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted — 2026-08-26.
+Accepted — 2026-08-26. **Amended 2026-08-26 (D-108)** — see "Amendment: Windows binaries"
+below: this record's Consequences claimed no Windows binaries exist, which is false. The four
+decisions and their reasoning are untouched.
 
 Opens a new scope by explicit owner decision: product binaries stop being delivered as
 per-platform npm packages and start being taken from the GitHub release the CI already
@@ -202,6 +204,45 @@ artifact class because the owner chose a moving channel for it, and for no other
 - **This does not change the ONNX Runtime version.** Decision 4 moves where the library comes
   from, not which one; the pinned table is carried over as-is, including the older pin that
   `darwin-x64` needs because upstream stopped shipping Intel-Mac builds.
+
+## Amendment: Windows binaries (2026-08-26, D-108)
+
+**Windows binaries exist and already ship.** Release `0.0.0` carries all three product binaries
+for `x86_64-pc-windows-msvc`; `dist-manifest.json` gives each of them a single `executable`
+member and records a dedicated `build:local:x86_64-pc-windows-msvc` build environment. The
+Consequences section below says the opposite. It is left standing, because an ADR is evidence of
+what was decided and on what basis — including where that basis was wrong — and this amendment is
+how the record is corrected.
+
+### Why the error happened
+
+`D-029` and `D-033` were read and their wording carried over without checking how they ended.
+`D-033` is **resolved**: the first real `windows-latest` runner found that `win32-x64` did not
+compile at all, because `crates/local-rag-hook/src/recall.rs` imported
+`std::os::unix::net::UnixStream` unconditionally; the fix `#[cfg(unix)]`-gated the IPC transport
+and made the Windows branches a typed immediate refusal. Windows has built and shipped ever since.
+
+The empty `npm/memory-win32-x64/bin/` has a different cause entirely: `cargo-zigbuild` cannot
+target Windows, and the by-hand ritual that filled the platform packages ran through it. CI never
+used `cargo-zigbuild` — it appears in neither `.github/workflows/release.yml` nor
+`dist-workspace.toml`.
+
+### What this invalidates in the text above
+
+Only the Consequences bullet beginning "**This does not fix win32.**" Its factual claim is wrong
+and its conclusion is backwards. The corrected statement, and it argues *for* Decision 1 rather
+than qualifying it: **the release-asset channel already delivers Windows, and the platform-package
+channel structurally could not.** The abandoned channel was not merely unimplemented on Windows —
+it was unimplementable there from this project's own build machine.
+
+What is genuinely unfinished on Windows, stated precisely so the gap is not overclaimed in either
+direction: the daemon's IPC is a typed refusal rather than an implementation, with full
+named-pipe IPC deferred to a future task by the owner's decision inside `D-033`; and `ORT_ASSETS`
+carries no `win32` entry, whose recorded reason is again `cargo-zigbuild`. That reason dissolves
+under this ADR, so a Windows ONNX Runtime becomes obtainable — an input for the card that moves
+ORT into the first-run installer, not a claim made here.
+
+No decision, alternative or consequence other than that one bullet is affected.
 
 ## Alternatives rejected
 
