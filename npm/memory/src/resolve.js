@@ -19,6 +19,19 @@ const {
  */
 
 /**
+ * @deprecated ADR-0013: there is no platform package to resolve. `src/locate.js`
+ *   (T22-09) resolves an executable instead. This file stays until its last
+ *   caller does — the three `bin/` shims (T22-10) and five tests (T22-11) — and
+ *   goes with them.
+ *
+ *   Renaming it here, as T22-09's card asked, was measured and rejected: eight
+ *   files require it directly and five more reach it through
+ *   `test/helpers/fixture-layout.js`'s copy of the real `src/` and `bin/`, so a
+ *   rename would have left ~20 cases red across three cards. The decisive one is
+ *   not the count: a top-level `require` that throws is *not* fail-open, so the
+ *   hook shim would have exited non-zero with a stack trace and broken
+ *   `11 §3.1` `[FIXED]` ("always exit 0") until T22-10 rewrote it.
+ *
  * Resolve the platform package for the current (or an injected) host,
  * honoring whatever npm/pnpm/yarn layout actually installed it.
  *

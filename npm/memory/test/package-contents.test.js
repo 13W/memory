@@ -28,6 +28,7 @@ const PACKAGES = [
       "package.json",
       "bin/local-rag-mcp.js",
       "src/resolve.js",
+      "src/locate.js",
       "scripts/install.js",
     ],
   },

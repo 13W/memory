@@ -72,6 +72,35 @@ D-055's finding is not overturned either — it is carried out. It established t
 this machine" is what a user actually has, and that a single global install is the only route to a
 network-free cold start. This change removes the last path that contradicted it.
 
+As-built note (T22-09, `[SPEC]`, [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)).
+**The npm package resolves too, and its order is not §2's.** §2 states the order for a client that
+did not install the binaries — an override, then `PATH`, then well-known global-bin directories —
+and its own amendment note assigns it to `T22-12`/`T22-13`. `@13w/memory` is the other side of the
+same sentence in §1 above: it *obtains and exposes* them, so it knows where it put them, and it
+carries one obligation the plugin does not — a developer's own build must win over anything
+downloaded. `npm/memory/src/locate.js` therefore resolves, in order: `LOCAL_RAG_BIN_DIR`; a source
+checkout containing this very package (`target/release`, then `target/debug`); the package's own
+`bin/`; the per-user cache at `<data_dir>/local-rag/bin/<target-triple>`; then "not installed".
+
+Three properties of that order are load-bearing rather than incidental.
+
+- **A rung yields a directory, and counts only when that directory holds every required binary.**
+  §4's co-location clause is what makes "the version comes from whichever binary is found next to
+  this proxy" a definition; a resolver answering per binary could return a proxy from one rung and
+  a daemon from another, and nothing downstream would notice until the versions disagreed.
+- **The first two rungs are terminal.** An override that does not hold the binaries is an error,
+  never a reason to look further — ADR-0013 introduced it as the air-gapped answer, "which wins
+  over everything and never downloads", and an override silently ignored is worse than none. A
+  checkout with nothing built is likewise an error naming `cargo build`, because falling through
+  would run a download that does not correspond to the source sitting right there.
+- **The checkout outranks the package's own `bin/`.** In a checkout that directory holds committed
+  shims, and a stray `npm install` inside it can drop downloaded binaries there; the order is what
+  stops those from shadowing a local build.
+
+The last two rungs require a current install manifest (`packageVersion` and platform key matching,
+every file it claims present); the first two do not, because a manifest certifies what the
+*installer* put down, and neither an override nor a local build was installed.
+
 As-built note (T19-03, `[SPEC]`, group 19 plan). Two changes to the plugin's own launch path,
 distinct from the npm launcher T17-01/T17-03 already cover above:
 
