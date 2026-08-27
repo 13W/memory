@@ -58,7 +58,10 @@ function writePlatformPackageAt(packageDir, packageName, opts = {}) {
  * so a fixture tree without it would exercise a launcher that can never heal —
  * passing for the wrong reason.
  *
- * @returns {string} absolute path to the copied `bin/local-rag-mcp.js`
+ * @returns {string} absolute path to the copied `bin/local-rag-proxy` — the
+ *   stub that actually ships since T22-10. Most callers want only its
+ *   directory; T22-12 deleted `bin/local-rag-mcp.js`, so returning that name
+ *   would hand back a path to a file that is not there.
  */
 function writeLauncherPackageAt(launcherDir) {
   fs.mkdirSync(launcherDir, { recursive: true });
@@ -74,7 +77,7 @@ function writeLauncherPackageAt(launcherDir) {
     path.join(REAL_LAUNCHER_ROOT, "package.json"),
     path.join(launcherDir, "package.json"),
   );
-  return path.join(launcherDir, "bin", "local-rag-mcp.js");
+  return path.join(launcherDir, "bin", "local-rag-proxy");
 }
 
 /**
@@ -165,7 +168,7 @@ function buildPnpmLayout(root, platformPackages) {
   fs.symlinkSync(launcherRealDir, topLevelLink, "dir");
 
   return {
-    launcherBinFile: path.join(topLevelLink, "bin", "local-rag-mcp.js"),
+    launcherBinFile: path.join(topLevelLink, "bin", "local-rag-proxy"),
     packageDirs,
   };
 }

@@ -36,7 +36,7 @@ test("resolution works when the whole install tree lives under a path containing
 test("spawning the launcher under a spaced path works with no shell/quoting involved (argv array, not a shell string)", { skip: process.platform === "win32" }, async () => {
   const root = mkSpacedTmpRoot();
   const fakeBinarySrc = fs.readFileSync(path.join(__dirname, "helpers", "fake-binary.js"), "utf8");
-  const { launcherBinFile } = buildFlatLayout(root, [
+  const { launcherBinFile, packageDirs } = buildFlatLayout(root, [
     {
       name: `@13w/memory-${process.platform}-${process.arch}`,
       platform: process.platform,
@@ -45,7 +45,20 @@ test("spawning the launcher under a spaced path works with no shell/quoting invo
     },
   ]);
 
-  const launcher = spawn(process.execPath, [launcherBinFile], { stdio: ["ignore", "pipe", "pipe"] });
+  // T22-12 deleted `bin/local-rag-mcp.js`, so `launcherBinFile` is now the
+  // shipping stub, which resolves through `locate.js` rather than through a
+  // platform package. `LOCAL_RAG_BIN_DIR` points it at the fixture's binaries;
+  // `LOCAL_RAG_HOME` keeps the developer's real cache out of the answer.
+  const binDir = path.join(packageDirs[`@13w/memory-${process.platform}-${process.arch}`], "bin");
+  const launcher = spawn(process.execPath, [launcherBinFile], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      LOCAL_RAG_BIN_DIR: binDir,
+      LOCAL_RAG_HOME: path.join(root, "empty-home"),
+      LOCAL_RAG_RELEASE_BASE_URL: "http://127.0.0.1:1/releases",
+    },
+  });
   const { line } = await waitForStdoutLine(launcher, (l) => l.startsWith("READY "));
   const childPid = Number(/pid=(\d+)/.exec(line)[1]);
 

@@ -20,6 +20,7 @@ if (process.platform === "win32") {
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
@@ -233,4 +234,24 @@ test("the hook stub stays fail-open even when its own module cannot be loaded", 
   const proxy = await run(s.stub("local-rag-proxy"), []);
   assert.equal(proxy.code, 1, "the same breakage is correctly fatal for the MCP server");
   assert.equal(proxy.stdout, "");
+});
+
+test("a stub under a path with spaces and parentheses spawns its binary", async (t) => {
+  // Ported from `spaces-and-symlinks.test.js`, whose subject retires with the
+  // platform packages in T22-11. The property is live and nothing else covers
+  // it: this repository's own path has no spaces, so a quoting regression would
+  // pass every other test here. The spawn uses an argv array and no shell, so
+  // what is proved is that nothing downstream reassembles it into one.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "lr shim (spaces)-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.match(root, /\s/);
+  const pkg = path.join(root, "pkg");
+  writeLauncherPackageAt(pkg);
+  const binDir = writeEchoBinaries(path.join(root, "bin"), REQUIRED);
+
+  const proxy = await run(path.join(pkg, "bin", "local-rag-proxy"), ["--flag"], {
+    LOCAL_RAG_BIN_DIR: binDir,
+  });
+  assert.equal(proxy.code, 0, proxy.stderr);
+  assert.match(proxy.stdout, /RAN local-rag-proxy --flag/);
 });
