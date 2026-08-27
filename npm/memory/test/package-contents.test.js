@@ -3,10 +3,16 @@
 // Card requirement: "package contents exclude weights and unrelated files"
 // (ADR-0004/0005 `[FIXED policy]`: weights are never shipped in npm
 // packages). Verified hermetically via `npm pack --dry-run --json` — local
-// only, no registry contact, no publish — over a *copy* of each real
-// package directory with synthetic decoy files injected, so the test
-// proves both that real decoys would be excluded AND that the `files`
-// allowlist is not so narrow it would also drop legitimate files.
+// only, no registry contact, no publish — over a *copy* of the real package
+// directory with synthetic decoy files injected, so the test proves both that
+// real decoys would be excluded AND that the `files` allowlist is not so
+// narrow it would also drop legitimate files.
+//
+// ONE PACKAGE, not six (T22-11). This file used to walk `memory` plus the five
+// `@13w/memory-<platform>` packages; ADR-0013 replaced that whole channel with
+// GitHub release assets, and this test is also the card's acceptance —
+// "`npm pack --dry-run` gives one package of the expected shape". Its five
+// platform entries went with the directories they described.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -24,19 +30,25 @@ const PACKAGES = [
     // checkout is worse than no file: the package would look complete and heal
     // nothing. The npm `scripts` *field* — the lifecycle hooks — is a separate
     // thing and belongs to T22-10.
+    //
+    // Named individually because each one is load-bearing for a different
+    // reason: all four `bin/` stubs are what `postinstall` replaces with native
+    // binaries, and `src/locate.js` is the resolver every command goes through.
+    // The exhaustive check — that no module can be added to the checkout and
+    // silently not ship — is derived from the directory below rather than
+    // maintained here by hand.
     expectedFiles: [
       "package.json",
+      "bin/local-rag",
       "bin/local-rag-proxy",
-      "src/resolve.js",
+      "bin/local-rag-hook",
+      "bin/local-rag-tui",
       "src/locate.js",
       "scripts/install.js",
+      "scripts/postinstall.js",
+      "scripts/prepack.js",
     ],
   },
-  { dir: "memory-darwin-arm64", expectedFiles: ["package.json"] },
-  { dir: "memory-darwin-x64", expectedFiles: ["package.json"] },
-  { dir: "memory-linux-x64", expectedFiles: ["package.json"] },
-  { dir: "memory-linux-arm64", expectedFiles: ["package.json"] },
-  { dir: "memory-win32-x64", expectedFiles: ["package.json"] },
 ];
 
 const DECOY_FILES = [
@@ -111,6 +123,29 @@ for (const { dir, expectedFiles } of PACKAGES) {
     fs.rmSync(copy, { recursive: true, force: true });
   });
 }
+
+test("every file the checkout actually has under bin/, src/ and scripts/ is packed", () => {
+  // The list above names what must ship; this names what exists. A new module
+  // added to `src/` and forgotten in the `files` allowlist would leave a
+  // package that looks complete and throws `MODULE_NOT_FOUND` on the user's
+  // first command — the exact failure `expectedFiles` cannot catch, because a
+  // hand-maintained list does not grow by itself.
+  const realDir = path.join(REPO_NPM_DIR, "memory");
+  const packed = new Set(packedFileList(preparePackageCopy(realDir)));
+  const onDisk = [];
+  for (const sub of ["bin", "src", "scripts"]) {
+    for (const name of fs.readdirSync(path.join(realDir, sub))) {
+      // Installer artefacts are not source; `prepack` refuses to pack a bin/
+      // that has been installed into, and that is its own test below.
+      if (name.startsWith(".")) continue;
+      onDisk.push(`${sub}/${name}`);
+    }
+  }
+  assert.ok(onDisk.length > 10, "a near-empty checkout would satisfy this trivially");
+  for (const file of onDisk) {
+    assert.ok(packed.has(file), `${file} exists in the checkout but npm pack would not ship it`);
+  }
+});
 
 test("a bin/ that has been installed into cannot be packed at all", () => {
   // The design has `postinstall` replace the stubs in `bin/` with native

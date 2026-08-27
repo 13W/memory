@@ -1,67 +1,11 @@
 "use strict";
 
-const { SUPPORTED_PLATFORMS } = require("./platform");
-
-/** @param {Extract<import('./resolve').ResolveResult, {ok:false}>} result */
-function formatUnsupportedPlatformError(result) {
-  return (
-    `local-rag: no prebuilt binary is available for this platform (${result.key}).\n` +
-    `Supported platforms: ${SUPPORTED_PLATFORMS.join(", ")}.`
-  );
-}
-
-/** @param {Extract<import('./resolve').ResolveResult, {ok:false}>} result */
-function formatDeferredPlatformError(result) {
-  return (
-    `local-rag: no prebuilt binary is available for this platform (${result.key}).\n` +
-    `Supported platforms: ${SUPPORTED_PLATFORMS.join(", ")}.\n` +
-    `${result.key} support is planned but not yet available.`
-  );
-}
-
-/**
- * @deprecated ADR-0013: there is no platform package to be missing. Kept while
- *   the three `bin/` shims still call it through `formatMissingPlatformError`;
- *   they are rewritten by T22-10, which deletes both. `subprocess.test.js`
- *   asserts the real shim's stderr against this text, so it must keep the
- *   `local-rag: ` prefix and the platform key until then.
- * @param {Extract<import('./resolve').ResolveResult, {ok:false}>} result
- */
-function formatMissingPackageError(result) {
-  return (
-    `local-rag: the platform package "${result.packageName}" for ${result.key} is not installed.\n` +
-    "This usually means optional dependencies were skipped during install\n" +
-    '(e.g. "npm install --omit=optional", "--no-optional", a lockfile mismatch,\n' +
-    "or a registry/network failure).\n" +
-    "Fix: reinstall without omitting optional dependencies, or run\n" +
-    `  npm install ${result.packageName} --save-optional`
-  );
-}
-
-/**
- * @deprecated ADR-0013 — see `formatMissingPackageError`. Deleted by T22-10
- *   together with its three `bin/` callers.
- * @param {Extract<import('./resolve').ResolveResult, {ok:false}>} result
- * @returns {string}
- */
-function formatMissingPlatformError(result) {
-  switch (result.reason) {
-    case "unsupported":
-      return formatUnsupportedPlatformError(result);
-    case "deferred":
-      return formatDeferredPlatformError(result);
-    case "not-installed":
-      return formatMissingPackageError(result);
-    default:
-      throw new Error(`local-rag: unknown resolve failure reason: ${result.reason}`);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// ADR-0013 formatters. Unlike the four above these take plain arguments rather
-// than a `ResolveResult`, so this module stops depending on the shape of
-// `resolve.js` — which T22-09 renames. Every message names what is needed to
-// act and ends with exactly one runnable command, never advice.
+// ADR-0013 formatters. These take plain arguments rather than a `ResolveResult`
+// — the four that took one went with `src/resolve.js` in T22-11, having been
+// marked `@deprecated` since T22-09 and left without a caller once the shims
+// were rewritten. Every message names what is needed to act and ends with
+// exactly one runnable command, never advice.
 // ---------------------------------------------------------------------------
 
 /**
@@ -158,10 +102,6 @@ function formatOverrideMissingError({ dir, binary, envVar = "LOCAL_RAG_BIN_DIR" 
 }
 
 module.exports = {
-  formatMissingPlatformError,
-  formatUnsupportedPlatformError,
-  formatDeferredPlatformError,
-  formatMissingPackageError,
   formatNotInstalledError,
   formatSourceCheckoutNotBuiltError,
   formatChecksumMismatchError,

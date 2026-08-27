@@ -1,8 +1,17 @@
 "use strict";
 
-// Builds synthetic on-disk `node_modules` trees standing in for real
-// npm/yarn/pnpm installs, so the resolution logic can be exercised without
-// ever running a real `npm install` (hermetic, offline, no registry).
+// Builds synthetic on-disk trees for the subprocess-tier tests, so a real
+// entrypoint can be spawned against a fixture without ever running a real
+// `npm install` (hermetic, offline, no registry).
+//
+// WHAT "PACKAGE" MEANS HERE CHANGED IN T22-11, and the names below outlived
+// it. This helper was built for `resolve.js`, which walked `node_modules` to
+// find a per-platform npm package; ADR-0013 deleted that whole channel, and
+// with it `buildNestedLayout` and `buildPnpmLayout`, whose only subject was
+// which tree shapes that walk had to survive. What survives is the plain part:
+// a directory holding the required binaries. `writePlatformPackageAt` still
+// writes one, and its callers still hand it a scoped name — but the name is
+// now a fixture directory label, not a package anybody could install.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -10,7 +19,7 @@ const path = require("node:path");
 const DEFAULT_BINARIES = Object.freeze(["local-rag", "local-rag-proxy", "local-rag-hook"]);
 const REAL_LAUNCHER_ROOT = path.resolve(__dirname, "..", "..");
 
-/** "@13w/memory-darwin-arm64" -> "memory-darwin-arm64" */
+/** "@13w/some-name" -> "some-name" — a scope-stripping helper, nothing more. */
 function shortName(fullName) {
   return fullName.split("/")[1];
 }
@@ -101,84 +110,8 @@ function buildFlatLayout(root, platformPackages) {
   return { launcherBinFile, packageDirs };
 }
 
-/**
- * Nested/unhoisted npm layout: platform packages live inside the
- * launcher's own private `node_modules`, not the shared top-level one —
- * one of the real layouts npm itself can produce depending on the
- * dependency graph/lockfile.
- *
- * @param {string} root
- * @param {Array<{name: string} & Parameters<typeof writePlatformPackageAt>[2]>} platformPackages
- * @returns {{launcherBinFile: string, packageDirs: Record<string,string>}}
- */
-function buildNestedLayout(root, platformPackages) {
-  const launcherDir = path.join(root, "node_modules", "@13w", "memory");
-  const launcherBinFile = writeLauncherPackageAt(launcherDir);
-  const nestedScope = path.join(launcherDir, "node_modules", "@13w");
-  const packageDirs = {};
-  for (const p of platformPackages) {
-    const dir = path.join(nestedScope, shortName(p.name));
-    writePlatformPackageAt(dir, p.name, p);
-    packageDirs[p.name] = dir;
-  }
-  return { launcherBinFile, packageDirs };
-}
-
-/**
- * pnpm-style layout: every package's real files live in a flat,
- * content-addressed-ish `.pnpm` store directory, each with its own
- * *private* `node_modules` holding only its own declared deps, wired
- * together entirely through real symlinks — using absolute symlink targets
- * throughout so there is no hand-counted relative-depth arithmetic to get
- * wrong (a mistake that silently breaks the very thing under test). This is
- * the actual property being proven: `createRequire`'s own directory walk,
- * anchored at the launcher's real symlink-resolved location, must reach
- * the platform package's *private* `node_modules`, exactly like pnpm's own
- * non-hoisting isolation model expects.
- *
- * @param {string} root
- * @param {Array<{name: string} & Parameters<typeof writePlatformPackageAt>[2]>} platformPackages
- * @returns {{launcherBinFile: string, packageDirs: Record<string,string>}}
- */
-function buildPnpmLayout(root, platformPackages) {
-  const store = path.join(root, "node_modules", ".pnpm");
-  const launcherRealDir = path.join(
-    store,
-    "@13w+memory@0.0.0",
-    "node_modules",
-    "@13w",
-    "memory",
-  );
-  writeLauncherPackageAt(launcherRealDir);
-
-  const launcherPrivateScope = path.join(launcherRealDir, "node_modules", "@13w");
-  fs.mkdirSync(launcherPrivateScope, { recursive: true });
-
-  const packageDirs = {};
-  for (const p of platformPackages) {
-    const short = shortName(p.name);
-    const realDir = path.join(store, `@13w+${short}@0.0.0`, "node_modules", "@13w", short);
-    writePlatformPackageAt(realDir, p.name, p);
-    fs.symlinkSync(realDir, path.join(launcherPrivateScope, short), "dir");
-    packageDirs[p.name] = realDir;
-  }
-
-  const topLevelLink = path.join(root, "node_modules", "@13w", "memory");
-  fs.mkdirSync(path.dirname(topLevelLink), { recursive: true });
-  fs.symlinkSync(launcherRealDir, topLevelLink, "dir");
-
-  return {
-    launcherBinFile: path.join(topLevelLink, "bin", "local-rag-proxy"),
-    packageDirs,
-  };
-}
-
 module.exports = {
-  DEFAULT_BINARIES,
-  shortName,
   writePlatformPackageAt,
   writeLauncherPackageAt,
   buildFlatLayout,
-  buildNestedLayout,
-  buildPnpmLayout,
 };

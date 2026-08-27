@@ -28,13 +28,16 @@ const { startFixtureRelease } = require("./helpers/fixture-server.js");
 
 const FAKE_BINARY_SRC = fs.readFileSync(path.join(__dirname, "helpers", "fake-binary.js"), "utf8");
 const HOST_KEY = platformKey(); // real host's own platform-arch, e.g. "darwin-arm64"
-const HOST_PACKAGE_NAME = `@13w/memory-${HOST_KEY}`;
+// Just a fixture directory label. It used to be the real per-platform package
+// name; T22-11 deleted those packages, and a name that still looked installable
+// would be the only thing left in this file suggesting they exist.
+const FIXTURE_BIN_DIR_NAME = "@13w/memory-fixture-bins";
 
 /** Builds a fixture whose `local-rag-proxy` binary is the real fake-binary.js script. */
 function buildHostLayout(root, opts = {}) {
   const { launcherBinFile, packageDirs } = buildFlatLayout(root, [
     {
-      name: HOST_PACKAGE_NAME,
+      name: FIXTURE_BIN_DIR_NAME,
       platform: process.platform,
       cpu: process.arch,
       binaryContents: { "local-rag-proxy": FAKE_BINARY_SRC },
@@ -47,7 +50,7 @@ function buildHostLayout(root, opts = {}) {
   // actually gets installed — `bin/local-rag-mcp.js` still exists beside it,
   // but only until T22-12 stops resolving it.
   const stub = path.join(path.dirname(launcherBinFile), "local-rag-proxy");
-  const packageDir = packageDirs[HOST_PACKAGE_NAME];
+  const packageDir = packageDirs[FIXTURE_BIN_DIR_NAME];
   return { launcherBinFile: stub, packageDir, binDir: path.join(packageDir, "bin") };
 }
 
