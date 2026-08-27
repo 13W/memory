@@ -40,12 +40,6 @@ npm/**/*.tgz
 # — never a real install, never committed.
 /node_modules/
 
-# Platform packages' `bin/` (T17-03): release binaries and the bundled ONNX
-# Runtime shared library, populated locally by `cargo build --release`/`cargo
-# zigbuild`/`cargo xtask dist-ort` for verification — build output, not
-# source, same category as `target/` itself. Never committed.
-npm/memory-*/bin/
-
 # NOTE: Cargo.lock IS committed (workspace with binaries / dependency policy).
 
 AGENTS.md

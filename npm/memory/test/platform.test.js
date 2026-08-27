@@ -13,7 +13,6 @@ const {
   platformKey,
   targetTriple,
   exeSuffix,
-  platformPackageName,
   isSupported,
   isDeferred,
 } = require("../src/platform.js");
@@ -37,10 +36,6 @@ test("platformKey composes platform and arch", () => {
 
 test("platformKey defaults to the real host when called with no arguments", () => {
   assert.equal(platformKey(), `${process.platform}-${process.arch}`);
-});
-
-test("platformPackageName is scoped under @13w", () => {
-  assert.equal(platformPackageName("darwin-arm64"), "@13w/memory-darwin-arm64");
 });
 
 test("exactly the five v0 platform targets are supported (spec 13 §1/15 §2)", () => {

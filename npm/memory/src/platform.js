@@ -56,19 +56,6 @@ function exeSuffix(platform = process.platform) {
   return platform === "win32" ? ".exe" : "";
 }
 
-/**
- * @deprecated ADR-0013: there are no per-platform npm packages any more.
- *   Kept only because live callers still exist — `src/resolve.js` (retired by
- *   T22-09) and `plugin/test/mcp-launcher-tiers.test.js` (replaced by T22-12).
- *   Delete with the last of them, in T22-12; deleting it here would redden both
- *   suites for the whole npm branch.
- * @param {string} key e.g. "darwin-arm64"
- * @returns {string} e.g. "@13w/memory-darwin-arm64"
- */
-function platformPackageName(key) {
-  return `@13w/memory-${key}`;
-}
-
 /** @param {string} key @returns {boolean} */
 function isSupported(key) {
   return SUPPORTED_PLATFORMS.includes(key);
@@ -86,7 +73,6 @@ module.exports = {
   platformKey,
   targetTriple,
   exeSuffix,
-  platformPackageName,
   isSupported,
   isDeferred,
 };

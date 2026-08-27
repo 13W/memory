@@ -12,8 +12,8 @@
 // Every tree here is synthetic. Anchoring on the real package would make the
 // positive cases pass on a developer's machine for reasons that have nothing to
 // do with this code — this checkout already has a global npm link pointing at
-// it and hand-made symlinks from `npm/memory-darwin-arm64/bin` into
-// `target/release`.
+// it. (Until T22-11 it also carried hand-made symlinks into `target/release`
+// from a per-platform package directory; those five directories are gone.)
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
