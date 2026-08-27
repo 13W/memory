@@ -24,6 +24,7 @@ const { platformKey } = require("../src/platform.js");
 const { buildFlatLayout } = require("./helpers/fixture-layout.js");
 const { mkTmpRoot } = require("./helpers/tmp.js");
 const { waitUntil, pidIsAlive, waitForStdoutLine } = require("./helpers/proc.js");
+const { startFixtureRelease } = require("./helpers/fixture-server.js");
 
 const FAKE_BINARY_SRC = fs.readFileSync(path.join(__dirname, "helpers", "fake-binary.js"), "utf8");
 const HOST_KEY = platformKey(); // real host's own platform-arch, e.g. "darwin-arm64"
@@ -40,14 +41,43 @@ function buildHostLayout(root, opts = {}) {
       ...opts,
     },
   ]);
-  return { launcherBinFile, packageDir: packageDirs[HOST_PACKAGE_NAME] };
+  // The shim T22-10 ships, not the one it replaced. This file is the only
+  // real-process coverage of `lifecycle.js`'s signal forwarding and of the
+  // not-installed exit contract, so it has to test the entry point that
+  // actually gets installed — `bin/local-rag-mcp.js` still exists beside it,
+  // but only until T22-12 stops resolving it.
+  const stub = path.join(path.dirname(launcherBinFile), "local-rag-proxy");
+  const packageDir = packageDirs[HOST_PACKAGE_NAME];
+  return { launcherBinFile: stub, packageDir, binDir: path.join(packageDir, "bin") };
 }
 
-function spawnLauncher(launcherBinFile, args = []) {
+/**
+ * `LOCAL_RAG_HOME` is always set, even for the failure cases: without it the
+ * resolver's last rung is the developer's real per-user cache, and a test that
+ * consults it is neither hermetic nor honest. `LOCAL_RAG_BIN_DIR` stands in for
+ * the install — `writePlatformPackageAt` writes exactly the required set, which
+ * is what the resolver demands of a directory before it will use one.
+ *
+ * `LOCAL_RAG_RELEASE_BASE_URL` is pinned to a closed loopback port by default,
+ * and that is not belt-and-braces. The MCP stub heals synchronously before it
+ * reports a failure, so a not-installed run really does try to fetch — measured
+ * reaching github.com in 576 ms before this line existed. A test that wants the
+ * heal to get somewhere points this at its own fixture server instead.
+ */
+function spawnLauncher(launcherBinFile, args = [], env = {}) {
   return spawn(process.execPath, [launcherBinFile, ...args], {
     stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      LOCAL_RAG_HOME: EMPTY_HOME,
+      LOCAL_RAG_RELEASE_BASE_URL: "http://127.0.0.1:1/releases",
+      ...env,
+    },
   });
 }
+
+/** A guaranteed-empty store root, so the cache rung can never resolve. */
+const EMPTY_HOME = mkTmpRoot("lr-subprocess-home-");
 
 function collectText(stream) {
   const chunks = [];
@@ -64,8 +94,8 @@ async function readReadyPid(launcher) {
 
 test("SIGTERM sent to the launcher is forwarded to the child and the launcher exits 0", async () => {
   const root = mkTmpRoot("lr-sub-sigterm-");
-  const { launcherBinFile } = buildHostLayout(root);
-  const launcher = spawnLauncher(launcherBinFile);
+  const { launcherBinFile, binDir } = buildHostLayout(root);
+  const launcher = spawnLauncher(launcherBinFile, [], { LOCAL_RAG_BIN_DIR: binDir });
   const getStderr = collectText(launcher.stderr);
 
   const childPid = await readReadyPid(launcher);
@@ -83,8 +113,8 @@ test("SIGTERM sent to the launcher is forwarded to the child and the launcher ex
 
 test("SIGINT sent to the launcher is forwarded to the child and the launcher exits 0", async () => {
   const root = mkTmpRoot("lr-sub-sigint-");
-  const { launcherBinFile } = buildHostLayout(root);
-  const launcher = spawnLauncher(launcherBinFile);
+  const { launcherBinFile, binDir } = buildHostLayout(root);
+  const launcher = spawnLauncher(launcherBinFile, [], { LOCAL_RAG_BIN_DIR: binDir });
   const getStderr = collectText(launcher.stderr);
 
   const childPid = await readReadyPid(launcher);
@@ -100,8 +130,8 @@ test("SIGINT sent to the launcher is forwarded to the child and the launcher exi
 
 test("no orphan: once the launcher has exited after SIGTERM, the grandchild process is gone too", async () => {
   const root = mkTmpRoot("lr-sub-noorphan-");
-  const { launcherBinFile } = buildHostLayout(root);
-  const launcher = spawnLauncher(launcherBinFile);
+  const { launcherBinFile, binDir } = buildHostLayout(root);
+  const launcher = spawnLauncher(launcherBinFile, [], { LOCAL_RAG_BIN_DIR: binDir });
 
   const childPid = await readReadyPid(launcher);
   process.kill(launcher.pid, "SIGTERM");
@@ -120,7 +150,15 @@ test("missing platform package end to end: the real launcher prints an actionabl
   // computed dynamically so this test passes on every one of the 5 CI
   // hosts without hardcoding one platform.
   const { launcherBinFile } = buildFlatLayout(root, []);
-  const launcher = spawnLauncher(launcherBinFile);
+  const stub = path.join(path.dirname(launcherBinFile), "local-rag-proxy");
+  // A release that resolves a tag and then carries nothing. The MCP stub heals
+  // before it reports, so it has to be given somewhere to try — and a real host
+  // would make this test depend on the network and on a published release's
+  // state. The fixture answers in milliseconds and records that the attempt
+  // happened at all.
+  const server = await startFixtureRelease({ tag: "0.0.0", assets: {} });
+  const launcher = spawnLauncher(stub, [], { LOCAL_RAG_RELEASE_BASE_URL: server.origin });
+  const getStdout = collectText(launcher.stdout);
   const getStderr = collectText(launcher.stderr);
 
   const [code] = await new Promise((resolve) => launcher.on("exit", (c, s) => resolve([c, s])));
@@ -128,14 +166,19 @@ test("missing platform package end to end: the real launcher prints an actionabl
   const stderr = getStderr();
   assert.match(stderr, new RegExp(HOST_KEY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(stderr, /local-rag:/);
+  // stdout is the JSON-RPC stream on this path; a diagnostic there corrupts the
+  // framing before a client has read a byte.
+  assert.equal(getStdout(), "");
+  assert.ok(server.requestCount() > 0, "the stub tried to heal before giving up");
 
+  await server.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
 
 test("the child's own stdout/stderr reach the launcher's own stdout/stderr unchanged (stdio: inherit pass-through)", async () => {
   const root = mkTmpRoot("lr-sub-passthrough-");
-  const { launcherBinFile } = buildHostLayout(root);
-  const launcher = spawnLauncher(launcherBinFile);
+  const { launcherBinFile, binDir } = buildHostLayout(root);
+  const launcher = spawnLauncher(launcherBinFile, [], { LOCAL_RAG_BIN_DIR: binDir });
 
   const { lines } = await waitForStdoutLine(launcher, (l) => l.startsWith("READY "));
   assert.ok(lines.some((l) => l.startsWith("READY pid=")));
@@ -148,8 +191,8 @@ test("the child's own stdout/stderr reach the launcher's own stdout/stderr uncha
 
 test("accepted limitation: SIGKILL of the launcher itself cannot be forwarded, so the grandchild briefly survives it", async () => {
   const root = mkTmpRoot("lr-sub-sigkill-");
-  const { launcherBinFile } = buildHostLayout(root);
-  const launcher = spawnLauncher(launcherBinFile);
+  const { launcherBinFile, binDir } = buildHostLayout(root);
+  const launcher = spawnLauncher(launcherBinFile, [], { LOCAL_RAG_BIN_DIR: binDir });
 
   const childPid = await readReadyPid(launcher);
 
