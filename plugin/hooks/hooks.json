@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/memory local-rag-hook spool-write 2>/dev/null || true"
+            "command": "LOCAL_RAG_NOT_INSTALLED_JSON=\"${CLAUDE_PLUGIN_ROOT}\"/hooks/not-installed.json \"${CLAUDE_PLUGIN_ROOT}\"/bin/local-rag-resolve-hook.sh spool-write 2>/dev/null || true"
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/memory local-rag-hook spool-write 2>/dev/null || true"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/local-rag-resolve-hook.sh spool-write 2>/dev/null || true"
           }
         ]
       }
@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/memory local-rag-hook spool-write 2>/dev/null || true"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/local-rag-resolve-hook.sh spool-write 2>/dev/null || true"
           }
         ]
       }
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/memory local-rag-hook spool-write 2>/dev/null || true"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/local-rag-resolve-hook.sh spool-write 2>/dev/null || true"
           }
         ]
       }
@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/memory local-rag-hook spool-write 2>/dev/null || true"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/local-rag-resolve-hook.sh spool-write 2>/dev/null || true"
           }
         ]
       }
@@ -55,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/memory local-rag-hook spool-write 2>/dev/null || true"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/local-rag-resolve-hook.sh spool-write 2>/dev/null || true"
           }
         ]
       }
@@ -65,7 +65,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_DATA}\"/bin/local-rag-hook spool-write 2>/dev/null || npx --yes --package=@13w/memory local-rag-hook spool-write 2>/dev/null || true"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/local-rag-resolve-hook.sh spool-write 2>/dev/null || true"
           }
         ]
       }
