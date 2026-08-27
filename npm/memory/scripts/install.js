@@ -24,7 +24,7 @@ const { installDir, PathsError } = require("../src/paths");
 const { installBinaries, ERROR_FILE, InstallError } = require("../src/install");
 const { LockError } = require("../src/lock");
 
-const USAGE = `Usage: local-rag-install [options]
+const USAGE = `Usage: node <package>/scripts/install.js [options]
 
   --dir <path>     install into <path> instead of the per-user cache
   --if-needed      do nothing, and touch no network, when already installed

@@ -49,6 +49,12 @@ test(
 
     const localRagHome = mkTmpRoot("lr-nowrites-home-");
     prepareSpoolDir(localRagHome, "sess-nowrites");
+    // ADR-0013 Decision 3 retired the `${CLAUDE_PLUGIN_DATA}/bin` cache. This
+    // run uses the real native binary rather than a stub, so it is the strongest
+    // place to prove the tier stays gone: a cache keyed by path is what pointed
+    // a stale proxy at a stale daemon (D-103). `no-network.test.js` asserts the
+    // same for the stubbed MCP channel.
+    const pluginData = mkTmpRoot("lr-nowrites-plugindata-");
 
     const result = spawnSync("/bin/sh", ["-c", command], {
       input: JSON.stringify({
@@ -65,6 +71,7 @@ test(
         CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT,
         LOCAL_RAG_BIN_DIR: binDir,
         LOCAL_RAG_HOME: localRagHome,
+        CLAUDE_PLUGIN_DATA: pluginData,
       },
     });
     assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
@@ -82,6 +89,7 @@ test(
     const spoolFiles = fs.readdirSync(path.join(localRagHome, "local-rag", "spool", "sess-nowrites"));
     assert.ok(spoolFiles.length > 0, "a real spool segment should have been written to the store");
     assert.doesNotMatch(result.stdout, /not installed/, "the binary ran; the notice must not appear");
+    assert.deepEqual(fs.readdirSync(pluginData), [], "the retired ${CLAUDE_PLUGIN_DATA} cache must stay empty");
   },
 );
 

@@ -34,10 +34,11 @@ quarantine/
 npm/**/node_modules/
 npm/**/*.tgz
 
-# Root-level node_modules: machine-local dev symlinks so the plugin launcher's
-# tier 1 (plugin/bin/local-rag-mcp-launcher.js) resolves @13w/memory and its
-# platform package straight to this checkout instead of npm's tier-3 fallback
-# — never a real install, never committed.
+# Root-level node_modules: what `npm install` at the root produces from the
+# committed root package.json's `file:npm/memory` link (T22-11) — a developer
+# convenience only. Nothing in the product consults node_modules any more
+# (ADR-0013 Decision 3), so this is never needed to run anything, and never
+# committed.
 /node_modules/
 
 # NOTE: Cargo.lock IS committed (workspace with binaries / dependency policy).
