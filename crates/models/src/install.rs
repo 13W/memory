@@ -39,9 +39,11 @@ use std::path::{Path, PathBuf};
 
 use local_rag_core::paths::{PathError, StoreLayout, perms};
 
+use crate::archive::{self, ArchiveError, Limits as ArchiveLimits};
 use crate::catalog::{AssetFile, ModelCatalogEntry};
 use crate::fetch::{AssetFetcher, FetchError};
-use crate::manifest::{ManifestFile, ModelManifest};
+use crate::manifest::{ManifestFile, ModelManifest, OrtManifest};
+use crate::ort_catalog::OrtAsset;
 
 /// The marker file that makes a model directory usable (spec 10 §5).
 pub const OK_MARKER: &str = ".ok";
@@ -106,6 +108,8 @@ pub enum InstallError {
         /// The size actually received.
         actual: u64,
     },
+    /// Taking the library out of a downloaded archive failed.
+    Archive(ArchiveError),
     /// A filesystem operation failed.
     Io(io::Error),
     /// Creating the model directory with the required permissions failed.
@@ -139,6 +143,7 @@ impl fmt::Display for InstallError {
                 f,
                 "size mismatch for {file}: expected {expected} bytes, got {actual}"
             ),
+            InstallError::Archive(e) => write!(f, "extracting the runtime failed: {e}"),
             InstallError::Io(e) => write!(f, "filesystem error during install: {e}"),
             InstallError::Path(e) => write!(f, "could not prepare the model directory: {e}"),
             #[cfg(feature = "failpoints")]
@@ -151,6 +156,7 @@ impl std::error::Error for InstallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             InstallError::Fetch(e) => Some(e),
+            InstallError::Archive(e) => Some(e),
             InstallError::Io(e) => Some(e),
             InstallError::Path(e) => Some(e),
             _ => None,
@@ -301,6 +307,195 @@ pub fn install_model(
     // ... and only then the marker that makes the directory usable.
     atomic_write(&dir.join(OK_MARKER), b"")?;
     report.marked_ready = true;
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// ONNX Runtime (T22-15)
+// ---------------------------------------------------------------------------
+
+/// Where a runtime version lives: `<store>/models/onnxruntime/<version>/`.
+///
+/// Under `models/` because spec 10 §5 `[FIXED, ADR-0013]` says "installed at
+/// first run **beside the weights**, by the same verified path"; keyed by
+/// version so a pin change installs alongside rather than over the library a
+/// running process may have open — replacing a `dlopen`ed file in place is how
+/// a live daemon gets a segfault instead of an upgrade.
+///
+/// The cost of that choice, stated rather than left to be discovered: nothing
+/// here removes the previous version's directory, so a store accumulates ~30 MB
+/// per pin change. Reporting and reclaiming that is `doctor`'s job (T22-16),
+/// which is also the card that gives this installer a caller.
+pub fn ort_dir(layout: &StoreLayout, asset: &OrtAsset) -> PathBuf {
+    layout.models_dir().join("onnxruntime").join(asset.version)
+}
+
+/// The installed library's own path.
+pub fn ort_dylib_path(layout: &StoreLayout, asset: &OrtAsset) -> PathBuf {
+    ort_dir(layout, asset).join(asset.dylib_name)
+}
+
+/// Whether this platform's pinned runtime is installed and usable.
+///
+/// The same rule the weights use: the `.ok` marker, and nothing else. Anything
+/// short of it — a half-extracted `.part`, a library with no manifest — is
+/// indistinguishable from "not installed" by construction.
+pub fn ort_is_installed(layout: &StoreLayout, asset: &OrtAsset) -> bool {
+    ort_dir(layout, asset).join(OK_MARKER).is_file()
+}
+
+/// What one runtime install run did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrtInstallReport {
+    /// The platform key installed for.
+    pub platform: String,
+    /// The upstream version installed.
+    pub version: String,
+    /// The installed library.
+    pub path: PathBuf,
+    /// Bytes pulled over the network by this run (0 when nothing was fetched).
+    pub bytes_downloaded: u64,
+    /// Whether this run was the one that wrote the `.ok` marker.
+    pub marked_ready: bool,
+}
+
+/// Install (or complete a partial install of) `asset`'s shared library.
+///
+/// # Two digests, and neither is redundant
+///
+/// The weights installer verifies each file it downloads, because each file is
+/// what it installs. Here the download and the installed file are different
+/// bytes: an archive comes down the wire and one member comes out of it. So
+/// `archive_sha256` is checked before anything is unpacked — that is the
+/// wire/tamper boundary — and `dylib_sha256` is checked before the library is
+/// renamed into place, which is what catches this project's own extractor
+/// putting the wrong bytes somewhere. Verifying only the input would trust code
+/// that was written for this task.
+///
+/// # The archive is scaffolding, and it is cleaned up
+///
+/// It is kept next to the `.part` until the marker is written, so an interrupt
+/// mid-extract resumes without re-downloading 77 MB, and removed once the
+/// install is complete so a finished store does not hoard it.
+pub fn install_ort(
+    layout: &StoreLayout,
+    asset: &OrtAsset,
+    fetcher: &dyn AssetFetcher,
+) -> Result<OrtInstallReport, InstallError> {
+    let dir = ort_dir(layout, asset);
+    let dylib = dir.join(asset.dylib_name);
+    let mut report = OrtInstallReport {
+        platform: asset.platform.to_string(),
+        version: asset.version.to_string(),
+        path: dylib.clone(),
+        bytes_downloaded: 0,
+        marked_ready: false,
+    };
+
+    if ort_is_installed(layout, asset) {
+        return Ok(report);
+    }
+
+    // Two levels, created one at a time. `perms::ensure_dir` is not
+    // `create_dir_all`: on Unix it builds a single directory so each one gets
+    // 0700 and an ownership check (`crates/core/src/paths/perms.rs`), and
+    // `install_model` already creates nested parents the same way. A
+    // `create_dir_all` here would make `models/onnxruntime/` inherit the
+    // process umask instead — spec 02 §2.1 / 12 §6 `[FIXED]`.
+    perms::ensure_dir(dir.parent().expect("ort_dir always has a parent"))?;
+    perms::ensure_dir(&dir)?;
+
+    let archive_name = asset
+        .url
+        .rsplit('/')
+        .next()
+        .unwrap_or("onnxruntime-archive");
+    let archive_path = dir.join(archive_name);
+
+    // Reuse only what verifies — the same rule the weights follow. A leftover
+    // archive of the right name and wrong bytes is as good as absent.
+    let archive_ready = archive_path.is_file()
+        && fs::metadata(&archive_path)?.len() == asset.archive_size
+        && sha256_file(&archive_path)? == asset.archive_sha256;
+
+    if !archive_ready {
+        let part = part_path(&archive_path);
+        let mut sink = HashingWriter::create(&part)?;
+        fetcher.fetch(asset.url, &mut sink)?;
+        let (written, digest) = sink.finish()?;
+        if written != asset.archive_size {
+            return Err(InstallError::SizeMismatch {
+                file: archive_name.to_string(),
+                expected: asset.archive_size,
+                actual: written,
+            });
+        }
+        if digest != asset.archive_sha256 {
+            return Err(InstallError::ChecksumMismatch {
+                file: archive_name.to_string(),
+                expected: asset.archive_sha256.to_string(),
+                actual: digest,
+            });
+        }
+        fs::rename(&part, &archive_path)?;
+        sync_dir(&dir)?;
+        report.bytes_downloaded = written;
+    }
+
+    let part = part_path(&dylib);
+    let mut sink = HashingWriter::create(&part)?;
+    archive::extract_member(
+        &archive_path,
+        asset.archive_format,
+        asset.archive_member,
+        &mut sink,
+        &ArchiveLimits::default(),
+    )
+    .map_err(InstallError::Archive)?;
+    let (written, digest) = sink.finish()?;
+    if written != asset.dylib_size {
+        return Err(InstallError::SizeMismatch {
+            file: asset.dylib_name.to_string(),
+            expected: asset.dylib_size,
+            actual: written,
+        });
+    }
+    if digest != asset.dylib_sha256 {
+        return Err(InstallError::ChecksumMismatch {
+            file: asset.dylib_name.to_string(),
+            expected: asset.dylib_sha256.to_string(),
+            actual: digest,
+        });
+    }
+    fs::rename(&part, &dylib)?;
+    sync_dir(&dir)?;
+    set_file_mode(&dylib)?;
+
+    // Crash point *between* a durable library and the marker that makes it
+    // usable — the instant a `kill -9` is most awkward here, and the one the
+    // ordering exists to make safe. Without it nothing observes the ordering:
+    // a mutation that wrote the marker early left every test green.
+    #[cfg(feature = "failpoints")]
+    local_rag_test_support::fail_point!(
+        "models.install.ort_before_marker",
+        Err(InstallError::Interrupted)
+    );
+
+    let manifest = OrtManifest {
+        platform: asset.platform.to_string(),
+        version: asset.version.to_string(),
+        source: asset.url.to_string(),
+        archive_sha256: asset.archive_sha256.to_string(),
+        file: asset.dylib_name.to_string(),
+        size: asset.dylib_size,
+        sha256: asset.dylib_sha256.to_string(),
+    };
+    atomic_write(&dir.join(MANIFEST_FILE), manifest.to_json().as_bytes())?;
+    atomic_write(&dir.join(OK_MARKER), b"")?;
+    report.marked_ready = true;
+
+    // Only now: before the marker it is the thing that makes a retry cheap.
+    let _ = fs::remove_file(&archive_path);
     Ok(report)
 }
 

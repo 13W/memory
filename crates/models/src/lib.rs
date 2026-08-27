@@ -12,6 +12,14 @@
 //!   the model ADR-0004 selected through `ort`'s `load-dynamic` feature so the
 //!   build stays offline (ADR-0005).
 //!
+//! T22-15 added a third thing to the same delivery half: the ONNX Runtime is now
+//! an artifact of first run too (spec 10 §5 `[FIXED, ADR-0013]`), pinned in
+//! [`ort_catalog`], taken out of an upstream release archive by [`archive`], and
+//! installed by [`install::install_ort`] beside the weights. Nothing in the
+//! product calls it yet — `local-rag init`/`doctor` are T22-16's, and this card
+//! deliberately shipped the mechanism and the resolution rung without a
+//! trigger.
+//!
 //! # Why this is not part of `crates/embed`
 //!
 //! `crates/embed` carries a structural guarantee — a test asserts its manifest
@@ -25,26 +33,34 @@
 //! # What stays elsewhere
 //!
 //! The `local-rag init --download-models` *command* is T15-07's CLI card; this
-//! crate provides the typed API it will call. Verifying ORT bundling across the
-//! whole platform matrix is T17-03's "before the final CI matrix", and excluding
-//! weights from the npm packages is T17-01's packaging test.
+//! crate provides the typed API it will call, and T22-16 extends that surface to
+//! the runtime. Exercising the runtime on every platform is T22-17's CI matrix:
+//! this machine verified `darwin-arm64` end to end (download, extraction,
+//! `ort::init_from`, real inference) and the other four only structurally, by
+//! extracting each archive and comparing digests — the same honest split
+//! `D-029` already recorded.
 
+pub mod archive;
 pub mod catalog;
 pub mod fetch;
 pub mod install;
 pub mod manifest;
 pub mod onnx;
+pub mod ort_catalog;
 
+pub use archive::{ArchiveError, ArchiveFormat, Limits as ArchiveLimits, extract_member};
 pub use catalog::{
     AssetFile, CATALOG, DEFAULT_MODEL_ID, DEFAULT_MODEL_LICENSE, DEFAULT_MODEL_LICENSE_URL,
     DEFAULT_MODEL_REVISION, DEFAULT_MODEL_SOURCE, EMBEDDINGGEMMA_300M, ModelCatalogEntry, find,
 };
 pub use fetch::{AssetFetcher, FetchError, HttpFetcher, LocalFetcher};
 pub use install::{
-    InstallError, InstallReport, MANIFEST_FILE, OK_MARKER, PART_SUFFIX, install_model,
-    is_installed, write_license_notice,
+    InstallError, InstallReport, MANIFEST_FILE, OK_MARKER, OrtInstallReport, PART_SUFFIX,
+    install_model, install_ort, is_installed, ort_dylib_path, ort_is_installed,
+    write_license_notice,
 };
-pub use manifest::{ManifestFile, ModelManifest};
+pub use manifest::{ManifestFile, ModelManifest, OrtManifest};
 pub use onnx::{MAX_SEQUENCE_TOKENS, OnnxEmbedder, OnnxError, POOLED_OUTPUT};
+pub use ort_catalog::{ORT_ASSETS, OrtAsset, for_current_platform};
 
 pub use local_rag_core::VERSION;

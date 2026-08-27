@@ -50,5 +50,14 @@ sysinfo = { version = "0.39", default-features = false, features = [
 # logic now, not only `#[cfg(test)]` code.
 local-rag-test-support = { path = "../test-support" }
 
+[dev-dependencies]
+# Only to build a one-member `.tgz` in `dist_ort`'s own test fixture. That
+# fixture used to shell out to `tar -czf`, on the argument that it should build
+# its archive with the same tool the code under test extracted with; T22-15
+# removed the system `tar` from that code, so the argument went with it.
+# Building the bytes in-process is also one less thing about the host that a
+# test result depends on.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 [lints]
 workspace = true

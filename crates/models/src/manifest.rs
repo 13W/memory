@@ -57,6 +57,45 @@ impl ModelManifest {
     }
 }
 
+/// What an installed ONNX Runtime records about itself (T22-15).
+///
+/// Deliberately its own type rather than a [`ModelManifest`] with odd fields:
+/// a runtime has no dimensions, no license URL and no revision, and a manifest
+/// whose half the fields are placeholders is a manifest nobody can trust.
+///
+/// The two digests are both here because both were checked, and a reader
+/// should be able to tell which is which: `archive_sha256` certifies the bytes
+/// that were downloaded, `sha256` certifies the file that was installed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrtManifest {
+    /// The platform key this runtime was installed for.
+    pub platform: String,
+    /// The upstream ONNX Runtime release tag.
+    pub version: String,
+    /// The release-asset URL it came from.
+    pub source: String,
+    /// SHA-256 of the downloaded archive.
+    pub archive_sha256: String,
+    /// The installed library's file name.
+    pub file: String,
+    /// The installed library's size in bytes.
+    pub size: u64,
+    /// The installed library's SHA-256.
+    pub sha256: String,
+}
+
+impl OrtManifest {
+    /// Serialize for on-disk storage.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("manifest holds only plain owned data") + "\n"
+    }
+
+    /// Parse a stored manifest.
+    pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

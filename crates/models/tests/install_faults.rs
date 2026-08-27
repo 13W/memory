@@ -24,13 +24,16 @@ use std::sync::Mutex;
 use local_rag_core::paths::StoreLayout;
 use local_rag_embed::{EmbedError, require_model_assets};
 use local_rag_models::{
-    HttpFetcher, InstallError, MANIFEST_FILE, OK_MARKER, install_model, is_installed,
+    HttpFetcher, InstallError, LocalFetcher, MANIFEST_FILE, OK_MARKER, install_model, install_ort,
+    is_installed, ort_is_installed,
 };
 use local_rag_test_support::TempHome;
 use local_rag_test_support::failpoint::{Action, global};
 use support::{FIXTURE_FILES, FIXTURE_MODEL_ID, FixtureServer};
 
 const FAILPOINT: &str = "models.install.between_files";
+/// Fires between a durable ONNX Runtime library and the marker (T22-15).
+const ORT_FAILPOINT: &str = "models.install.ort_before_marker";
 
 /// The failpoint registry is process-global, so an arming in one test would be
 /// visible to a concurrently running one. Serializing the whole file is the same
@@ -45,19 +48,23 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 
 /// Arm the crash point, guaranteeing it is disarmed when the guard drops — a
 /// leaked arming would silently break every later test in the binary.
-struct Armed;
+struct Armed(&'static str);
 
 impl Armed {
     fn new() -> Self {
-        global().register(FAILPOINT);
-        global().arm(FAILPOINT, Action::Error).expect("arm");
-        Armed
+        Self::at(FAILPOINT)
+    }
+
+    fn at(name: &'static str) -> Self {
+        global().register(name);
+        global().arm(name, Action::Error).expect("arm");
+        Armed(name)
     }
 }
 
 impl Drop for Armed {
     fn drop(&mut self) {
-        let _ = global().disarm(FAILPOINT);
+        let _ = global().disarm(self.0);
     }
 }
 
@@ -187,4 +194,52 @@ fn a_stale_part_file_is_overwritten_rather_than_resumed_blindly() {
         "the stale prefix was discarded, not appended to"
     );
     assert!(!dir.join("weights.onnx.part").exists());
+}
+
+#[test]
+fn a_runtime_install_killed_before_the_marker_is_not_a_runtime_install() {
+    // The ordering property `install_ort` rests on, made observable. Without
+    // this the marker could be written before the library was durable and every
+    // test stayed green — found by a mutation that did exactly that, not by
+    // reading the code.
+    //
+    // The three things asserted are the same three the weights' own crash test
+    // asserts, in the same order: the library is durable, nothing that makes it
+    // usable exists, and a rerun completes without refetching.
+    let _serial = serial();
+    let home = TempHome::new().expect("temp home");
+    let layout = StoreLayout::new(home.join("local-rag"));
+    layout.ensure().expect("ensure store tree");
+
+    let payload = vec![7u8; 4096];
+    let f = support::ort_fixture(&home, &payload);
+    let dir = layout
+        .models_dir()
+        .join("onnxruntime")
+        .join(f.asset.version);
+
+    let armed = Armed::at(ORT_FAILPOINT);
+    let err = install_ort(&layout, &f.asset, &LocalFetcher::new(&f.served))
+        .expect_err("the crash point fires");
+    assert!(matches!(err, InstallError::Interrupted), "{err:?}");
+    drop(armed);
+
+    assert_eq!(
+        std::fs::read(dir.join(f.asset.dylib_name)).expect("the library survived"),
+        payload,
+        "a file renamed into place stays durable across the crash"
+    );
+    assert!(!dir.join(MANIFEST_FILE).exists(), "no manifest yet");
+    assert!(!dir.join(OK_MARKER).exists(), "no marker yet");
+    assert!(
+        !ort_is_installed(&layout, &f.asset),
+        "an interrupted install must be indistinguishable from 'not installed'"
+    );
+
+    // The archive is still there, which is the whole reason it is kept until
+    // the marker: the rerun finishes without going back to the network.
+    let report = install_ort(&layout, &f.asset, &support::ForbiddenFetcher).expect("resume");
+    assert!(report.marked_ready);
+    assert_eq!(report.bytes_downloaded, 0);
+    assert!(ort_is_installed(&layout, &f.asset));
 }
