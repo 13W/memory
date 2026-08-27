@@ -18,7 +18,19 @@ const { execFileSync } = require("node:child_process");
 const REPO_NPM_DIR = path.resolve(__dirname, "..", "..");
 
 const PACKAGES = [
-  { dir: "memory", expectedFiles: ["package.json", "bin/local-rag-mcp.js", "src/resolve.js"] },
+  {
+    dir: "memory",
+    // `scripts/install.js` is listed because a file that ships only in the
+    // checkout is worse than no file: the package would look complete and heal
+    // nothing. The npm `scripts` *field* — the lifecycle hooks — is a separate
+    // thing and belongs to T22-10.
+    expectedFiles: [
+      "package.json",
+      "bin/local-rag-mcp.js",
+      "src/resolve.js",
+      "scripts/install.js",
+    ],
+  },
   { dir: "memory-darwin-arm64", expectedFiles: ["package.json"] },
   { dir: "memory-darwin-x64", expectedFiles: ["package.json"] },
   { dir: "memory-linux-x64", expectedFiles: ["package.json"] },
