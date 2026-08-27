@@ -27,6 +27,26 @@ function releaseBaseUrl(env = process.env) {
 }
 
 /**
+ * The product binaries a release carries, and which of them an install may do
+ * without.
+ *
+ * `local-rag-tui` is optional, and the rule is written generally rather than
+ * around it: under `latest` the resolved tag can be *older than the package* —
+ * tag `0.0.0` predates the `local-rag-tui` crate entirely — and an installer
+ * that dies because the release has not caught up is worse than one that
+ * records the gap. The other three are the product: without `local-rag-proxy`
+ * there is no MCP server at all.
+ *
+ * @type {ReadonlyArray<{name: string, required: boolean}>}
+ */
+const PRODUCT_BINARIES = Object.freeze([
+  Object.freeze({ name: "local-rag", required: true }),
+  Object.freeze({ name: "local-rag-proxy", required: true }),
+  Object.freeze({ name: "local-rag-hook", required: true }),
+  Object.freeze({ name: "local-rag-tui", required: false }),
+]);
+
+/**
  * The archive `cargo-dist` publishes for one binary on one platform.
  *
  * The two extensions are `dist-workspace.toml`'s `unix-archive` and
@@ -154,6 +174,7 @@ function parseSha256Sidecar(text, asset) {
 
 module.exports = {
   DEFAULT_RELEASE_BASE_URL,
+  PRODUCT_BINARIES,
   releaseBaseUrl,
   assetName,
   sidecarName,
