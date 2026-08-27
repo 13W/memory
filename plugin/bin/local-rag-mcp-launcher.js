@@ -1,42 +1,45 @@
 #!/usr/bin/env node
 "use strict";
 
-// Ships with the plugin (plugin/bin/), NOT with @13w/memory — this file
-// must run correctly even when @13w/memory is not installed anywhere on
-// disk (that is the whole reason tier 3 exists), so it never require()s
-// anything under npm/memory/src/*. Every helper below is a small,
-// deliberate, commented duplication of a convention that also lives in
-// npm/memory/src/{platform,binary-cache}.js — kept honest by
-// plugin/test/mcp-launcher-tiers.test.js, which CAN require both trees
-// and assert they agree.
+// Ships with the plugin (plugin/bin/), NOT with @13w/memory — this file must
+// run correctly when @13w/memory is not installed anywhere on disk, which is
+// why it never require()s anything under npm/memory/src/*. It resolves an
+// **executable by name**, and nothing else: no `node_modules`, no npm package,
+// no `npx`, no cache. Spec 13 §2 `[FIXED, ADR-0013]` states the order —
+// `LOCAL_RAG_BIN_DIR`, then the entries of `PATH` in order, then a list of
+// well-known global-bin directories — and ADR-0013 Decision 3 says why the
+// three tiers this replaces are gone: "Nothing consults `node_modules`, and
+// nothing runs `npx`."
 //
-// Three tiers, tried in order (T19-03, group 19 plan — replaces the bare
-// `npx --yes --package=@13w/memory local-rag-mcp` `.mcp.json` used to run
-// directly):
-//   1. @13w/memory installed on this machine (require()-delegated to its
-//      own bin/local-rag-mcp.js — zero duplicated resolution logic, zero
-//      extra nested Node process; see tier1()'s own doc comment for why a
-//      bare require() is not safe on its own). Two anchors are tried, in
-//      order: the current project's own node_modules (an explicit local
-//      override/pin, checked first so it wins when present) and this
-//      machine's global npm install location (D-055: the intended common
-//      case — the plugin ships through the marketplace, which never
-//      installs the server itself, so a real user's only path to a
-//      network-free cold start is `npm install --global @13w/memory` once,
-//      usable from every project; a plain project-local check alone can
-//      never see that).
-//   2. the known-path cache at ${CLAUDE_PLUGIN_DATA}/bin/local-rag-proxy,
-//      populated by a previous successful tier-1 or tier-3 run (both
-//      paths run npm/memory/bin/local-rag-mcp.js under the hood, which
-//      refreshes this cache as a side effect — no write-path code needed
-//      here, only the read/stat check)
-//   3. `npx --yes --package=@13w/memory local-rag-mcp`, today's only
-//      behavior, kept as the universally-correct last resort
+// WHY A THIRD RUNG AT ALL, when `PATH` already exists. A GUI-launched client
+// inherits launchd's `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), not the shell's,
+// so a perfectly good global install is invisible to it. That single case is
+// what the well-known directories recover, and it is why ADR-0013 rejected the
+// simpler "let the client resolve the binary itself" design outright.
 //
-// Hard rule: every diagnostic line below goes to stderr, never stdout.
-// Once any tier's child is spawned with stdio:'inherit', this process's
-// stdout *is* the MCP JSON-RPC channel — a stray stdout write corrupts
-// the protocol framing.
+// THE LIST IS THIS FILE'S OWN CHOICE — the specification names the rung and its
+// purpose but enumerates nothing, so the reasoning lives here.
+//
+// Its first entry is derived rather than guessed: this launcher is started as
+// `node <this file>`, and for every Node-managed global install a package's bin
+// entries are siblings of `node` itself. One line covers nvm, fnm, volta, a
+// system Node and a Homebrew Node at once, and on this machine it is the *only*
+// directory that holds a `local-rag` command at all — every hard-coded path
+// below is empty here. That is D-055's finding carried out ("a single global
+// install is the only route to a network-free cold start") without the
+// `require.resolve` machinery ADR-0013 retired.
+//
+// The rest are the global bin directories of the installers ADR-0013 Decision 3
+// names — npm under both Homebrew prefixes, `pnpm link --global`, bun, volta —
+// plus the XDG convention. They must stay expressible in POSIX `sh` built-ins,
+// because T22-14 requires the hook's shell resolver to produce a byte-identical
+// ordered list from the same environment; anything needing `brew --prefix` or a
+// config read would make that impossible.
+//
+// Hard rule, unchanged: every diagnostic line goes to stderr, never stdout.
+// Once a child is spawned with stdio:'inherit', this process's stdout *is* the
+// MCP JSON-RPC channel, and a stray write corrupts the protocol framing
+// (spec 13 §2: "stdout stays byte-empty").
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -45,68 +48,97 @@ const { constants } = require("node:os");
 
 const FORWARDED_SIGNALS = Object.freeze(["SIGINT", "SIGTERM"]);
 
-/** Mirrors npm/memory/src/platform.js's platformKey()+platformPackageName(). */
-function platformPackageName() {
-  return `@13w/memory-${process.platform}-${process.arch}`;
+const BIN_DIR_VAR = "LOCAL_RAG_BIN_DIR";
+const TEST_DIRS_VAR = "LOCAL_RAG_TEST_BIN_DIRS";
+const DEBUG_VAR = "LOCAL_RAG_DEBUG";
+
+const SERVER_BINARY = "local-rag-proxy";
+// The daemon the proxy will look for beside itself. Spec 13 §4
+// `[SPEC, ADR-0013]` makes that co-location a requirement rather than a
+// coincidence, and `crates/local-rag-proxy/src/connect.rs:55` is the code that
+// depends on it.
+const DAEMON_BINARY = "local-rag";
+
+/** An empty variable is unset, the same rule the rest of the project follows. */
+function nonemptyVar(env, name) {
+  const value = env[name];
+  return typeof value === "string" && value !== "" ? value : null;
 }
 
 /**
- * Where a plain `npm install --global @13w/memory` lands, computed
- * synchronously from `process.execPath` — the same default-prefix
- * convention npm itself falls back to absent a custom `.npmrc` prefix
- * (`<node-install>/lib/node_modules` on POSIX, `<node-install>/node_modules`
- * on win32, since Windows npm's default prefix is the Node install
- * directory itself, not a `lib/` subdirectory of it). Deliberately not
- * `npm root -g`/`npm config get prefix` (a Node/npm subprocess spawn,
- * historically 100-300ms — too expensive for what is supposed to be the
- * fast tier): a user who has customized their global prefix away from this
- * default is a known, accepted miss here, same trade-off as before — they
- * fall through to tier 2/tier 3, not a crash or a wrong answer.
+ * Every directory this launcher will look in, in order, without touching the
+ * filesystem once.
  *
- * @param {string} [execPath] defaults to `process.execPath`; a parameter
- *   only so this stays a pure, directly unit-testable function.
- * @param {string} [platform] defaults to `process.platform`.
- * @returns {string}
- */
-function npmGlobalNodeModules(execPath = process.execPath, platform = process.platform) {
-  // path.win32/path.posix, not the ambient `path` (host-OS-flavored): a
-  // test on a POSIX CI runner must still be able to verify the win32
-  // shape (backslash-separated) correctly, and vice versa — real
-  // production calls only ever pair a real `process.execPath` with the
-  // matching real `process.platform`, so this is a no-op switch there.
-  const p = platform === "win32" ? path.win32 : path.posix;
-  const nodeDir = p.dirname(execPath);
-  return platform === "win32"
-    ? p.join(nodeDir, "node_modules")
-    : p.join(p.dirname(nodeDir), "lib", "node_modules");
-}
-
-/**
- * The anchor tier1() actually uses for "installed globally on this
- * machine". `LOCAL_RAG_TEST_GLOBAL_NODE_MODULES` is a test-only override,
- * unset (and inert) in every real invocation — this machine's *real*
- * global npm directory always lives under the user's home directory
- * (`~/.nvm/...`, `~/.local/...`, platform-package-manager-specific), and
- * CLAUDE.md forbids tests depending on it; this seam is what lets
- * `plugin/test/mcp-launcher-tiers.test.js` exercise tier1()'s global path
- * against a hermetic fixture instead (same class of test-only,
- * zero-production-effect override as the Rust side's
- * `LOCAL_RAG_TEST_FAKE_DAEMON_VERSION`).
+ * Pure so the other platform's shape can be asserted from this one — the same
+ * discipline `npm/memory/src/paths.js` follows, and the same trap D-055
+ * recorded: `path.win32`/`path.posix` are named explicitly, because the ambient
+ * `path` module joins with the host's separator and a cross-platform test would
+ * then pass for the wrong reason.
  *
- * @returns {string}
+ * @param {{env?: NodeJS.ProcessEnv, platform?: string, execPath?: string}} [opts]
+ * @returns {string[]}
  */
-function globalNodeModulesAnchor() {
-  return process.env.LOCAL_RAG_TEST_GLOBAL_NODE_MODULES || npmGlobalNodeModules();
-}
+function candidateBinDirs(opts = {}) {
+  const env = opts.env ?? process.env;
+  const platform = opts.platform ?? process.platform;
+  const execPath = opts.execPath ?? process.execPath;
 
-/** Mirrors npm/memory/src/binary-cache.js's cachedBinaryPath(..., "local-rag-proxy"). */
-function cachedProxyPath() {
-  const pluginData = process.env.CLAUDE_PLUGIN_DATA;
-  if (!pluginData) {
-    return null;
+  // The whole list, replaced — not extended. A seam that prepended would let
+  // the developer's real PATH decide a test's outcome, and "it resolved" would
+  // stop meaning "it resolved where the test put it".
+  const replacement = nonemptyVar(env, TEST_DIRS_VAR);
+  if (replacement !== null) {
+    return dedupe(replacement.split(path.delimiter).filter((d) => d !== ""));
   }
-  const suffix = process.platform === "win32" ? ".exe" : "";
-  return path.join(pluginData, "bin", "local-rag-proxy" + suffix);
+
+  const p = platform === "win32" ? path.win32 : path.posix;
+  const dirs = [];
+
+  const override = nonemptyVar(env, BIN_DIR_VAR);
+  if (override !== null) dirs.push(override);
+
+  const pathVar = nonemptyVar(env, "PATH") ?? "";
+  const delimiter = platform === "win32" ? ";" : ":";
+  for (const entry of pathVar.split(delimiter)) {
+    if (entry !== "") dirs.push(entry);
+  }
+
+  // Derived, not guessed: a Node-managed global install puts a package's bins
+  // beside `node` itself.
+  dirs.push(p.dirname(execPath));
+
+  const home = nonemptyVar(env, platform === "win32" ? "USERPROFILE" : "HOME");
+  if (platform === "win32") {
+    const appData = nonemptyVar(env, "APPDATA");
+    if (appData !== null) dirs.push(p.join(appData, "npm"));
+    const localAppData = nonemptyVar(env, "LOCALAPPDATA");
+    if (localAppData !== null) dirs.push(p.join(localAppData, "pnpm"));
+  } else {
+    dirs.push("/opt/homebrew/bin", "/usr/local/bin");
+    if (home !== null) {
+      dirs.push(
+        p.join(home, ".local", "bin"),
+        p.join(home, ".local", "share", "pnpm"),
+        p.join(home, ".bun", "bin"),
+        p.join(home, ".volta", "bin"),
+        p.join(home, ".npm-global", "bin"),
+      );
+    }
+  }
+
+  return dedupe(dirs);
+}
+
+/** Order-preserving, because the order is the contract. */
+function dedupe(dirs) {
+  const seen = new Set();
+  const out = [];
+  for (const dir of dirs) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    out.push(dir);
+  }
+  return out;
 }
 
 /** Synchronous, cross-platform-best-effort "is this a runnable file" check. */
@@ -120,18 +152,55 @@ function isExecutableFile(p) {
 }
 
 /**
+ * The first candidate directory that holds a usable installation.
+ *
+ * "Usable" means the daemon is there too. Spec 13 §4 requires the daemon to sit
+ * beside the proxy that spawns it, and `connect.rs:55` is what relies on it;
+ * accepting a directory with only the proxy would move the failure to the
+ * moment the proxy looks for its daemon, where it reads as "daemon missing"
+ * rather than "the install is incomplete".
+ *
+ * Note which parts are parameterised and which are not. The *list* is a pure
+ * formula and takes `platform`, so the win32 shape can be asserted from a POSIX
+ * host. The *probe* joins with the host's own separator — these are files on
+ * this machine, and a `\\` in the middle of a POSIX path would look for
+ * something that cannot exist. Only the `.exe` suffix follows the injected
+ * platform, because that is the one part of the probe that is a naming rule
+ * rather than a filesystem fact.
+ *
+ * @param {string} name
+ * @param {object} [opts] see `candidateBinDirs`
+ * @returns {{path: string, dir: string} | null}
+ */
+function resolveBinary(name, opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  const suffix = platform === "win32" ? ".exe" : "";
+  for (const dir of candidateBinDirs(opts)) {
+    const candidate = path.join(dir, name + suffix);
+    if (!isExecutableFile(candidate)) continue;
+    if (name !== DAEMON_BINARY && !isExecutableFile(path.join(dir, DAEMON_BINARY + suffix))) {
+      continue;
+    }
+    return { path: candidate, dir };
+  }
+  return null;
+}
+
+/**
  * Spawn `execPath` as an attached (never detached), stdio-inherited child,
  * forward SIGINT/SIGTERM 1:1, and exit this process with the child's own
  * exit code/signal once it exits. Mirrors npm/memory/src/lifecycle.js's
- * `runAndForwardSignals` + npm/memory/bin/local-rag-mcp.js's own exit-code
- * mapping — a smaller inline copy (this file cannot require() that
- * module), used identically by tier2/tier3 below. Once a tier commits to
- * spawning here there is no further fallback, by design: this is the same
- * point of no return `local-rag-mcp.js`'s own `runAndForwardSignals(...)
- * .catch(...)` already is for the standalone-binary case — an async spawn
- * error (rare once tier2's own synchronous existence/executable-bit check
- * already passed) is fatal for *this* run, not a signal to try the next
- * tier.
+ * `runAndForwardSignals` — a smaller inline copy, because this file cannot
+ * require() that module and must keep working when it is not installed.
+ *
+ * Once this function is entered there is no further fallback, by design: the
+ * resolver has already established synchronously that the file exists and is
+ * executable, so an async spawn error is fatal for *this* run rather than a
+ * signal to look somewhere else.
+ *
+ * The body below is preserved verbatim from the three-tier version this file
+ * replaces — it is `[FIXED list]` item 1 (signal forwarding, reliable
+ * termination, orphan cleanup), and T22-12's card says so.
  *
  * @param {string} execPath
  * @param {string[]} args
@@ -184,131 +253,57 @@ function runChildAndExit(execPath, args) {
 }
 
 /**
- * Tier 1: `@13w/memory` installed on this machine. Two anchors are tried,
- * in order (D-055 — the original single-anchor, project-only design
- * turned out to make the intended common case, a real user's global
- * install, unreachable; see the module doc comment above and
- * `DEVIATIONS.md` D-055 for the full history):
+ * The not-installed contract, spec 13 §2 `[FIXED, ADR-0013]`, verbatim in
+ * behaviour: stdout stays byte-empty because it is the JSON-RPC stream, the
+ * diagnostic names both the install command and the override variable, and the
+ * process exits non-zero so the client shows a failed server rather than a
+ * silent one.
  *
- *   1. `${CLAUDE_PROJECT_DIR}/node_modules` — an explicit local
- *      override/pin (monorepo vendoring, a pinned version for
- *      reproducibility); checked first so it wins when present, the same
- *      "local beats global" precedence most npm-based CLI tools already
- *      give a project devDependency over a global install.
- *   2. `npmGlobalNodeModules()` — this machine's global npm install
- *      location (`globalNodeModulesAnchor()`, test-overridable). Not a
- *      monorepo-relative guess off `${CLAUDE_PLUGIN_ROOT}` either way (a
- *      real, marketplace-installed `${CLAUDE_PLUGIN_ROOT}` points into
- *      `~/.claude/plugins/cache/...`, unrelated to any project's own
- *      source layout, so guessing a relative path from there would be
- *      actively wrong for every real user, not just unnecessary).
- *
- * Delegates to the already-correct `@13w/memory/bin/local-rag-mcp.js` via
- * `require()` rather than duplicating its resolution logic, and rather
- * than `spawn`-ing it (which would pay a second, nested Node bootstrap on
- * top of this one). That file's own `main()` calls `process.exit(1)`
- * synchronously on a resolution failure — fatal by design for the
- * standalone-binary case — so a bare `require()` here could kill this
- * whole launcher before tier 2/3 ever run. The preflight below
- * independently confirms *both* the base package and the
- * platform-specific package resolve from the same anchor before
- * committing to `require()`, so the common real-world failure mode (the
- * platform `optionalDependency` was skipped — `npm install
- * --omit=optional`, a lockfile mismatch, a registry hiccup) is caught
- * here and falls through cleanly, never fatal. Residual, accepted risk:
- * if the preflight passes but the delegated module's own resolution still
- * somehow disagrees, or its resolved binary fails to spawn asynchronously
- * after `require()` returns, its `main()` calls `process.exit()` directly
- * and this function cannot intercept that — narrow, since preflight and
- * delegate use the identical anchor and the same deterministic
- * `require.resolve` algorithm.
- *
- * @returns {boolean} true if this tier took over (in practice `require()`
- *   already called `process.exit()` by the time this returns).
+ * The candidate list is printed only under `LOCAL_RAG_DEBUG=1`. It is the right
+ * answer to "why did it not find it" and the wrong thing to put in front of
+ * somebody who just wants the one command that fixes this.
  */
-function tier1() {
-  const projectDir = process.env.CLAUDE_PROJECT_DIR;
-  const anchors = [];
-  if (projectDir) {
-    anchors.push(path.join(projectDir, "node_modules"));
+function reportNotInstalled(env) {
+  process.stderr.write(
+    "local-rag: the memory server is not installed.\n" +
+      "The plugin never downloads anything — obtaining the binaries is the npm\n" +
+      `package's job. Set ${BIN_DIR_VAR} to a directory of prebuilt binaries for\n` +
+      "an offline or air-gapped install.\n" +
+      "Fix:\n" +
+      "  npm i -g @13w/memory\n",
+  );
+  if (nonemptyVar(env, DEBUG_VAR) !== null) {
+    process.stderr.write(`local-rag: looked in (in order):\n`);
+    for (const dir of candidateBinDirs({ env })) {
+      process.stderr.write(`  ${dir}\n`);
+    }
   }
-  anchors.push(globalNodeModulesAnchor());
-  try {
-    require.resolve(`${platformPackageName()}/package.json`, { paths: anchors });
-  } catch {
-    // Routine, expected miss for the vast majority of real users (no
-    // local @13w/memory install at all) — silent by design, not a bug.
-    // Only a failure *after* both preflight checks already passed (the
-    // require() below) is surprising enough to be worth a stderr note.
-    return false;
-  }
-  let launcherPath;
-  try {
-    launcherPath = require.resolve("@13w/memory/bin/local-rag-mcp.js", { paths: anchors });
-  } catch {
-    return false; // same routine-miss reasoning as above
-  }
-  try {
-    require(launcherPath); // self-executing: handles its own stdio/signals/exit,
-    return true; // and (via binary-cache.js) refreshes tier 2's cache too
-  } catch (err) {
-    process.stderr.write(
-      `local-rag: installed @13w/memory failed to start, falling back: ${err.message}\n`,
-    );
-    return false;
-  }
-}
-
-/**
- * Tier 2: the cache tier 1/tier 3 populate on any prior successful start.
- * A missing or non-executable cache entry falls through to tier 3
- * synchronously, before ever spawning — see `runChildAndExit`'s own doc
- * comment for why a spawn failure *after* this check is not itself a
- * fallback trigger.
- *
- * @returns {boolean}
- */
-function tier2() {
-  const cached = cachedProxyPath();
-  if (!cached || !isExecutableFile(cached)) {
-    return false;
-  }
-  runChildAndExit(cached, process.argv.slice(2));
-  return true;
-}
-
-/** Tier 3: today's only behavior, unconditional last resort. */
-function tier3() {
-  runChildAndExit("npx", [
-    "--yes",
-    "--package=@13w/memory",
-    "local-rag-mcp",
-    ...process.argv.slice(2),
-  ]);
 }
 
 function main() {
-  if (tier1()) {
+  const resolved = resolveBinary(SERVER_BINARY);
+  if (resolved === null) {
+    reportNotInstalled(process.env);
+    process.exit(1);
     return;
   }
-  if (tier2()) {
-    return;
-  }
-  tier3();
+  runChildAndExit(resolved.path, process.argv.slice(2));
 }
 
 if (require.main === module) {
   main();
 }
 
-// Exported for plugin/test/mcp-launcher-tiers.test.js only — production
+// Exported for plugin/test/mcp-launcher-resolution.test.js only — production
 // entry is the `require.main === module` branch above.
 module.exports = {
+  BIN_DIR_VAR,
+  TEST_DIRS_VAR,
+  DEBUG_VAR,
+  SERVER_BINARY,
+  DAEMON_BINARY,
+  candidateBinDirs,
+  isExecutableFile,
+  resolveBinary,
   main,
-  tier1,
-  tier2,
-  tier3,
-  platformPackageName,
-  cachedProxyPath,
-  npmGlobalNodeModules,
 };

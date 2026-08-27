@@ -26,7 +26,7 @@ const PACKAGES = [
     // thing and belongs to T22-10.
     expectedFiles: [
       "package.json",
-      "bin/local-rag-mcp.js",
+      "bin/local-rag-proxy",
       "src/resolve.js",
       "src/locate.js",
       "scripts/install.js",
