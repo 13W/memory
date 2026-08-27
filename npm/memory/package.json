@@ -1,13 +1,20 @@
 {
   "name": "@13w/memory",
   "version": "0.0.0",
-  "description": "npm launcher for local-rag: resolves the platform-specific native binaries and runs the stdio MCP proxy or the ingestion hook writer.",
+  "description": "local-rag: obtains the native binaries from the project's own GitHub releases and puts them on your PATH — memory, hybrid code search and observation capture for Claude Code.",
   "license": "UNLICENSED",
   "type": "commonjs",
   "bin": {
-    "local-rag-mcp": "bin/local-rag-mcp.js",
-    "local-rag-hook": "bin/local-rag-hook.js",
-    "local-rag-dashboard": "bin/local-rag-dashboard.js"
+    "local-rag": "bin/local-rag",
+    "local-rag-proxy": "bin/local-rag-proxy",
+    "local-rag-hook": "bin/local-rag-hook",
+    "local-rag-tui": "bin/local-rag-tui",
+    "local-rag-mcp": "bin/local-rag-proxy",
+    "local-rag-dashboard": "bin/local-rag-tui"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "prepack": "node scripts/prepack.js"
   },
   "files": [
     "bin",

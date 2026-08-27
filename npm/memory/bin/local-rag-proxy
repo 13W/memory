@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+"use strict";
+
+// The stub for the stdio MCP proxy. After a normal npm install this file is not here:
+// `replace-shims.js` has put the native `local-rag-proxy` at this exact path and the
+// command execs it directly. See `../src/shim.js` for the paths where that did
+// not happen — `--ignore-scripts`, pnpm, Yarn, Windows, a source checkout.
+//
+// Every diagnostic goes to stderr. On the MCP path stdout is the JSON-RPC
+// stream (`13 §2`: "stdout stays byte-empty"), and on the others it belongs to
+// whatever the user is piping into.
+
+Promise.resolve()
+  .then(() => require("../src/shim.js").runManagedShim("local-rag-proxy"))
+  .catch((err) => {
+    const what = "local-rag-proxy";
+    process.stderr.write(`local-rag: the ${what} stub could not start: ${err && err.message}\n`);
+    process.exit(1);
+  });

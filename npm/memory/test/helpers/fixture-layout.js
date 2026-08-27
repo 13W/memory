@@ -48,11 +48,15 @@ function writePlatformPackageAt(packageDir, packageName, opts = {}) {
  * `launcherDir`, so subprocess-tier tests can spawn a genuine, standalone
  * copy of `bin/local-rag-mcp.js` against a fixture tree instead of the real
  * checkout (which has no `node_modules` of its own to resolve against).
- * Every `bin/*.js` entrypoint's own `require("../src/...")` calls stay
- * correct after the copy because both directories move together; copying
- * the whole `bin/` directory (not one named file) means a future new
- * entrypoint needs no change here, mirroring `package.json`'s own
- * `files: ["bin", "src"]` allowlist.
+ * Every entrypoint's own `require("../src/...")` calls stay correct after the
+ * copy because the directories move together; copying whole directories (not
+ * named files) means a new entrypoint needs no change here, mirroring
+ * `package.json`'s own `files: ["bin", "src", "scripts"]` allowlist.
+ *
+ * `scripts/` is copied for the same reason as the other two, and T22-10 is why
+ * it had to start being: the shims' repair path spawns `scripts/install.js`,
+ * so a fixture tree without it would exercise a launcher that can never heal —
+ * passing for the wrong reason.
  *
  * @returns {string} absolute path to the copied `bin/local-rag-mcp.js`
  */
@@ -60,6 +64,9 @@ function writeLauncherPackageAt(launcherDir) {
   fs.mkdirSync(launcherDir, { recursive: true });
   fs.cpSync(path.join(REAL_LAUNCHER_ROOT, "src"), path.join(launcherDir, "src"), { recursive: true });
   fs.cpSync(path.join(REAL_LAUNCHER_ROOT, "bin"), path.join(launcherDir, "bin"), { recursive: true });
+  fs.cpSync(path.join(REAL_LAUNCHER_ROOT, "scripts"), path.join(launcherDir, "scripts"), {
+    recursive: true,
+  });
   for (const name of fs.readdirSync(path.join(launcherDir, "bin"))) {
     fs.chmodSync(path.join(launcherDir, "bin", name), 0o755);
   }

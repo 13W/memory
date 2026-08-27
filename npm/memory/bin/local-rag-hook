@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+"use strict";
+
+// The hook stub. `11 §3.1` `[FIXED]` says the seven hook events always exit 0,
+// and that covers this whole file — a top-level `require` that throws is not
+// fail-open, so the require is inside the `try` rather than above it.
+//
+// After a normal npm install this file is not here: `replace-shims.js` has put
+// the native `local-rag-hook` at this exact path and the command execs it with
+// no Node involved. See `../src/shim.js` for every path where that did not
+// happen.
+
+try {
+  require("../src/shim.js").runHookShim("local-rag-hook");
+} catch (err) {
+  try {
+    process.stderr.write(`local-rag: the hook stub could not start: ${err && err.message}\n`);
+  } catch {
+    // Even stderr being gone must not change the exit code.
+  }
+  process.exit(0);
+}

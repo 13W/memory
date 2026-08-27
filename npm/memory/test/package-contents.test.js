@@ -112,6 +112,38 @@ for (const { dir, expectedFiles } of PACKAGES) {
   });
 }
 
+test("a bin/ that has been installed into cannot be packed at all", () => {
+  // The design has `postinstall` replace the stubs in `bin/` with native
+  // binaries — in a checkout, that is the very directory `npm pack` reads. So
+  // publishing from a machine that has ever installed the package would put one
+  // platform's binaries into a tarball every platform downloads. `prepack` is
+  // the only thing standing between those two facts.
+  //
+  // `prepack` runs for `npm pack --dry-run` too, and a non-zero exit aborts the
+  // pack before a tarball exists. Measured, not assumed: npm's own
+  // `libnpmpack` awaits the script before `pacote.tarball`, and `dryRun` gates
+  // only the final write.
+  const copy = preparePackageCopy(path.join(REPO_NPM_DIR, "memory"));
+
+  // Not "#!" — which is the whole test. The rule is a whitelist, so a Mach-O,
+  // an ELF and a PE all fail it without anyone enumerating magic numbers.
+  fs.writeFileSync(path.join(copy, "bin", "local-rag-proxy"), Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0c]));
+  fs.writeFileSync(path.join(copy, "bin", ".local-rag-install.json"), "{}");
+
+  assert.throws(
+    () => packedFileList(copy),
+    (err) => {
+      const output = `${err.stdout ?? ""}${err.stderr ?? ""}${err.message}`;
+      assert.match(output, /refusing to pack/);
+      assert.match(output, /local-rag-proxy/);
+      assert.match(output, /installer artefact/);
+      return true;
+    },
+  );
+
+  fs.rmSync(copy, { recursive: true, force: true });
+});
+
 test("the launcher's own README.md is not required for the launcher to run, but is still packed if present (informational, not a decoy)", () => {
   const realDir = path.join(REPO_NPM_DIR, "memory");
   const copy = preparePackageCopy(realDir);
