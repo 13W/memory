@@ -87,8 +87,12 @@ main().then(
   (err) => {
     process.stderr.write(`${err && err.message ? err.message : err}\n`);
     process.stderr.write(
+      // Not "or by `local-rag-install`", which this said until T22-14: no such
+      // command exists — `bin` maps six names and that is not one of them.
+      // Pointing a user at a command that is not there is worse than saying
+      // nothing, and the healing path is real (see `src/shim.js`).
       "local-rag: the package is installed; the binaries are not. " +
-        "They will be fetched on first use, or by `local-rag-install`.\n",
+        "They will be fetched on first use.\n",
     );
     process.exit(0);
   },

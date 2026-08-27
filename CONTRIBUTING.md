@@ -340,64 +340,82 @@ rewritten.
   winning backend is promoted into the product workspace at T12-02. Never
   distributed.
 
-## npm packages (`npm/`)
+## npm package (`npm/`)
 
-T17-01's six npm packages (spec 13 §1), parallel to `crates/` rather than inside it — a
-self-contained subtree with different tooling, the same pattern `spike/` already established for
-its own separate Cargo workspace:
+**One** package (spec 13 §1, [ADR-0013](docs/adr/0013-binary-delivery-via-release-assets.md)),
+parallel to `crates/` rather than inside it — a self-contained subtree with different tooling, the
+same pattern `spike/` already established for its own separate Cargo workspace. It was six until
+T22-11: `@13w/memory` plus five `optionalDependencies` platform packages. ADR-0013 replaced that
+whole channel with the project's own GitHub release assets, and the packages, the `npx` fallback
+and the `${CLAUDE_PLUGIN_DATA}` cache went with it.
 
-- `npm/memory/` — `@13w/memory`, the thin JS launcher (`bin/local-rag-mcp.js`, glue only)
-  that resolves the caller's platform package (`src/resolve.js`, `require.resolve`/
-  `createRequire`-based — the same hoisting-aware algorithm every package manager's
-  npm/pnpm/yarn layout already targets, not a hand-rolled `node_modules` walk) and execs the
-  native `local-rag-proxy` in place (`stdio: 'inherit'`), forwarding `SIGINT`/`SIGTERM`
-  (`src/lifecycle.js`) 1:1 to it — never `detached`, the inverse of `crates/local-rag-proxy/src/
-  connect.rs::spawn_detached_daemon`'s own process-group isolation. T17-02 adds a second
-  entrypoint, `bin/local-rag-hook.js`, for the ingestion hook path — it must **always** exit 0
-  (fail-open, unlike the MCP launcher) and best-effort refreshes a direct-exec cache symlink
-  under `${CLAUDE_PLUGIN_DATA}` (`src/binary-cache.js`, T19-03; was hook-only `hook-cache.js`) so
-  a Claude Code plugin's hook commands can skip Node/npx entirely on the steady-state path — see
-  `## Claude Code plugin` below. T19-03 makes `bin/local-rag-mcp.js` refresh that same cache too
-  (a second entry, `local-rag-proxy`, alongside the hook's own `local-rag-hook`), so
-  `plugin/bin/local-rag-mcp-launcher.js`'s known-path tier has something to find. T18-01 adds a
-  third entrypoint, `bin/local-rag-dashboard.js`, execing the native `local-rag-tui` terminal
-  dashboard — `stdio: 'inherit'` here is not just convenient but load-bearing: a full-screen
-  interactive TUI needs the real inherited TTY (raw-mode/alternate-screen ioctls have no meaning
-  over a pipe), unlike the MCP proxy where it is "correct rather than a manual pipe/relay" for
-  protocol reasons.
-- `npm/memory-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}/` — the five
-  `optionalDependencies` platform packages (`os`/`cpu` fields select the right one at install
-  time). `win32-arm64` is deferred `[FIXED]`, spec 13 §1 — no sixth package.
-- In this checkout, every platform package ships `package.json`/`README.md` only — `bin/` (the
-  four product binaries `local-rag`/`local-rag-proxy`/`local-rag-hook`/`local-rag-tui`) is
-  populated by T17-03's release build, not committed here. T17-01's own tests never depend on a
-  real compiled binary:
-  they build synthetic fixture trees (`npm/memory/test/helpers/fixture-layout.js`) standing in
-  for npm-flat, npm-nested, and pnpm-symlinked installs, and a scriptable stand-in
-  (`test/helpers/fake-binary.js`) for `local-rag-proxy` in the real-subprocess signal tests.
+`npm/memory/` — `@13w/memory`. Its job is to **obtain and expose** the native binaries, not to
+contain them:
 
-Run the suite: `cd npm/memory && node --test test/*.test.js` — **not** bare `node --test`
-(Node's default test-file discovery treats every `.js` file under a directory named `test` as a
-test file, which would try to run `test/helpers/fake-binary.js` itself and hang forever in its
-own `setInterval`; the explicit glob scopes discovery to the top-level `*.test.js` files only).
-Zero `dependencies`/`devDependencies` — only `node:test`/`node:assert`/`node:child_process`/
-`node:module`/`node:path`/`node:os`/`node:fs` built-ins, plus `node:http`/`node:https`/`node:crypto`
-in `src/http.js` and the fixture server that tests it (T22-06, ADR-0013) and `node:zlib` in
-`src/archive.js` and its fixtures (T22-07) — the same "built-ins over
-an external dependency" stance the Rust "Dependency policy" section above takes; `npm` itself (bundled with
-Node) is the one host tool `test/package-contents.test.js` needs, purely locally (`npm pack
---dry-run`), no registry contact. Requires Node.js ≥20.15, the floor at which `zlib.crc32` exists —
-`archive.js` needs it because raw deflate, unlike a gzip stream, carries no checksum of its own.
+- `bin/` — four extensionless stubs (`local-rag`, `local-rag-proxy`, `local-rag-hook`,
+  `local-rag-tui`), each `#!/usr/bin/env node`. `package.json`'s `bin` map adds two compatibility
+  aliases, `local-rag-mcp` → the proxy and `local-rag-dashboard` → the TUI. The stubs are
+  temporary by design (T22-10): `postinstall` **replaces the files themselves** with the
+  downloaded native binaries, and npm's `.bin` entry is a symlink to that path, so after a normal
+  install the command execs the binary with no Node in the way. Until that happens — or when
+  `--ignore-scripts` means it never does — the stub resolves and heals on first use.
+- `src/` — `platform.js` (platform keys, target triples), `release.js` (asset/sidecar names, URL
+  shapes, SHA-256 sidecar parsing), `http.js` (the **only** module that touches the network:
+  `node:https`, redirects, proxy, retries), `archive.js` (single-member `.tar.gz`/`.zip`
+  extraction on `node:zlib` alone, no shelling out), `paths.js` + `lock.js` + `install.js` (where
+  binaries land, the `O_EXCL` install lock, and verify-before-trust installation: `.part` → fsync
+  → digest → `rename`), `locate.js` (the resolution ladder), `shim.js` + `replace-shims.js` (the
+  stub runtime and postinstall's swap), `lifecycle.js` (1:1 `SIGINT`/`SIGTERM` forwarding to the
+  exec'd child — never `detached`, the inverse of `crates/local-rag-proxy/src/connect.rs::
+  spawn_detached_daemon`'s own process-group isolation), `errors.js` (every message names what is
+  needed to act and ends with exactly one runnable command).
+- `scripts/` — `install.js` (the installer proper, also what a stub spawns to heal),
+  `postinstall.js` (exits 0 whatever happens — a failed download must not fail the user's whole
+  `npm install`), `prepack.js` (refuses to pack a `bin/` that has been installed into: in a
+  checkout that is the very directory `npm pack` reads, so publishing from a machine that ever
+  installed the package would put one platform's binaries into a tarball every platform
+  downloads).
 
-Not yet wired into `cargo xtask ci` / `.github/workflows/ci.yml` — that file's own comment already
-earmarks "additional platform targets are added by the distribution work (T17)"; running the npm
-suite locally is a manual step for anyone touching `npm/` until T17-03 adds real CI coverage.
+Every command resolves an executable in this order (`13 §1`, as-built T22-09; the **plugin**'s own
+order is `13 §2` and is not the same list): `LOCAL_RAG_BIN_DIR` — a directory of prebuilt binaries
+that wins over everything and downloads nothing, the supported air-gapped route; then a **source
+checkout**, when the package is running from inside one (`target/release`, then `target/debug`) —
+final, because falling through to a download would run something other than the source sitting
+right there; then the binaries this package installed. `npm link`/`pnpm link --global` from this
+repository therefore works offline and needs no `postinstall`.
+
+The repository root carries a `package.json` declaring `"@13w/memory": "file:npm/memory"` (T22-11).
+It is a developer convenience — `npm install` at the root links the checkout — and nothing in the
+product consults `node_modules`; `/node_modules/` stays gitignored.
+
+Run the suite: `cd npm/memory && node --test test/*.test.js` — **182 tests**, and **not** bare
+`node --test` (Node's default test-file discovery treats every `.js` file under a directory named
+`test` as a test file, which would try to run `test/helpers/fake-binary.js` itself and hang forever
+in its own `setInterval`; the explicit glob scopes discovery to the top-level `*.test.js` files
+only). Zero `dependencies`/`devDependencies` — only `node:test`/`node:assert`/`node:child_process`/
+`node:path`/`node:os`/`node:fs` built-ins, plus `node:http`/`node:https`/`node:crypto` in
+`src/http.js` and the fixture server that tests it (T22-06) and `node:zlib` in `src/archive.js` and
+its fixtures (T22-07) — the same "built-ins over an external dependency" stance the Rust
+"Dependency policy" section above takes; `npm` itself (bundled with Node) is the one host tool
+`test/package-contents.test.js` needs, purely locally (`npm pack --dry-run`), no registry contact.
+Requires Node.js ≥20.15, the floor at which `zlib.crc32` exists — `archive.js` needs it because raw
+deflate, unlike a gzip stream, carries no checksum of its own.
+
+No test here reaches the network. The ones about downloading run against a loopback fixture server
+(`test/helpers/fixture-server.js`), and `LOCAL_RAG_RELEASE_BASE_URL` is pinned to a closed loopback
+port by default so a test that forgets to point somewhere cannot silently reach github.com — a real
+576 ms round trip, measured, before that default existed.
+
+Not yet wired into `cargo xtask ci` / `.github/workflows/ci.yml`; running the npm suite locally is
+a manual step for anyone touching `npm/` until T22-17 adds real CI coverage.
 
 ## Claude Code plugin (`plugin/`, `.claude-plugin/`)
 
-T17-02's plugin registration (spec 11 §3.1, spec 13 §1-2), a real Claude Code plugin/marketplace
+T17-02's plugin registration (spec 11 §3.1, spec 13 §2), a real Claude Code plugin/marketplace
 pair, not a stub — every manifest here is verified against the actual `claude` CLI, not a
-reimplemented schema check:
+reimplemented schema check. What it resolves changed completely in T22-12/T22-13: there is no npm
+package to find, no plugin-data cache to consult and no `npx` to fall back to — only **a binary
+found by name in an ordered list of directories**.
 
 - `.claude-plugin/marketplace.json` — repo root (required location for `claude plugin marketplace
   add <this-repo>`); one entry, `"source": "./plugin"`.
@@ -405,48 +423,45 @@ reimplemented schema check:
   MCP config stay on their default locations, `hooks/hooks.json`/`.mcp.json`, not duplicated
   explicitly).
 - `plugin/hooks/hooks.json` — the seven spec 11 §3.1 `[FIXED]` events (`SessionStart`,
-  `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop`, `SessionEnd`),
-  every one the identical shell-form command: exec a cached direct path under
-  `${CLAUDE_PLUGIN_DATA}` if the previous run populated it, else fall back to
-  `npx --yes --package=@13w/memory local-rag-hook spool-write`, else `true` — the trailing
-  `|| true` is load-bearing: spec 11 §3.1's "always exit 0" is a `[FIXED]` contract on the whole
-  command a `hooks.json` entry invokes, not just the native binary once it is running, so it must
-  hold even when both the cache and `npx` fail (e.g. first run, offline). `${CLAUDE_PLUGIN_DATA}`
-  itself was independently audited against the official Claude Code plugin docs (T19-03,
-  `code.claude.com/docs/en/plugins-reference`): a real, documented, persistent-per-plugin
-  directory distinct from the ephemeral `${CLAUDE_PLUGIN_ROOT}`, used here exactly the way the
-  docs' own worked example does — no code change followed from the audit, only this confirmation.
+  `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop`, `SessionEnd`).
+  Six carry the identical command — `"${CLAUDE_PLUGIN_ROOT}"/bin/local-rag-resolve-hook.sh
+  spool-write 2>/dev/null || true` — and `SessionStart` differs by exactly one environment variable
+  in front of it (`LOCAL_RAG_NOT_INSTALLED_JSON`). The trailing `|| true` is load-bearing: spec
+  11 §3.1's "always exit 0" is a `[FIXED]` contract on the whole command a `hooks.json` entry
+  invokes, not just the native binary once it is running, and the resolver deliberately exits 127
+  when it finds nothing. That split is the design, not an accident — a script that swallowed its
+  own failure could not tell `SessionStart` there was nothing to run.
+- `plugin/bin/local-rag-resolve-hook.sh` (T22-13) — the repository's only shell script. POSIX `sh`
+  on built-ins alone (`command -v`, `case`, `read`, `printf`, `[ -x ]`, `exec`): an external
+  command would be a dependency on `PATH`, and a hook that must work under launchd's four-entry
+  `PATH` cannot afford one. `--print-candidates` is a seam, not a feature — it is how
+  `no-network.test.js`'s sibling in `hook-resolution.test.js` proves this script and the MCP
+  launcher build the *same* ordered list.
+- `plugin/hooks/not-installed.json` (T22-13) — a golden `additionalContext` envelope in exactly
+  the bytes `crates/local-rag-hook/src/recall.rs::print_hook_output` emits, with no interpolation;
+  the resolver prints it verbatim when it finds nothing. Its keys are **alphabetical**, not in
+  source order: `serde_json::Map` is a `BTreeMap` unless the `preserve_order` feature is on, and it
+  is not. Spec 11 §3.2 `[SPEC, ADR-0013]` is why only `SessionStart` speaks: the other six stay
+  silent, and the exit code is 0 in every case.
 - `plugin/.mcp.json` — the `memory` MCP server, `"command": "node", "args":
-  ["${CLAUDE_PLUGIN_ROOT}/bin/local-rag-mcp-launcher.js"]` (T19-03; was a bare `npx --yes
-  --package=@13w/memory local-rag-mcp` — `--package=`/`--yes` verified empirically as the form
-  that actually selects a non-default bin from a multi-bin package, still true of the launcher's
-  own tier-3 fallback below). `command`/`args` must be `"node"` + a script path, not a bare
-  shebang'd path: the official docs' own worked example for a plugin-bundled JS server uses
-  exactly this shape, and unlike a POSIX shebang it also works on `win32-x64` (a real, supported
-  platform this project ships), where a direct, shell-less spawn does not consult shebangs at all.
-- `plugin/bin/local-rag-mcp-launcher.js` (T19-03) — ships with the plugin itself (not with
-  `@13w/memory`, which may not be installed anywhere on disk at all), and tries three tiers in
-  order: (1) a locally installed `@13w/memory`, resolved from `${CLAUDE_PROJECT_DIR}/node_modules`
-  only (not a monorepo-relative guess — a real installed plugin's `${CLAUDE_PLUGIN_ROOT}` lives in
-  `~/.claude/plugins/cache/...`, unrelated to this repo's own layout — and not `npm root -g`, a
-  100-300ms subprocess spawn on what is supposed to be the fast tier) and, once resolvable,
-  `require()`-delegated straight into `npm/memory/bin/local-rag-mcp.js` rather than duplicating its
-  resolution logic or paying a second nested Node bootstrap; a two-part preflight check (base
-  package *and* platform-specific package both resolvable) runs before that `require()`, because
-  the delegated file's own `main()` calls `process.exit(1)` synchronously on a resolution failure
-  — fatal by design for the standalone-binary case, which would otherwise kill this launcher before
-  tier 2/3 ever ran; (2) the same `${CLAUDE_PLUGIN_DATA}/bin/` cache the hook already uses, second
-  entry `local-rag-proxy` alongside `local-rag-hook` (`npm/memory/src/binary-cache.js`, renamed and
-  generalized from the hook-only `hook-cache.js` it replaces — `npm/memory/bin/local-rag-mcp.js`
-  now refreshes it too, so both tier-1 delegation and tier-3 `npx` naturally populate it, no
-  separate write-path code in the plugin launcher); (3) today's `npx --yes --package=@13w/memory
-  local-rag-mcp`, unconditional last resort. A real measurement of the launcher's own overhead on
-  the cached tier-2 path lands around p50 ≈ 39ms / p95 ≈ 42ms, under the p95 < 100ms budget T19-03
-  chose (`docs/specification/13-distribution-and-migrations.md` §1/§2) — structurally larger than
-  the hook's own <50ms budget because Node startup itself (`.mcp.json`'s `command` has no shell for
-  `||` chaining, so Node is unavoidable on every tier) is the dominant cost, not a missed
-  optimization; the MCP server pays this once per session, not once per hook event the way the
-  hook's own budget matters for.
+  ["${CLAUDE_PLUGIN_ROOT}/bin/local-rag-mcp-launcher.js"]`. `command`/`args` must be `"node"` + a
+  script path, not a bare shebang'd path: the official docs' own worked example for a
+  plugin-bundled JS server uses exactly this shape, and unlike a POSIX shebang it also works on
+  `win32-x64`, where a direct, shell-less spawn does not consult shebangs at all.
+- `plugin/bin/local-rag-mcp-launcher.js` — ships with the plugin itself, not with `@13w/memory`,
+  which may not be installed anywhere on disk; it therefore `require()`s nothing from
+  `npm/memory/src/`. It resolves `local-rag-proxy` by name through spec 13 §2's order:
+  `LOCAL_RAG_BIN_DIR`, then every entry of `PATH` in order, then a list of well-known global-bin
+  directories. That third rung exists for one real case: a GUI-launched client inherits launchd's
+  `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), not the shell's, so a perfectly good global install is
+  invisible to it. The list itself is the launcher's own choice — the specification names the rung
+  and its purpose but enumerates nothing — and its first entry is derived rather than guessed: the
+  launcher runs as `node <this file>`, and a Node-managed global install puts a package's bins
+  beside `node` itself. A directory holding the proxy but **not** `local-rag` is skipped: spec 13
+  §4 requires the daemon beside the proxy that spawns it (`connect.rs:55` relies on it), and
+  accepting a half-install would surface as "daemon missing" instead of "the install is
+  incomplete". Nothing resolving is not a crash — stdout stays byte-empty (it is the JSON-RPC
+  stream) and stderr names the one command that fixes it.
 - `plugin/skills/memory-first-workflow/SKILL.md` (T19-04) — a fifth adoption channel alongside
   `SERVER_INSTRUCTIONS` (D-041), the tool catalog (T19-01), and the recall trailer (T19-02): a
   compact routing table (built-in → local-rag tool → when) for all five read-heavy tools, reusing
@@ -458,30 +473,48 @@ reimplemented schema check:
   stays in the per-session skill listing so Claude can route to it without an explicit invocation,
   which is the entire point of this channel; the official quickstart's own canonical example
   defaults the *other* way (`disable-model-invocation: true`, user-invocable only), a deliberate
-  deviation here. Real `claude plugin details memory@memory` output confirms discovery:
-  `Skills (1)  memory-first-workflow`.
+  deviation here.
+
+Budgets, re-measured on what actually executes (T22-12/T22-13; the numbers this section used to
+carry were measured on the tiers ADR-0013 deleted, and are not comparable). The **hook path** is
+timed as the whole `hooks.json` command line — the `/bin/sh` fork, the resolver's walk, the `exec`
+and the native binary's own run — because spec 13 §1's "exec-fast (<50 ms cold)" is about the
+path, not the binary: p50 12.9 / p95 14.0 ms on a first-candidate hit, 14.0 / 15.9 ms when the
+binary sits in the last of the 24 directories this machine really has, 8.9 / 9.6 ms on a complete
+miss. The **MCP launcher** is structurally slower and always will be — `.mcp.json`'s `command` has
+no shell for `||` chaining, so Node startup is on every path and is the dominant cost, not a missed
+optimization; it is paid once per session, not once per hook event: p50 39.7 / p95 43.9 ms to a
+resolved server, 19.8 / 21.1 ms to report "not installed", against a p95 < 100 ms budget.
 
 Run the suite: `node --test plugin/test/*.test.js` (same explicit-glob reasoning as `npm/`'s own
-section above). Three tiers: pure JSON/logic checks (always run, including
-`mcp-launcher-tiers.test.js`'s fall-through-only assertions and `mcp-cold-start.test.js`'s
-synthetic-fixture budget check); real cargo-built-binary-backed end-to-end checks
-(`no-writes-in-sample-repo.test.js`, `cold-start.test.js` against `target/debug/local-rag-hook`;
-`mcp-launcher-tiers.test.js`'s real-subprocess tier tests and `mcp-cold-start.test.js`'s optional
-informational measurement against `target/debug/local-rag-proxy` — skip with a named reason if not
-built, `cargo build -p local-rag-hook -p local-rag-proxy`); real `claude` CLI checks
-(`manifest-validate.test.js`, `install-uninstall.test.js`, both gated on `claude` being on `PATH`).
-All `claude`-CLI-mutating round trips (`marketplace add`/`install`/`uninstall`/`details`) live in
-one file (`install-uninstall.test.js`) deliberately — Node's test runner parallelizes across files,
-and concurrent `claude` invocations against the same source repo path raced when split across
-files; tests within one file run sequentially by default, which avoids it. Every mutating round
-trip runs under an isolated `CLAUDE_CONFIG_DIR` (a real, respected env var — this project's own dev
-sessions run under one), the same isolation idiom `LOCAL_RAG_HOME` gives every Rust test here.
+section above) — **53 tests** across nine files, in three tiers:
 
-Windows: the `${CLAUDE_PLUGIN_DATA}` symlink cache, the hooks.json shell-form command, and the MCP
-launcher's real-subprocess tier tests are not verified on Windows in this task (current CI is
-Ubuntu-only; the platform matrix is T17-03) — the same named, scoped deferral pattern the daemon's
-own Windows named-pipe gap already used (group 16). The fallback path (`npx`) still runs correctly
-there; only the fast paths are unverified.
+- pure logic and manifest checks, always run: `hooks-list.test.js` (the shape of the seven
+  commands), `mcp-launcher-resolution.test.js`'s in-process half, `no-network.test.js`.
+- real cargo-built-binary-backed end-to-end checks: `no-writes-in-sample-repo.test.js` and
+  `cold-start.test.js` against `target/debug/local-rag-hook`, `mcp-cold-start.test.js` against
+  `target/debug/local-rag-proxy` — skipped with a named reason if not built
+  (`cargo build -p local-rag-hook -p local-rag-proxy`). `hook-resolution.test.js` needs no native
+  binary: it runs the seven real command lines under a poisoned environment.
+- real `claude` CLI checks: `manifest-validate.test.js`, `install-uninstall.test.js`, both gated on
+  `claude` being on `PATH`. All `claude`-mutating round trips (`marketplace add`/`install`/
+  `uninstall`/`details`) live in one file deliberately — Node's test runner parallelizes across
+  files, and concurrent `claude` invocations against the same source repo path raced when split
+  across files; tests within one file run sequentially by default. Every mutating round trip runs
+  under an isolated `CLAUDE_CONFIG_DIR` (a real, respected env var — this project's own dev
+  sessions run under one), the same isolation idiom `LOCAL_RAG_HOME` gives every Rust test here.
+
+"The plugin never downloads anything" is a test, not a comment (T22-14, `no-network.test.js`): both
+channels run with a `PATH` consisting solely of poisoned `npx`/`npm`/`pnpm`/`yarn`/`bunx`/`curl`/
+`wget`/`git` shims that record being called, and the marker must stay absent — plus the two shipped
+files are read and checked for an HTTP module or a `fetch`, because a `PATH` trap says nothing
+about a download that calls no external command.
+
+Windows: the shell resolver (`local-rag-resolve-hook.sh`) and the launcher's `.exe` branch are not
+verified on Windows in this task — current CI is Ubuntu-only, and the platform matrix is T22-17.
+The launcher's *list* is asserted for the win32 shape from a POSIX host (`candidateBinDirs` is a
+pure function that takes `platform`), so what is unverified is execution, not the rule. This is the
+same named, scoped deferral pattern the daemon's own Windows named-pipe gap already uses (group 16).
 
 ## Committing
 
