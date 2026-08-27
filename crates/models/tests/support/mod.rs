@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use local_rag_models::archive::ArchiveFormat;
+use local_rag_models::ort_catalog::OrtAsset;
 use local_rag_models::{AssetFetcher, AssetFile, FetchError, ModelCatalogEntry};
+use local_rag_test_support::TempHome;
 
 /// The fixture model's id — deliberately not the real one, so a test can never
 /// be confused with an installation of the shipped default.
@@ -44,7 +47,7 @@ pub const FIXTURE_FILES: &[(&str, &str, &[u8])] = &[
 /// tests need runtime values (a digest, a port). Leaking a handful of small
 /// strings per test process is the cheapest way to bridge that without making
 /// the production type generic over its lifetime.
-fn leak(s: String) -> &'static str {
+pub fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
@@ -285,5 +288,73 @@ impl<F: AssetFetcher> AssetFetcher for ObservingFetcher<F> {
         entries.sort();
         self.seen.lock().expect("snapshots mutex").push(entries);
         self.inner.fetch(url, sink)
+    }
+}
+
+/// A tar.gz holding one member, plus a decoy, built in memory.
+fn ort_fixture_archive(payload: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    fn header(name: &str, len: usize) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        h[100..107].copy_from_slice(b"0000644");
+        h[108..115].copy_from_slice(b"0000000");
+        h[116..123].copy_from_slice(b"0000000");
+        let size = format!("{len:011o} ");
+        h[124..124 + size.len()].copy_from_slice(size.as_bytes());
+        h[136..147].copy_from_slice(b"00000000000");
+        h[156] = b'0';
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        h[148..156].copy_from_slice(b"        ");
+        let sum: u32 = h.iter().map(|&b| b as u32).sum();
+        let chk = format!("{sum:06o}\0 ");
+        h[148..148 + chk.len()].copy_from_slice(chk.as_bytes());
+        h
+    }
+    let mut tar = Vec::new();
+    for (name, data) in [
+        ("ort/lib/decoy", b"nope".as_slice()),
+        ("ort/lib/thing", payload),
+    ] {
+        tar.extend_from_slice(&header(name, data.len()));
+        tar.extend_from_slice(data);
+        tar.extend(std::iter::repeat_n(0u8, (512 - data.len() % 512) % 512));
+    }
+    tar.extend(std::iter::repeat_n(0u8, 1024));
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    e.write_all(&tar).expect("gzip");
+    e.finish().expect("finish gzip")
+}
+
+fn ort_sha256(bytes: &[u8]) -> String {
+    local_rag_core::hash::sha256_hex(bytes)
+}
+
+pub struct OrtFixture {
+    pub asset: OrtAsset,
+    /// Directory a `LocalFetcher` serves the archive from.
+    pub served: std::path::PathBuf,
+}
+
+pub fn ort_fixture(home: &TempHome, payload: &[u8]) -> OrtFixture {
+    let archive = ort_fixture_archive(payload);
+    let served = home.join("served");
+    std::fs::create_dir_all(&served).expect("serve dir");
+    std::fs::write(served.join("ort-fixture.tgz"), &archive).expect("write archive");
+    OrtFixture {
+        asset: OrtAsset {
+            platform: "test-platform",
+            version: "9.9.9",
+            url: "https://example.invalid/ort-fixture.tgz",
+            archive_format: ArchiveFormat::TarGz,
+            archive_size: archive.len() as u64,
+            archive_sha256: leak(ort_sha256(&archive)),
+            archive_member: "ort/lib/thing",
+            dylib_name: "libonnxruntime.test",
+            dylib_size: payload.len() as u64,
+            dylib_sha256: leak(ort_sha256(payload)),
+        },
+        served,
     }
 }

@@ -35,6 +35,21 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = [
 ] }
 ndarray = "0.17"
 
+# The DEFLATE side of `.tar.gz`/`.zip`, for `src/archive.rs` (T22-15). ONNX
+# Runtime ships its library only inside its own release archives, so installing
+# it at first run means opening one — and `std` has no decompressor. The two
+# alternatives were both worse: `cargo xtask dist-ort` shells out to the system
+# `tar`, which is fine for a dev tool and forbidden here (spec 01 §1's "no
+# mandatory external daemon" stance, and `src/fetch.rs`'s own doc comment on why
+# product code does not shell out); and hand-writing an inflate implementation
+# is exactly the kind of code that fails silently on the archive nobody tested.
+# `rust_backend` is the load-bearing part of this line: it selects `miniz_oxide`,
+# pure Rust, so there is no C toolchain and no system zlib to bundle per
+# platform — the same reason ADR-0005 chose `rustls` over OpenSSL. The tar and
+# zip container walks are this crate's own; only the compressed stream is
+# `flate2`'s.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # The model's own tokenizer (`tokenizer.json` ships with the weights). Encoding
 # must match the training-time tokenizer byte for byte or the vectors are
 # meaningless; `std` obviously has no BPE/SentencePiece implementation, and this
@@ -66,3 +81,4 @@ tokio = { version = "1", default-features = false, features = [
 
 [lints]
 workspace = true
+

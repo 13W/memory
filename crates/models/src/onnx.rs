@@ -135,7 +135,12 @@ impl OnnxEmbedder {
     ) -> Result<Self, OnnxError> {
         let dir = local_rag_embed::require_model_assets(layout, entry.model_id)
             .map_err(OnnxError::Assets)?;
-        Self::open_dir(&dir, entry)
+        Self::open_dir_with_key(
+            &dir,
+            entry,
+            entry.representation_key(),
+            installed_ort(layout),
+        )
     }
 
     /// Open the provider against an already-resolved asset directory.
@@ -143,8 +148,11 @@ impl OnnxEmbedder {
     /// Split out so a caller that has already validated the directory (or a test
     /// working against a fixture) does not repeat the marker check; the
     /// marker-checking entry point is [`OnnxEmbedder::open`].
+    /// A caller with only a directory has no store to look in, so the
+    /// installed-runtime rung is simply absent here — the override and the
+    /// beside-the-executable rung still apply.
     pub fn open_dir(dir: &Path, entry: &ModelCatalogEntry) -> Result<Self, OnnxError> {
-        Self::open_dir_with_key(dir, entry, entry.representation_key())
+        Self::open_dir_with_key(dir, entry, entry.representation_key(), None)
     }
 
     /// Open the provider for `entry`'s `memory` representation (D-036) — same
@@ -158,7 +166,12 @@ impl OnnxEmbedder {
     ) -> Result<Self, OnnxError> {
         let dir = local_rag_embed::require_model_assets(layout, entry.model_id)
             .map_err(OnnxError::Assets)?;
-        Self::open_dir_with_key(&dir, entry, entry.memory_representation_key())
+        Self::open_dir_with_key(
+            &dir,
+            entry,
+            entry.memory_representation_key(),
+            installed_ort(layout),
+        )
     }
 
     /// Shared body of [`Self::open_dir`]/[`Self::open_for_memory`]: everything
@@ -167,6 +180,7 @@ impl OnnxEmbedder {
         dir: &Path,
         entry: &ModelCatalogEntry,
         key: RepresentationKey,
+        installed_runtime: Option<PathBuf>,
     ) -> Result<Self, OnnxError> {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| OnnxError::Tokenizer(e.to_string()))?;
@@ -184,7 +198,7 @@ impl OnnxEmbedder {
         // available, per `a_marked_directory_gets_past_the_gate_and_fails_
         // on_the_asset_itself` (`crates/models/tests/onnx.rs`) — the gate
         // this function passes through is the asset marker, not the runtime.
-        ensure_ort_initialized()?;
+        ensure_ort_initialized(installed_runtime.as_deref())?;
 
         let session = Session::builder()
             .and_then(|mut b| b.commit_from_file(dir.join(graph)))
@@ -315,14 +329,34 @@ fn ort_dylib_file_name() -> &'static str {
     }
 }
 
+/// The runtime this store has installed for this platform, if any (T22-15).
+///
+/// `None` covers three different situations on purpose, because the caller
+/// treats them identically: this build has no pinned runtime for its platform,
+/// the store has not installed one yet, or the file named by the catalog is not
+/// there. Each of them means "look at the next rung", and none of them is an
+/// error until every rung has been tried.
+fn installed_ort(layout: &local_rag_core::paths::StoreLayout) -> Option<PathBuf> {
+    let asset = crate::ort_catalog::for_current_platform()?;
+    let path = crate::install::ort_dylib_path(layout, asset);
+    path.is_file().then_some(path)
+}
+
 /// Locate an ONNX Runtime shared library bundled next to `exe` — the same
 /// flat, no-manifest convention `local-rag-proxy::connect::
 /// resolve_daemon_binary_path` uses to find its daemon (one npm platform
 /// package / `target/{debug,release}` directory, no separate lookup path).
 ///
 /// `None` when no such file sits beside `exe`: a dev build, `cargo test`, or
-/// a platform package that has not bundled a runtime. Callers treat that as
-/// "no bundled default", not an error — `ort`'s own resolution still applies.
+/// a `LOCAL_RAG_BIN_DIR` layout that carries only the executables. Callers
+/// treat that as "try the next rung", never as a licence to fall through to
+/// `ort`'s own implicit search — D-028 showed that search can hang the calling
+/// thread instead of erroring, and [`resolve_ort_source`] returns an error
+/// rather than reaching it.
+///
+/// Kept after T22-15 moved the runtime into the store: this rung is what still
+/// serves a `LOCAL_RAG_BIN_DIR` install and a checkout that has a library next
+/// to `target/release`.
 fn bundled_ort_dylib_path(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
     let candidate = dir.join(ort_dylib_file_name());
@@ -335,8 +369,12 @@ fn bundled_ort_dylib_path(exe: &Path) -> Option<PathBuf> {
 /// touching process environment state) and the running executable's own
 /// path.
 ///
-/// `Ok(path)` — `dylib_path_override` when set, else a runtime bundled next
-/// to `exe`. Either way the caller must go on to explicitly
+/// `Ok(path)` — `dylib_path_override` when set, else the runtime this store
+/// installed (T22-15), else one bundled next to `exe`. That is ADR-0013
+/// Decision 4's order verbatim, and the override stays first for the reason it
+/// always was: an operator pointing at a specific library must not be
+/// second-guessed by whatever a store happens to hold. Either way the caller
+/// must go on to explicitly
 /// `ort::init_from(path)` **itself**, rather than leaving `ORT_DYLIB_PATH`
 /// to `ort`'s own env-var-driven lazy pickup inside `Session::builder()`:
 /// that indirection means the *first* `ort` API touch in the process — and
@@ -351,14 +389,19 @@ fn bundled_ort_dylib_path(exe: &Path) -> Option<PathBuf> {
 /// second `OnnxError::Runtime(err.to_string())` would produce.
 fn resolve_ort_source(
     dylib_path_override: Option<&std::ffi::OsStr>,
+    installed: Option<&Path>,
     exe: &Path,
 ) -> Result<PathBuf, String> {
     if let Some(over) = dylib_path_override {
         return Ok(PathBuf::from(over));
     }
+    if let Some(installed) = installed {
+        return Ok(installed.to_path_buf());
+    }
     bundled_ort_dylib_path(exe).ok_or_else(|| {
         format!(
-            "no ONNX Runtime found: ORT_DYLIB_PATH is unset and no {} sits beside {}",
+            "no ONNX Runtime found: ORT_DYLIB_PATH is unset, none is installed in the store, \
+             and no {} sits beside {}",
             ort_dylib_file_name(),
             exe.display()
         )
@@ -413,7 +456,13 @@ const ORT_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// only ever spawns one such thread per process, via the `OnceLock`, so the
 /// worst case is one permanently-blocked thread for the life of the daemon,
 /// which is a bounded, known cost — not the unbounded hang this replaces.
-fn ensure_ort_initialized() -> Result<(), OnnxError> {
+///
+/// `installed` is this store's own copy, passed in rather than looked up here:
+/// the `OnceLock` means the *first* caller in a process decides for all of
+/// them, so which rungs were available has to be the caller's fact, not a
+/// global one. In the daemon every caller comes through
+/// [`OnnxEmbedder::open`]/[`OnnxEmbedder::open_for_memory`], which supply it.
+fn ensure_ort_initialized(installed: Option<&Path>) -> Result<(), OnnxError> {
     static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     INIT.get_or_init(|| {
         let dylib_path_override = std::env::var_os("ORT_DYLIB_PATH");
@@ -423,7 +472,7 @@ fn ensure_ort_initialized() -> Result<(), OnnxError> {
                  for a bundled ONNX Runtime: {e}"
             )
         })?;
-        let path = resolve_ort_source(dylib_path_override.as_deref(), &exe)?;
+        let path = resolve_ort_source(dylib_path_override.as_deref(), installed, &exe)?;
         init_ort_with_timeout(path)
     })
     .clone()
@@ -612,37 +661,98 @@ mod tests {
 
         let override_value = std::ffi::OsStr::new("/somewhere/else/libonnxruntime.dylib");
         assert_eq!(
-            resolve_ort_source(Some(override_value), &exe).expect("ok"),
+            resolve_ort_source(Some(override_value), None, &exe).expect("ok"),
             PathBuf::from("/somewhere/else/libonnxruntime.dylib")
         );
     }
 
     #[test]
-    fn no_override_falls_back_to_the_bundled_file_when_present() {
+    fn the_resolution_order_is_override_then_store_then_beside_the_exe() {
+        // ADR-0013 Decision 4 states the order; this walks every combination of
+        // the three rungs rather than the four the card named, because "which
+        // one wins" is only meaningful against what else was available. A pure
+        // function over paths that need not exist: `resolve_ort_source` decides
+        // *which* library to load, and whether it loads is `ort`'s problem.
         let home = TempHome::new().expect("temp home");
         let exe = home.join("local-rag");
         std::fs::write(&exe, b"not a real binary").expect("write fake exe");
-        let dylib = home.join(ort_dylib_file_name());
-        std::fs::write(&dylib, b"bundled").expect("write bundled");
+        let beside = home.join(ort_dylib_file_name());
+        let installed = home.join("store").join(ort_dylib_file_name());
+        let override_path = PathBuf::from("/somewhere/else/libonnxruntime.dylib");
+        let override_os = std::ffi::OsStr::new("/somewhere/else/libonnxruntime.dylib");
 
-        assert_eq!(resolve_ort_source(None, &exe).expect("ok"), dylib);
+        for &has_beside in &[false, true] {
+            if has_beside {
+                std::fs::write(&beside, b"bundled").expect("write bundled");
+            } else {
+                let _ = std::fs::remove_file(&beside);
+            }
+            for &has_installed in &[false, true] {
+                let installed_arg = has_installed.then_some(installed.as_path());
+                for &has_override in &[false, true] {
+                    let override_arg = has_override.then_some(override_os);
+                    let got = resolve_ort_source(override_arg, installed_arg, &exe);
+                    let expected = if has_override {
+                        Some(override_path.clone())
+                    } else if has_installed {
+                        Some(installed.clone())
+                    } else if has_beside {
+                        Some(beside.clone())
+                    } else {
+                        None
+                    };
+                    match expected {
+                        Some(want) => assert_eq!(
+                            got.as_ref().expect("a rung should have matched"),
+                            &want,
+                            "override={has_override} installed={has_installed} beside={has_beside}"
+                        ),
+                        None => assert!(
+                            got.is_err(),
+                            "nothing available must be an error, not {got:?}"
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn neither_an_override_nor_a_bundled_file_is_a_typed_error_not_a_hang() {
+    fn an_override_is_never_second_guessed_by_a_store_that_has_one() {
+        // Split out of the table above because it is the one case where the
+        // winning rung points at a file that does not exist while a losing rung
+        // points at one that does. An operator naming a library must get that
+        // library, and the failure must come from the loader — a silent fall
+        // through to the store's copy would load something they did not ask for.
+        let home = TempHome::new().expect("temp home");
+        let exe = home.join("local-rag");
+        std::fs::write(&exe, b"not a real binary").expect("write fake exe");
+        let installed = home.join(ort_dylib_file_name());
+        std::fs::write(&installed, b"installed").expect("write installed");
+
+        let over = std::ffi::OsStr::new("/nowhere/at/all/libonnxruntime.dylib");
+        assert_eq!(
+            resolve_ort_source(Some(over), Some(&installed), &exe).expect("ok"),
+            PathBuf::from("/nowhere/at/all/libonnxruntime.dylib")
+        );
+    }
+
+    #[test]
+    fn nothing_anywhere_is_a_typed_error_not_a_hang() {
         // The regression this guards: `ort` 2.0.0-rc.12 deadlocks trying to
         // construct its own "library not found" error when `Session::
         // builder()` runs without anything ever having been initialized
         // first (see this function's doc comment for how that was
         // confirmed). `open_dir` must never reach `Session::builder()` in
         // this case — it must fail here, synchronously, with a message that
-        // names what was missing.
+        // names every rung that was tried.
         let home = TempHome::new().expect("temp home");
         let exe = home.join("local-rag");
         std::fs::write(&exe, b"not a real binary").expect("write fake exe");
 
-        let message = resolve_ort_source(None, &exe).expect_err("nothing to find");
+        let message = resolve_ort_source(None, None, &exe).expect_err("nothing to find");
         assert!(message.contains("ORT_DYLIB_PATH"), "{message}");
+        assert!(message.contains("installed in the store"), "{message}");
         assert!(message.contains(ort_dylib_file_name()), "{message}");
     }
 

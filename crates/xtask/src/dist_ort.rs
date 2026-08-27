@@ -1,109 +1,34 @@
 //! `cargo xtask dist-ort` — fetches and verifies the ONNX Runtime shared
-//! library each platform package bundles (spec 10 §1's runtime requirement,
-//! ADR-0005's `ort`/`load-dynamic` choice, `crates/models/src/onnx.rs`'s
-//! `bundled_ort_dylib_path`) — T17-03.
+//! library for one platform into a caller-chosen directory.
 //!
-//! Pinned URL + SHA-256 per platform, the same verify-before-trust shape
-//! `crates/models::install` uses for model weights, but scoped to a build/
-//! release tool rather than a user-facing runtime command: this never runs as
-//! part of `cargo xtask ci` (it needs the network, like `bench`/
-//! `memory-bench`) and it writes into a caller-chosen output directory, not a
-//! `StoreLayout`. Archive extraction shells out to the system `tar` — a
-//! dependency this module's own network fetch deliberately avoids in product
-//! code (see `crates/models/src/fetch.rs`'s doc comment), but reasonable here:
-//! this is a manually invoked, already-network-touching dev tool, not
-//! something `cargo xtask ci` must run offline.
+//! # What moved out of this file in T22-15
 //!
-//! `win32-x64`/`win32-arm64` are not in [`ORT_ASSETS`]: `cargo-zigbuild` does
-//! not support Windows targets at all, so this machine has no reachable
-//! Windows build to bundle a runtime into. Tracked as a `blocked` deviation in
-//! `PROGRESS.md`, not a silent gap.
+//! The pinned catalog (`OrtAsset`/`ORT_ASSETS`) now lives in
+//! [`local_rag_models::ort_catalog`], because ADR-0013 made the runtime an
+//! artifact of first run: the *product* needs the pins, and `xtask` already
+//! depends on that crate, so the table could only move in that direction. This
+//! file reads it from there and defines none of its own.
+//!
+//! Extraction moved with it. This module used to shell out to the system `tar`,
+//! with a doc comment arguing that was reasonable for a manually invoked dev
+//! tool even though product code may not do it. That argument is now moot:
+//! `local_rag_models::archive` exists because the installer needed it, it
+//! handles the `.zip` the newly pinned `win32-x64` asset ships in (which `tar
+//! -xzf` would not have), and running the same reader here means the release
+//! tool and the runtime cannot disagree about what "the member" is.
+//!
+//! What has not changed: this never runs as part of `cargo xtask ci` (it needs
+//! the network, like `bench`/`memory-bench`), and it writes into a
+//! caller-chosen output directory, not a `StoreLayout`.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
+use local_rag_models::archive::{ArchiveError, Limits as ArchiveLimits, extract_member};
+use local_rag_models::ort_catalog::{ORT_ASSETS, OrtAsset, find};
 use local_rag_models::{AssetFetcher, FetchError, HttpFetcher};
-
-/// One platform's pinned ONNX Runtime release archive.
-pub struct OrtAsset {
-    /// The npm platform-package key this bundles into (`platform.js`'s own
-    /// naming convention, e.g. `darwin-arm64`).
-    pub platform: &'static str,
-    /// The upstream ONNX Runtime release tag this asset was fetched from.
-    pub version: &'static str,
-    /// The exact release-asset download URL.
-    pub url: &'static str,
-    /// The archive's pinned SHA-256 — the security-critical check here,
-    /// `crates/models::install`'s digest-pin idiom applied to a build tool
-    /// instead of a runtime one.
-    pub archive_sha256: &'static str,
-    /// Path, inside the extracted archive, to the *real* (non-symlink)
-    /// shared-library file.
-    ///
-    /// ONNX Runtime's own release layout ships the fully versioned file name
-    /// (`libonnxruntime.<version>.dylib`/`.so.<version>`) as a regular file
-    /// and the unversioned name as a symlink to it — confirmed by inspecting
-    /// all four archives below, where the unversioned entry is a symlink in
-    /// three of the four and, in the fourth, a byte-identical duplicate
-    /// (`tar -tvzf`, not documented upstream behavior either way). Always
-    /// targeting the versioned member means bundling never depends on `tar`
-    /// preserving a symlink, and the platform package ships exactly one file.
-    pub archive_member: &'static str,
-    /// The flat file name `bundled_ort_dylib_path` (`crates/models/src/
-    /// onnx.rs`) looks for next to a product binary.
-    pub dylib_name: &'static str,
-}
-
-/// The four platforms this machine can reach (spec 13 §1's tooling list; see
-/// the module doc comment for why Windows is absent).
-///
-/// `darwin-x64` deliberately pins an older release than the other three:
-/// ONNX Runtime dropped prebuilt Intel-Mac binaries as of v1.27.0, and
-/// v1.20.0 is the newest tag that still ships `onnxruntime-osx-x86_64-*`.
-/// `crates/models`'s own G11 evidence already validated v1.27.0 end to end on
-/// the other three platforms, so this is the one platform where the pinned
-/// version differs from what production inference was measured against.
-pub const ORT_ASSETS: &[OrtAsset] = &[
-    OrtAsset {
-        platform: "darwin-arm64",
-        version: "1.27.0",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz",
-        archive_sha256: "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a",
-        archive_member: "onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime.1.27.0.dylib",
-        dylib_name: "libonnxruntime.dylib",
-    },
-    OrtAsset {
-        platform: "darwin-x64",
-        version: "1.20.0",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.20.0/onnxruntime-osx-x86_64-1.20.0.tgz",
-        archive_sha256: "d28e603b47b74050f2c30a7069bf3fb371cfba7205d7771f22cabc7b02953757",
-        archive_member: "onnxruntime-osx-x86_64-1.20.0/lib/libonnxruntime.1.20.0.dylib",
-        dylib_name: "libonnxruntime.dylib",
-    },
-    OrtAsset {
-        platform: "linux-x64",
-        version: "1.27.0",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz",
-        archive_sha256: "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f",
-        archive_member: "onnxruntime-linux-x64-1.27.0/lib/libonnxruntime.so.1.27.0",
-        dylib_name: "libonnxruntime.so",
-    },
-    OrtAsset {
-        platform: "linux-arm64",
-        version: "1.27.0",
-        url: "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-aarch64-1.27.0.tgz",
-        archive_sha256: "3e4d83ac06924a32a07b6d7f91ce6f852876153fc0bbdf931bf517a140bfbe48",
-        archive_member: "onnxruntime-linux-aarch64-1.27.0/lib/libonnxruntime.so.1.27.0",
-        dylib_name: "libonnxruntime.so",
-    },
-];
-
-/// Find a catalog entry by its platform key.
-pub fn find(platform: &str) -> Option<&'static OrtAsset> {
-    ORT_ASSETS.iter().find(|a| a.platform == platform)
-}
 
 /// Why `dist-ort` could not bundle a runtime.
 #[derive(Debug)]
@@ -114,7 +39,9 @@ pub enum DistOrtError {
     Fetch(FetchError),
     /// The downloaded archive's SHA-256 does not match the pinned digest.
     ChecksumMismatch { expected: String, actual: String },
-    /// A filesystem or `tar` operation failed.
+    /// Reading the member out of the archive failed.
+    Archive(ArchiveError),
+    /// A filesystem operation failed.
     Io(String),
 }
 
@@ -129,10 +56,18 @@ impl std::fmt::Display for DistOrtError {
             DistOrtError::ChecksumMismatch { expected, actual } => write!(
                 f,
                 "archive checksum mismatch: expected {expected}, got {actual} \
-                 (the pinned digest in dist_ort.rs no longer matches the release asset)"
+                 (the pinned digest in local_rag_models::ort_catalog no longer matches \
+                 the release asset)"
             ),
+            DistOrtError::Archive(e) => write!(f, "{e}"),
             DistOrtError::Io(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl From<ArchiveError> for DistOrtError {
+    fn from(e: ArchiveError) -> Self {
+        DistOrtError::Archive(e)
     }
 }
 
@@ -181,34 +116,22 @@ pub fn bundle(
     };
     drop(bytes);
 
-    let extract_dir = out_dir.join(".extract").join(asset.platform);
-    if extract_dir.is_dir() {
-        fs::remove_dir_all(&extract_dir)?;
-    }
-    fs::create_dir_all(&extract_dir)?;
-
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(&extract_dir)
-        .arg(asset.archive_member)
-        .status()
-        .map_err(|e| DistOrtError::Io(format!("spawning tar failed: {e}")))?;
-    if !status.success() {
-        return Err(DistOrtError::Io(format!(
-            "tar -xzf {} -C {} {} exited with {status}",
-            archive_path.display(),
-            extract_dir.display(),
-            asset.archive_member
-        )));
-    }
-
-    let extracted = extract_dir.join(asset.archive_member);
     let dest = out_dir.join(asset.dylib_name);
-    fs::copy(&extracted, &dest)?;
-    fs::remove_dir_all(out_dir.join(".extract"))?;
+    let part = dest.with_extension("part");
+    {
+        let mut sink = File::create(&part)?;
+        extract_member(
+            &archive_path,
+            asset.archive_format,
+            asset.archive_member,
+            &mut sink,
+            &ArchiveLimits::default(),
+        )?;
+    }
+    fs::rename(&part, &dest)?;
 
+    // 0755 here, unlike the installer's 0600: this writes a directory a release
+    // process hands on, not a per-user store the spec locks down (12 §6).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -286,84 +209,12 @@ pub fn run() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use local_rag_models::archive::ArchiveFormat;
 
-    #[test]
-    fn every_reachable_platform_is_cataloged_exactly_once() {
-        let mut seen = std::collections::HashSet::new();
-        for asset in ORT_ASSETS {
-            assert!(
-                seen.insert(asset.platform),
-                "duplicate platform key: {}",
-                asset.platform
-            );
-        }
-        assert_eq!(
-            seen,
-            std::collections::HashSet::from([
-                "darwin-arm64",
-                "darwin-x64",
-                "linux-x64",
-                "linux-arm64",
-            ]),
-            "win32-x64/win32-arm64 are deliberately absent — see the module doc comment"
-        );
-    }
-
-    #[test]
-    fn every_pinned_digest_is_a_64_character_hex_string() {
-        for asset in ORT_ASSETS {
-            assert_eq!(
-                asset.archive_sha256.len(),
-                64,
-                "{}: not a sha256 hex digest",
-                asset.platform
-            );
-            assert!(
-                asset.archive_sha256.chars().all(|c| c.is_ascii_hexdigit()),
-                "{}: not a sha256 hex digest",
-                asset.platform
-            );
-        }
-    }
-
-    #[test]
-    fn every_archive_member_path_is_rooted_inside_its_own_release_directory() {
-        // Guards against a copy/paste slip pointing one platform at another
-        // platform's extracted directory name.
-        for asset in ORT_ASSETS {
-            let archive_stem = asset
-                .url
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .trim_end_matches(".tgz");
-            assert!(
-                asset.archive_member.starts_with(archive_stem),
-                "{}: archive_member {:?} is not rooted at {:?}",
-                asset.platform,
-                asset.archive_member,
-                archive_stem
-            );
-        }
-    }
-
-    #[test]
-    fn darwin_dylib_names_are_dylib_and_linux_are_so() {
-        for asset in ORT_ASSETS {
-            let expected = if asset.platform.starts_with("darwin") {
-                "libonnxruntime.dylib"
-            } else {
-                "libonnxruntime.so"
-            };
-            assert_eq!(asset.dylib_name, expected, "{}", asset.platform);
-        }
-    }
-
-    #[test]
-    fn find_resolves_known_platforms_and_rejects_unknown_ones() {
-        assert!(find("darwin-arm64").is_some());
-        assert!(find("win32-x64").is_none());
-    }
+    // The catalog's own shape — one entry per platform, digest form, member
+    // paths, library names — is asserted where the catalog now lives
+    // (`local_rag_models::ort_catalog`, T22-15). What is left here is this
+    // tool's own behaviour: fetching, verifying and extracting one asset.
 
     #[test]
     fn an_unknown_platform_error_names_it_and_lists_the_known_ones() {
@@ -447,52 +298,66 @@ mod tests {
         assert_eq!(fs::read(&dest).expect("read"), member_bytes);
     }
 
-    /// Builds a real `.tgz` (by shelling out to the same `tar` `bundle` itself
-    /// extracts with) containing exactly one file at `member_path`, and serves
-    /// those archive bytes in place of the network — so `bundle`'s real
-    /// tar-extraction and digest-check logic run for real without touching
-    /// github.com. [`FixtureFetcher::asset`] returns a throwaway [`OrtAsset`]
-    /// whose `archive_sha256` is the *fixture's own* digest, not any of
+    /// Builds a real `.tgz` in memory containing exactly one file at
+    /// `member_path`, and serves those archive bytes in place of the network —
+    /// so `bundle`'s real extraction and digest-check logic run without
+    /// touching github.com. [`FixtureFetcher::asset`] returns a throwaway
+    /// [`OrtAsset`] whose digests are the *fixture's own*, not any of
     /// [`ORT_ASSETS`]'s pinned ones — those name real upstream bytes this
     /// fixture never reproduces.
+    ///
+    /// It used to shell out to `tar -czf`, on the argument that it should build
+    /// its fixture with the same tool `bundle` extracted with. T22-15 removed
+    /// that tool from `bundle`, so the argument went with it; building the
+    /// bytes here also means this test no longer depends on which `tar` the
+    /// host has.
     struct FixtureFetcher {
         archive_bytes: Vec<u8>,
         archive_sha256: String,
         member_path: &'static str,
+        dylib_sha256: String,
+        dylib_size: u64,
     }
 
     impl FixtureFetcher {
         fn new(
-            home: &local_rag_test_support::home::TempHome,
+            _home: &local_rag_test_support::home::TempHome,
             member_path: &'static str,
             contents: &[u8],
         ) -> Self {
-            let staging = home.join("fixture-staging");
-            let member_file = staging.join(member_path);
-            fs::create_dir_all(member_file.parent().expect("member has a parent"))
-                .expect("mkdir staging");
-            fs::write(&member_file, contents).expect("write fixture member");
+            let mut header = [0u8; 512];
+            header[..member_path.len()].copy_from_slice(member_path.as_bytes());
+            header[100..107].copy_from_slice(b"0000644");
+            header[108..115].copy_from_slice(b"0000000");
+            header[116..123].copy_from_slice(b"0000000");
+            let size = format!("{:011o} ", contents.len());
+            header[124..124 + size.len()].copy_from_slice(size.as_bytes());
+            header[136..147].copy_from_slice(b"00000000000");
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            header[148..156].copy_from_slice(b"        ");
+            let sum: u32 = header.iter().map(|&b| b as u32).sum();
+            let chk = format!("{sum:06o}\0 ");
+            header[148..148 + chk.len()].copy_from_slice(chk.as_bytes());
 
-            let archive_path = home.join("fixture-source.tgz");
-            let status = Command::new("tar")
-                .arg("-czf")
-                .arg(&archive_path)
-                .arg("-C")
-                .arg(&staging)
-                .arg(member_path)
-                .status()
-                .expect("spawn tar -czf to build the test fixture");
-            assert!(
-                status.success(),
-                "tar -czf failed while building the fixture"
-            );
+            let mut tar = Vec::new();
+            tar.extend_from_slice(&header);
+            tar.extend_from_slice(contents);
+            tar.extend(std::iter::repeat_n(0u8, (512 - contents.len() % 512) % 512));
+            tar.extend(std::iter::repeat_n(0u8, 1024));
 
-            let archive_bytes = fs::read(&archive_path).expect("read built fixture archive");
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&tar).expect("gzip the fixture");
+            let archive_bytes = encoder.finish().expect("finish gzip");
             let archive_sha256 = local_rag_core::hash::sha256_hex(&archive_bytes);
             FixtureFetcher {
                 archive_bytes,
                 archive_sha256,
                 member_path,
+                dylib_sha256: local_rag_core::hash::sha256_hex(contents),
+                dylib_size: contents.len() as u64,
             }
         }
 
@@ -501,9 +366,13 @@ mod tests {
                 platform: "darwin-arm64",
                 version: "0.0.0-fixture",
                 url: "https://example.invalid/fixture-source.tgz",
+                archive_format: ArchiveFormat::TarGz,
+                archive_size: self.archive_bytes.len() as u64,
                 archive_sha256: self.archive_sha256.clone().leak(),
                 archive_member: self.member_path,
                 dylib_name: "libonnxruntime.dylib",
+                dylib_size: self.dylib_size,
+                dylib_sha256: self.dylib_sha256.clone().leak(),
             }
         }
     }
