@@ -167,6 +167,30 @@ fn ready_embedder_provider() -> Arc<LazyEmbedderProvider> {
     ))
 }
 
+/// How long one managed worktree may take to reach an active generation, and
+/// why this is a constant rather than a number repeated five times (D-111).
+///
+/// MEASURED, not chosen: a single worktree converges in ~41 s on this machine
+/// — daemon start dominates, not the indexing itself — so 45 s left four
+/// seconds of headroom, and the one wait that asks for **two** worktrees
+/// (`shutdown_leaves_no_dangling_task_and_no_orphaned_building_generation`)
+/// spent ~40 s and failed on the deadline rather than on its assertion.
+/// Re-run with a wider bound it passes in 40.4 s, which is the whole finding:
+/// the budget had not been scaled to what the wait actually waits for.
+///
+/// The sibling module states the same principle for its own fixtures
+/// (`daemon::indexing::worktree_task`'s `SUITE_STARVATION_BUDGET`, "five times
+/// the measured worst case"): the bound exists so a genuine hang fails loudly,
+/// not to assert speed. What these tests assert is a *value* — that a
+/// generation became active at all — so the bound should be generous and the
+/// assertion sharp, never the other way round.
+const CONVERGE_ONE: Duration = Duration::from_secs(120);
+
+/// Two worktrees share one daemon and one store writer, so the wait for both
+/// is not the wait for one. Scaled rather than reused — reusing it is exactly
+/// what made this test the only red one in the suite.
+const CONVERGE_TWO: Duration = Duration::from_secs(240);
+
 /// Bounded, event-driven wait — mirrors
 /// `daemon::indexing::worktree_task`'s own tests' `wait_for`: a real but tiny
 /// poll interval (this crate carries no `tokio` `test-util`, so there is no
@@ -218,7 +242,7 @@ async fn a_managed_worktree_is_indexed_at_startup_and_survives_a_daemon_restart(
     let handle = DaemonHandle::start(opts).await.expect("start");
 
     let state = StateDb::open(layout.state_db()).expect("reopen state.sqlite for polling");
-    wait_for(Duration::from_secs(45), || {
+    wait_for(CONVERGE_ONE, || {
         active_generation(&state, &worktree_id).is_some()
     })
     .await;
@@ -246,7 +270,15 @@ async fn a_managed_worktree_is_indexed_at_startup_and_survives_a_daemon_restart(
     // trigger tries again on its own", `worktree_task.rs::project_one`'s own
     // doc) — so this loop keeps supplying one.
     let mut attempt = 0u32;
-    tokio::time::timeout(Duration::from_secs(60), async {
+    // `CONVERGE_ONE`, not a bound of its own (D-111): this waits for a
+    // *restarted* daemon to produce a generation, so it pays a second
+    // daemon start on top of the convergence the constant is derived from —
+    // strictly more than the waits above, and it was given less (60 s). It
+    // is the third under-budgeted bound in this file and the second to go
+    // red; the first two were `wait_for` calls, this one is a bare
+    // `timeout` with its own message, which is why the first sweep missed
+    // it. The observed failure took 77.57 s.
+    tokio::time::timeout(CONVERGE_ONE, async {
         loop {
             attempt += 1;
             std::fs::write(
@@ -288,7 +320,7 @@ async fn a_disabled_managed_worktree_is_never_started() {
     let handle = DaemonHandle::start(opts).await.expect("start");
 
     let state = StateDb::open(layout.state_db()).expect("reopen state.sqlite for polling");
-    wait_for(Duration::from_secs(45), || {
+    wait_for(CONVERGE_ONE, || {
         active_generation(&state, &enabled_id).is_some()
     })
     .await;
@@ -323,7 +355,7 @@ async fn reload_starts_and_stops_exactly_the_delta() {
     let handle = DaemonHandle::start(opts).await.expect("start");
 
     let state = StateDb::open(layout.state_db()).expect("reopen state.sqlite for polling");
-    wait_for(Duration::from_secs(45), || {
+    wait_for(CONVERGE_ONE, || {
         active_generation(&state, &first_id).is_some()
     })
     .await;
@@ -365,7 +397,7 @@ async fn reload_starts_and_stops_exactly_the_delta() {
     assert_eq!(outcome.stopped, 1, "exactly the newly-disabled row stops");
 
     // The started delta really runs...
-    wait_for(Duration::from_secs(45), || {
+    wait_for(CONVERGE_ONE, || {
         active_generation(&state, &second_id).is_some()
     })
     .await;
@@ -407,7 +439,7 @@ async fn shutdown_leaves_no_dangling_task_and_no_orphaned_building_generation() 
     let jobs = handle.jobs.clone();
 
     let state = StateDb::open(layout.state_db()).expect("reopen state.sqlite for polling");
-    wait_for(Duration::from_secs(45), || {
+    wait_for(CONVERGE_TWO, || {
         active_generation(&state, &id_a).is_some() && active_generation(&state, &id_b).is_some()
     })
     .await;
