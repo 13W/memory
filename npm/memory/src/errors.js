@@ -62,14 +62,35 @@ function formatChecksumMismatchError({ asset, expected, actual }) {
  * @param {{binary: string, tag: string, key: string}} o
  * @returns {string}
  */
-function formatAssetAbsentError({ binary, tag, key }) {
-  return (
-    `local-rag: release ${tag} ships no ${binary} for ${key}.\n` +
-    "The other binaries installed normally; this one is unavailable in that\n" +
-    "release rather than broken here.\n" +
-    "Fix:\n" +
-    "  npm install --global @13w/memory@latest"
-  );
+function formatAssetAbsentError({ binary, tag, key, othersInstalled = true }) {
+  // The two callers of this reach it in opposite states, and the middle
+  // sentence is the difference (T22-17, found by running the installer against
+  // the real release rather than a fixture).
+  //
+  // `locate.js` only ever gets here for an **optional** binary — its own
+  // comment says so, the required set having been checked when the directory
+  // was chosen — so the rest of the install really is there, and telling the
+  // user otherwise would send them to reinstall something that is fine.
+  //
+  // `install.js` only ever gets here for a **required** one, and every failure
+  // path there removes the whole scratch directory, so nothing is installed.
+  // The default stays `true` because that is the older caller's meaning and
+  // the shape its test already pins.
+  const middle = othersInstalled
+    ? "The other binaries installed normally; this one is unavailable in that\n" +
+      "release rather than broken here.\n"
+    : "Nothing was installed: this binary is required, so the install stopped\n" +
+      "and left the directory as it found it.\n";
+  // And the way out differs too. When the rest is installed, picking up a newer
+  // package is the whole fix. When a *required* binary is missing from the
+  // release, reinstalling the package changes nothing — it would resolve the
+  // same release — so the honest advice is the offline route, or a release that
+  // carries it.
+  const fix = othersInstalled
+    ? "Fix:\n  npm install --global @13w/memory@latest"
+    : `Fix: use a release that carries ${binary}, or install offline:\n` +
+      "  LOCAL_RAG_BIN_DIR=/path/to/prebuilt/binaries";
+  return `local-rag: release ${tag} ships no ${binary} for ${key}.\n` + middle + fix;
 }
 
 /**

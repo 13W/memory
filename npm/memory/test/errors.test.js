@@ -92,6 +92,43 @@ for (const [name, msg, expectations] of ADR_0013_MESSAGES) {
   });
 }
 
+test("the asset-absent message tells the truth about what is on disk (T22-17)", () => {
+  // Found by running the installer against the real release, not by reading the
+  // code: `latest` still resolves to tag 0.0.0, which predates T22-07's move to
+  // `.tar.gz`, so every required binary is "absent" there. The message printed
+  // said "The other binaries installed normally" while the directory held
+  // nothing but `.local-rag-install.error` — false in the only case it is ever
+  // shown, because `install.js` removes the whole scratch directory on failure.
+  const required = formatAssetAbsentError({
+    binary: "local-rag",
+    tag: "0.0.0",
+    key: "darwin-arm64",
+    othersInstalled: false,
+  });
+  assert.match(required, /Nothing was installed/);
+  assert.doesNotMatch(required, /other binaries installed normally/);
+  // Reinstalling the package would resolve the same release, so advising it
+  // here would be advice that cannot work.
+  assert.doesNotMatch(required, /npm install --global @13w\/memory@latest/);
+  assert.match(required, /LOCAL_RAG_BIN_DIR/);
+
+  // `locate.js` reaches this only for an OPTIONAL binary, with the rest of the
+  // install genuinely present — there the original sentence is true, and the
+  // default keeps it.
+  const optional = formatAssetAbsentError({
+    binary: "local-rag-tui",
+    tag: "0.0.0",
+    key: "linux-x64",
+  });
+  assert.match(optional, /other binaries installed normally/);
+  assert.match(optional, /npm install --global @13w\/memory@latest/);
+
+  for (const msg of [required, optional]) {
+    assert.ok(msg.startsWith("local-rag: "), msg);
+    assert.equal(msg, msg.trimEnd(), msg);
+  }
+});
+
 test("every ADR-0013 message keeps the local-rag: prefix and no trailing whitespace", () => {
   for (const [name, msg] of ADR_0013_MESSAGES) {
     assert.ok(msg.startsWith("local-rag: "), `${name} must carry the tool prefix`);

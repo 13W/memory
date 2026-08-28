@@ -33,6 +33,35 @@ emits (11 §7); tag `0.0.0` predates that crate and carries only three. Delibera
 here: how a client finds the binary, what it trusts, and what triggers an upgrade — §2 and §4,
 amended separately.
 
+As-built note (T22-17, `[SPEC]`, [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)).
+**The asset-name contract**, stated here because it lived only in code and tests: for each binary
+and target, `cargo-dist` publishes `<binary>-<target-triple>.<ext>` where `<ext>` is `.tar.gz` on
+every target but Windows and `.zip` on Windows (`dist-workspace.toml`'s `unix-archive`/
+`windows-archive`, T22-07), each archive carrying exactly one member — the executable itself,
+`auto-includes = false` — and each accompanied by a `<asset>.sha256` sidecar in coreutils form
+(`<64 lowercase hex> *<asset name>`, trailing blank line included: read off the real release, not
+assumed). A `dist-manifest.json` and a `sha256.sum` sit alongside. `latest` resolves through a
+redirect whose `Location` names the concrete tag, which is what makes an unpinned install
+reproducible after the fact (§2, 12 §1).
+
+Producer and consumer are held together by tests rather than by this paragraph, in both of the
+places they can drift. The target triples: `npm/memory/test/platform.test.js` reads
+`dist-workspace.toml`'s `targets` and requires set equality with `TARGET_TRIPLES`. The binaries:
+`npm/memory/test/release-urls.test.js` reads every `crates/*/Cargo.toml`, collects those carrying
+`[package.metadata.dist] dist = true`, and requires set equality with `PRODUCT_BINARIES` — the
+switch is that metadata and **not** `publish`, since every crate here is `publish = false` and
+`xtask` is excluded precisely by having no such section. The archive extensions have their own
+test in the same file. `local-rag-tui` is `required: false` in that list, which is what lets an
+install succeed against a tag cut before the crate existed; `install.js` records the absence
+instead of failing.
+
+Attestation (T22-17): the release now emits GitHub artifact attestations
+(`github-attestations = true`, which regenerates `release.yml` with `attestations: write`,
+`id-token: write` and an `actions/attest` step). ADR-0013 describes them as "verified in addition
+to the digest"; the **installer does not verify them** — `D-110` — because doing so would require
+`gh` or a sigstore library inside a package whose whole stance is Node built-ins only. A reader can
+verify one by hand with `gh attestation verify`, which `cargo-dist` documents in the release body.
+
 As-built note (T17-03, `[SPEC]`). The npm scope stays `@13w`, but the launcher and platform
 package **names** are `@13w/memory` / `@13w/memory-{darwin-arm64,darwin-x64,linux-x64,
 linux-arm64,win32-x64}` — an owner decision made when `cargo dist generate` needed a real
