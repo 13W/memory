@@ -313,7 +313,16 @@ async function installOne(binary, ctx) {
       }
       throw new InstallError(
         "asset-absent",
-        formatAssetAbsentError({ binary: binary.name, tag: ctx.tag, key: ctx.key }),
+        // `othersInstalled: false` — this path is required-only, and the
+        // failure handler removes the whole scratch directory, so the default
+        // wording ("the other binaries installed normally") would be false in
+        // the one situation it is ever printed.
+        formatAssetAbsentError({
+          binary: binary.name,
+          tag: ctx.tag,
+          key: ctx.key,
+          othersInstalled: false,
+        }),
         { binary: binary.name, asset },
       );
     }

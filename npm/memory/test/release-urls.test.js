@@ -11,6 +11,7 @@ const assert = require("node:assert/strict");
 const { SUPPORTED_PLATFORMS } = require("../src/platform.js");
 const {
   DEFAULT_RELEASE_BASE_URL,
+  PRODUCT_BINARIES,
   releaseBaseUrl,
   assetName,
   sidecarName,
@@ -181,6 +182,58 @@ test("an empty or non-text sidecar is rejected", () => {
   assert.throws(() => parseSha256Sidecar("", REAL_ASSET), /is empty/);
   assert.throws(() => parseSha256Sidecar("\n\n  \n", REAL_ASSET), /is empty/);
   assert.throws(() => parseSha256Sidecar(null, REAL_ASSET), /was not text/);
+});
+
+/**
+ * Every crate `cargo-dist` would ship, read out of the workspace instead of
+ * retyped. A crate is shipped when it carries `[package.metadata.dist]` with
+ * `dist = true` — that, and not `publish`, is the switch here: every crate in
+ * this workspace is `publish = false` (the root's `[workspace.package]`), so
+ * `publish` says nothing about the release, and `xtask` is excluded precisely
+ * because it has no such section.
+ */
+function distShippedCrates() {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const cratesDir = path.join(__dirname, "..", "..", "..", "crates");
+  const shipped = [];
+  for (const entry of fs.readdirSync(cratesDir)) {
+    const manifest = path.join(cratesDir, entry, "Cargo.toml");
+    if (!fs.existsSync(manifest)) continue;
+    const toml = fs.readFileSync(manifest, "utf8");
+    const section = /\[package\.metadata\.dist\]([\s\S]*?)(?=\n\[|$)/.exec(toml);
+    if (section === null || !/^\s*dist\s*=\s*true\s*$/m.test(section[1])) continue;
+    const name = /^\s*name\s*=\s*"([^"]+)"/m.exec(toml);
+    assert.ok(name, `${entry}/Cargo.toml must declare a package name`);
+    shipped.push(name[1]);
+  }
+  return shipped;
+}
+
+test("PRODUCT_BINARIES is exactly what cargo-dist would ship (T22-17)", () => {
+  // The other half of "the release produces exactly what the installer
+  // consumes". `platform.test.js` already holds the *triples* to
+  // `dist-workspace.toml`; nothing held the *binaries* to anything, and that is
+  // the half that actually moved: release 0.0.0 carries three binaries because
+  // it was cut before `local-rag-tui` existed, while this list has four.
+  //
+  // A mismatch is invisible until a user's install 404s (a name the release
+  // does not carry) or silently ships less than it could (a crate the installer
+  // never asks for) — `local-rag-tui` spent three weeks in the second state.
+  assert.deepEqual(
+    PRODUCT_BINARIES.map((b) => b.name).sort(),
+    distShippedCrates().sort(),
+  );
+});
+
+test("only local-rag-tui is optional, and it is the one the old release lacks", () => {
+  // `required: false` is load-bearing rather than decorative: `install.js`
+  // records an absent optional binary and carries on, which is what lets the
+  // installer work against a tag cut before that binary existed. Pinning it
+  // here means dropping the distinction shows up as a failure and not as a
+  // mysteriously tolerant install.
+  const optional = PRODUCT_BINARIES.filter((b) => !b.required).map((b) => b.name);
+  assert.deepEqual(optional, ["local-rag-tui"]);
 });
 
 test("nothing in this module reaches the network", () => {
