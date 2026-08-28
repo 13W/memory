@@ -371,8 +371,23 @@ fn spawn_fake_mismatched_daemon(
     socket_path: std::path::PathBuf,
     connections: u32,
 ) -> std::thread::JoinHandle<()> {
+    // D-111: bind on the CALLER's thread, not inside the spawned one. Every
+    // caller does `spawn_fake_*(...)` and then immediately `spawn_proxy(...)`,
+    // so a bind that happens inside the thread is racing the proxy's first
+    // connect. Lose that race and the proxy finds no socket, does exactly what
+    // it is supposed to do — spawns a REAL `local-rag serve` — and the test
+    // then asserts against a real daemon's answer while the fake sits waiting
+    // for a connection that never comes. It surfaced as a real daemon's
+    // `initialize` result arriving where an error was required.
+    //
+    // The race was invisible for as long as `syspolicyd` charged 20-45 s for
+    // the first exec of a freshly built binary: the thread always won by four
+    // orders of magnitude. Removing that tax made the machine fast enough for
+    // the proxy to win. Binding here removes the race rather than widening a
+    // window: the socket exists before this function returns, so the caller's
+    // `spawn_proxy` cannot precede it.
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
     std::thread::spawn(move || {
-        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
         for round in 1..=connections {
             let (stream, _) = listener.accept().expect("accept fake daemon connection");
             let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
@@ -697,8 +712,23 @@ fn a_live_proxy_reconnects_after_its_daemon_is_restarted_mid_session() {
 fn spawn_fake_daemon_dying_mid_request(
     socket_path: std::path::PathBuf,
 ) -> std::thread::JoinHandle<()> {
+    // D-111: bind on the CALLER's thread, not inside the spawned one. Every
+    // caller does `spawn_fake_*(...)` and then immediately `spawn_proxy(...)`,
+    // so a bind that happens inside the thread is racing the proxy's first
+    // connect. Lose that race and the proxy finds no socket, does exactly what
+    // it is supposed to do — spawns a REAL `local-rag serve` — and the test
+    // then asserts against a real daemon's answer while the fake sits waiting
+    // for a connection that never comes. It surfaced as a real daemon's
+    // `initialize` result arriving where an error was required.
+    //
+    // The race was invisible for as long as `syspolicyd` charged 20-45 s for
+    // the first exec of a freshly built binary: the thread always won by four
+    // orders of magnitude. Removing that tax made the machine fast enough for
+    // the proxy to win. Binding here removes the race rather than widening a
+    // window: the socket exists before this function returns, so the caller's
+    // `spawn_proxy` cannot precede it.
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
     std::thread::spawn(move || {
-        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
         let (stream, _) = listener.accept().expect("accept fake daemon connection");
         let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
         let mut writer = stream;
@@ -810,8 +840,23 @@ fn spawn_fake_daemon_with_spool_version(
     socket_path: std::path::PathBuf,
     spool_max_format_version: u16,
 ) -> std::thread::JoinHandle<()> {
+    // D-111: bind on the CALLER's thread, not inside the spawned one. Every
+    // caller does `spawn_fake_*(...)` and then immediately `spawn_proxy(...)`,
+    // so a bind that happens inside the thread is racing the proxy's first
+    // connect. Lose that race and the proxy finds no socket, does exactly what
+    // it is supposed to do — spawns a REAL `local-rag serve` — and the test
+    // then asserts against a real daemon's answer while the fake sits waiting
+    // for a connection that never comes. It surfaced as a real daemon's
+    // `initialize` result arriving where an error was required.
+    //
+    // The race was invisible for as long as `syspolicyd` charged 20-45 s for
+    // the first exec of a freshly built binary: the thread always won by four
+    // orders of magnitude. Removing that tax made the machine fast enough for
+    // the proxy to win. Binding here removes the race rather than widening a
+    // window: the socket exists before this function returns, so the caller's
+    // `spawn_proxy` cannot precede it.
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
     std::thread::spawn(move || {
-        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
         let (stream, _) = listener.accept().expect("accept fake daemon connection");
         let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
         let mut writer = stream;

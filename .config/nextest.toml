@@ -1,0 +1,78 @@
+# `cargo-nextest` configuration — D-111 (T22-17, 2026-08-28).
+#
+# WHY THIS FILE EXISTS AT ALL. `root:test` was red on `master` and nobody had
+# seen it, because on this machine the job never reached its run phase: Apple's
+# `syspolicyd` charged 20-45 s for the first exec of every freshly built binary,
+# and nextest execs each test binary twice just to enumerate it, so ~70 binaries
+# meant 2-3 h of listing before a single test ran. With that tax removed the job
+# finally got far enough to fail, and what it exposed is this: eighteen tests in
+# `local-rag` each start a **real daemon** or run a **real indexing cycle**, and
+# they cannot do that at the same time as each other.
+#
+# MEASURED, on the committed tree with no other change (`37713b2`):
+#   five of them run in parallel  -> 5 FAIL  (45 s, 120 s, 120 s, 120 s, 123 s)
+#   the same five with `-j 1`     -> 5 PASS  (17.6 / 22.0 / 21.2 / 0.1 / 41.5 s)
+#   each one alone                -> PASS    (15.9 s, 16.7 s)
+# The failure is not a slow test finally timing out; it is contention. The
+# clearest instance names it outright — a daemon restart could not take the
+# store lock because the previous daemon had not finished leaving:
+#   restart: Lock(Locked { owner: StoreLockInfo { pid: 60791, ready: true, .. } })
+# which is `D-084`/`D-090` territory: the lock is released by the *process*, and
+# a machine running a dozen indexing cycles at once does not let processes leave
+# on the schedule these tests assume.
+#
+# WHY A TEST GROUP AND NOT LONGER DEADLINES. For *this* defect, raising the
+# deadlines would hide exactly the signal these tests exist to give — "the
+# daemon came up / went away within a budget" — and would keep the suite
+# dependent on how loaded the machine happens to be. Serializing costs gate
+# time and nothing else.
+#
+# Three bounds WERE raised, and that is a different defect, not a workaround for
+# this one. Once the group removed the contention, two tests still failed
+# **alone**, on an idle machine, because their bounds sat below what the work
+# actually takes here:
+#   shutdown_leaves_no_dangling_task_..     ~40 s of convergence vs a 45 s bound
+#   a_managed_worktree_..survives_a_..restart      77.6 s vs a 60 s bound
+# The third bound is the two-worktree wait in `reload_starts_and_stops_exactly_
+# the_delta`; it was raised on the same evidence one step removed — serialized
+# and passing, it takes 105 s, so its original 45 s could never have held. Two
+# alone-failures and one measurement, not three of either.
+#
+# They live in `indexing_supervisor.rs` as `CONVERGE_ONE`/`CONVERGE_TWO`, each
+# carrying the number it came from. The bounds were widened, never removed: the
+# tests still fail if convergence stops happening. Telling the two defects apart
+# is the whole reason the A/B above was run alone as well as in parallel — had
+# it only been run in parallel, serializing would have looked like a full fix
+# and the next red gate would have started the diagnosis over.
+
+[test-groups.daemon-heavy]
+# One at a time. Not "a few": two concurrent indexing cycles on this workspace
+# already saturate the CPU, and the budgets under test are wall-clock ones.
+#
+# KNOW WHAT THIS DOES NOT DO. `max-threads = 1` serializes the group's members
+# **against each other**; the other ~590 tests in the run keep going in
+# parallel, so a member still executes on a loaded machine. That is why this
+# file alone did not turn `root:test` green: it removed the mutual interference
+# (the daemon-restart lock contention above) and left standing every place a
+# test had assumed an idle machine — three under-budgeted bounds and one test
+# synchronising on the wrong signal entirely (it waited on the in-memory status
+# and then read the durable mirror, which production writes *afterwards*, by
+# design). Those were fixed where they live. If a member of this group goes red
+# again, check that distinction first: interference is fixed here, assumptions
+# are fixed in the test.
+max-threads = 1
+
+[[profile.default.overrides]]
+# Every test that starts a daemon or drives a full indexing cycle. Listed by
+# binary where the whole binary qualifies, and by test path for the unit tests
+# that live inside the `local-rag` binary itself.
+filter = """
+package(local-rag) & (
+    binary(admin_indexing)
+  + binary(cli_project)
+  + binary(idle_shutdown)
+  + binary(indexing_supervisor)
+  + test(/^daemon::indexing::worktree_task::/)
+)
+"""
+test-group = 'daemon-heavy'

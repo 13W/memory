@@ -965,6 +965,22 @@ mod tests {
     /// the run forever.
     const SUITE_STARVATION_BUDGET: Duration = Duration::from_secs(600);
 
+    /// The gap between the in-memory fold and its durable mirror — a
+    /// synchronisation point, not a budget (D-111).
+    ///
+    /// The cycle updates `status` under the mutex **first** and only then opens
+    /// a separate global-writer transaction for `worktree_indexing_status`; the
+    /// ordering is deliberate (`MutexGuard` is not `Send` across the `.await`),
+    /// and between the two sit a `tracing` call, a durable `read_coverage` and
+    /// the wait for the writer. So "the in-memory status names a generation"
+    /// has never implied "the durable row exists" — it only looked that way on
+    /// an idle machine, where the gap is sub-millisecond. Under a loaded suite
+    /// it is not, and the test read an empty row after winning the first race.
+    ///
+    /// The value asserted here is the row's **content**; this bound exists only
+    /// so a mirror that never lands fails loudly instead of hanging the run.
+    const DURABLE_MIRROR_LAG: Duration = Duration::from_secs(30);
+
     async fn wait_for(deadline: Duration, mut check: impl FnMut() -> bool) {
         tokio::time::timeout(deadline, async {
             while !check() {
@@ -982,6 +998,17 @@ mod tests {
 
         wait_for(Duration::from_secs(10), || {
             handle.status().last_generation_id.is_some()
+        })
+        .await;
+
+        // The durable mirror lands *after* the in-memory fold, so it needs its
+        // own wait; see `DURABLE_MIRROR_LAG`. The 10 s bound above still means
+        // what it did — the cycle itself completes within it.
+        wait_for(DURABLE_MIRROR_LAG, || {
+            let conn = fx.state.open_read().expect("read conn");
+            local_rag_store::indexing_status(&conn, &fx.worktree_id.to_string())
+                .expect("read indexing status")
+                .is_some()
         })
         .await;
 
