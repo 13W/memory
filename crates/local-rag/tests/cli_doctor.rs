@@ -1495,3 +1495,189 @@ async fn the_indexing_section_breaks_skips_down_by_reason() {
         "reasons that never fired are absent, not zero-filled: {entry}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T22-16: the `runtime:` and `delivery:` sections
+// ---------------------------------------------------------------------------
+//
+// Both are filesystem-and-environment facts, so nothing here needs a model, a
+// runtime, or the network — which is the point: these are exactly the sections
+// a user reads on a machine where none of those exist yet.
+
+mod delivery_and_runtime {
+    use super::*;
+
+    /// The pinned entry for the host this test runs on, or `None` on a platform
+    /// this build carries no runtime for. Every assertion below that depends on
+    /// a catalog entry is skipped there rather than asserted wrongly.
+    fn host_asset() -> Option<&'static local_rag_models::OrtAsset> {
+        local_rag_models::for_current_platform()
+    }
+
+    fn run_with_env(home: &TempHome, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut cmd = home.command(env!("CARGO_BIN_EXE_local-rag"));
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.output().expect("run local-rag")
+    }
+
+    /// Put a runtime where the store expects one, marker last — the same
+    /// ordering `install_ort` uses, so `ort_is_installed` agrees. The bytes are
+    /// not a real library: nothing in `doctor` loads it, and a test that needed
+    /// a real one would be testing `ort`, not this.
+    fn fake_installed_runtime(layout: &StoreLayout, asset: &local_rag_models::OrtAsset) -> String {
+        let path = local_rag_models::ort_dylib_path(layout, asset);
+        let dir = path.parent().expect("version dir");
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(&path, b"not a real library").expect("write dylib");
+        std::fs::write(dir.join(".ok"), b"").expect("write marker");
+        path.display().to_string()
+    }
+
+    #[test]
+    fn a_clean_store_says_what_is_missing_and_what_to_type() {
+        // The card's acceptance, as an assertion: on a machine with nothing,
+        // `doctor` must name the gap AND the command that closes it.
+        let (home, _layout) = open_layout();
+        let out = run_cli(&home, &["doctor"]);
+        let text = stdout(&out);
+
+        let Some(_) = host_asset() else {
+            assert!(
+                text.contains("runtime: this build pins no ONNX Runtime"),
+                "{text}"
+            );
+            return;
+        };
+        assert!(text.contains("runtime:"), "{text}");
+        assert!(text.contains("NOT INSTALLED"), "{text}");
+        assert!(
+            text.contains("local-rag init --download-models"),
+            "the line must name the command that fixes it: {text}"
+        );
+        assert!(
+            text.contains("runtime: nothing would load"),
+            "an absent runtime must say so in the resolution line too: {text}"
+        );
+    }
+
+    #[test]
+    fn an_installed_runtime_is_reported_with_its_path_and_the_rung_that_wins() {
+        let Some(asset) = host_asset() else { return };
+        let (home, layout) = open_layout();
+        let path = fake_installed_runtime(&layout, asset);
+
+        let out = run_cli(&home, &["doctor"]);
+        let text = stdout(&out);
+        assert!(
+            text.contains(&format!(
+                "runtime: ONNX Runtime {} installed",
+                asset.version
+            )),
+            "{text}"
+        );
+        assert!(text.contains(&path), "{text}");
+        // The second line is the one that carries information the first does
+        // not: which file would actually load.
+        assert!(
+            text.contains(&format!(
+                "runtime: would load {path} (installed in this store)"
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_override_is_reported_as_the_winner_over_an_installed_copy() {
+        // The case a user cannot diagnose any other way: a store copy is
+        // present and correct, and something else is being loaded instead.
+        let Some(asset) = host_asset() else { return };
+        let (home, layout) = open_layout();
+        let store_path = fake_installed_runtime(&layout, asset);
+        let override_path = home.join("elsewhere.dylib");
+        std::fs::write(&override_path, b"override").expect("write override");
+
+        let out = run_with_env(
+            &home,
+            &["doctor"],
+            &[("ORT_DYLIB_PATH", &override_path.display().to_string())],
+        );
+        let text = stdout(&out);
+        assert!(
+            text.contains(&format!(
+                "runtime: ONNX Runtime {} installed",
+                asset.version
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "would load {} (ORT_DYLIB_PATH)",
+                override_path.display()
+            )),
+            "the override must be named as the winner: {text}"
+        );
+        assert!(
+            !text.contains(&format!("would load {store_path}")),
+            "the store copy must not be reported as loading: {text}"
+        );
+    }
+
+    #[test]
+    fn a_binary_with_no_install_manifest_is_unmanaged_not_broken() {
+        // The normal state in a checkout, and the one this section must not
+        // dress up as a fault.
+        let (home, _layout) = open_layout();
+        let text = stdout(&run_cli(&home, &["doctor"]));
+        assert!(
+            text.contains("delivery: not installed by @13w/memory"),
+            "{text}"
+        );
+        assert!(text.contains(".local-rag-install.json"), "{text}");
+        assert!(
+            text.contains("source checkout or a hand-placed binary"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn neither_new_section_can_make_doctor_red() {
+        // Precedent: `generator` is absent from `is_clean` for the same reason
+        // — a store with nothing installed yet is a legitimate state, and a
+        // `doctor` that exits non-zero on every fresh machine is a `doctor`
+        // nobody reads.
+        let (home, _layout) = open_layout();
+        let out = run_cli(&home, &["doctor"]);
+        let text = stdout(&out);
+        assert!(
+            text.contains("runtime:") && text.contains("delivery:"),
+            "{text}"
+        );
+        assert!(
+            out.status.success(),
+            "a missing runtime and an unmanaged binary must not fail doctor: {text}\n{}",
+            stderr(&out)
+        );
+    }
+
+    #[test]
+    fn the_json_report_carries_both_sections() {
+        let (home, _layout) = open_layout();
+        let out = run_cli(&home, &["doctor", "--json"]);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout(&out)).expect("doctor --json emits JSON");
+        assert!(json.get("runtime").is_some(), "{json}");
+        assert!(json.get("delivery").is_some(), "{json}");
+        assert_eq!(json["delivery"]["state"], "unmanaged");
+        if host_asset().is_some() {
+            assert_eq!(json["runtime"]["catalogued"], true);
+            assert_eq!(json["runtime"]["installed_in_store"], false);
+            assert!(json["runtime"]["source"]["rung"].is_null(), "{json}");
+        }
+    }
+}

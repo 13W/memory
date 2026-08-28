@@ -14,6 +14,12 @@
 //! `local-rag-models`'s own `real_inference_when_the_runtime_and_weights_are_present`
 //! precedent exactly: skip loudly when the environment does not supply both.
 //!
+//! T22-16: the ONNX Runtime is a **third** artifact `--download-models`
+//! installs, and it gets the same disk-state-gate coverage for the same
+//! reason it works for the generator — `ort_is_installed` is a marker check,
+//! so a fixture `.ok` is enough to exercise "already installed" without a
+//! real 38 MB library or the network.
+//!
 //! D-045: the generative model gets the same disk-state-gate coverage as the
 //! embedder. Unlike the embedder, `is_installed` is all its install status
 //! ever needs (no ONNX/database registration step), so a fixture `.ok`
@@ -108,6 +114,88 @@ fn generator_install_marker_suppresses_only_the_generators_hint() {
     assert!(
         !layout.state_db().exists(),
         "the embedder's own early return must still hold — nothing to register yet"
+    );
+}
+
+/// T22-16: the runtime's own hint, on the same disk-state gate the two models
+/// use. The fixture is a marker plus a stand-in file — `init` never loads the
+/// library on this path, and a test that supplied a real one would be
+/// exercising `ort`, not this gate.
+#[test]
+fn the_runtime_hint_is_gated_on_its_own_disk_state() {
+    let Some(asset) = local_rag_models::for_current_platform() else {
+        // A platform with no pinned runtime gets a different line entirely,
+        // and asserting the installed-state one there would be asserting
+        // something this build cannot do.
+        let (home, _layout) = open_layout();
+        let stdout = String::from_utf8_lossy(&run_cli(&home, &["init"]).stdout).into_owned();
+        assert!(
+            stdout.contains("no pinned ONNX Runtime for this platform"),
+            "{stdout:?}"
+        );
+        return;
+    };
+
+    let (home, layout) = open_layout();
+    let stdout = String::from_utf8_lossy(&run_cli(&home, &["init"]).stdout).into_owned();
+    assert!(
+        stdout.contains("the ONNX Runtime is not installed yet"),
+        "{stdout:?}"
+    );
+    // The consequence, not just the fact: without it the embedder cannot be
+    // opened at all, which is why the line says what it says.
+    assert!(stdout.contains("lexical-only"), "{stdout:?}");
+    assert!(
+        !layout.state_db().exists(),
+        "a bare init must still not touch state.sqlite"
+    );
+
+    // Now put one where the store expects it, marker last — `install_ort`'s
+    // own ordering, so `ort_is_installed` agrees.
+    let dylib = local_rag_models::ort_dylib_path(&layout, asset);
+    let dir = dylib.parent().expect("version dir");
+    std::fs::create_dir_all(dir).expect("create runtime dir");
+    std::fs::write(&dylib, b"not a real library").expect("write stand-in");
+    std::fs::write(dir.join(".ok"), b"").expect("write fixture .ok marker");
+
+    let stdout = String::from_utf8_lossy(&run_cli(&home, &["init"]).stdout).into_owned();
+    assert!(
+        !stdout.contains("the ONNX Runtime is not installed yet"),
+        "the runtime hint must not print once its marker is on disk: {stdout:?}"
+    );
+    // And it is independent of the two models, exactly as they are of each
+    // other: both are still uninstalled here and must still say so.
+    assert!(
+        stdout.contains(&format!("{DEFAULT_MODEL_ID} is not installed yet")),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains(&format!("{GENERATOR_MODEL_ID} is not installed yet")),
+        "{stdout:?}"
+    );
+}
+
+/// T22-16: a bare `init` still downloads nothing, runtime included.
+///
+/// Worth its own assertion rather than trusting the branch: the runtime block
+/// sits *before* the embedder's early return, so a `download` flag read wrongly
+/// there would fetch 30 MB on a command whose whole contract is that it does
+/// not touch the network.
+#[test]
+fn bare_init_installs_no_runtime() {
+    let Some(asset) = local_rag_models::for_current_platform() else {
+        return;
+    };
+    let (home, layout) = open_layout();
+    let output = run_cli(&home, &["init"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !local_rag_models::ort_dylib_path(&layout, asset).exists(),
+        "a bare init must not fetch the runtime"
+    );
+    assert!(
+        !layout.models_dir().join("onnxruntime").exists(),
+        "not even the directory"
     );
 }
 

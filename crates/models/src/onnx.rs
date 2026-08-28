@@ -391,21 +391,88 @@ fn resolve_ort_source(
     dylib_path_override: Option<&std::ffi::OsStr>,
     installed: Option<&Path>,
     exe: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<OrtSource, String> {
     if let Some(over) = dylib_path_override {
-        return Ok(PathBuf::from(over));
+        return Ok(OrtSource {
+            rung: OrtRung::Override,
+            path: PathBuf::from(over),
+        });
     }
     if let Some(installed) = installed {
-        return Ok(installed.to_path_buf());
+        return Ok(OrtSource {
+            rung: OrtRung::Store,
+            path: installed.to_path_buf(),
+        });
     }
-    bundled_ort_dylib_path(exe).ok_or_else(|| {
-        format!(
-            "no ONNX Runtime found: ORT_DYLIB_PATH is unset, none is installed in the store, \
-             and no {} sits beside {}",
-            ort_dylib_file_name(),
-            exe.display()
-        )
-    })
+    bundled_ort_dylib_path(exe)
+        .map(|path| OrtSource {
+            rung: OrtRung::BesideExecutable,
+            path,
+        })
+        .ok_or_else(|| {
+            format!(
+                "no ONNX Runtime found: ORT_DYLIB_PATH is unset, none is installed in the store, \
+                 and no {} sits beside {}",
+                ort_dylib_file_name(),
+                exe.display()
+            )
+        })
+}
+
+/// Which rung of ADR-0013 Decision 4's order supplied the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrtRung {
+    /// `ORT_DYLIB_PATH`.
+    Override,
+    /// The copy this store installed (T22-15).
+    Store,
+    /// A library sitting next to the running executable.
+    BesideExecutable,
+}
+
+impl OrtRung {
+    /// A phrase for a diagnostic line, so `doctor` and this module cannot
+    /// describe the same rung differently.
+    pub fn describe(self) -> &'static str {
+        match self {
+            OrtRung::Override => "ORT_DYLIB_PATH",
+            OrtRung::Store => "installed in this store",
+            OrtRung::BesideExecutable => "beside the executable",
+        }
+    }
+}
+
+/// Where the runtime would come from, and by which rung.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrtSource {
+    pub rung: OrtRung,
+    pub path: PathBuf,
+}
+
+/// Answer "which library would load, and why that one" **without loading it**
+/// — `local-rag doctor`'s runtime section (T22-16).
+///
+/// This is the same function the loader itself calls, deliberately: a
+/// diagnostic that re-implemented the order would eventually disagree with the
+/// loader, and the whole value of the line it prints is that it does not.
+///
+/// Nothing here touches `ort`. That is not tidiness: `D-028` showed `ort`'s own
+/// implicit search can hang the calling thread instead of erroring, and a
+/// daemon running alongside `doctor` may already hold the library — a report
+/// has no business competing for it. Existence is checked with `is_file`, and
+/// whether the file actually *loads* is a question only a real session can
+/// answer.
+pub fn diagnose_ort_source(
+    layout: &local_rag_core::paths::StoreLayout,
+) -> Result<OrtSource, String> {
+    let override_path = std::env::var_os("ORT_DYLIB_PATH");
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("could not resolve the running executable's own path: {e}"))?;
+    resolve_ort_source(
+        override_path.as_deref(),
+        installed_ort(layout).as_deref(),
+        &exe,
+    )
 }
 
 /// How long [`ensure_ort_initialized`] waits for `ort::init_from` before
@@ -472,8 +539,8 @@ fn ensure_ort_initialized(installed: Option<&Path>) -> Result<(), OnnxError> {
                  for a bundled ONNX Runtime: {e}"
             )
         })?;
-        let path = resolve_ort_source(dylib_path_override.as_deref(), installed, &exe)?;
-        init_ort_with_timeout(path)
+        let source = resolve_ort_source(dylib_path_override.as_deref(), installed, &exe)?;
+        init_ort_with_timeout(source.path)
     })
     .clone()
     .map_err(OnnxError::Runtime)
@@ -662,7 +729,10 @@ mod tests {
         let override_value = std::ffi::OsStr::new("/somewhere/else/libonnxruntime.dylib");
         assert_eq!(
             resolve_ort_source(Some(override_value), None, &exe).expect("ok"),
-            PathBuf::from("/somewhere/else/libonnxruntime.dylib")
+            OrtSource {
+                rung: OrtRung::Override,
+                path: PathBuf::from("/somewhere/else/libonnxruntime.dylib"),
+            }
         );
     }
 
@@ -693,18 +763,21 @@ mod tests {
                     let override_arg = has_override.then_some(override_os);
                     let got = resolve_ort_source(override_arg, installed_arg, &exe);
                     let expected = if has_override {
-                        Some(override_path.clone())
+                        Some((OrtRung::Override, override_path.clone()))
                     } else if has_installed {
-                        Some(installed.clone())
+                        Some((OrtRung::Store, installed.clone()))
                     } else if has_beside {
-                        Some(beside.clone())
+                        Some((OrtRung::BesideExecutable, beside.clone()))
                     } else {
                         None
                     };
                     match expected {
-                        Some(want) => assert_eq!(
+                        // The rung is asserted alongside the path because it is
+                        // what `doctor` prints (T22-16): the right library under
+                        // the wrong name still misleads whoever reads the line.
+                        Some((rung, want)) => assert_eq!(
                             got.as_ref().expect("a rung should have matched"),
-                            &want,
+                            &OrtSource { rung, path: want },
                             "override={has_override} installed={has_installed} beside={has_beside}"
                         ),
                         None => assert!(
@@ -733,7 +806,10 @@ mod tests {
         let over = std::ffi::OsStr::new("/nowhere/at/all/libonnxruntime.dylib");
         assert_eq!(
             resolve_ort_source(Some(over), Some(&installed), &exe).expect("ok"),
-            PathBuf::from("/nowhere/at/all/libonnxruntime.dylib")
+            OrtSource {
+                rung: OrtRung::Override,
+                path: PathBuf::from("/nowhere/at/all/libonnxruntime.dylib"),
+            }
         );
     }
 

@@ -60,7 +60,10 @@ pub use install::{
     write_license_notice,
 };
 pub use manifest::{ManifestFile, ModelManifest, OrtManifest};
-pub use onnx::{MAX_SEQUENCE_TOKENS, OnnxEmbedder, OnnxError, POOLED_OUTPUT};
+pub use onnx::{
+    MAX_SEQUENCE_TOKENS, OnnxEmbedder, OnnxError, OrtRung, OrtSource, POOLED_OUTPUT,
+    diagnose_ort_source,
+};
 pub use ort_catalog::{ORT_ASSETS, OrtAsset, for_current_platform};
 
 pub use local_rag_core::VERSION;

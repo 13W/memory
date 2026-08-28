@@ -15,11 +15,14 @@
 // will never have xz, so an installer that must work on a machine nobody has
 // ever seen cannot unpack that with built-ins. Shelling out to the system
 // archiver was considered and rejected in ADR-0013 on this project's own
-// precedent: `crates/xtask/src/dist_ort.rs:11-15` shells out to `tar` and says
-// in its own module documentation that this is fine for a manually invoked
+// precedent: `crates/xtask/src/dist_ort.rs` used to shell out to `tar`, and its
+// own module documentation argued that this was fine for a manually invoked
 // development tool and not for something that must work offline in production —
 // on minimal Linux images GNU tar delegates to an external `xz` binary that is
-// not installed. So T22-07 moved the producer instead: `dist-workspace.toml`
+// not installed. (T22-15 finished that argument on the Rust side too: the
+// runtime installer needed the same guarantee, so `crates/models/src/archive.rs`
+// now reads both containers in-process and `dist_ort` uses it. The precedent
+// stands; the `tar` call it pointed at is gone.) So T22-07 moved the producer instead: `dist-workspace.toml`
 // now sets `unix-archive = ".tar.gz"` and `windows-archive = ".zip"`, the two
 // formats Node can read unaided, and this module is the reader.
 //

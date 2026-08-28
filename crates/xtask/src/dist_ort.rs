@@ -17,6 +17,24 @@
 //! -xzf` would not have), and running the same reader here means the release
 //! tool and the runtime cannot disagree about what "the member" is.
 //!
+//! # What this command is FOR now, and what it is not
+//!
+//! It is no longer how the runtime reaches users. `T22-15` made that
+//! `local_rag_models::install::install_ort`, called from `local-rag init
+//! --download-models` (T22-16): the library lands in the store beside the
+//! model weights, with a `.ok` marker and a manifest, and
+//! `local_rag_models::onnx::resolve_ort_source` finds it there. If you are
+//! looking for "how does a user get an ONNX Runtime", that is the answer, and
+//! this file is not it.
+//!
+//! What it still does, and nothing else covers: materialise the library into
+//! an **arbitrary directory**, with no store involved. That is what preparing a
+//! `LOCAL_RAG_BIN_DIR` layout for an offline or air-gapped machine takes —
+//! spec 13 §2's first resolution rung, which the READMEs advertise as the
+//! supported route and which `install_ort` cannot serve, because it writes a
+//! store-shaped directory (0600, `.ok`, manifest) rather than a bin directory.
+//! Owner's decision, 2026-08-28: keep it for that, say so here.
+//!
 //! What has not changed: this never runs as part of `cargo xtask ci` (it needs
 //! the network, like `bench`/`memory-bench`), and it writes into a
 //! caller-chosen output directory, not a `StoreLayout`.

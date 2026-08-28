@@ -774,6 +774,42 @@ registration below, since the generative model has no database registration step
 installed the generative model — `local_rag_generate::install_model` existed but was unwired,
 so a fresh `init --download-models` left memory consolidation permanently unable to run.
 
+As-built note (T22-16, `[SPEC]`, [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)).
+`init --download-models` installs **three** artifacts, not two: the two models above and the ONNX
+Runtime (`local_rag_models::install_ort`, 10 §5 `[FIXED, ADR-0013]` — "installed at first run
+beside the weights, by the same verified path"). Until T22-15 the runtime rode inside an npm
+platform package; those are gone (13 §1), so first run is the only place it can arrive from. The
+third install is independent of the other two in exactly the way D-045 made them independent of
+each other — a failed runtime install is printed and does not abort the command, because nothing
+below it depends on the runtime being present — with one placement rule that is not arbitrary: the
+runtime block runs **before** the embedder's disk-state gate, which returns early, so a machine
+with no weights still gets a runtime. That is the machine most likely to be running `init` for the
+first time. A platform this build pins no runtime for is told to supply one itself
+(`ORT_DYLIB_PATH`, or beside the executable), not treated as an error.
+
+`doctor` gains two sections for the same delivery story:
+
+- **`runtime:`** — whether a runtime is pinned for this platform, whether this store has one, and
+  **which rung would supply it** (ADR-0013 Decision 4's order: `ORT_DYLIB_PATH`, the store, beside
+  the executable). The second line is the one that carries information the first does not: with an
+  override set, "installed" and "used" stop being the same question, and nothing else tells the
+  reader which file wins. It calls the loader's own resolver
+  (`local_rag_models::diagnose_ort_source`) rather than restating the order, so the report and the
+  loader cannot drift apart. **It never loads the library** — `D-028` showed `ort`'s implicit
+  search can hang the calling thread instead of erroring, and a daemon alongside `doctor` may
+  already hold it.
+- **`delivery:`** — where the running binary came from, read from the `.local-rag-install.json` the
+  npm package writes beside the binaries it installed (13 §1): package version, release tag,
+  platform key, and which binaries the install recorded. A missing manifest is reported as
+  "unmanaged", never as a fault: a source checkout and a hand-placed `LOCAL_RAG_BIN_DIR` are both
+  legitimate. A manifest whose `manifestVersion` this binary does not know is reported as damaged
+  rather than read, since every other field's meaning is defined by that number.
+
+Neither section can make `doctor` exit non-zero, for the reason the `generator:` section already
+established: a store with nothing installed yet is a legitimate pre-install state, and a `doctor`
+that failed on every fresh machine is one nobody reads. `doctor` continues to diagnose, never
+repair — installing is `init`'s job, and the sections name that command.
+
 As-built note (T15-07, `[SPEC]`). `serve/status/stop/restart/init/index/reindex/watch/repo/
 worktree/rebuild` are implemented in `crates/local-rag/src/cli/`, hand-parsed (`std::env::args()`,
 the same convention `main.rs`/`local-rag-proxy`/`xtask::run_bench` already use — no CLI-parsing

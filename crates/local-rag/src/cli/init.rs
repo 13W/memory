@@ -17,6 +17,16 @@
 //! different `RepresentationKey`s (`OnnxEmbedder::open`/`open_for_memory`,
 //! D-036) — `kind` does not change tokenization or inference, only identity.
 //!
+//! T22-16: `--download-models` installs a **third** artifact, the ONNX
+//! Runtime (`local_rag_models::install_ort`, spec 10 §5 `[FIXED, ADR-0013]`).
+//! It is independent of both models in the same way they are independent of
+//! each other: its failure is printed and does not abort the command, because
+//! nothing below it depends on the runtime being present — and conversely a
+//! machine with no weights still gets a runtime, which is why the block sits
+//! *before* the embedder's disk-state gate rather than after it. Until
+//! `T22-15` the runtime rode inside an npm platform package; those are gone,
+//! so first run is now the only place it can arrive from.
+//!
 //! D-045: `--download-models` also installs the default generative model
 //! (`local_rag_generate`, spec 10 §5's install policy applied a second time
 //! to a second catalog) — the memory-router
@@ -38,7 +48,8 @@ use local_rag_generate::{
     is_installed as generator_is_installed,
 };
 use local_rag_models::{
-    DEFAULT_MODEL_ID, HttpFetcher, OnnxEmbedder, find, install_model, is_installed,
+    DEFAULT_MODEL_ID, HttpFetcher, OnnxEmbedder, find, for_current_platform, install_model,
+    install_ort, is_installed, ort_dylib_path, ort_is_installed,
 };
 use local_rag_store::{
     DEFAULT_MODEL_SPACE_ID, RepresentationKey, RepresentationKind, StateDb, WriteError,
@@ -114,6 +125,43 @@ pub fn run(args: InitArgs) -> ExitCode {
              --download-models` to fetch it. Until then, memory consolidation stays disabled: \
              spool observations are imported but never turn into memory entries."
         );
+    }
+
+    // T22-16: the ONNX Runtime, a **third** independent artifact — exactly the
+    // shape D-045 gave the generator when it became the second. Spec 10 §5
+    // `[FIXED, ADR-0013]`: "installed at first run beside the weights, by the
+    // same verified path". Independence is the point: a failed runtime install
+    // must not stop representation registration, and a machine that already
+    // has one must not pay for a download.
+    //
+    // Placed **before** the embedder's disk-state gate below, which returns
+    // early: a machine without weights would otherwise never get a runtime,
+    // and it is the one machine most likely to be running `init` for the first
+    // time.
+    match for_current_platform() {
+        Some(asset) => {
+            if download && let Err(e) = install_ort(&layout, asset, &HttpFetcher::new()) {
+                // Reported, not fatal. `fail` here would abort the whole
+                // command over an artifact nothing below depends on.
+                println!(
+                    "{BIN}: could not install the ONNX Runtime ({} {}): {e}",
+                    asset.platform, asset.version,
+                );
+            }
+            if !ort_is_installed(&layout, asset) {
+                println!(
+                    "{BIN}: the ONNX Runtime is not installed yet; run `local-rag init \
+                     --download-models` to fetch it (expected {}). Until then the embedding \
+                     model cannot be opened at all, so search_code/recall stay lexical-only.",
+                    ort_dylib_path(&layout, asset).display(),
+                );
+            }
+        }
+        None => println!(
+            "{BIN}: this build has no pinned ONNX Runtime for this platform; supply one yourself \
+             with ORT_DYLIB_PATH, or place it beside the executable. Until then search_code/recall \
+             stay lexical-only."
+        ),
     }
 
     if !is_installed(&layout, DEFAULT_MODEL_ID) {
