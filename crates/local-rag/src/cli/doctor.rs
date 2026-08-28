@@ -37,6 +37,7 @@
 
 use std::process::ExitCode;
 
+use super::delivery::DeliveryFinding;
 use local_rag_core::identity::Uuid;
 use local_rag_core::paths::{PathError, StoreLayout};
 use local_rag_projection::{
@@ -86,6 +87,12 @@ pub struct DoctorReport {
     /// T21-08: whether the local generative model both consolidation and
     /// normalization need is installed at all — a **file** check, never a load.
     pub generator: GeneratorFinding,
+    /// T22-16: the ONNX Runtime — is one pinned for this platform, is it
+    /// installed, and **which rung would supply it**. A file check, never a
+    /// load: see [`RuntimeFinding`].
+    pub runtime: RuntimeFinding,
+    /// T22-16: where the running binary itself came from (spec 13 §1/§2).
+    pub delivery: super::delivery::DeliveryFinding,
     /// `X-012`: how much of the database file is dead space GC freed inside it
     /// but SQLite never returned to the filesystem.
     pub space: SpaceFinding,
@@ -134,6 +141,35 @@ pub struct GeneratorFinding {
     pub installed: bool,
     /// Where the assets are expected, so the message is actionable.
     pub expected_path: String,
+}
+
+/// T22-16: the ONNX Runtime's installed state and the rung that would supply
+/// it (ADR-0013 Decision 4, spec 10 §5 `[FIXED]`).
+///
+/// **A filesystem check, never a load** — the same rule
+/// [`GeneratorFinding`] states for weights, and here it is load-bearing twice
+/// over. `D-028` showed `ort`'s own implicit search can hang the calling thread
+/// instead of erroring; and the daemon running alongside this command may
+/// already hold the library, which a diagnostic has no business competing for.
+/// So this reports which file *would* be loaded and whether it exists. Whether
+/// it actually loads is a question only a real session can answer, and
+/// `local-rag init`/`serve` are where that happens.
+pub enum RuntimeFinding {
+    /// This build pins no runtime for this platform. Not a fault: it means the
+    /// user has to supply one, and the message says how.
+    NotCatalogued,
+    Checked {
+        platform: String,
+        version: String,
+        /// Whether this store has one installed (`.ok` marker).
+        installed_in_store: bool,
+        /// Where the store's copy is (or would be).
+        store_path: String,
+        /// Which rung wins right now, and the file it names — `Err` when no
+        /// rung has anything, carrying the loader's own message so the two
+        /// surfaces cannot describe the same absence differently.
+        source: Result<local_rag_models::OrtSource, String>,
+    },
 }
 
 /// How many dead-lettered entries `doctor` lists before deferring to the count
@@ -412,6 +448,11 @@ fn build_report(
     // filesystem fact, independent of whether the store opens at all, and it is
     // exactly what a user on a fresh install needs to be told.
     let generator = build_generator(layout);
+    // Same reasoning as `generator` directly above, and the same placement:
+    // both are filesystem facts that hold whether or not the store opens, and
+    // both are exactly what a user on a fresh install needs to be told.
+    let runtime = build_runtime(layout);
+    let delivery = super::delivery::diagnose();
     let permissions = layout.audit_permissions();
     let versions = StateDb::diagnose_versions(&layout.state_db(), local_rag_store::ALL)
         .map_err(|e| e.to_string());
@@ -441,6 +482,8 @@ fn build_report(
             },
             normalization: NormalizationFinding::Skipped { reason },
             generator,
+            runtime,
+            delivery,
             space: SpaceFinding::Skipped,
         };
     }
@@ -471,6 +514,8 @@ fn build_report(
                 },
                 normalization: NormalizationFinding::Skipped { reason },
                 generator,
+                runtime,
+                delivery,
                 space: SpaceFinding::Skipped,
             };
         }
@@ -501,6 +546,8 @@ fn build_report(
                 },
                 normalization: NormalizationFinding::Skipped { reason },
                 generator,
+                runtime,
+                delivery,
                 space: SpaceFinding::Skipped,
             };
         }
@@ -535,6 +582,8 @@ fn build_report(
         consolidation,
         normalization,
         generator,
+        runtime,
+        delivery,
         space,
     }
 }
@@ -592,6 +641,26 @@ fn build_generator(layout: &StoreLayout) -> GeneratorFinding {
         catalogued: local_rag_generate::find(model_id).is_some(),
         installed: local_rag_generate::is_installed(layout, model_id),
         expected_path: layout.model_dir(model_id).display().to_string(),
+    }
+}
+
+/// T22-16's `runtime:` section. Pure filesystem + environment; see
+/// [`RuntimeFinding`] for why nothing here may touch `ort`.
+fn build_runtime(layout: &StoreLayout) -> RuntimeFinding {
+    let Some(asset) = local_rag_models::for_current_platform() else {
+        return RuntimeFinding::NotCatalogued;
+    };
+    RuntimeFinding::Checked {
+        platform: asset.platform.to_string(),
+        version: asset.version.to_string(),
+        installed_in_store: local_rag_models::ort_is_installed(layout, asset),
+        store_path: local_rag_models::ort_dylib_path(layout, asset)
+            .display()
+            .to_string(),
+        // The loader's own function, deliberately: a diagnostic that
+        // re-implemented the order would eventually disagree with what
+        // actually loads, and agreeing is the entire value of this line.
+        source: local_rag_models::diagnose_ort_source(layout),
     }
 }
 
@@ -987,6 +1056,58 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         "expected_path": report.generator.expected_path,
     });
 
+    let runtime = match &report.runtime {
+        RuntimeFinding::NotCatalogued => serde_json::json!({"catalogued": false}),
+        RuntimeFinding::Checked {
+            platform,
+            version,
+            installed_in_store,
+            store_path,
+            source,
+        } => serde_json::json!({
+            "catalogued": true,
+            "platform": platform,
+            "version": version,
+            "installed_in_store": installed_in_store,
+            "store_path": store_path,
+            "source": match source {
+                Ok(src) => serde_json::json!({
+                    "rung": src.rung.describe(),
+                    "path": src.path.display().to_string(),
+                }),
+                Err(detail) => serde_json::json!({"rung": serde_json::Value::Null, "detail": detail}),
+            },
+        }),
+    };
+
+    let delivery = match &report.delivery {
+        DeliveryFinding::Unknown { detail } => {
+            serde_json::json!({"state": "unknown", "detail": detail})
+        }
+        DeliveryFinding::Unmanaged { exe_dir } => serde_json::json!({
+            "state": "unmanaged",
+            "exe_dir": exe_dir.display().to_string(),
+        }),
+        DeliveryFinding::Damaged { path, detail } => serde_json::json!({
+            "state": "damaged",
+            "path": path.display().to_string(),
+            "detail": detail,
+        }),
+        DeliveryFinding::Managed { exe_dir, manifest } => serde_json::json!({
+            "state": "managed",
+            "exe_dir": exe_dir.display().to_string(),
+            "package_version": manifest.package_version,
+            "platform_key": manifest.platform_key,
+            "target_triple": manifest.target_triple,
+            "tag": manifest.tag,
+            "binaries": manifest
+                .binaries
+                .iter()
+                .map(|(name, b)| (name.clone(), serde_json::json!({"state": b.state, "file": b.file})))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        }),
+    };
+
     let indexing = match &report.indexing {
         IndexingFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
         IndexingFinding::Checked(list) => serde_json::Value::Array(
@@ -1043,6 +1164,8 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
         "consolidation": consolidation,
         "normalization": normalization,
         "generator": generator,
+        "runtime": runtime,
+        "delivery": delivery,
         "space": match &report.space {
             SpaceFinding::Skipped => serde_json::Value::Null,
             SpaceFinding::Checked(sp) => serde_json::json!({
@@ -1189,6 +1312,8 @@ fn print_human(report: &DoctorReport) {
     print_consolidation(&report.consolidation);
     print_normalization(&report.normalization);
     print_generator(&report.generator);
+    print_runtime(&report.runtime);
+    print_delivery(&report.delivery);
     print_space(&report.space);
 }
 
@@ -1262,6 +1387,92 @@ fn print_generator(finding: &GeneratorFinding) {
              until then consolidation and normalization have no provider",
             finding.model_id, finding.expected_path,
         );
+    }
+}
+
+/// T22-16's `runtime:` section.
+///
+/// Two facts, in the order a reader needs them: is there one at all, and —
+/// when there is — **which** one would load. The second line exists because
+/// "installed" and "used" are different questions the moment `ORT_DYLIB_PATH`
+/// is set, and a user staring at a store copy that is being overridden has no
+/// other way to find that out short of reading the source.
+fn print_runtime(finding: &RuntimeFinding) {
+    match finding {
+        RuntimeFinding::NotCatalogued => println!(
+            "runtime: this build pins no ONNX Runtime for this platform — supply one with \
+             ORT_DYLIB_PATH or place it beside the executable; until then search_code/recall \
+             stay lexical-only",
+        ),
+        RuntimeFinding::Checked {
+            platform,
+            version,
+            installed_in_store,
+            store_path,
+            source,
+        } => {
+            if *installed_in_store {
+                println!("runtime: ONNX Runtime {version} installed for {platform} ({store_path})");
+            } else {
+                println!(
+                    "runtime: ONNX Runtime {version} for {platform} NOT INSTALLED (expected \
+                     {store_path}) — run `local-rag init --download-models`",
+                );
+            }
+            match source {
+                Ok(src) => println!(
+                    "runtime: would load {} ({})",
+                    src.path.display(),
+                    src.rung.describe(),
+                ),
+                Err(detail) => println!("runtime: nothing would load — {detail}"),
+            }
+        }
+    }
+}
+
+/// T22-16's `delivery:` section — where this binary came from.
+///
+/// Never a fault line. "Unmanaged" is the normal state in a checkout and for
+/// anyone who placed the binaries themselves; the reason to print it at all is
+/// that "which tag am I running" is otherwise unanswerable, and a stale
+/// install under a moving `latest` is exactly the thing that looks like a bug
+/// somewhere else.
+fn print_delivery(finding: &super::delivery::DeliveryFinding) {
+    match finding {
+        DeliveryFinding::Unknown { detail } => {
+            println!("delivery: could not locate this executable — {detail}")
+        }
+        DeliveryFinding::Unmanaged { exe_dir } => println!(
+            "delivery: not installed by @13w/memory (no {} in {}) — a source checkout or a \
+             hand-placed binary",
+            super::delivery::INSTALL_MANIFEST,
+            exe_dir.display(),
+        ),
+        DeliveryFinding::Damaged { path, detail } => println!(
+            "delivery: the install manifest at {} could not be read — {detail}",
+            path.display(),
+        ),
+        DeliveryFinding::Managed { exe_dir, manifest } => {
+            let installed: Vec<&str> = manifest
+                .binaries
+                .iter()
+                .filter(|(_, b)| b.state == "installed")
+                .map(|(name, _)| name.as_str())
+                .collect();
+            println!(
+                "delivery: @13w/memory {} installed release {} for {} in {} ({})",
+                manifest.package_version,
+                manifest.tag,
+                manifest.platform_key,
+                exe_dir.display(),
+                if installed.is_empty() {
+                    "no binaries recorded".to_string()
+                } else {
+                    installed.join(", ")
+                },
+            );
+        }
     }
 }
 

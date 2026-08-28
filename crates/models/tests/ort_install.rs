@@ -31,10 +31,6 @@ fn layout(home: &TempHome) -> StoreLayout {
     layout
 }
 
-fn sha256(bytes: &[u8]) -> String {
-    local_rag_core::hash::sha256_hex(bytes)
-}
-
 #[test]
 fn a_clean_install_verifies_extracts_and_marks_ready() {
     let home = TempHome::new().expect("temp home");
