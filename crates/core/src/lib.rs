@@ -35,9 +35,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A build identifier that changes on every commit (D-050) — `git describe
 /// --always --dirty`, captured at compile time by `build.rs`; falls back to
 /// `"unknown"` outside a git checkout, never fails the build. Unlike
-/// [`VERSION`] (this workspace's `Cargo.toml` pins a fixed `"0.0.0"`
-/// placeholder, never bumped per commit), this always changes when the
-/// source does — used to fingerprint "the code that produced this
+/// [`VERSION`] (this workspace's `Cargo.toml` carries a release version,
+/// bumped only when a release is cut, never per commit), this always changes
+/// when the source does — used to fingerprint "the code that produced this
 /// deterministic failure" (`local_rag_store::memory::consolidation`).
 ///
 /// ```

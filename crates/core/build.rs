@@ -1,6 +1,7 @@
 //! Embeds a build identifier (D-050) that changes on every commit — unlike
-//! [`CARGO_PKG_VERSION`](std::env!), which this workspace pins to a fixed
-//! placeholder (`Cargo.toml`'s `version = "0.0.0"`, never bumped per commit).
+//! [`CARGO_PKG_VERSION`](std::env!), which this workspace bumps only when a
+//! release is cut (the tag *is* the version), never per commit. The literal
+//! is deliberately not repeated here: it moved once already, 0.0.0 -> 0.1.0.
 //! `local_rag_core::BUILD_ID` needs exactly this property to fingerprint
 //! "the code that produced this deterministic failure" (see
 //! `local_rag_store::memory::consolidation`'s own doc for the consumer).
