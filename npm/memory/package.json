@@ -1,6 +1,6 @@
 {
   "name": "@13w/memory",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "local-rag: obtains the native binaries from the project's own GitHub releases and puts them on your PATH — memory, hybrid code search and observation capture for Claude Code.",
   "license": "UNLICENSED",
   "type": "commonjs",

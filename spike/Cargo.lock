@@ -2117,7 +2117,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "local-rag-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "casefold",
@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-projection"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "local-rag-core",
  "local-rag-store",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "casefold",
  "local-rag-core",

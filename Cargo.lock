@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "libc",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "casefold",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-embed"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "local-rag-core",
  "local-rag-protocol",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-generate"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "encoding_rs",
  "llama-cpp-2",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-hook"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "local-rag",
  "local-rag-core",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-index"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ignore",
  "local-rag-core",
@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-memory"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "local-rag-core",
  "local-rag-embed",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-models"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "local-rag-core",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-projection"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "local-rag-core",
  "local-rag-store",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-protocol"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "local-rag-core",
  "serde",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-proxy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "local-rag",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-search"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "local-rag-core",
  "local-rag-projection",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "local-rag-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "casefold",
  "local-rag-core",
@@ -1237,11 +1237,11 @@ dependencies = [
 
 [[package]]
 name = "local-rag-test-support"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "local-rag-tui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crossterm",
  "local-rag",
@@ -3061,7 +3061,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "local-rag-core",
