@@ -52,3 +52,21 @@ github-attestations = true
 # because this repository happens to have no such files at its root: adding one
 # would silently put a second member into every release archive.
 auto-includes = false
+
+# Build only what is actually shipped. Without this, `cargo-dist` builds with
+# `cargo build --workspace`, which compiles every crate in the repository —
+# including `xtask`, a development-only crate that is neither in
+# `default-members` nor marked `dist = true` and appears in no release asset.
+#
+# It was not free. In the failed `0.1.0` run (D-112) `xtask` reached the linker
+# on `x86_64-pc-windows-msvc` and died there, adding a second, unrelated red
+# block to a log that already carried the real one.
+#
+# Read what this does and does not fix. It stops building a crate nothing ships,
+# and it shortens every release. It does NOT fix that link error: `xtask` pulls
+# `llama-cpp-sys-2` through `local-rag-generate`, and so does the shipped
+# `local-rag` binary (`crates/local-rag/Cargo.toml` depends on it
+# unconditionally). Whatever makes llama.cpp link on MSVC has to be fixed on its
+# own terms; this line only stops an unshipped crate from being the first to
+# report it.
+precise-builds = true

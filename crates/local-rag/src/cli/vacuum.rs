@@ -109,6 +109,15 @@ fn free_disk_bytes(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
+// D-112: paired whole, the way `free_disk_bytes` above is, rather than
+// stubbing the two helpers this body calls. `run_locked` and
+// `acquire_store_lock` are `#[cfg(unix)]`; this function was not, so on
+// `x86_64-pc-windows-msvc` it failed to compile (`E0425` twice, plus two
+// `E0277` cascades from the inference that then had nothing to infer from)
+// and took the whole release build with it. Pairing the two helpers instead
+// would leave `run_locked` unreachable — dead code behind an
+// `acquire_store_lock` that can only ever fail.
+#[cfg(unix)]
 pub fn run(args: VacuumArgs) -> ExitCode {
     let (layout, _config) = match resolve_layout_and_config() {
         Ok(v) => v,
@@ -153,6 +162,29 @@ pub fn run(args: VacuumArgs) -> ExitCode {
     let outcome = run_locked(&layout, args.dry_run);
     guard.release(&layout);
     outcome
+}
+
+/// The same command where the store lock does not exist.
+///
+/// This refuses for a reason, and the reason is worth stating rather than
+/// hiding behind "unsupported platform": exclusivity here is a POSIX advisory
+/// lock (`daemon/lock.rs`), which is the single mechanism `D-084` built so
+/// that "who owns this store" has one answer. A `VACUUM` that could not take
+/// it would be rewriting a database a live daemon may be using — the one
+/// outcome this command must never produce. `D-029` already records the
+/// Windows path as designed and unproven; this is one of the places that is
+/// true, stated out loud instead of discovered at runtime.
+#[cfg(not(unix))]
+pub fn run(args: VacuumArgs) -> ExitCode {
+    // Read by the unix pass only; touched here so the field does not trip
+    // `dead_code` on a platform that never runs one.
+    let _ = args.dry_run;
+    fail(
+        BIN,
+        "`vacuum` needs the store to itself, and on this platform there is no way to take it: \
+         store exclusivity is a POSIX advisory lock, which this target does not have. Stop the \
+         daemon and run the pass on a Unix host against the same store directory.",
+    )
 }
 
 /// The pass itself, with the store lock already held by the caller.

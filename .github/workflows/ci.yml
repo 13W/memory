@@ -4,8 +4,8 @@ on:
   push:
   pull_request:
 
-# Single host target for v0 (T00-02). Additional platform targets are added
-# by the distribution work (T17).
+# The full check runs on one host target (T00-02); `windows` below covers the
+# one other target that is built for release but never otherwise compiled here.
 jobs:
   check:
     name: full check
@@ -21,3 +21,37 @@ jobs:
         run: cargo install cargo-nextest --locked
       - name: Run full check
         run: cargo xtask ci
+
+  windows:
+    name: windows release build
+    runs-on: windows-latest
+    # D-112: nothing compiled this target between tags, so a Windows break
+    # stayed invisible until a release ran — and then it was a failed release,
+    # not a failed check. Two of them at once, in fact: a `#[cfg(unix)]` gap in
+    # `cli/vacuum.rs` that had been on `master` since X-012, and a llama.cpp
+    # link failure that arrived with a GitHub runner image bump
+    # (windows-2022 20260707.563 -> 20260819.586) under an unchanged
+    # `llama-cpp-sys-2 0.1.152`. The second one is why this job exists in this
+    # shape rather than as a cheaper check.
+    #
+    # `build`, not `check`: `cargo check` does not link, and the failure that
+    # actually cost the release was `link.exe exit 1120` — twenty-odd
+    # unresolved UCRT imports. A `check` job would have been green through all
+    # of it.
+    #
+    # `--profile dist`: that profile is what `cargo-dist` builds a release
+    # with, and it is not `release` — it inherits from it and adds
+    # `lto = "thin"`. Building anything else here would make this job an
+    # approximation of the thing it exists to predict.
+    #
+    # Scope is the four shipped binaries. Test targets are knowingly excluded:
+    # they carry their own instances of the same `cfg` defect (D-113), and
+    # widening this job belongs with fixing those, not before.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Build the shipped binaries
+        run: >
+          cargo build --profile dist
+          -p local-rag -p local-rag-proxy -p local-rag-hook -p local-rag-tui
