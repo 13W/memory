@@ -29,6 +29,11 @@
 // install is the only route to a network-free cold start") without the
 // `require.resolve` machinery ADR-0013 retired.
 //
+// A second derived entry joins it: `PNPM_HOME`, which pnpm's own installer
+// exports, together with its `bin` child — `D-124`, where naming only the
+// hard-coded default made a real `pnpm link --global` unresolvable under any
+// Node the shims were not installed into.
+//
 // The rest are the global bin directories of the installers ADR-0013 Decision 3
 // names — npm under both Homebrew prefixes, `pnpm link --global`, bun, volta —
 // plus the XDG convention. They must stay expressible in POSIX `sh` built-ins,
@@ -63,6 +68,31 @@ const DAEMON_BINARY = "local-rag";
 function nonemptyVar(env, name) {
   const value = env[name];
   return typeof value === "string" && value !== "" ? value : null;
+}
+
+/**
+ * A pnpm global directory and its `bin` child, in that order.
+ *
+ * Both shapes are real, and that is the whole of `D-124`: this list named
+ * `$HOME/.local/share/pnpm` and nothing else, while pnpm on the owner's machine
+ * keeps every global command one level down, in `.../pnpm/bin`. An interactive
+ * `PATH` carries both, so the miss stays invisible until this rung is the only
+ * one left — which is the GUI-launched client the rung exists for.
+ *
+ * Trailing separators come off first, and that is the shell's constraint rather
+ * than this file's: `local-rag-resolve-hook.sh` has to emit the byte-identical
+ * list (T22-14), and there `"$d/bin"` on a value ending in `/` yields `//bin`
+ * where `path.join` yields `/bin`. It is the same measured trap the
+ * node-directory rung documents, in the one other place a child path is formed.
+ *
+ * @param {path.PlatformPath} p
+ * @param {string} dir
+ * @returns {[string, string]}
+ */
+function withBinChild(p, dir) {
+  const trimmed = dir.replace(/[/\\]+$/, "");
+  const base = trimmed === "" ? p.sep : trimmed;
+  return [base, p.join(base, "bin")];
 }
 
 /**
@@ -107,18 +137,25 @@ function candidateBinDirs(opts = {}) {
   // beside `node` itself.
   dirs.push(p.dirname(execPath));
 
+  // Derived on the same terms, and ahead of the hard-coded guesses below for
+  // the same reason: pnpm's own installer exports `PNPM_HOME`, so it is this
+  // machine's answer rather than this file's. The hard-coded pnpm entry stays,
+  // because a machine that never ran `pnpm setup` has no such variable.
+  const pnpmHome = nonemptyVar(env, "PNPM_HOME");
+  if (pnpmHome !== null) dirs.push(...withBinChild(p, pnpmHome));
+
   const home = nonemptyVar(env, platform === "win32" ? "USERPROFILE" : "HOME");
   if (platform === "win32") {
     const appData = nonemptyVar(env, "APPDATA");
     if (appData !== null) dirs.push(p.join(appData, "npm"));
     const localAppData = nonemptyVar(env, "LOCALAPPDATA");
-    if (localAppData !== null) dirs.push(p.join(localAppData, "pnpm"));
+    if (localAppData !== null) dirs.push(...withBinChild(p, p.join(localAppData, "pnpm")));
   } else {
     dirs.push("/opt/homebrew/bin", "/usr/local/bin");
     if (home !== null) {
       dirs.push(
         p.join(home, ".local", "bin"),
-        p.join(home, ".local", "share", "pnpm"),
+        ...withBinChild(p, p.join(home, ".local", "share", "pnpm")),
         p.join(home, ".bun", "bin"),
         p.join(home, ".volta", "bin"),
         p.join(home, ".npm-global", "bin"),

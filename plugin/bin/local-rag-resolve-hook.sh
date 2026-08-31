@@ -95,11 +95,26 @@ _emit_candidates() {
         printf '%s\n' "${_nodedir:-/}"
     fi
 
+    # `PNPM_HOME` plus its `bin` child — the JS `withBinChild` rung (D-124).
+    # The stripping is the same one the node directory needs, for the same
+    # measured reason: `"$_pnpm/bin"` on a value ending in `/` would emit
+    # `//bin` where `path.join` emits `/bin`, and the parity test compares
+    # bytes, not intent.
+    if [ -n "${PNPM_HOME:-}" ]; then
+        _pnpm="$PNPM_HOME"
+        while [ -n "$_pnpm" ] && [ "${_pnpm%/}" != "$_pnpm" ]; do
+            _pnpm="${_pnpm%/}"
+        done
+        _pnpm="${_pnpm:-/}"
+        printf '%s\n' "$_pnpm" "${_pnpm%/}/bin"
+    fi
+
     printf '%s\n' /opt/homebrew/bin /usr/local/bin
     if [ -n "${HOME:-}" ]; then
         printf '%s\n' \
             "$HOME/.local/bin" \
             "$HOME/.local/share/pnpm" \
+            "$HOME/.local/share/pnpm/bin" \
             "$HOME/.bun/bin" \
             "$HOME/.volta/bin" \
             "$HOME/.npm-global/bin"

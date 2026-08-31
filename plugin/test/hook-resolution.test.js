@@ -263,6 +263,10 @@ test("--print-candidates agrees with candidateBinDirs(), entry for entry", () =>
       PATH: [nodeDir + suffix, "/usr/bin", "/bin"].join(":"),
       HOME: home,
       LOCAL_RAG_BIN_DIR: path.join(home, "override"),
+      // D-124's rung, carried through the same trailing-slash shapes: it is the
+      // second place a child path is formed, so it is the second place the two
+      // implementations can disagree about `//bin` versus `/bin`.
+      PNPM_HOME: path.join(home, "pnpm") + suffix,
     };
     const fromJs = candidateBinDirs({ env, platform: "linux", execPath: process.execPath });
     assert.ok(fromJs.length > 5, "a degenerate empty list would satisfy deepEqual trivially");

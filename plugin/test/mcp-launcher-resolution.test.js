@@ -100,6 +100,56 @@ test("the order is the override, then PATH in order, then the well-known directo
   assert.deepEqual(dirs.slice(0, 4), ["/override", "/a", "/b", "/usr/lib/node/bin"]);
   assert.ok(dirs.includes("/opt/homebrew/bin"));
   assert.ok(dirs.includes("/home/u/.local/share/pnpm"));
+  // D-124: the commands live one level down on a real pnpm install, and naming
+  // only the parent is what made a `pnpm link --global` unresolvable.
+  assert.ok(dirs.includes("/home/u/.local/share/pnpm/bin"));
+});
+
+test("PNPM_HOME is derived, and it brings its bin child with it", () => {
+  // The regression D-124 exists for. `pnpm setup` exports this variable, so it
+  // is the machine's own answer and outranks the hard-coded default below it —
+  // the same standing `dirname(execPath)` has, and for the same reason.
+  const dirs = candidateBinDirs({
+    platform: "linux",
+    execPath: "/usr/lib/node/bin/node",
+    env: { PATH: "/a", HOME: "/home/u", PNPM_HOME: "/home/u/.local/share/pnpm" },
+  });
+  assert.deepEqual(dirs.slice(0, 5), [
+    "/a",
+    "/usr/lib/node/bin",
+    "/home/u/.local/share/pnpm",
+    "/home/u/.local/share/pnpm/bin",
+    "/opt/homebrew/bin",
+  ]);
+  // A pnpm home that is not the default is reached too — the point of reading
+  // the variable rather than guessing the path.
+  const moved = candidateBinDirs({
+    platform: "linux",
+    execPath: "/usr/lib/node/bin/node",
+    env: { PATH: "", HOME: "/home/u", PNPM_HOME: "/opt/pnpm" },
+  });
+  assert.deepEqual(moved.slice(0, 3), ["/usr/lib/node/bin", "/opt/pnpm", "/opt/pnpm/bin"]);
+});
+
+test("a trailing separator on PNPM_HOME does not become a doubled one", () => {
+  // Not cosmetic: `local-rag-resolve-hook.sh` must emit the byte-identical list
+  // (T22-14), and there `"$d/bin"` on a value ending in `/` produces `//bin`.
+  // The shell strips first; so does this, or the parity test fails.
+  for (const raw of ["/opt/pnpm/", "/opt/pnpm//"]) {
+    const dirs = candidateBinDirs({
+      platform: "linux",
+      execPath: "/usr/lib/node/bin/node",
+      env: { PATH: "", HOME: "", PNPM_HOME: raw },
+    });
+    assert.deepEqual(dirs.slice(1, 3), ["/opt/pnpm", "/opt/pnpm/bin"], `PNPM_HOME=${raw}`);
+  }
+  // The degenerate value has one right answer rather than an empty string.
+  const root = candidateBinDirs({
+    platform: "linux",
+    execPath: "/usr/lib/node/bin/node",
+    env: { PATH: "", HOME: "", PNPM_HOME: "/" },
+  });
+  assert.deepEqual(root.slice(1, 3), ["/", "/bin"]);
 });
 
 test("the directory beside node is derived, not guessed", () => {
@@ -145,6 +195,7 @@ test("win32 shapes are computed correctly from a POSIX host", () => {
     "C:\\Program Files\\nodejs",
     "C:\\Users\\u\\AppData\\Roaming\\npm",
     "C:\\Users\\u\\AppData\\Local\\pnpm",
+    "C:\\Users\\u\\AppData\\Local\\pnpm\\bin",
   ]);
 });
 
@@ -205,6 +256,43 @@ test("a truncated PATH still finds a global install — the launchd case", (t) =
     env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: root },
   });
   assert.equal(found.dir, beside);
+});
+
+test("a pnpm global install is found when it is the only rung left — D-124", (t) => {
+  // The regression, in the shape it actually occurred. `pnpm link --global`
+  // puts the commands in `$PNPM_HOME/bin`; the list named only `$PNPM_HOME`,
+  // so with a truncated PATH and a Node the shims were never installed into,
+  // nothing resolved and the client reported a server that had failed to
+  // start. Both halves matter — hence the poisoned parent directory.
+  const root = mkTmpRoot("lr-resolve-pnpm-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pnpmHome = path.join(root, "pnpm");
+  const realDir = installInto(path.join(pnpmHome, "bin"));
+  fs.writeFileSync(path.join(pnpmHome, "not-a-binary"), "");
+
+  const found = resolveBinary(SERVER_BINARY, {
+    platform: "linux",
+    // A Node with no global install beside it: the v24.20.0 half of the report.
+    execPath: path.join(mkTmpRoot("lr-resolve-pnpm-node-"), "node"),
+    env: { PATH: "/usr/bin:/bin", HOME: root, PNPM_HOME: pnpmHome },
+  });
+  assert.ok(found, "the install exists and must be reachable without PATH");
+  assert.equal(found.dir, realDir);
+});
+
+test("the hard-coded pnpm default keeps working without PNPM_HOME", (t) => {
+  // `pnpm setup` exports the variable, but a machine that installed pnpm some
+  // other way has the directory and not the variable. Both rungs stay.
+  const root = mkTmpRoot("lr-resolve-pnpm-default-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = installInto(path.join(root, ".local", "share", "pnpm", "bin"));
+
+  const found = resolveBinary(SERVER_BINARY, {
+    platform: "linux",
+    execPath: path.join(mkTmpRoot("lr-resolve-pnpm-default-node-"), "node"),
+    env: { PATH: "/usr/bin:/bin", HOME: root },
+  });
+  assert.equal(found.dir, dir);
 });
 
 test("a directory holding the proxy but not the daemon is skipped", (t) => {

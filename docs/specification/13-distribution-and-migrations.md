@@ -252,6 +252,18 @@ never write into a user's project on install/uninstall — no new test needed fo
 - the ONNX Runtime is an artifact of first run, installed beside the weights rather than bundled
   into a package `[FIXED, ADR-0013]` (10 §5).
 
+As-built note (`D-124`, `[SPEC]`). The well-known-directories rung is not only hard-coded paths.
+It also takes the locations a package manager exports into the environment, and it offers each
+such location **together with its `bin` child**. `PNPM_HOME` is the case that forced both halves:
+pnpm's own installer exports it, the global commands sit in `$PNPM_HOME/bin`, and the list named
+the parent alone — so a `pnpm link --global` was unresolvable under any Node the shims had not
+been installed into. An interactive `PATH` hides that miss, which is why it surfaced only as the
+failure this rung exists to prevent: a client with no inherited `PATH` reporting a server that
+would not start. The enumeration itself stays the launcher's own choice rather than this
+document's — this section names the rung and its purpose, `plugin/bin/local-rag-mcp-launcher.js`
+carries the list and the reasoning, and `plugin/bin/local-rag-resolve-hook.sh` is held to the
+byte-identical list by T22-14's parity test.
+
 Amendment note (T22-04, `[FIXED]` change under
 [ADR-0013](../adr/0013-binary-delivery-via-release-assets.md)). Four of the six requirements above
 are this ADR's; the first and the checksum one are untouched in substance. Two of them replace
