@@ -1,0 +1,263 @@
+# Group 23 — Consolidation recovery and candidate dedup (post-v0)
+
+The sixth group opened after `T00–T17` closed (`G17: PASS`), by the owner's explicit product
+decision of 2026-08-31. The decision itself is recorded in
+`docs/adr/0014-consolidation-recovery-and-candidate-dedup.md`, written by card `T23-01` — until
+then every reference to that ADR is forward-looking. No gate `G00–G22` is reopened.
+
+**This is the first group opened from the state of a live store rather than from the plan's own
+queue,** and that is the reason it exists in this shape: every number in the diagnosis below was
+measured on `~/.local/share/local-rag/state.sqlite` while the daemon was running, not derived from
+reading code. The precedent paragraph in `TRACEABILITY.md` records what that changes about how a
+group may be opened.
+
+Goal: consolidation that can get itself unstuck without rebuilding the binary, a backlog an
+operator can see the shape of, and a candidate queue that stops accumulating the same proposal.
+
+References: ADR-0014 (created by `T23-01`); ADR-0006 (the local generator and its bounds);
+ADR-0010/ADR-0011 (memory canon, for the entry shapes the router writes); spec 04 §4 (the
+consolidation-run machine); spec 08 §3/§4 (candidates, the consolidation loop, and the accepted
+cost this group revisits); spec 12 §3; `crates/store/src/memory/consolidation.rs`;
+`crates/store/src/memory/runner.rs`; `crates/store/src/memory/stats.rs`;
+`crates/memory/src/recall/mod.rs`; `crates/memory/src/router.rs`;
+`crates/local-rag/src/daemon/consolidation_trigger.rs`; `crates/local-rag/src/cli/stats.rs`;
+`crates/local-rag/src/cli/doctor.rs`; `D-024`, `D-050`, `D-052`, `D-058`, `D-061`, `D-071`,
+`D-080`, `D-096` (the observability precedent), `X-005`.
+
+Card format follows `TASK-TEMPLATE.md`; group structure follows groups 18/20/21/22. One task —
+one iteration — one commit.
+
+## Diagnosis (context for the executor — read before starting)
+
+Every figure below is reproducible against a live store with `sqlite3 "file:<state.sqlite>?mode=ro"`.
+They are recorded here so a later reader can tell what this group was actually looking at.
+
+1. **Consolidation is stopped, and the backlog is not spread out.**
+   `throughput_observations_per_min` is `0.0` with `pending_backlog_total` 1386. All 1386
+   observations sit behind **four** sessions whose latest run is `failed`. Twenty-five sessions
+   carry a failed run; twenty-one of them are harmless — their cursor is already past, backlog 0 —
+   and two of the remaining four hold 1368 of the 1386.
+
+2. **Two of those four are blocked permanently, and it is provable rather than suspected.** Their
+   latest run is a `mechanical` dead-letter that is **not** a context overflow (`optimistic
+   conflict: expected entry_version 2, found 3`, and `router output did not parse as a JSONL ops
+   stream: EOF while parsing a string at line 1 column 4430`). No path forward exists for such a
+   row:
+   - `stale_runs` (`crates/store/src/memory/consolidation.rs`) deliberately excludes it —
+     `mechanical` with a matching fingerprint — and that exclusion is right: it is the guard
+     `D-050`/spec 08 §4 added so that
+     no failure class retries unboundedly, after one window of three observations was retried 627
+     times;
+   - `dead_letter_shrink_decision` (same file) requires `last_failure_context_overflow`,
+     so `D-058`'s shrink ladder does not apply;
+   - the CLI cannot act on it. `doctor` and `stats` report it, `purge` deletes the session's data
+     rather than consolidating it, and nothing else touches a run.
+
+3. **The specification foresaw this and accepted its cost — under an assumption release `0.1.0`
+   falsified.** Spec 08 §4 says, verbatim: "Knowingly accepted cost of (3): a genuinely long
+   generator outage parks the runs it hits **until the binary is rebuilt** — a daemon restart does
+   not revive them — and `open_next_run` blocks that session's whole backlog meanwhile." The
+   escape is a rebuild, because a rebuild changes `BUILD_ID` and the fingerprint stops matching.
+   A published release has no rebuild: checked on the downloaded `0.1.0`, its `BUILD_ID` is the
+   literal `0.1.0`, constant for the life of that release. For anyone running a released binary
+   the first mechanical dead-letter parks that session **forever**, with no supported remedy at
+   all. The cost was accepted when the only user was a developer with `cargo build` at hand;
+   publishing made the assumption false, not the cost larger.
+
+4. **Candidate dedup is delegated entirely to the generator, and the generator cannot do it.**
+   9564 pending candidates carry **3294** distinct texts — 66 % duplicates — and the worst single
+   text has been proposed **476** times. The `conflicts` column is non-empty on **0 of 9564**.
+   The mechanism is not a tuning problem: spec 08 §4 step 3 hands the router a "candidate conflict
+   set", and `recall::candidate_conflict_set` builds it from `active_entries_for_scope` — **active
+   entries only**. A pending candidate is not an entry, so a proposal identical to 475 pending
+   siblings is never shown to the router, cannot be named as a conflict, and is written as a new
+   row. There is no deterministic backstop in the store.
+
+5. **The backlog is a single number.** `pending_backlog_total` has no per-session breakdown, so
+   "all 1386 are behind four sessions" was only obtainable with hand-written SQL — exactly the gap
+   `D-096` closed for indexing, in the same shape.
+
+6. **Two root failures are defects in their own right, and are not the same defect as (2).** The
+   `optimistic conflict` was retried ten times against a moving `entry_version` rather than
+   re-read; and the router's output was truncated mid-string at 4430 characters, against a fixed
+   `MAX_GENERATION_TOKENS = 1024` (`crates/memory/src/router.rs`) that does not scale with the
+   window it must describe.
+
+## Baseline, recorded before any card runs
+
+A group that means to move numbers has to state them first. Measured 2026-08-31:
+
+| Measure | Before |
+| --- | --- |
+| Backlog | 1386 observations, 100 % behind 4 sessions |
+| Throughput | 0.0 observations/min |
+| Failed runs | 27, across 25 sessions |
+| Pending candidates | 9564, over 3294 distinct texts |
+| Candidates with a non-empty `conflicts` | 0 of 9564 |
+
+## T23-00 — Scope registration
+
+- **Depends on:** —.
+- **Specification:** `TRACEABILITY.md` (the "new scope → ADR + group" rule); `CLAUDE.md`
+  (deviation workflow).
+- **Result:** this file, the `## 23` section in `PROGRESS.md`, rows `D-117`…`D-122` in
+  `DEVIATIONS.md` (status `open`, corrective cards named), and the sixth precedent paragraph in
+  `TRACEABILITY.md`.
+- **In scope:** documentation only; every cross-reference must resolve.
+- **Not in scope:** ADR-0014 itself — it is `T23-01`; any edit to `[FIXED]` text; any code.
+- **Tests:** none. `cargo test -p xtask --test adr_links` is deliberately **not** run: no
+  `docs/adr/*.md` is touched, and the ADR that would make it meaningful is created by `T23-01`.
+  The `T22-00` evidence line sets that precedent.
+- **Acceptance:** the listed files exist and are internally consistent; every reference either
+  resolves to an existing file or is explicitly marked forward-looking with the card that creates
+  it named; no `T23-01+` card counts as started before this one lands.
+- **Evidence:** the `T23-00` row in "Task evidence" (`PROGRESS.md`).
+
+## T23-01 — ADR-0014: recovery from a parked run, and where dedup lives
+
+- **Depends on:** `T23-00`.
+- **Specification:** ADR-0005 (form and bar); `TRACEABILITY.md` (the precedent list).
+- **Result:** `docs/adr/0014-consolidation-recovery-and-candidate-dedup.md`, in Nygard form, in
+  English, plus the sixth precedent paragraph's cross-reference.
+- **In scope:** two decisions, each with its price stated. (1) A parked run must have a supported
+  recovery path that does not require rebuilding the binary — and the ADR must say what "recovery"
+  is allowed to mean, since abandoning a window advances a cursor past observations that were
+  never consolidated, which is data loss of a bounded kind and must be recorded as such. (2)
+  Candidate dedup is deterministic and lives in the store; the generator's `conflicts` output
+  stays a hint rather than the only source. Rejected alternatives recorded, including "let the
+  operator edit SQLite" (what has actually happened four times) and "make the fingerprint
+  time-based rather than build-based" (revives the retry storm `D-050` stopped).
+- **Not in scope:** any code; any `[FIXED]` edit — the ADR makes a change legal, the cards make it.
+- **Tests:** `cargo test -p xtask --test adr_links`, whose link check now covers the new file.
+- **Acceptance:** both decisions and both prices are named; every relative link resolves; the ADR
+  does not silently lower a bar set by ADR-0006 or spec 08 without naming it.
+- **Evidence:** the `T23-01` row in "Task evidence".
+
+## T23-02 — The backlog says which sessions it is behind
+
+- **Depends on:** `T23-01`.
+- **Specification:** spec 08 §4; spec 11 §6 (`stats`, `doctor`).
+- **Result:** `stats` and `doctor` report the backlog per session, together with what is holding
+  each one.
+- **In scope:** a module that owns the computation, with the commands only formatting it — the
+  shape `crates/local-rag/src/cli/coverage.rs` established for `D-096`, for the same reason: two
+  callers must not be
+  able to disagree about the number.
+- **Not in scope:** acting on anything; that is `T23-03`.
+- **Tests:** a fixture store with a blocked session and a healthy one; the per-session breakdown
+  must sum to `pending_backlog_total`, proved by a mutation that makes it not.
+- **Acceptance:** the fact "all N observations are behind M sessions" is obtainable without SQL.
+- **Evidence:** the `T23-02` row, with the live figure from the owner's store.
+
+## T23-03 — A supported repair for a parked session
+
+- **Depends on:** `T23-02`.
+- **Specification:** ADR-0014 Decision 1; spec 04 §4; spec 08 §4; spec 12 §3 (audit).
+- **Result:** a command that clears a session's block without rebuilding the binary.
+- **In scope:** both directions ADR-0014 allows — retry a parked run on demand, and declare a
+  window unconsolidatable and move the cursor past it — each writing an `audit_event` that says
+  which observations were skipped and why. Whatever the repair does, it must not resurrect the
+  retry storm `D-050` stopped: an explicit operator action is not a background retry.
+- **Not in scope:** the root causes; they are `T23-04`…`T23-06`.
+- **Tests:** a parked mechanical non-overflow run is repairable; the audit row names the skipped
+  range; the repair is idempotent; and a **regression against the storm**: the repair must not make
+  `stale_runs` pick the row up again on its own.
+- **Acceptance:** on the owner's live store, the four blocked sessions clear and the backlog moves
+  without hand-written SQL. This is the card that unsticks the store — the fix and the remedy are
+  one piece of work here, not two.
+- **Evidence:** the `T23-03` row, with before/after backlog from the live store.
+
+## T23-04 — The window is bounded by tokens, not by row count
+
+- **Depends on:** `T23-01`.
+- **Specification:** spec 08 §4; `config.memory.router_conflict_token_budget`'s own derivation.
+- **Result:** a window that cannot deterministically overflow the model's context.
+- **In scope:** the same treatment the conflict set already gets — `D-080` capped that at 12 000
+  tokens with `estimate_tokens` after measuring the identical failure — applied to the window
+  itself, which is currently bounded only by `consolidation_batch_size` (20) on the assumption of
+  "short excerpts". Removing the class at its source, not shrinking after the failure: `D-058`'s
+  ladder stays as the backstop it was designed to be.
+- **Not in scope:** changing what a window means, or the trigger's cadence.
+- **Tests:** a window of oversized observations is split rather than failed; the arithmetic
+  (context − answer reserve − prompt) is asserted, not hard-coded twice.
+- **Acceptance:** the `context overflow` failure class stops being reachable by a normal window.
+- **Evidence:** the `T23-04` row.
+
+## T23-05 — An optimistic conflict is re-read, not retried
+
+- **Depends on:** `T23-01`.
+- **Specification:** spec 08 §4 step 4; spec 04 §4.
+- **Result:** a stale plan is refreshed rather than replayed.
+- **In scope:** `expected entry_version 2, found 3` is not a transient fault — it is a plan built
+  against a version that has since moved. Ten identical retries cannot succeed, and the tenth
+  escalates it to a permanent mechanical dead-letter (`D-050`'s cap doing its job on the wrong
+  input).
+- **Not in scope:** the version-check itself, which is correct and stays.
+- **Tests:** a concurrent writer bumps `entry_version` between plan and apply; the run converges
+  instead of dead-lettering. Proved by mutation both ways.
+- **Acceptance:** this failure reason disappears from a store under concurrent writes.
+- **Evidence:** the `T23-05` row.
+
+## T23-06 — The router's answer budget follows its window
+
+- **Depends on:** `T23-01`.
+- **Specification:** spec 08 §4 step 3 (two-tier malformed-output handling); ADR-0006.
+- **Result:** the generator is not asked to describe a window in fewer tokens than the answer needs.
+- **In scope:** `MAX_GENERATION_TOKENS = 1024` (`crates/memory/src/router.rs`) is a constant
+  against a window of up to 20
+  observations; the live failure truncated a string at 4430 characters and then failed the whole
+  window after its one corrective re-prompt. The budget is derived from the window, and the
+  interaction with `T23-04`'s window budget is stated in one place rather than two.
+- **Not in scope:** the corrective re-prompt itself, which stays.
+- **Tests:** a window that legitimately needs a long answer completes; the derivation is asserted.
+- **Acceptance:** truncation stops being a window-failing class.
+- **Evidence:** the `T23-06` row.
+
+## T23-07 — Deterministic candidate dedup in the store
+
+- **Depends on:** `T23-01`.
+- **Specification:** ADR-0014 Decision 2; spec 08 §3/§4 step 3.
+- **Result:** a proposal identical to something already pending, or already an entry, does not
+  create another row.
+- **In scope:** the gap is precise and must be fixed at its cause: `recall::candidate_conflict_set`
+  builds from `active_entries_for_scope`, so a pending candidate is structurally invisible to the
+  router that is supposed to notice it. Both halves matter — show pending candidates to the router,
+  *and* keep a deterministic store-side check so the answer does not depend on a 4B model noticing.
+- **Not in scope:** near-duplicate or semantic dedup; exact-text first, measured before anything
+  fuzzier is proposed.
+- **Tests:** the same proposal twice yields one row; a genuinely different proposal is unaffected;
+  the store-side check is proved by a mutation that removes it while the generator still says
+  nothing.
+- **Acceptance:** on the live store, re-running a window that previously produced a duplicate
+  produces none.
+- **Evidence:** the `T23-07` row, with the distinct-vs-total figure remeasured.
+
+## T23-08 — The queue can be triaged in bulk
+
+- **Depends on:** `T23-07`.
+- **Specification:** spec 08 §3; spec 11 §2/§6.
+- **Result:** 9564 candidates can be worked through by something other than one call per candidate.
+- **In scope:** grouping identical and near-identical proposals so a decision applies to a group;
+  the existing per-candidate review path (`approve`/`reject`/`edit`) stays and remains the only way
+  a candidate becomes an entry.
+- **Not in scope:** automatic approval. A candidate exists because a human decides; bulk **reject**
+  of exact duplicates is a different act from bulk accept, and the card must not blur them.
+- **Tests:** a bulk decision touches exactly the group it names; a group of one behaves like the
+  existing path.
+- **Acceptance:** the owner's queue is reducible without losing a distinct proposal — the
+  distinct-text count is the invariant, not the total.
+- **Evidence:** the `T23-08` row.
+
+## G23 — Consolidation and candidate review gate
+
+- **Depends on:** every card of the group.
+- **Specification:** spec 04 §4; spec 08 §3/§4; spec 11 §6; spec 12 §3; ADR-0014.
+- **Result:** `PASS`, `PASS after D-NNN` or `BLOCKED` in the Gate results table.
+- **In scope:** reread the named sections; build the requirement → code → test trace; check every
+  `[FIXED]`/`[SPEC]`/`[OPEN]` the group touched — in particular spec 08 §4's accepted-cost
+  paragraph, which this group's premise contradicts and which must end up saying what is true;
+  confirm `D-117`…`D-122` are all `resolved`; run both JS suites and `cargo xtask ci`; and
+  **remeasure the baseline table above on the live store**, since a group opened from a live store
+  is answerable to it.
+- **Not in scope:** reopening `G00`–`G22`.
+- **Acceptance:** the trace is reproducible and the evidence is appended to `PROGRESS.md`.

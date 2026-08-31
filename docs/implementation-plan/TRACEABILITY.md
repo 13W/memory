@@ -90,3 +90,32 @@ ADR, для одного класса артефактов и сохраняет
 оставил открытым и адресовал `T17-03` («this ADR decides the binding, not the packaging»),
 поэтому замещается as-built ответ `T17-03`, а не запись ADR. Реализуется группой `22` с гейтом
 `G22` (`groups/22-binary-delivery-and-resolution.md`); ни один гейт `G00–G21` не переоткрывается.
+
+The sixth precedent is `docs/adr/0014-consolidation-recovery-and-candidate-dedup.md`, and what is
+new about it is not the scope but **where the evidence for opening it came from**. Groups 18, 20,
+21 and 22 were all opened from a reading: a design wish, a `[FIXED]` line with no owner, an
+unanswered question about language, a delivery channel that turned out to be unimplemented. Group
+23 was opened from a **running store**. Every figure in its diagnosis — the backlog of 1386
+observations sitting entirely behind four sessions, 27 failed runs across 25 sessions, 9564
+pending candidates over 3294 distinct texts, `conflicts` non-empty on none of them — was measured
+against the live store's `state.sqlite` with the daemon up, and none of it is visible from the source alone.
+
+Two rules follow, and they are the reason this is written down rather than left as a habit.
+
+**A group opened from a live store owes that store a before-and-after.** Group 23 records its
+baseline in its own file and in `PROGRESS.md` before any card runs, and `G23` is required to
+remeasure it. A group whose premise is "the system is stopped" cannot be closed by a green test
+suite alone; the thing that was stopped has to be shown moving.
+
+**A specification may accept a cost, and a later release may falsify the assumption the acceptance
+rested on — and that is a deviation, not a change of mind.** Spec 08 §4 accepted, in as many
+words, that a parked consolidation run stays parked "until the binary is rebuilt". The reasoning
+was sound while the only user was a developer with `cargo build` at hand. Publishing `0.1.0` — a
+binary whose `BUILD_ID` is fixed for the life of the release — removed the escape without touching
+a line of the text that names it. So the discrepancy is registered as `D-117` and repaired by
+cards, on the same principle ADR-0013 established: an ADR makes a change legal, it does not make
+it. What this case adds is that the trigger for such a registration can be an event outside the
+repository entirely.
+
+Implemented by group `23` with gate `G23` (`groups/23-consolidation-recovery.md`); no gate
+`G00–G22` is reopened.

@@ -1384,6 +1384,74 @@ structural sharing для ~2 900 впервые пригодных файлов.
 продукта впервые находится его собственным кодовым поиском.
 
 
+## 23 — Consolidation recovery and candidate dedup
+
+The sixth group opened after `T00–T17`/`G17` closed, by the owner's explicit product decision of
+2026-08-31, recorded in `docs/adr/0014-consolidation-recovery-and-candidate-dedup.md` by card
+`T23-01`; no gate `G00–G22` is reopened. Cards and their descriptions:
+`docs/implementation-plan/groups/23-consolidation-recovery.md`.
+
+**This is the first group opened from the state of a live store rather than from the plan's own
+queue,** and the distinction is not cosmetic: every figure below was measured on
+`~/.local/share/local-rag/state.sqlite` with the daemon running, so the group is answerable to
+that store and `G23` remeasures it. The precedent paragraph in `TRACEABILITY.md` records what
+that changes.
+
+The ground for opening it: **consolidation has stopped, and the mechanism cannot restart itself.**
+`throughput_observations_per_min` is `0.0` with a backlog of 1386 observations, and all 1386 sit
+behind four sessions whose latest run is `failed`. Two of those four are blocked permanently, and
+provably so: their latest run is a `mechanical` dead-letter that is not a context overflow, and
+for such a row `stale_runs` deliberately declines to retry (rightly — that is `D-050`'s guard
+against the retry storm that once cost 627 attempts on one window), `dead_letter_shrink_decision`
+does not apply (it requires a context overflow), and no CLI command can act on it at all.
+
+Spec 08 §4 foresaw exactly this and accepted its cost in as many words — "parks the runs it hits
+**until the binary is rebuilt**". That escape works because a rebuild moves `BUILD_ID`. **A
+published release has no rebuild**: the downloaded `0.1.0` carries the literal `BUILD_ID` `0.1.0`,
+constant for the life of the release, so for any user of a released binary the first mechanical
+dead-letter parks that session forever with no supported remedy. The cost was accepted when the
+only user was a developer with `cargo build` at hand; publishing `0.1.0` made the assumption
+false, not the cost larger. That is the group's premise, and `G23` must leave the specification
+saying something true about it.
+
+Measured alongside it, and in scope as their own cards rather than as guesses: candidate dedup is
+delegated entirely to the generator and the generator structurally cannot do it —
+`recall::candidate_conflict_set` builds the router's conflict set from `active_entries_for_scope`,
+so a pending candidate is invisible to the very step meant to notice it, and 9564 pending
+candidates carry 3294 distinct texts with the worst proposed 476 times and `conflicts` non-empty
+on none of them; the backlog is a single number with no per-session breakdown, so its shape was
+only obtainable by hand-written SQL (`D-096`'s gap, in the same shape); and the two root failures
+are defects in themselves — an optimistic conflict retried ten times against a moving
+`entry_version` instead of re-read, and a router answer truncated at 4430 characters against a
+fixed `MAX_GENERATION_TOKENS = 1024`.
+
+Owner decisions taken while planning (2026-08-31): the work is carried as a **group with an ADR**
+rather than a set of `D-NNN`, because both central changes are new behaviour rather than a return
+to what the specification already says; and **consolidation comes before candidates**, because the
+mechanism fix and the remedy for the live store are one piece of work (`T23-03`), not two.
+
+Baseline recorded before any card runs, so the group can be held to it:
+
+| Measure | Before (2026-08-31) |
+| --- | --- |
+| Backlog | 1386 observations, 100 % behind 4 sessions |
+| Throughput | 0.0 observations/min |
+| Failed runs | 27, across 25 sessions |
+| Pending candidates | 9564, over 3294 distinct texts |
+| Candidates with a non-empty `conflicts` | 0 of 9564 |
+
+- [x] T23-00 Scope registration (this section, `groups/23-*`, rows `D-117`…`D-122`, the sixth
+      precedent paragraph in `TRACEABILITY.md`)
+- [ ] T23-01 ADR-0014: recovery from a parked run, and where dedup lives
+- [ ] T23-02 The backlog says which sessions it is behind
+- [ ] T23-03 A supported repair for a parked session (unsticks the live store)
+- [ ] T23-04 The window is bounded by tokens, not by row count
+- [ ] T23-05 An optimistic conflict is re-read, not retried
+- [ ] T23-06 The router's answer budget follows its window
+- [ ] T23-07 Deterministic candidate dedup in the store
+- [ ] T23-08 The queue can be triaged in bulk
+- [ ] G23 Consolidation and candidate review gate
+
 ## Evidence
 
 ### Gate results
@@ -1727,6 +1795,7 @@ requirement→test-звенья четырёх удаляемых тестов `
 | G22 | commit `G22: delivery and resolution reviewed` (evidence line in that same commit) | `cargo xtask ci` — **all 18 jobs passed** (`root:test` 373.6 s); `npm/memory` **185/185**; `plugin` **53/53**; `cargo test -p xtask --test adr_links` **11/11**; `dist generate --check` exit 0; live acceptance of `T22-17` against the published `0.1.0` — four binaries, four digests matching the release sidecars | Requirement → code → test trace over spec 13 §1/§2/§4, 01 §1/§2, 12 §1, 11 §3.1/§3.2, plus the `G17`/`G19` rows `T22-00` declared obsolete — every one of those re-traced to what replaced it rather than dropped. Read personally, no subagents, no as-built sentence taken on faith: `hooks.json` was parsed to confirm seven events all ending `\|\| true` and `SessionStart` differing by exactly one environment variable; `dist_ort.rs` was opened to confirm it *imports* the catalog it used to define. **Four findings, all documentation over already-correct code, all closed in the gate without a `D-NNN`** (the `G17`/`G19`/`G20` precedent): three live references to a file `T22-15` moved; an asset contract describing 42 assets where a real release carries 44 (`cargo-dist`'s `source.tar.gz` and its sidecar were unnamed); a licence comment of mine that said a release carries no licence copy, when `source.tar.gz` carries `LICENSE` and `NOTICE` — checked by extracting it; and `D-110`, closed by amending ADR-0013 rather than by moving a status, because what remained was a text claiming a verification the code deliberately does not do. `D-102`…`D-107` all `resolved`, checked mechanically. The only deviation open anywhere is `D-042` (`blocked`, group 19, owner decision), not reopened here. **Boundary stated rather than left implied:** every platform claim but `darwin-arm64` rests on CI compiling and `dist` producing an archive, not on running a binary — the same line `D-029` drew | Claude Opus 5 / 2026-08-31 |
 | `D-115` — an EOF from the proxy stops being a puzzle (appendix, 2026-08-31) | commit `D-115: an EOF from the proxy stops being a puzzle` plus this line; registered **after** `G22` was recorded `PASS`, and the gate is not reopened — the same disposition `G19` used for `D-042` | CI run `33387761931` on `a0d3d7d`: `daemon_version_mismatch_triggers_the_upgrade_flow_and_completes_against_the_new_daemon` FAIL in **0.016 s**. The neighbouring run `33387801240` on `e62a925` — same suite — is `success`. Locally: 20 of 20 green in isolation, and zero failures across nine full-suite runs the same day. Mutation proving the new diagnostic, then reverted: `proxy.kill()` right after `spawn_proxy` now yields `the proxy closed stdout without answering / proxy exit: signal: 9 (SIGKILL)` where the old code yielded `parse response: EOF while parsing a value` | **The finding is that the test could not have explained itself.** 0.016 s against a 25 s budget is not a spent budget and not a slow host: the proxy closed stdout without writing a byte. But `read_line` returned `Ok("")` on EOF, telling an answer and a death apart nowhere, and `spawn_proxy` pipes a stderr nothing ever reads — so the one artefact that could name the cause was discarded on every run. Fixed the way `D-114` was: instrument first, theorise never. `read_line` now asserts on the byte count and, on both failure paths, prints the proxy's `try_wait()` and its stderr; `Child` is threaded through all 12 call sites in the file rather than only the one that failed, because this file has produced this shape of puzzle before (`D-111`'s bind-inside-the-thread race lived here). **Left `open` deliberately:** the change makes the next occurrence self-explaining, it does not remove the cause, and calling it resolved would be a lie. It matters more than a normal flake because the path is the upgrade flow — the one that took the owner's live MCP down on 2026-08-28 | Claude Opus 5 / 2026-08-31 |
 | `D-116` — the explicit reload was racing the supervisor's own backstop (appendix, 2026-08-31) | commit `D-116: the explicit reload was racing the supervisor's own backstop` plus this line | CI run `33393785932` on `1b810ad`: `reload_starts_and_stops_exactly_the_delta` FAIL in 0.347 s, `outcome.started` 0 against 1. Reproduced deterministically here by inserting a 200 ms sleep before the `reload()` — the window a loaded runner gives away for free: **`left: 0, right: 1`, the identical failure**. With the fix and the same window: PASS. Mutation reverted. `binary(indexing_supervisor)` 5/5; `cargo xtask ci` — all 18 jobs passed | **The product was right and the test was asserting past it.** `managed_worktree` has two observers by design: the explicit `reload()` and a backstop poll, which `support::start_options` sets to **50 ms**. Between the test's two registry writes and its `reload()` sit two awaited transactions; on a loaded machine the backstop tick lands in that gap, starts the new row itself, and `reload()` then correctly reports `started: 0` for a delta someone else already applied. The backstop exists precisely so a registry change is picked up without an explicit reload — so widening the assertion would have been asserting away the feature. Instead the test raises `indexing_backstop_poll_interval` to an hour for its own duration, making `reload()` the only observer, which is what the test is about. That is a strengthening: an unintended second observer is removed, not a requirement relaxed. It is the one test in the file that asserts on a delta; every other asserts on the end state, where either observer is a legitimate answer | Claude Opus 5 / 2026-08-31 |
+| T23-00 | commit `T23-00: register group 23 — consolidation cannot unstick itself` (evidence line in that same commit) | Documentation only, so the checks are about resolvability and about nothing having been broken. (1) Every backtick path reference in the new group file, the new `## 23` section, the six `D-NNN` rows and the sixth precedent paragraph was extracted and resolved mechanically: **0 unresolved**, with exactly three deliberate exceptions, each accounted for — `docs/adr/0014-...md` (forward-looking, created by `T23-01`, and marked as such in all three places), the `docs/adr/*.md` glob in this card's own test note, and `state.sqlite`, which is a live-store file rather than a repository path. (2) `DEVIATIONS.md` table integrity: all six new rows carry exactly 7 columns, status `open`, corrective card named. (3) Every measured figure quoted in the registration was taken from the live store with a read-only connection and is reproducible: backlog and its per-session distribution from `observation_envelope` joined to `processing_cursor`; failed-run counts and fingerprints from `consolidation_run`; candidate totals and distinct texts from `pending_memory_candidate`. (4) Every quoted specification line checked verbatim: spec 08 §4's accepted-cost paragraph, spec 08 §4 step 3's conflict-set sentence, `stale_runs`' and `dead_letter_shrink_decision`'s conditions, `recall::candidate_conflict_set`'s use of `active_entries_for_scope`, and `MAX_GENERATION_TOKENS` in `crates/memory/src/router.rs`. **Not run, and why:** `cargo xtask ci` and both JS suites — not a line of Rust or JS changed; `cargo test -p xtask --test adr_links` — no `docs/adr/*.md` was touched, and ADR-0014 is `T23-01`'s. `T22-00`'s evidence sets both precedents | `docs/implementation-plan/groups/23-consolidation-recovery.md` (10 cards + `G23`), the `## 23` section in `PROGRESS.md`, rows `D-117`…`D-122` in `DEVIATIONS.md`, and the sixth precedent paragraph in `TRACEABILITY.md`. **The finding the registration exists for:** spec 08 §4 accepted, in as many words, that a parked consolidation run stays parked "until the binary is rebuilt" — and that escape does not exist in a released binary, whose `BUILD_ID` is fixed for the life of the release (checked on the downloaded `0.1.0`: the literal `0.1.0`). So for any user of a release the first mechanical, non-overflow dead-letter parks that session forever, with no supported remedy: `stale_runs` declines it (rightly — `D-050`'s guard against a storm that once cost 627 attempts), `dead_letter_shrink_decision` does not apply (it needs a context overflow), and no CLI command can act on a run. Registered as `D-117`. **The second finding is exact rather than statistical:** `recall::candidate_conflict_set` builds the router's conflict set from `active_entries_for_scope`, so a pending candidate is structurally invisible to the step meant to notice it — which is why 9564 candidates carry 3294 distinct texts, the worst proposed 476 times, and `conflicts` is non-empty on none of them (`D-118`). **A correction to my own plan, made before implementing rather than discovered after:** the plan's step list put ADR-0014 under `T23-00`, while its card queue gave it to `T23-01`. `T22-00`'s precedent is unambiguous — registration does not write the ADR — so the card queue won, and this card's "Not in scope" says so | Claude Opus 5 / 2026-08-31 |
 
 ### G00 — трейс требование → artifact/test
 
