@@ -234,7 +234,7 @@ fn wait_until_searchable(socket_path: &Path, repo_root: &str, needle: &str, time
 }
 
 /// Count of `generation` rows in state `active` for `worktree_id` — the
-/// literal "итоговое активное поколение — одно" check, not just trusting
+/// literal "exactly one active generation in the end" check, not just trusting
 /// `worktree_projection_state.active_generation_id`'s own pointer (which
 /// could in principle point at a stale/wrong row if something upstream were
 /// broken; counting the source of truth directly is the stronger check).

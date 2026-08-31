@@ -214,7 +214,7 @@ pub(crate) const DAEMON_MANAGED_ADVISORY: &str = "local-rag: this worktree is ma
 /// the same `read_store_lock_file` → `pid_exists` → `fetch_welcome` liveness
 /// sequence `cli::status::compute_status` already uses. Never fails, never
 /// changes the caller's exit code or stdout — this is fail-open by the
-/// card's own explicit "не в scope: отказ выполнять команду": the printed
+/// card's own explicit "out of scope: refusing to run the command": the printed
 /// line is the only observable effect, the command itself always continues.
 pub(crate) fn advise_if_daemon_managed(layout: &StoreLayout, state: &StateDb, worktree_id: Uuid) {
     let managed = state

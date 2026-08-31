@@ -145,6 +145,27 @@ Preserve these system-wide invariants in every task:
 - Do not implement deferred description, reranker, graph, ANN-memory, multi-harness, FreeBSD,
   or win32-arm64 scope as part of v0 tasks.
 
+## Language
+
+Everything that lands in this repository is written in **English**: commit messages, code and
+doc comments, new deviation rows, new evidence lines, PR and issue text. Russian belongs to the
+conversation with the owner and does not leave it. (Owner decision, 2026-08-31.)
+
+The exception is not a loophole, and it is the difference between the language a thing is
+*written in* and the language a thing *is*. Non-English text that is the subject under test stays
+verbatim: the cross-lingual corpora under `fixtures/`, the Russian inputs in
+`crates/memory/src/normalize/{detect,translate}.rs` and their tests, the deliberately multilingual
+few-shots in `crates/memory/src/prompt.rs`, the non-English query in
+`crates/local-rag/src/daemon/mcp/code.rs`, the Unicode cases in
+`crates/core/src/redaction/mod.rs` and `crates/index/src/parse/universal/mod.rs`, and the 2-byte
+character in `crates/local-rag-hook/src/payload.rs` that has to land on a byte boundary.
+Translating any of those deletes the property it proves. The same holds for an illustrative
+sample inside a comment when the sample *is* the input being described.
+
+The pre-existing Russian plan corpus (`docs/implementation-plan/**`, `docs/idea.md`) is **not**
+retranslated — that was the owner's explicit scope decision. New text added to those files is
+English, so they converge rather than being rewritten.
+
 ## Repository hygiene
 
 - Use `rg`/`rg --files` for discovery.
