@@ -1,0 +1,40 @@
+// How the status tags become colour on a rendered diagram.
+//
+// Why this file is separate from spec.c4: a tag's `color` there tints the tag
+// chip in the interactive UI and does NOT colour the node — a node's colour
+// comes only from a style rule. The two blocks also disagree on syntax: the
+// `tag` block accepts only hex/rgb(), a `style` block accepts only theme names.
+//
+// Every view must opt in with one line, or these rules silently do not apply:
+//
+//   view someView {
+//     include *
+//     global style status
+//   }
+//
+// LikeC4 1.59.2 cannot drive a relationship's colour from a tag: neither
+// `style relation.tag == #partial` nor a `where tag == ...` clause parses. A
+// tagged relationship still carries its meaning in the chips and in queries.
+
+global {
+  styleGroup status {
+
+    // Untagged elements keep the default. Only a deviation from "built and
+    // matching the specification" earns a colour.
+
+    style element.tag == #partial {
+      color amber
+    }
+
+    style element.tag == #planned {
+      color green
+    }
+
+    // Dotted border as well as grey, so "not in v0" survives greyscale and
+    // stays legible to a reader who cannot separate the hues.
+    style element.tag == #deferred {
+      color muted
+      border dotted
+    }
+  }
+}

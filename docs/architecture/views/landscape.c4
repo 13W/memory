@@ -1,0 +1,36 @@
+// The two top-level views: who talks to the system, and what the system is
+// made of.
+//
+// `include *` is not "include everything" — it takes the top level only, so the
+// descendants have to be asked for by name. There is no `include **`; it is a
+// parse error.
+
+views {
+
+  view index {
+    title 'local-rag v2 — landscape'
+    description '''
+      Everyone who uses the system and everything it depends on. The three
+      external hosts are reached at install time only: after
+      `local-rag init --download-models` the product is fully offline, and the
+      remote inference endpoint does not exist in v0 at all.
+    '''
+
+    include *
+
+    global style status
+  }
+
+  view containers {
+    title 'Containers — processes and stores'
+    description '''
+      Five processes, two shipped artifacts, six stores. Read the store column
+      top to bottom: state.sqlite is canonical, everything below it is derived
+      and rebuildable, and no transaction ever spans two of them.
+    '''
+
+    include *, localRag.*
+
+    global style status
+  }
+}

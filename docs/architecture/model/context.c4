@@ -1,0 +1,141 @@
+// Everything outside the system boundary: who uses local-rag, what it reads,
+// and where its bytes come from.
+//
+// The negatives matter as much as the positives here, so each one is stated on
+// the element it constrains rather than left to be noticed as an absence:
+// there is no mandatory external daemon, the plugin never downloads anything,
+// and a hook never starts the daemon.
+
+model {
+
+  // --- People and harness --------------------------------------------------
+
+  claudeCode = actor 'Claude Code (MCP host)' {
+    #implemented
+    description '''
+      The only supported harness. Spawns one thin MCP proxy per session over
+      stdio and speaks MCP JSON-RPC to it: initialize, tools/list, tools/call,
+      ping, notifications. Tool errors come back as isError content carrying the
+      error-taxonomy code.
+    '''
+    metadata {
+      spec 'docs/specification/02-architecture.md §1'
+    }
+  }
+
+  claudeCodeHooks = actor 'Claude Code hook runtime' {
+    #implemented
+    #pillar-observations
+    description '''
+      Invokes the hook binary once per captured event, passing the event JSON on
+      stdin, and reads additionalContext on stdout for SessionStart and
+      UserPromptSubmit only. Delivery is at-least-once; the daemon dedups at
+      import. The hook always exits 0, whatever happened.
+    '''
+    metadata {
+      spec 'docs/specification/07-observations-spool.md §1'
+      code 'plugin/hooks/hooks.json'
+    }
+  }
+
+  operator = actor 'Store owner / operator' {
+    #implemented
+    description '''
+      The human who owns the store. Two surfaces, both able to read and write
+      state.sqlite directly with no daemon running: the CLI and the TUI
+      dashboard.
+    '''
+    metadata {
+      spec 'docs/specification/11-interfaces.md §6'
+    }
+  }
+
+  // --- Content and third parties -------------------------------------------
+
+  repoUnderIndex = externalSystem 'Indexed git worktree' {
+    #implemented
+    #pillar-search
+    description '''
+      A read-only content source. The reconcile scan walks it gitignore-aware
+      and stores the exact source_blob of every indexed file; nothing is ever
+      written back. A repository checkout must not be able to change daemon
+      policy, so per-repository settings live in state.sqlite and never in files
+      inside the tree.
+    '''
+    metadata {
+      spec 'docs/specification/06-reconcile-and-fts.md §1'
+      code 'crates/index/src/scan/mod.rs'
+    }
+  }
+
+  githubReleases = externalSystem 'GitHub release assets' {
+    #implemented
+    description '''
+      The source of the four native binaries: one archive per binary per target
+      plus a .sha256 sidecar published in the same release. Tracked at `latest`,
+      whose redirect names the concrete tag — resolved once per install so half
+      the set cannot arrive from a different release.
+    '''
+    metadata {
+      spec 'docs/specification/13-distribution-and-migrations.md §1'
+      plan 'docs/implementation-plan/groups/22-binary-delivery.md'
+      code 'npm/memory/src/release.js'
+    }
+  }
+
+  npmRegistry = externalSystem 'npm registry' {
+    #implemented
+    description '''
+      Hosts exactly one package, @13w/memory, whose job is to obtain and expose
+      the binaries — never to contain them. The per-platform packages earlier
+      revisions described were deleted before they were ever published.
+    '''
+    metadata {
+      spec 'docs/specification/13-distribution-and-migrations.md §1'
+      code 'npm/memory/package.json'
+    }
+  }
+
+  modelWeightHost = externalSystem 'Model weight & ONNX Runtime hosts' {
+    #implemented
+    description '''
+      Hugging Face for the embedding model (embeddinggemma-300m, 768d) and the
+      generative router model (gemma-4-e2b-it, GGUF), github.com/microsoft for
+      the ONNX Runtime shared library. Every artifact is pinned by URL, byte
+      size and SHA-256 compiled into the binary. Reached only by
+      `local-rag init --download-models`; the product is fully offline after it.
+    '''
+    metadata {
+      spec 'docs/specification/10-models-and-embeddings.md §5'
+      code 'crates/models/src/catalog.rs'
+    }
+  }
+
+  multiHarness = externalSystem 'Another agent harness' {
+    #deferred
+    description '''
+      Claude Code is the only supported harness, and that is a scope decision
+      rather than a technical limit: the spool wire format, the MCP surface and
+      the request context carry nothing Claude-specific. Modelled so the
+      boundary of the decision is visible when someone asks for a second one.
+    '''
+    metadata {
+      spec 'docs/specification/01-overview.md §2'
+    }
+  }
+
+  remoteInferenceEndpoint = externalSystem 'Remote embedding / LLM endpoint' {
+    #deferred
+    description '''
+      Strictly optional and absent in v0 — a mandatory external daemon would
+      contradict the headline break from v1. It is modelled because the policy
+      that would gate it is already built and enforced: under the default
+      local_only a remote provider is never even a candidate, and a remote-only
+      pool answers POLICY_BLOCKED_REMOTE.
+    '''
+    metadata {
+      spec 'docs/specification/10-models-and-embeddings.md §1'
+      code 'crates/embed/src/policy.rs'
+    }
+  }
+}

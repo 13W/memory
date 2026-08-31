@@ -26,7 +26,7 @@ use local_rag_store::{
 };
 
 use crate::budget::PromptBudget;
-use crate::{guard, parse, prompt, recall, schema};
+use crate::{guard, parse, plan, prompt, recall, schema};
 
 /// `[SPEC]` placeholder upper bound on generated tokens per router call —
 /// large enough for a multi-op window's JSON array, small enough that a
@@ -71,6 +71,19 @@ fn trace_raw_response(text: &str) {
 fn trace_dropped_tail(reason: &str) {
     if std::env::var_os("LOCAL_RAG_ROUTER_DEBUG").is_some() {
         eprintln!("[router debug] dropped trailing content: {reason}");
+    }
+}
+
+/// Same gate again — `D-121`: how many ops of one plan named an entry another
+/// op in the same plan already named. Not a failure and not worth a log line
+/// in production (the collapse is the normal outcome of a window repeating
+/// itself), but the one place the shape is visible while tuning the prompt.
+fn trace_collapsed(before: usize, after: usize) {
+    if std::env::var_os("LOCAL_RAG_ROUTER_DEBUG").is_some() {
+        eprintln!(
+            "[router debug] collapsed {} of {before} ops onto an entry another op already named",
+            before - after
+        );
     }
 }
 
@@ -187,6 +200,16 @@ pub async fn route(
         let op = guard::materialize(&conn, &by_id, &window.observations, uuids, raw)
             .map_err(|e| ClassifiedFailure::mechanical(e.to_string()))?;
         ops.push(op);
+    }
+    // `D-121`/`T23-05`: `guard::materialize` read every target's version
+    // above, all of them before any op is applied, so two ops naming one
+    // entry both carry the version the first will move. Fold them here,
+    // before the plan can leave the router carrying a contradiction it is
+    // guaranteed to fail on.
+    let before = ops.len();
+    let ops = plan::collapse(ops);
+    if ops.len() != before {
+        trace_collapsed(before, ops.len());
     }
     Ok(ops)
 }
@@ -527,6 +550,90 @@ mod tests {
                 payload: None,
             }],
         }
+    }
+
+    /// The same window, with two observations, so a merged plan can be shown
+    /// to carry both citations.
+    fn window_with_two(a: &str, b: &str) -> ConsolidationWindow {
+        let mut window = window_with(a);
+        let mut second = window.observations[0].clone();
+        second.observation_id = b.to_string();
+        second.received_seq = 2;
+        window.observations.push(second);
+        window.to_received_seq = 2;
+        window
+    }
+
+    /// `D-121`'s live shape, through the real router: a window that proposes
+    /// one already-stored text twice. `D-078`'s rewrite turns both `create`s
+    /// into reinforces of the same entry carrying the same snapshot, and
+    /// before `T23-05` that plan was guaranteed to fail its own version check
+    /// mid-batch.
+    #[tokio::test]
+    async fn a_window_proposing_one_existing_text_twice_routes_to_a_single_reinforce() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        seed_observation(&db, "o2").await;
+        seed_global_entry(&db, &uuid(90), "use pnpm").await;
+
+        let line_a = r#"{"op":"create","kind":"decision","text":"use pnpm","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}"#;
+        let line_b = r#"{"op":"create","kind":"decision","text":"use pnpm","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o2"]}"#;
+        let pool = pool_with(vec![&format!("{line_a}\n{line_b}")]);
+        let uuids = SeqUuidV7::new();
+
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with_two("o1", "o2"),
+            NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
+        )
+        .await
+        .expect("routes cleanly");
+
+        assert_eq!(ops.len(), 1, "one entry, one op: {ops:?}");
+        let GeneratedOp::Materialize {
+            operation: local_rag_store::ProposedOperation::Reinforce { memory_id, .. },
+            evidence_observation_ids,
+        } = &ops[0]
+        else {
+            panic!("D-078 should have rewritten both creates into one reinforce: {ops:?}");
+        };
+        assert_eq!(*memory_id, uuid(90));
+        assert_eq!(
+            evidence_observation_ids,
+            &vec!["o1".to_string(), "o2".to_string()],
+            "and it cites what both proposals cited"
+        );
+    }
+
+    /// The control against over-merging: two proposals of two different texts
+    /// are two entries, and nothing about them groups.
+    #[tokio::test]
+    async fn a_window_proposing_two_different_texts_still_routes_to_two_ops() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        seed_observation(&db, "o2").await;
+
+        let line_a = r#"{"op":"create","kind":"decision","text":"use pnpm","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}"#;
+        let line_b = r#"{"op":"create","kind":"decision","text":"use nextest","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o2"]}"#;
+        let pool = pool_with(vec![&format!("{line_a}\n{line_b}")]);
+        let uuids = SeqUuidV7::new();
+
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with_two("o1", "o2"),
+            NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
+        )
+        .await
+        .expect("routes cleanly");
+        assert_eq!(ops.len(), 2, "two distinct texts stay two ops: {ops:?}");
     }
 
     #[tokio::test]

@@ -206,14 +206,25 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
 - **Depends on:** `T23-01`.
 - **Specification:** spec 08 §4 step 4; spec 04 §4.
 - **Result:** a stale plan is refreshed rather than replayed.
-- **In scope:** `expected entry_version 2, found 3` is not a transient fault — it is a plan built
-  against a version that has since moved. Ten identical retries cannot succeed, and the tenth
-  escalates it to a permanent mechanical dead-letter (`D-050`'s cap doing its job on the wrong
-  input).
-- **Not in scope:** the version-check itself, which is correct and stays.
-- **Tests:** a concurrent writer bumps `entry_version` between plan and apply; the run converges
-  instead of dead-lettering. Proved by mutation both ways.
-- **Acceptance:** this failure reason disappears from a store under concurrent writes.
+- **In scope:** `expected entry_version 2, found 3` is not a transient fault. This card first read
+  it as a plan built against a version an outside writer had moved; **measured while executing
+  `T23-05`, all eight live rows are self-inflicted** — `found = expected + 1` on every one, op
+  index at least 3 on every one, and for one of them the audit trail shows no entry anywhere
+  reaching the "found" version during the failure window. The cause is that
+  `guard::materialize` captures every op's `expected_version` before any op is applied, so two ops
+  naming one entry — which `D-078`'s rewrite produces whenever a window proposes one stored text
+  twice — both hold the version the first will move. Also corrected: "ten identical retries cannot
+  succeed" is too strong. Seven of the eight runs eventually **applied**, because a re-sampled plan
+  happened not to duplicate; the cost is eight burned local generations per occurrence, and it
+  became an absolute block exactly once — on the run holding 1081 observations.
+- **Not in scope:** the version-check itself, which is correct and stays — and after this card it is
+  untouched literally: `crates/store` does not change.
+- **Tests:** a routed plan naming one entry twice applies, with both proposals' citations merged;
+  the same plan un-collapsed still fails with the live string verbatim; an outside writer between
+  plan and apply still conflicts, and only re-planning converges; and the rejected store-side fix's
+  own trap is pinned — two ops that pass the version check collide on `memory_evidence`'s primary
+  key instead. Each rule proved by a named mutation.
+- **Acceptance:** a plan that names one entry twice can no longer reach the store.
 - **Evidence:** the `T23-05` row.
 
 ## T23-06 — The router's answer budget follows its window

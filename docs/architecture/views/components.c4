@@ -1,0 +1,97 @@
+// One view per subsystem. Each is a slice of the same model, not a separate
+// model: an element appears in several views and is declared exactly once.
+//
+// A tag view needs two predicates — the tag itself, and `<-> *` for whatever it
+// talks to. Without the second line the view is a set of disconnected boxes.
+// The incoming/outgoing forms (`include -> element.tag == #x`) parse without
+// complaint and then resolve to nothing.
+
+views {
+
+  view daemonComponents {
+    title 'Daemon — components'
+    description 'Everything hosted inside the one daemon process: the request path, the background loops, and the cross-cutting machinery they all go through.'
+
+    include localRag.daemon, localRag.daemon.**
+    include localRag.mcpProxy, localRag.hookBinary, localRag.tui
+    include localRag.stateDb, localRag.cacheDb, localRag.projectionStore, localRag.spoolStore
+
+    global style status
+  }
+
+  view searchComponents {
+    title 'Code search'
+    description '''
+      The hybrid pipeline and the two legs it fuses. The read lock spans the
+      whole thing; a leg the requested mode did not ask for is not run at all —
+      no head validation, no embedder call, no shard open.
+    '''
+
+    include element.tag == #pillar-search
+    include element.tag == #pillar-search <-> *
+
+    global style status
+  }
+
+  view memoryComponents {
+    title 'Durable memory'
+    description '''
+      Capture is cheap and always-on; promotion is the expensive, transactional
+      half. The router is the only LLM call, and it deliberately runs outside
+      any transaction, strictly behind the cursor.
+    '''
+
+    include element.tag == #pillar-memory
+    include element.tag == #pillar-memory <-> *
+
+    global style status
+  }
+
+  view observationComponents {
+    title 'Observation capture'
+    description '''
+      The one-way path from a Claude Code hook event to a durable envelope.
+      Hooks have exactly one ingestion route — the spool — and the daemon is
+      never on the critical path of recording something.
+    '''
+
+    include element.tag == #pillar-observations
+    include element.tag == #pillar-observations <-> *
+
+    global style status
+  }
+
+  view storeComponents {
+    title 'Stores and the writers that touch them'
+    description '''
+      Who writes what, and through which queue. The daemon writes through two
+      bounded single-writer queues; the CLI and the TUI open the same files
+      in-process without taking the store lock, which is safe because SQLite's
+      own locking is the arbiter there and neither runs a background loop.
+    '''
+
+    include localRag.stateDb, localRag.cacheDb, localRag.projectionStore
+    include localRag.spoolStore, localRag.modelStore, localRag.storeControlFiles
+    include localRag.daemon, localRag.cli, localRag.tui, localRag.hookBinary
+    include localRag.daemon.writeQueues, localRag.daemon.lockRegistry
+    include localRag.daemon.migrationRunner, localRag.daemon.retentionGc
+
+    global style status
+  }
+
+  view deliveryComponents {
+    title 'Delivery — npm package and plugin'
+    description '''
+      Two resolution problems that must not be conflated: the package resolves a
+      directory that holds every binary, the plugin resolves one executable.
+      Nothing here downloads on behalf of the plugin, ever.
+    '''
+
+    include localRag.npmInstaller, localRag.npmInstaller.**
+    include localRag.ccPlugin, localRag.ccPlugin.**
+    include localRag.mcpProxy, localRag.hookBinary
+    include githubReleases, npmRegistry, claudeCode, claudeCodeHooks
+
+    global style status
+  }
+}

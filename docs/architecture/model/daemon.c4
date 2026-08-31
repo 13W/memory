@@ -1,0 +1,584 @@
+// Inside the daemon: the components that serve requests and the loops that run
+// on their own.
+//
+// Two things this file tries to make legible, because they are the ones that
+// have actually cost this project incidents. First, where a lock is held and
+// for how long — the search pipeline holds a read lock end to end, recall holds
+// none at all, and the router runs outside any transaction. Second, which loops
+// are self-driving: a background loop that starts work on a timer behaves very
+// differently from a component that only answers.
+
+model {
+
+  extend localRag.daemon {
+
+    // --- Request path ------------------------------------------------------
+
+    daemonHandshake = component 'Handshake & session registry' {
+      #implemented
+      description '''
+        One long-lived task per accepted connection: read HELLO, negotiate the
+        proto range, answer WELCOME or INCOMPATIBLE, register the session for
+        the connection's lifetime, then loop. A SHUTDOWN_REQUEST does not close
+        the connection — the requesting proxy learns it may reconnect by
+        observing EOF, which happens only after the real drain has finished.
+      '''
+      metadata {
+        spec 'docs/specification/02-architecture.md §4.2'
+        code 'crates/local-rag/src/daemon/handshake.rs'
+      }
+    }
+
+    mcpDispatcher = component 'MCP dispatcher & tool catalog' {
+      #implemented
+      #v0
+      description '''
+        Nineteen tools: search_code, get_file_context, project_overview, recall,
+        list_memory, list_memory_candidates, inspect_memory_evidence, stats,
+        health, remember, and nine review verbs. Plus initialize, tools/list,
+        ping and notifications. In migration-only mode the first three still
+        answer and every tools/call short-circuits to INCOMPATIBLE_STORE rather
+        than hanging.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §2'
+        code 'crates/local-rag/src/daemon/mcp/dispatch.rs'
+      }
+    }
+
+    adminVerbs = component 'admin/* JSON-RPC surface' {
+      #implemented
+      #post-v0
+      description 'tail_calls, tool_stats, projects_list, projects_reload, reconcile_now — the TUI dashboard and project enrolment surface.'
+      metadata {
+        spec 'docs/specification/11-interfaces.md §8'
+        plan 'docs/implementation-plan/groups/20-daemon-managed-indexing.md'
+        code 'crates/local-rag/src/daemon/mcp/dispatch.rs'
+      }
+    }
+
+    symbolGraphTools = component 'find_usages / get_dependencies' {
+      #deferred
+      #v0x
+      #pillar-search
+      description '''
+        The v1 parity tools. Blocked on the second half of O7: the graph
+        semantics are declared but their final shape is still open, so the
+        edge kinds exist in the schema and nothing queries them yet.
+      '''
+      metadata {
+        spec 'docs/specification/09-search.md §6'
+      }
+    }
+
+    // --- Search ------------------------------------------------------------
+
+    searchEngine = component 'Hybrid search pipeline' {
+      #implemented
+      #v0
+      #pillar-search
+      description '''
+        Resolves the worktree from the explicit request context BEFORE taking
+        any lock, then holds the per-worktree read lock for the entire pipeline
+        — otherwise the lexical leg could read generation N while the dense leg
+        reads an in-flight N+1. The lock prevents mixing; it does not prove the
+        lexical projection is complete, which is the head's job.
+      '''
+      metadata {
+        spec 'docs/specification/09-search.md §1'
+        code 'crates/search/src/pipeline.rs'
+      }
+
+      lexicalLeg = component 'FTS5 lexical leg' {
+        #implemented
+        #pillar-search
+        description '''
+          BM25 over the materialized occurrence view with per-column weights.
+          Runs only if the FTS head validates: an empty FTS is never silently
+          treated as a correct lexical result — the response is explicitly
+          dense_only with the reason stated.
+        '''
+        metadata {
+          spec 'docs/specification/09-search.md §2'
+          code 'crates/search/src/lexical.rs'
+        }
+      }
+
+      denseLeg = component 'Dense shard leg' {
+        #implemented
+        #pillar-search
+        description 'Embeds the query and scans the worktree shard. Searches the code_raw representation only.'
+        metadata {
+          spec 'docs/specification/09-search.md §3'
+          code 'crates/search/src/dense.rs'
+        }
+      }
+
+      fusion = component 'RRF fusion' {
+        #implemented
+        #pillar-search
+        description 'Reciprocal rank fusion, k = 60, weighted per leg, tie-broken by (score desc, occurrence id asc). Both legs are cut at max(limit x 4, 50).'
+        metadata {
+          spec 'docs/specification/09-search.md §4'
+          code 'crates/search/src/fusion.rs'
+          rrf_k '60'
+        }
+      }
+
+      enrichment = component 'Snippet & context enrichment' {
+        #implemented
+        #pillar-search
+        description '''
+          Parent unit, file, qualified name, and a snippet cut from the stored
+          source_blob by byte span — never read from disk at query time. Capped,
+          and a truncation always leaves the hash and original size.
+        '''
+        metadata {
+          spec 'docs/specification/09-search.md §1'
+          code 'crates/search/src/snippet.rs'
+          snippet_cap_bytes '8192'
+        }
+      }
+
+      descriptionLeg = component 'LLM description leg' {
+        #deferred
+        #pillar-search
+        description 'Structural descriptions and the semantic mode. Deferred; the mode is refused with UNSUPPORTED_MODE before worktree resolution and before any lock.'
+        metadata {
+          spec 'docs/specification/09-search.md §5'
+        }
+      }
+
+      reranker = component 'Cross-encoder reranker' {
+        #deferred
+        #pillar-search
+        description 'Post-v0. Nothing in v0 reranks a fused list.'
+        metadata {
+          spec 'docs/specification/09-search.md §5'
+        }
+      }
+    }
+
+    // --- Indexing ----------------------------------------------------------
+
+    indexingSupervisor = component 'Indexing supervisor' {
+      #implemented
+      #post-v0
+      #pillar-search
+      description '''
+        Keeps one indexing task running per enabled managed worktree. The
+        enrolment table is a list of background work, never a routing input —
+        a request naming a managed worktree still resolves its own context from
+        scratch. Notification is a hint; the table is the truth, backstopped by
+        a poll.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §8'
+        plan 'docs/implementation-plan/groups/20-daemon-managed-indexing.md'
+        code 'crates/local-rag/src/daemon/indexing/supervisor.rs'
+        backstop_poll_secs '60'
+      }
+    }
+
+    reconcileDriver = component 'Worktree reconciler' {
+      #implemented
+      #v0
+      #pillar-search
+      description '''
+        Scan, classify, parse, build generation N+1, supersede the stragglers,
+        backfill embeddings, switch, materialize FTS — all under the worktree
+        write lock. Unchanged files are shared structurally: same file revision,
+        no read and no parse. A scan that reproduces the last built manifest
+        mints no generation at all.
+      '''
+      metadata {
+        spec 'docs/specification/06-reconcile-and-fts.md §2'
+        code 'crates/local-rag/src/indexing/mod.rs'
+      }
+    }
+
+    watcher = component 'Filesystem & git watcher' {
+      #implemented
+      #pillar-search
+      description 'Watcher is a hint, reconcile is the truth. Events schedule work after a debounce; an overflow forces a strict reconcile rather than a resync from events.'
+      metadata {
+        spec 'docs/specification/06-reconcile-and-fts.md §1'
+        code 'crates/index/src/reconcile/watcher.rs'
+        debounce_ms '500'
+      }
+    }
+
+    ftsMaterializer = component 'FTS materialized view' {
+      #implemented
+      #pillar-search
+      description '''
+        One cache transaction per generation delta: recompute missing normalized
+        text from the source blob, delete the worktree's stale rows, insert the
+        fresh set, and write the validity head strictly last. An interrupted
+        materialization leaves the previous valid head in place.
+      '''
+      metadata {
+        spec 'docs/specification/06-reconcile-and-fts.md §4'
+        code 'crates/store/src/cache/fts.rs'
+      }
+    }
+
+    projectionSwitch = component 'Projection switch / validate / rebuild' {
+      #implemented
+      #pillar-search
+      description '''
+        Write-ahead: the intent is committed to SQLite before any backend
+        mutation, then the shard is reconciled to the desired point set — not a
+        replayed command log, so recovery after an unknown partial delta needs
+        no history. Validated on every open; any divergence funnels into the one
+        recovery path, a full idempotent rebuild.
+      '''
+      metadata {
+        spec 'docs/specification/05-projection.md §5'
+        code 'crates/projection/src/switch.rs'
+      }
+    }
+
+    shardManager = component 'Shard LRU manager' {
+      #implemented
+      description 'Ref-counted, bounded by max_open_shards. Its map lock is held for the lookup only and released before the query runs.'
+      metadata {
+        spec 'docs/specification/05-projection.md §8'
+        code 'crates/projection/src/manager.rs'
+      }
+    }
+
+    embeddingBackfill = component 'Embedding backfill' {
+      #implemented
+      description 'Fills the embedding cache for the target model space. Unchanged content is never re-embedded; there is no in-place re-embedding anywhere.'
+      metadata {
+        spec 'docs/specification/10-models-and-embeddings.md §3'
+        code 'crates/embed/src/backfill.rs'
+      }
+    }
+
+    // --- Observations ------------------------------------------------------
+
+    spoolImporter = component 'Spool tail importer' {
+      #implemented
+      #v0
+      #pillar-observations
+      description '''
+        Reads from the durable cursor, verifies length and CRC per frame, and
+        writes one transaction per batch: envelopes, paths, payloads with an
+        expiry, and the cursor advance together. A torn tail stops the pass — it
+        is by definition a non-durable event. Genuine corruption is reported,
+        never skipped past.
+      '''
+      metadata {
+        spec 'docs/specification/07-observations-spool.md §5'
+        code 'crates/store/src/observation/import.rs'
+      }
+    }
+
+    // --- Memory ------------------------------------------------------------
+
+    consolidationTrigger = component 'Consolidation trigger loop' {
+      #implemented
+      #v0
+      #pillar-memory
+      description '''
+        One interval worker owns all of it: reclaim stale runs first, import
+        each session tail, then open a run when a checkpoint, a backlog
+        threshold or an idle interval says so. Its first tick is also the
+        startup catch-up — deliberately not a second spawned pass, because two
+        passes read the same stale set and burned two attempts per restart.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §4'
+        code 'crates/local-rag/src/daemon/consolidation_trigger.rs'
+        interval_secs '15'
+      }
+    }
+
+    consolidationRunner = component 'Run / lease / apply engine' {
+      #implemented
+      #v0
+      #pillar-memory
+      description '''
+        Opens a run with a lease and a window snapshot, loads the window, calls
+        the router outside any transaction, then applies everything in ONE short
+        transaction: ops, evidence links, audit rows and the cursor advance. A
+        single rejected op rolls back the whole batch, the cursor included. A
+        crashed run is retryable under a fresh lease with a stable run id, and
+        the apply re-reads state and lease and refuses with zero mutation if
+        they moved.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §4'
+        code 'crates/store/src/memory/runner.rs'
+        lease_secs '120'
+      }
+    }
+
+    memoryRouter = component 'Consolidation router (LLM)' {
+      #implemented
+      #v0
+      #pillar-memory
+      description '''
+        Turns one window of observations plus a candidate conflict set into an
+        ordered ops list. Runs on the local generator under the default policy —
+        which is exactly why a quality gate exists — and strictly behind the
+        cursor. Both the window and the conflict set are bounded in tokens, not
+        in rows: bounding the set by count once ate 97 percent of the context it
+        existed to compare against.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §4'
+        code 'crates/memory/src/router.rs'
+      }
+    }
+
+    memoryGuard = component 'Placement guard & plan collapse' {
+      #implemented
+      #pillar-memory
+      description '''
+        Above the store, below the model. Degrades a hallucinated reference to a
+        no-op for that one op rather than failing the window; downgrades a
+        model-claim-only create to a review candidate; rewrites a create of
+        already-stored text into a reinforce; then collapses the plan so one
+        window cannot version-conflict with itself.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §3'
+        plan 'docs/implementation-plan/groups/23-consolidation-recovery.md'
+        code 'crates/memory/src/plan.rs'
+      }
+    }
+
+    memoryOps = component 'Transactional memory-op engine' {
+      #implemented
+      #v0
+      #pillar-memory
+      description '''
+        create, reinforce, resolve, supersede, retract, noop, plus the review
+        verbs. Every mutation carries an idempotency key and writes an audit row
+        with the incremented entry version; reinforce may raise confidence but
+        never changes text. Model claims are never auto-promoted to facts —
+        enforced in the guard and backstopped here.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §3'
+        code 'crates/store/src/memory/op.rs'
+      }
+    }
+
+    recallPipeline = component 'Recall pipeline & formatter' {
+      #implemented
+      #v0
+      #pillar-memory
+      description '''
+        Scope is the union of global, repository and worktree; an unresolvable
+        root degrades to global alone. Fuses a lexical and a dense leg, re-reads
+        each entry's lifecycle state fresh — it holds no lock across the
+        pipeline at all — then cuts a ranked prefix to the token budget. An
+        empty result emits no text whatsoever.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §6'
+        code 'crates/memory/src/recall/pipeline.rs'
+        token_budget '1500'
+      }
+    }
+
+    annMemoryBackend = component 'ANN relevance backend' {
+      #deferred
+      #pillar-memory
+      description 'The relevance backend is a trait so this can replace brute force — but only on cardinality and latency evidence, never by default.'
+      metadata {
+        spec 'docs/specification/10-models-and-embeddings.md §6'
+      }
+    }
+
+    fullRecall = component 'Full recall ranking' {
+      #deferred
+      #pillar-memory
+      description 'Tree validity and provenance, evidence trust, weak recency and importance, diversity and dedup. Post-v0; v0 recall is the fused prefix above.'
+      metadata {
+        spec 'docs/specification/08-memory.md §6'
+      }
+    }
+
+    normalizationWorker = component 'English-canon worker' {
+      #implemented
+      #post-v0
+      #pillar-memory
+      description '''
+        Durable memory text is stored in English, eventually: a failed
+        translation stores the author's text and this worker rewrites the canon
+        later through an audited system-actor edit, because losing a note to a
+        model failure is not an acceptable degradation. Observations, evidence
+        and code are never translated.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §3'
+        plan 'docs/implementation-plan/groups/21-english-normalization.md'
+        code 'crates/local-rag/src/daemon/normalization/boundary.rs'
+        interval_secs '60'
+      }
+    }
+
+    // --- Cross-cutting -----------------------------------------------------
+
+    providerPool = component 'Provider pool & data-policy guard' {
+      #partial
+      description '''
+        Holds the in-process embedder and generator and is the single place a
+        remote call could ever be made. The guard runs BEFORE provider
+        selection, on the most restrictive of the global and every involved
+        repository policy. As built, metadata_only_remote behaves identically to
+        local_only — neither provider trait has a metadata-only request shape,
+        so the four-level ladder is normative and only three levels differ.
+      '''
+      metadata {
+        spec 'docs/specification/12-security-privacy.md §1'
+        code 'crates/embed/src/policy.rs'
+      }
+    }
+
+    redactionScanner = component 'Redaction scanner' {
+      #implemented
+      description '''
+        One versioned scanner with three consumers: file classification (a
+        secret-bearing file is skipped and gets no source blob and no
+        occurrences), spool ingestion (redact before anything touches disk, and
+        before the size cap, so a secret near the boundary cannot survive inside
+        a truncated value), and remote transmission.
+      '''
+      metadata {
+        spec 'docs/specification/12-security-privacy.md §2'
+        code 'crates/core/src/redaction/mod.rs'
+      }
+    }
+
+    retentionGc = component 'Retention sweeps & housekeeping' {
+      #partial
+      description '''
+        Mark-and-sweep against pin roots, batched through the writer queue, plus
+        orphan shard directories, cache eviction, spool session GC and candidate
+        expiry. Driven by metrics and by explicit commands, never by a schedule.
+        Partial for one reason: the observation-payload TTL sweep exists as a
+        primitive that nothing currently schedules.
+      '''
+      metadata {
+        spec 'docs/specification/06-reconcile-and-fts.md §5'
+        plan 'docs/implementation-plan/groups/23-consolidation-recovery.md'
+        code 'crates/store/src/retention.rs'
+      }
+    }
+
+    migrationRunner = component 'Migration framework' {
+      #implemented
+      description '''
+        Numbered, checksummed, forward-only, resumable, under the migration
+        lock with the daemon otherwise quiescent, with a backup before any
+        destructive step. A store newer than the binary supports is refused.
+        cache.sqlite is never migrated — a version bump drops and rebuilds it.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §3'
+        code 'crates/store/src/migrate/mod.rs'
+      }
+    }
+
+    v1MemoryImporter = component 'v1 memory importer' {
+      #deferred
+      #pillar-memory
+      description 'O5 is still open: v0 is clean-start only, and whether GA ships a real importer or makes clean-start permanent is an undecided pre-GA product question.'
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §3'
+      }
+    }
+
+    writeQueues = component 'Single-writer queues (L4a / L4b)' {
+      #implemented
+      description '''
+        One bounded queue per database, each draining to a single writer task.
+        Direct write connections outside them are forbidden; busy_timeout is a
+        backstop, not the design. The queues are lock leaves: no other lock may
+        be taken inside a writer job.
+      '''
+      metadata {
+        spec 'docs/specification/03-data-model.md §3'
+        code 'crates/store/src/state/writer.rs'
+      }
+    }
+
+    lockRegistry = component 'Lock hierarchy' {
+      #implemented
+      description '''
+        L0 store lock, L1 migration lock, L2 per-worktree read/write, L3 shard
+        map, L4a/L4b write queues. A task may only take a lock ranked above
+        every lock it already holds. One writer per worktree ever exists, and
+        both switch axes are serialized by it — never both in one operation.
+      '''
+      metadata {
+        spec 'docs/specification/02-architecture.md §5'
+        code 'crates/store/src/lock/level.rs'
+      }
+    }
+
+    telemetry = component 'Call ring buffer & tool counters' {
+      #implemented
+      #post-v0
+      description 'In-memory only, read over admin/*. Never a request or response payload — recalled memory and indexed content are untrusted data.'
+      metadata {
+        spec 'docs/specification/11-interfaces.md §7'
+        code 'crates/local-rag/src/daemon/telemetry.rs'
+      }
+    }
+
+    // --- Wiring ------------------------------------------------------------
+
+    daemonHandshake -[calls]-> mcpDispatcher 'dispatches a request envelope'
+    mcpDispatcher -[calls]-> searchEngine 'search_code, get_file_context, project_overview'
+    mcpDispatcher -[calls]-> recallPipeline 'recall'
+    mcpDispatcher -[calls]-> memoryOps 'remember and the nine review verbs'
+    mcpDispatcher -[calls]-> adminVerbs 'admin/* methods'
+
+    // The four legs are children of the engine, so composition is already
+    // stated by nesting — LikeC4 rejects a parent-to-child relationship. The
+    // ORDER in which they run, and where the lock sits around them, is the
+    // dynamic view's job, not a set of arrows here.
+
+    searchEngine -[calls]-> lockRegistry 'holds the worktree read lock end to end'
+    denseLeg -[calls]-> providerPool 'embeds the query'
+    denseLeg -[calls]-> shardManager 'borrows the shard'
+
+    indexingSupervisor -[calls]-> reconcileDriver 'one task per enabled managed worktree'
+    watcher -[calls]-> reconcileDriver 'schedules a cycle'
+    reconcileDriver -[calls]-> redactionScanner 'classifies secret-bearing files'
+    reconcileDriver -[calls]-> embeddingBackfill 'fills the cache for the target space'
+    reconcileDriver -[calls]-> projectionSwitch 'switches the shard to the new generation'
+    reconcileDriver -[calls]-> ftsMaterializer 'materializes the lexical view'
+    embeddingBackfill -[calls]-> providerPool 'embeds new content'
+    projectionSwitch -[calls]-> shardManager 'opens and validates the shard'
+
+    consolidationTrigger -[calls]-> spoolImporter 'imports each session tail'
+    consolidationTrigger -[calls]-> consolidationRunner 'opens and runs the next window'
+    consolidationRunner -[calls]-> memoryRouter 'one LLM call, outside any transaction'
+    memoryRouter -[calls]-> providerPool 'greedy decoding on the local generator'
+    memoryRouter -[calls]-> memoryGuard 'materializes and collapses the plan'
+    memoryGuard -[calls]-> memoryOps 'applies the ops in one short transaction'
+    recallPipeline -[calls]-> providerPool 'embeds the query'
+    normalizationWorker -[calls]-> memoryOps 'rewrites a canon through an audited system edit'
+
+    memoryOps -[calls]-> writeQueues 'every mutation goes through the queue'
+    reconcileDriver -[calls]-> writeQueues 'every mutation goes through the queue'
+    reconcileDriver -[calls]-> lockRegistry 'holds the worktree write lock for the cycle'
+  }
+
+  // The hook shares the scanner with the daemon: the same rule set, the same
+  // version, applied before the bytes are durable.
+  localRag.hookBinary -[calls]-> localRag.daemon.redactionScanner 'redacts before the append' {
+    description 'Modelled as a shared component rather than duplicated, because a divergence between the two consumers would be a privacy defect, not a style one.'
+    metadata {
+      spec 'docs/specification/12-security-privacy.md §2'
+    }
+  }
+}

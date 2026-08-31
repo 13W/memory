@@ -1,0 +1,399 @@
+// The system boundary: the processes that run, the stores they own, and the
+// channels between them.
+//
+// A container here is a unit with its own lifecycle. `local-rag` ships as one
+// binary and appears twice — as `daemon` and as `cli` — because the two differ
+// in exactly the thing a diagram exists to show: the daemon holds the store
+// lock for its process lifetime, the CLI opens the same databases in-process
+// and takes neither L0 nor L2.
+
+model {
+
+  localRag = system 'local-rag v2' {
+    description '''
+      A local, co-located MCP service for Claude Code with three pillars:
+      durable auditable memory, hybrid semantic code search, and spool-only
+      capture of Claude Code observations. No mandatory external daemon.
+    '''
+    metadata {
+      spec 'docs/specification/01-overview.md §1'
+    }
+
+    // --- Processes ---------------------------------------------------------
+
+    mcpProxy = container 'local-rag-proxy' {
+      #implemented
+      #v0
+      description '''
+        The per-session stdio MCP proxy. Holds no state beyond the connection
+        and the handshake result — structurally, not by discipline: the crate
+        depends on no store, index or embed crate at all. The MCP payload rides
+        as an opaque raw value and is never parsed or rebuilt.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §1'
+        code 'crates/local-rag-proxy/src/main.rs'
+      }
+    }
+
+    hookBinary = container 'local-rag-hook' {
+      #implemented
+      #v0
+      #pillar-observations
+      description '''
+        The spool writer and recall injector, invoked once per captured event.
+        Its pipeline is fixed: parse stdin, redact before anything touches disk,
+        compute source identity exactly once at write time, frame, flock, append,
+        fdatasync, unlock, exit 0. Any internal error is a silent fail-open.
+      '''
+      metadata {
+        spec 'docs/specification/07-observations-spool.md §2'
+        code 'crates/local-rag-hook/src/main.rs'
+      }
+    }
+
+    daemon = container 'local-rag daemon' {
+      #implemented
+      #v0
+      description '''
+        One per OS user per store. Owns the store exclusively through
+        store.lock, hosts every SQLite connection, shard handle and background
+        worker, and defines routing — there is no ambient current project.
+        Identity is instance_uuid; the PID is advisory, because PIDs are reused.
+        Exclusivity is bounded by the process lifetime, not by the shutdown
+        sequence: if a worker outlives the drain budget the lock is kept until
+        the process exits.
+      '''
+      metadata {
+        spec 'docs/specification/02-architecture.md §4'
+        code 'crates/local-rag/src/daemon/lifecycle.rs'
+      }
+    }
+
+    cli = container 'local-rag CLI' {
+      #implemented
+      #v0
+      description '''
+        The same binary, multiplexed by subcommand: serve, status, stop, init,
+        index, watch, project, repo, worktree, rebuild, memory, consolidation,
+        inspect, export, purge, gc, vacuum, doctor, stats. Opens the databases
+        in-process with WAL and busy_timeout, and takes neither the store lock
+        nor the per-worktree lock.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §6'
+        code 'crates/local-rag/src/cli/mod.rs'
+      }
+    }
+
+    tui = container 'local-rag-tui dashboard' {
+      #implemented
+      #post-v0
+      description '''
+        Six screens: Status, Logs, Memory, Repositories, Repo Settings, Server
+        Settings. Most read and write the databases directly with no daemon
+        running; the Logs screen and live queue occupancy are the exception,
+        since that data exists only inside a running daemon and is polled
+        (~1 s) over admin/* — the protocol is request/response only, never
+        pushed. A saved config change takes effect after a restart; there is no
+        hot reload.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §7'
+        plan 'docs/implementation-plan/groups/18-tui-dashboard.md'
+        code 'crates/local-rag-tui/src/main.rs'
+      }
+    }
+
+    // --- Shipped artifacts -------------------------------------------------
+
+    npmInstaller = container '@13w/memory npm package' {
+      #implemented
+      #v0
+      description '''
+        Obtains and exposes the binaries; it never contains them. One package,
+        zero runtime dependencies, Node built-ins only. postinstall always exits
+        0 — an air-gapped install, a source checkout, an unsupported platform or
+        nowhere to write are all "do nothing", not failures.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §1'
+        plan 'docs/implementation-plan/groups/22-binary-delivery.md'
+        code 'npm/memory/scripts/postinstall.js'
+      }
+    }
+
+    ccPlugin = container 'Claude Code plugin' {
+      #implemented
+      #v0
+      description '''
+        Registers local-rag-proxy as the MCP server and local-rag-hook for the
+        seven capture events, and ships one skill. It resolves an executable,
+        never a package, and downloads nothing, ever — plugin packaging must not
+        modify a user's repository.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §2'
+        plan 'docs/implementation-plan/groups/19-mcp-adoption.md'
+        code 'plugin/.claude-plugin/plugin.json'
+      }
+    }
+
+    // --- Stores ------------------------------------------------------------
+
+    stateDb = store 'state.sqlite' {
+      #implemented
+      #v0
+      description '''
+        The canonical store and the only source of truth: registry, projection
+        state, the code side, generation membership, and the whole memory side.
+        WAL, foreign_keys ON, synchronous FULL — memory durability is the budget
+        priority. Every write goes through one bounded queue to a single writer
+        task; no writable connection ever leaves the store crate.
+      '''
+      metadata {
+        spec 'docs/specification/03-data-model.md §2'
+        code 'crates/store/src/state/mod.rs'
+      }
+    }
+
+    cacheDb = store 'cache.sqlite' {
+      #implemented
+      #v0
+      description '''
+        Rebuildable and independently validated: embedding vectors, normalized
+        text, the FTS5 materialized view and its head. foreign_keys OFF (no FKs
+        may cross a database), synchronous NORMAL — loss means a rebuild, never
+        data loss. Validated on open against store_instance_uuid and its schema
+        version; wrong either way, it is dropped and recreated. It is never
+        migrated.
+      '''
+      metadata {
+        spec 'docs/specification/03-data-model.md §4'
+        code 'crates/store/src/cache/mod.rs'
+      }
+    }
+
+    projectionStore = store 'Dense projection shards' {
+      #implemented
+      #v0
+      #pillar-search
+      description '''
+        One shard per worktree, split one level deeper per model space so a
+        model migration never rewrites the old one in place. The v0 backend is a
+        brute-force linear scan over the embedding cache (ADR-0003) — exact by
+        construction at any scale a per-worktree shard reaches. Always an
+        untrusted cache: the backend owes no durability barrier, only
+        detectability of divergence.
+      '''
+      metadata {
+        spec 'docs/specification/05-projection.md §1'
+        code 'crates/projection/src/brute_force.rs'
+      }
+    }
+
+    spoolStore = queue 'Spool segments' {
+      #implemented
+      #v0
+      #pillar-observations
+      description '''
+        Append-only per-session segments, the only path by which a hook's
+        observations enter the system. The durable moment of an event is a
+        successful atomic append; a segment is truncated or deleted only after
+        its bytes are at or below the committed import cursor.
+      '''
+      metadata {
+        spec 'docs/specification/07-observations-spool.md §3'
+        code 'crates/core/src/spool.rs'
+      }
+    }
+
+    modelStore = store 'Model & runtime store' {
+      #implemented
+      #v0
+      description '''
+        Downloaded weights plus the ONNX Runtime, each under a manifest.json
+        with an .ok marker written last — everything before that marker is
+        indistinguishable from "not installed". Weights are never shipped in
+        npm.
+      '''
+      metadata {
+        spec 'docs/specification/10-models-and-embeddings.md §5'
+        code 'crates/models/src/install.rs'
+      }
+    }
+
+    storeControlFiles = store 'Store control files' {
+      #implemented
+      #v0
+      description '''
+        store.lock (flock'd JSON with a readiness marker), migration.lock,
+        run/daemon.sock, logs/ (daily, seven kept), quarantine/ and backups/.
+        Directories 0700, files 0600; the store is never shared between OS users
+        and the daemon refuses to start on one owned by a different uid.
+      '''
+      metadata {
+        spec 'docs/specification/02-architecture.md §2'
+        code 'crates/core/src/paths/mod.rs'
+      }
+    }
+
+    // --- Channels inside the boundary --------------------------------------
+
+    mcpProxy -[calls]-> daemon 'MCP JSON-RPC passthrough' {
+      description '''
+        NDJSON over a unix domain socket (a named pipe on Windows). HELLO/WELCOME
+        first, then every request wrapped in an envelope carrying the explicit
+        request context. INCOMPATIBLE is raised only by a proto-range mismatch,
+        never by a version difference.
+      '''
+      metadata {
+        spec 'docs/specification/02-architecture.md §4.2'
+        transport 'unix domain socket, NDJSON'
+        max_message_bytes '8388608'
+      }
+    }
+
+    mcpProxy -[spawns]-> daemon 'starts the daemon on a failed connect' {
+      description '''
+        Spawned once — not once per retry — detached, with all three standard
+        streams null and its own process group, then retried with backoff. The
+        daemon binary is located next to the running proxy, which is what makes
+        "the version is whichever binary sits beside this proxy" a definition
+        rather than a coincidence.
+      '''
+      metadata {
+        spec 'docs/specification/02-architecture.md §4.2'
+        code 'crates/local-rag-proxy/src/connect.rs'
+        backoff_ms '250 doubling, cap 4000, total budget 20000'
+      }
+    }
+
+    mcpProxy -[calls]-> daemon 'SHUTDOWN_REQUEST on a version mismatch' {
+      description '''
+        The upgrade path. The old daemon finishes in-flight jobs, releases the
+        lock and exits; if it does not within the budget the proxy reports the
+        conflict instead of force-killing it.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §4'
+        timeout_ms '30000'
+      }
+    }
+
+    hookBinary -[appends]-> spoolStore 'durable frame append' {
+      description '''
+        flock, write(O_APPEND), fdatasync, unlock. This append IS the durable
+        moment of the event; the hook never writes any database and never sends
+        ingestion to the daemon.
+      '''
+      metadata {
+        spec 'docs/specification/07-observations-spool.md §2'
+        code 'crates/local-rag-hook/src/segment.rs'
+        budget_ms '200'
+      }
+    }
+
+    hookBinary -[calls]-> daemon 'read-only recall RPC' {
+      description '''
+        SessionStart and UserPromptSubmit only, and only after the append
+        returned Ok — recall is never attempted for an event that was not itself
+        durably recorded. Read-only, must not trigger daemon startup, and any
+        error or timeout prints nothing and exits 0.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §3.2'
+        code 'crates/local-rag-hook/src/recall.rs'
+        timeout_ms '1500'
+      }
+    }
+
+    tui -[calls]-> daemon 'admin/* poll' {
+      description 'Recent calls and per-tool counters, polled about once a second; that data lives only in the running daemon.'
+      metadata {
+        spec 'docs/specification/11-interfaces.md §7'
+        code 'crates/local-rag-tui/src/admin_client.rs'
+      }
+    }
+
+    cli -[calls]-> daemon 'status / stop / restart' {
+      description 'The only CLI verbs that need a live daemon; everything else opens the store in-process.'
+      metadata {
+        spec 'docs/specification/11-interfaces.md §6'
+      }
+    }
+
+    daemon -[writes]-> stateDb 'single bounded writer queue (L4a)'
+    daemon -[reads]-> stateDb 'snapshot reads under the worktree lock'
+    daemon -[writes]-> cacheDb 'separate bounded writer queue (L4b)'
+    daemon -[writes]-> projectionStore 'write-ahead switch, validate on open, rebuild on doubt'
+    daemon -[reads]-> spoolStore 'imports the tail and advances the durable cursor'
+    daemon -[writes]-> storeControlFiles 'holds store.lock for its process lifetime'
+    daemon -[reads]-> modelStore 'loads the ONNX session and the GGUF generator'
+
+    cli -[writes]-> stateDb 'direct in-process open, WAL + busy_timeout'
+    cli -[writes]-> cacheDb 'direct in-process open'
+    cli -[writes]-> projectionStore 'index / rebuild'
+    tui -[writes]-> stateDb 'settings and memory review, no daemon required'
+
+    // The one relation that is deliberately NOT a transaction. state.sqlite and
+    // cache.sqlite are never written in one transaction via ATTACH: cross-DB
+    // atomicity under WAL is not crash-guaranteed. Read-only ATTACH is allowed
+    // and is marked at its call sites, enforced by a source-lint test.
+
+    stateDb -[derives]-> cacheDb 'materialized from, never co-transacted with' {
+      metadata {
+        spec 'docs/specification/03-data-model.md §1.4'
+        code 'crates/store/tests/cache.rs'
+      }
+    }
+
+    stateDb -[derives]-> projectionStore 'expected point set is a function of the canonical rows' {
+      metadata {
+        spec 'docs/specification/05-projection.md §3'
+      }
+    }
+  }
+
+  // --- Edges that leave the boundary ---------------------------------------
+
+  claudeCode -[calls]-> localRag.mcpProxy 'MCP over stdio' {
+    metadata {
+      spec 'docs/specification/11-interfaces.md §1'
+      code 'plugin/.mcp.json'
+    }
+  }
+
+  claudeCodeHooks -[calls]-> localRag.hookBinary 'seven capture events on stdin' {
+    description 'SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure, Stop, SubagentStop, SessionEnd.'
+    metadata {
+      spec 'docs/specification/07-observations-spool.md §1'
+      code 'plugin/hooks/hooks.json'
+    }
+  }
+
+  operator -[calls]-> localRag.cli 'runs subcommands'
+  operator -[calls]-> localRag.tui 'opens the dashboard'
+
+  localRag.daemon -[reads]-> repoUnderIndex 'gitignore-aware scan of the exact bytes'
+  localRag.daemon -[watches]-> repoUnderIndex 'filesystem and .git/HEAD events' {
+    description 'Events only schedule work. Correctness comes from an authoritative reconcile, and a watcher overflow forces a strict one.'
+    metadata {
+      spec 'docs/specification/06-reconcile-and-fts.md §1'
+    }
+  }
+
+  localRag.npmInstaller -[downloads]-> githubReleases 'one archive per binary, verified against its same-release .sha256'
+  npmRegistry -[calls]-> localRag.npmInstaller 'npm install -g @13w/memory' {
+    description 'Modelled as the registry delivering the package; the installer is what runs afterwards.'
+  }
+  localRag.cli -[downloads]-> modelWeightHost 'local-rag init --download-models'
+  localRag.daemon -[calls]-> remoteInferenceEndpoint 'only after the central data-policy guard passes' {
+    #deferred
+    description 'No remote provider exists in v0. Under the default local_only the guard rejects one before provider selection, as POLICY_BLOCKED_REMOTE.'
+    metadata {
+      spec 'docs/specification/12-security-privacy.md §1'
+      code 'crates/embed/src/policy.rs'
+    }
+  }
+}

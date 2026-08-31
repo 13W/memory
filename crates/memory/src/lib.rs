@@ -45,6 +45,7 @@ pub mod budget;
 pub mod guard;
 pub mod normalize;
 pub mod parse;
+pub mod plan;
 pub mod prompt;
 pub mod recall;
 pub mod router;

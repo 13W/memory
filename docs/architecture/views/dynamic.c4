@@ -1,0 +1,161 @@
+// The six flows. Each is a direct projection of the normative steps, and each
+// step's label carries the thing a static diagram cannot show: where a lock is
+// taken, where a transaction begins and ends, which write is the durable
+// moment, and where a failure is deliberately swallowed.
+
+views {
+
+  dynamic view searchRequest {
+    title 'Hybrid search request'
+    description '''
+      The read lock is taken after the worktree is resolved and released only
+      after the results are shaped — it prevents the two legs from reading
+      different generations. An unsupported mode is refused before resolution
+      and before any lock. If the lexical head does not validate, the answer is
+      an explicitly degraded dense_only with the reason stated; if both legs are
+      unavailable it is INDEX_UNAVAILABLE, never an empty success.
+    '''
+
+    claudeCode -> localRag.mcpProxy 'tools/call search_code'
+    localRag.mcpProxy -> localRag.daemon.mcpDispatcher 'request envelope with the explicit context'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.searchEngine 'dispatch'
+    localRag.daemon.searchEngine -> localRag.daemon.lockRegistry 'take the worktree read lock, bounded wait'
+    localRag.daemon.searchEngine -> localRag.stateDb 'resolve the active generation and model space'
+    localRag.daemon.searchEngine -> localRag.daemon.lexicalLeg 'BM25, only if the FTS head validates'
+    localRag.daemon.lexicalLeg -> localRag.cacheDb 'query the materialized view'
+    localRag.daemon.searchEngine -> localRag.daemon.denseLeg 'embed the query and scan the shard'
+    localRag.daemon.denseLeg -> localRag.projectionStore 'brute-force cosine over the shard'
+    localRag.daemon.searchEngine -> localRag.daemon.fusion 'reciprocal rank fusion, k = 60'
+    localRag.daemon.searchEngine -> localRag.daemon.enrichment 'cut snippets from the stored source_blob'
+    localRag.daemon.searchEngine -> localRag.daemon.lockRegistry 'release the read lock'
+    localRag.daemon.mcpDispatcher -> localRag.mcpProxy 'results, generation, degraded flag, diagnostics'
+    localRag.mcpProxy -> claudeCode 'tool result'
+
+    global style status
+  }
+
+  dynamic view indexingCycle {
+    title 'Indexing cycle — building a generation'
+    description '''
+      One cycle under one write lock. The order of the last four steps is not
+      arbitrary: superseding the stragglers before the backfill stops abandoned
+      generations from accumulating as permanent pin roots, and the projection
+      head is written strictly after every point mutation, which is what makes a
+      crash detectable at the next open rather than silent.
+    '''
+
+    localRag.daemon.watcher -> localRag.daemon.reconcileDriver 'an event schedules a cycle (a hint, not truth)'
+    localRag.daemon.indexingSupervisor -> localRag.daemon.reconcileDriver 'or the enrolment table starts one'
+    localRag.daemon.reconcileDriver -> localRag.daemon.lockRegistry 'take the worktree write lock'
+    localRag.daemon.reconcileDriver -> repoUnderIndex 'authoritative gitignore-aware scan'
+    localRag.daemon.reconcileDriver -> localRag.daemon.redactionScanner 'classify: ignored, huge, lfs, binary, encoding, secret'
+    localRag.daemon.reconcileDriver -> localRag.stateDb 'write generation N+1: files, skips, occurrences'
+    localRag.daemon.reconcileDriver -> localRag.stateDb 'supersede lower-numbered stragglers'
+    localRag.daemon.reconcileDriver -> localRag.daemon.embeddingBackfill 'embed only what is new'
+    localRag.daemon.embeddingBackfill -> localRag.cacheDb 'fill the embedding cache'
+    localRag.daemon.reconcileDriver -> localRag.daemon.projectionSwitch 'write-ahead intent, then reconcile the desired point set'
+    localRag.daemon.projectionSwitch -> localRag.projectionStore 'upsert, delete, then write the head LAST'
+    localRag.daemon.reconcileDriver -> localRag.daemon.ftsMaterializer 'materialize the lexical view'
+    localRag.daemon.ftsMaterializer -> localRag.cacheDb 'one transaction, head written last'
+    localRag.daemon.reconcileDriver -> localRag.daemon.lockRegistry 'release, checkpoint the WAL'
+
+    global style status
+  }
+
+  dynamic view observationCapture {
+    title 'Observation capture — hook to durable envelope'
+    description '''
+      Two independent halves. The hook's half must survive a dead daemon, so it
+      ends at fdatasync and exits 0 whatever happened. The daemon's half is
+      transactional and idempotent: dedup at import, one transaction per batch,
+      and the cursor advances in that same transaction — so a crash re-imports,
+      it never loses or double-counts.
+    '''
+
+    claudeCodeHooks -> localRag.ccPlugin.hookResolver 'one of seven events, JSON on stdin'
+    localRag.ccPlugin.hookResolver -> localRag.hookBinary 'exec spool-write'
+    localRag.hookBinary -> localRag.daemon.redactionScanner 'redact BEFORE anything touches disk, then cap'
+    localRag.hookBinary -> localRag.spoolStore 'flock, append, fdatasync — the durable moment'
+    localRag.hookBinary -> claudeCodeHooks 'exit 0, always'
+    localRag.daemon.consolidationTrigger -> localRag.daemon.spoolImporter 'import the session tail'
+    localRag.daemon.spoolImporter -> localRag.spoolStore 'read frames from the durable cursor, verify CRC'
+    localRag.daemon.spoolImporter -> localRag.stateDb 'one transaction: envelopes, paths, payloads, cursor'
+
+    global style status
+  }
+
+  dynamic view consolidationRun {
+    title 'Consolidation — observations into memory'
+    description '''
+      The shape of this flow is the whole design: an expensive, non-deterministic
+      model call sits between two cheap transactions and inside neither. The
+      window and the conflict set are bounded in tokens; the guard is what stands
+      between a model's output and the canonical store; and the apply is atomic
+      across the entire ops list, cursor advance included, so one rejected op
+      rolls back the window rather than half-applying it.
+    '''
+
+    localRag.daemon.consolidationTrigger -> localRag.daemon.consolidationRunner 'checkpoint, backlog threshold or idle interval'
+    localRag.daemon.consolidationRunner -> localRag.stateDb 'tx 1: open the run, take a lease, snapshot the window'
+    localRag.daemon.consolidationRunner -> localRag.stateDb 'load the window and the candidate conflict set'
+    localRag.daemon.consolidationRunner -> localRag.daemon.memoryRouter 'route — outside any transaction'
+    localRag.daemon.memoryRouter -> localRag.daemon.providerPool 'local generator, greedy, one corrective re-prompt'
+    localRag.daemon.memoryRouter -> localRag.daemon.memoryGuard 'materialize, downgrade, collapse the plan'
+    localRag.daemon.memoryGuard -> localRag.daemon.memoryOps 'apply the ordered ops'
+    localRag.daemon.memoryOps -> localRag.stateDb 'tx 2: ops, evidence, audit, cursor — all or nothing'
+    localRag.daemon.normalizationWorker -> localRag.daemon.memoryOps 'later: rewrite the canon to English, audited'
+
+    global style status
+  }
+
+  dynamic view recallInjection {
+    title 'Recall — memory back into a session'
+    description '''
+      Two entry points, one pipeline. The hook path is fail-open by
+      construction: it runs only after its own append succeeded, it must not
+      start a daemon, and a timeout prints nothing. Recall holds no lock at all
+      and compensates with a fresh per-entry lifecycle re-read before
+      formatting, so a retracted memory cannot be served from a stale candidate
+      list.
+    '''
+
+    claudeCodeHooks -> localRag.hookBinary 'SessionStart or UserPromptSubmit'
+    localRag.hookBinary -> localRag.daemon.mcpDispatcher 'read-only recall RPC, 1500 ms budget'
+    claudeCode -> localRag.mcpProxy 'or an explicit recall tool call'
+    localRag.mcpProxy -> localRag.daemon.mcpDispatcher 'request envelope'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.recallPipeline 'dispatch'
+    localRag.daemon.recallPipeline -> localRag.stateDb 'scope: global union repository union worktree'
+    localRag.daemon.recallPipeline -> localRag.cacheDb 'fuse lexical and dense over memory text'
+    localRag.daemon.recallPipeline -> localRag.stateDb 're-read each entry lifecycle state fresh'
+    localRag.daemon.recallPipeline -> localRag.hookBinary 'ranked prefix within the token budget'
+    localRag.hookBinary -> claudeCodeHooks 'additionalContext, or nothing at all when empty'
+
+    global style status
+  }
+
+  dynamic view daemonLifecycle {
+    title 'Daemon lifecycle — start, upgrade, drain'
+    description '''
+      Ownership of the store is the subject here. A successful lock proves no
+      live process holds it, because the kernel releases a flock when its holder
+      dies; contention proves the opposite, so the contending path waits and
+      never reclaims. The release at the end is conditional: if a worker
+      outlived the drain budget the lock is deliberately kept until the process
+      exits, because releasing it would claim something untrue.
+    '''
+
+    localRag.mcpProxy -> localRag.daemon 'connect; on failure spawn once, detached'
+    localRag.daemon -> localRag.storeControlFiles 'acquire store.lock, or wait out the incumbent'
+    localRag.daemon -> localRag.daemon.migrationRunner 'migrate under the migration lock'
+    localRag.daemon.migrationRunner -> localRag.stateDb 'forward-only, checksummed, resumable'
+    localRag.daemon -> localRag.cacheDb 'validate; drop and recreate if it does not match this store'
+    localRag.daemon -> localRag.storeControlFiles 'bind the socket, mark ready, start workers'
+    localRag.daemon -> localRag.daemon.spoolImporter 'resume the pending import'
+    localRag.daemon -> localRag.daemon.consolidationTrigger 'first tick reclaims crashed runs'
+    localRag.mcpProxy -> localRag.daemon 'SHUTDOWN_REQUEST when the versions differ'
+    localRag.daemon -> localRag.daemon.indexingSupervisor 'stop accepting, cancel workers at a safe point'
+    localRag.daemon -> localRag.storeControlFiles 'checkpoint, then release — or keep it until exit'
+
+    global style status
+  }
+}

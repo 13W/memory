@@ -1,0 +1,176 @@
+// The notation for this model: element kinds, relationship kinds and tags.
+//
+// LikeC4 merges every `specification` block in the workspace, so a second block
+// redeclaring a kind is a duplicate-declaration error rather than a merge. This
+// file is therefore the only place the vocabulary is declared. How to use it —
+// naming, required metadata keys, when to update — is in README.md.
+
+specification {
+
+  // --- Element kinds -------------------------------------------------------
+
+  element actor {
+    notation 'Actor'
+    style {
+      shape person
+    }
+  }
+
+  element externalSystem {
+    notation 'External system'
+    style {
+      shape rectangle
+      color secondary
+    }
+  }
+
+  element system {
+    notation 'System'
+  }
+
+  // A container here is a running process or a shipped artifact — the unit that
+  // is separately started, installed or crashed. `local-rag` the daemon and
+  // `local-rag` the CLI are one binary and two containers, because they have
+  // different lifecycles and different access to the store.
+  element container {
+    notation 'Container'
+    style {
+      shape rectangle
+    }
+  }
+
+  element component {
+    notation 'Component'
+    style {
+      shape rectangle
+    }
+  }
+
+  element store {
+    notation 'Store'
+    style {
+      shape storage
+    }
+  }
+
+  // The spool is the only queue in the system, and it is a queue in the strict
+  // sense: an append-only log with a durable consumer cursor.
+  element queue {
+    notation 'Queue'
+    style {
+      shape queue
+    }
+  }
+
+  // --- Relationship kinds --------------------------------------------------
+
+  relationship calls {
+    notation 'Calls'
+  }
+
+  relationship spawns {
+    notation 'Spawns'
+    line dashed
+  }
+
+  relationship appends {
+    notation 'Appends'
+  }
+
+  relationship reads {
+    notation 'Reads'
+    line dotted
+  }
+
+  relationship writes {
+    notation 'Writes'
+    line dotted
+  }
+
+  // `derives` is the cache relation: the target is materialized from the source
+  // and can be dropped and rebuilt without data loss. It is deliberately not
+  // `writes` — no transaction ever spans the two.
+  relationship derives {
+    notation 'Derives'
+    line dashed
+  }
+
+  relationship downloads {
+    notation 'Downloads'
+    line dashed
+  }
+
+  // A watcher is a hint, never a source of truth (06 §1). Its own kind keeps
+  // that visible on every diagram it appears on.
+  relationship watches {
+    notation 'Watches (hint only)'
+    line dotted
+  }
+
+  // --- Deployment node kinds -----------------------------------------------
+  //
+  // There is exactly one deployment topology and it is a single machine: one
+  // OS user, one store, no server and no network hop. That is the product
+  // decision, so the node kinds are only what a laptop actually has.
+
+  deploymentNode machine {
+    notation 'Machine'
+    style {
+      shape rectangle
+    }
+  }
+
+  deploymentNode osUser {
+    notation 'OS user'
+  }
+
+  deploymentNode directory {
+    notation 'Directory'
+    style {
+      shape storage
+    }
+  }
+
+  // --- Status tags ---------------------------------------------------------
+  //
+  // What is built, as built. `partial` is the load-bearing one: it marks a
+  // place where the specification is normative and the code implements less
+  // than it says, which is exactly what a planning diagram must not hide.
+  // Colours must be hex or rgb() here; the theme names are rejected by the
+  // parser in this block and accepted only inside styles.c4.
+
+  tag implemented {
+    color #3b82f6
+  }
+
+  tag partial {
+    color #f59e0b
+  }
+
+  tag planned {
+    color #22c55e
+  }
+
+  tag deferred {
+    color #94a3b8
+  }
+
+  // --- Pillar tags ---------------------------------------------------------
+  //
+  // The three product pillars (01 §1). Deliberately unstyled: only status
+  // carries colour, so a slice never competes with the status legend.
+
+  tag pillar-memory
+  tag pillar-search
+  tag pillar-observations
+
+  // --- Scope tier tags -----------------------------------------------------
+  //
+  // `post-v0` means "after the MVP scope froze", NOT "not built": the TUI and
+  // daemon-managed indexing are labelled post-v0 in the spec and are shipped
+  // (ADR-0008, ADR-0009). Read tier and status together, never one alone.
+
+  tag v0
+  tag v0x
+  tag post-v0
+}

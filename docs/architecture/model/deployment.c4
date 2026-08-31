@@ -1,0 +1,62 @@
+// Where it all runs: one machine, one OS user, one store.
+//
+// This is the whole topology, and its smallness is the product decision rather
+// than a simplification for the diagram — no server, no network hop, no
+// multi-user store. The two things worth reading off it are the process counts
+// (one proxy per session, one hook process per event, exactly one daemon) and
+// the on-disk layout the daemon owns.
+
+deployment {
+
+  devMachine = machine 'Developer machine' {
+    description 'macOS, Linux or Windows. The same machine edits the code, runs Claude Code, and holds the store.'
+
+    user = osUser 'One OS user' {
+      description '''
+        The store is never shared between OS users: directories are 0700, files
+        0600, and the daemon refuses to start on a store owned by a different
+        uid.
+      '''
+
+      claudeCodeProcess = instanceOf claudeCode
+      proxyProcess = instanceOf localRag.mcpProxy
+      hookProcess = instanceOf localRag.hookBinary
+      daemonProcess = instanceOf localRag.daemon
+      cliProcess = instanceOf localRag.cli
+      tuiProcess = instanceOf localRag.tui
+
+      storeRoot = directory 'data_dir/local-rag' {
+        description '''
+          LOCAL_RAG_HOME, else XDG_DATA_HOME, else ~/.local/share on POSIX —
+          macOS takes the POSIX branch, not ~/Library. LOCAL_RAG_HOME overrides
+          everything, which is what makes a test or a container fully
+          self-contained.
+        '''
+
+        stateFile = instanceOf localRag.stateDb
+        cacheFile = instanceOf localRag.cacheDb
+        projectionDir = instanceOf localRag.projectionStore
+        spoolDir = instanceOf localRag.spoolStore
+        modelsDir = instanceOf localRag.modelStore
+        controlDir = instanceOf localRag.storeControlFiles
+      }
+    }
+
+    repoCheckout = directory 'Git worktrees under index' {
+      description 'Read-only to this product. Enrolled explicitly; nothing is indexed because it happens to be open.'
+      workingTree = instanceOf repoUnderIndex
+    }
+  }
+
+  // One proxy per session over stdio, one socket to the single daemon. The
+  // socket lives inside the store root, so the store directory is both the data
+  // and the rendezvous point.
+
+  devMachine.user.claudeCodeProcess -> devMachine.user.proxyProcess 'stdio, one per session'
+  devMachine.user.proxyProcess -> devMachine.user.daemonProcess 'run/daemon.sock'
+  devMachine.user.hookProcess -> devMachine.user.storeRoot.spoolDir 'append, then exit 0'
+  devMachine.user.daemonProcess -> devMachine.user.storeRoot 'holds store.lock for its process lifetime'
+  devMachine.user.daemonProcess -> devMachine.repoCheckout 'scans and watches, read-only'
+  devMachine.user.cliProcess -> devMachine.user.storeRoot 'opens the databases in-process'
+  devMachine.user.tuiProcess -> devMachine.user.storeRoot 'reads directly, polls the daemon for live data'
+}

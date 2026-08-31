@@ -111,6 +111,11 @@ section states less precisely than the code fixes:
   evidence, and leaving `confidence` untouched, because one window's opinion of a *new* entry is
   no basis for rewriting an accumulated one.
 
+  The rewrite looks the text up in the **store**, not in the plan it is building, so a window that
+  proposes one stored text twice produces two reinforces of one entry — the shape §4's collapse
+  exists to fold (`T23-05`/`D-121`). `D-078` stops the store accumulating copies; the collapse
+  stops one window's plan contradicting itself.
+
   This is a mechanical guard rather than a prompt rule for a measured reason: the router cannot
   see the duplicate. §4 step 3's candidate set is capped, and past the cap the model is blind to
   its own recent output (`D-080`), so it re-derives the same claim every window. On the owner's
@@ -138,7 +143,13 @@ section states less precisely than the code fixes:
   matching `audit_event`, consistent with "Response carries the new `entry_version`" being
   stated for every operation, not only state transitions. It does not check the entry's current
   `state`/terminality — that guard, if warranted, belongs to T14-03's kind/state-aware lifecycle
-  operations, which this task's card does not cover.
+  operations, which this task's card does not cover. `T23-05` found the consequence and left the
+  bullet standing: the optimistic version comparison is, accidentally, the only thing that stops a
+  consolidation batch from reinforcing an entry it superseded two ops earlier, which is one of the
+  three reasons §4's collapse happens above the store instead of by relaxing that comparison.
+  One window's repeated re-observation of one entry is **one** reinforce, not two, so a window
+  cannot inflate an entry's version — or its accumulated confidence — by saying the same thing
+  twice.
 
 As-built note (T14-03, `[SPEC]`): `resolve`/`retract` compose 04 §5's
 `MemoryState::check_transition` directly, so an illegal kind/state request (e.g. resolving a
@@ -439,6 +450,44 @@ batch); it is bounded by (2) instead. Knowingly accepted cost of (3): a genuinel
 outage parks the runs it hits until the binary is rebuilt — a daemon restart does not revive them
 — and `open_next_run` blocks that session's whole backlog meanwhile. D-071 is the observability
 half that surfaces such a row in `stats`/`doctor`.
+
+As-built note (`T23-05`/`D-121`, `[SPEC]`): step 3's "ordered ops list" may legitimately name one
+entry more than once, and step 4's `expected_version` for **every** op is captured once, by
+`local_rag_memory::guard::materialize`, before any op is applied. So a second op on one entry does
+not *race* into failing — it is guaranteed to fail, because the first op moves the version the
+second is still holding. `D-078`'s rewrite is the common producer: a `create` of text that already
+exists becomes a `reinforce` of that entry, so a window proposing one stored text twice yields two
+reinforces of one entry carrying one snapshot. Measured on a live store: eight runs failed this way,
+**every one with `found = expected + 1` and an op index of at least 3**, and 569 runs proposed one
+text more than once inside a single transaction.
+
+The plan is therefore collapsed above the store, by `local_rag_memory::plan::collapse`, before
+`run_once` is handed it — the same "dedup at the untrusted-input boundary" move `D-069` made one
+level down, and the sentence above about cross-op duplication stays true of `apply_run` itself,
+which is unchanged. The rules: ops group by the entry they version-check; `reinforce` yields to
+`supersede`/`resolve`/`retract`; among those three the last in plan order wins, plan order being
+the only evidence about which the model stated second; citations are unioned in plan order with the
+first occurrence winning; a merged `reinforce` keeps the last stated confidence, which is what
+`COALESCE(?2, confidence)` would have left; and `create`, `noop` and `propose_candidate` never
+participate — the first two carry no `expected_version`, and a candidate is a request for human
+review that no guard may answer by merging. `op_index` numbers the collapsed plan, and the shift is
+immaterial for the reason the `idempotency_key` paragraph above already gives.
+
+Why the store was not the place, recorded because the alternative looks obvious: `apply_run`
+already reads its own writes (SQLite shows an uncommitted `UPDATE` to later reads on the same
+transaction), so a batch-local version map could only *relax* the comparison, and relaxing it is
+worse twice over. `memory_evidence` is keyed `(memory_id, observation_id)` and `D-069`'s citation
+dedup is per-op, so two reinforces of one entry citing one observation — 70 of 96 within-run op
+pairs on the live store share a cited observation — would violate that key, and a constraint
+violation is `Mechanical` on the first attempt, i.e. an immediate permanent dead-letter instead of
+a retryable one. And `apply_reinforce` deliberately does not check the entry's `kind`/`state`, so
+the version comparison is the only thing preventing a batch from reinforcing an entry it has just
+superseded.
+
+What this does not fix, stated plainly: a genuine outside writer — a review tool, the normalization
+worker, another session's run — moving the version between plan and apply. That stays a conflict,
+correctly, and the existing retry converges on it because a retry re-invokes the generator and
+`guard` re-reads every version. Convergence there is a property of re-planning, not of waiting.
 
 ## 5. Explicit tool-initiated memory (`remember`, review tools)
 

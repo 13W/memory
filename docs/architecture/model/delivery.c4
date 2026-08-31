@@ -1,0 +1,145 @@
+// How the binaries reach a machine, and how Claude Code finds them afterwards.
+//
+// These are two different resolution problems and the model keeps them apart,
+// because conflating them has already cost a defect. The npm package resolves a
+// DIRECTORY — the daemon must sit beside the proxy that spawns it, so a rung
+// counts only if it holds every required binary. The plugin resolves an
+// EXECUTABLE and knows nothing about packages, node_modules or npx.
+
+model {
+
+  extend localRag.npmInstaller {
+
+    platformResolver = component 'Platform & target resolver' {
+      #implemented
+      description '''
+        Computes the platform key at runtime — darwin-x64, darwin-arm64,
+        linux-x64, linux-arm64, win32-x64 — and maps it to a Rust target triple.
+        The set is enumerated in code rather than left to npm's os/cpu
+        auto-selection, which went away with the per-platform packages.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §1'
+        code 'npm/memory/src/platform.js'
+      }
+    }
+
+    releaseDownloader = component 'Release downloader & verifier' {
+      #implemented
+      description '''
+        Resolves `latest` once per install through the redirect that names the
+        concrete tag, downloads one archive per binary and verifies each against
+        its .sha256 sidecar from the same release. Stated without euphemism in
+        the spec: that defends against corruption and tampering in transit, not
+        against a compromised release, since whoever can publish the asset can
+        publish its digest.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §1'
+        code 'npm/memory/src/release.js'
+      }
+    }
+
+    binDirLadder = component 'Binary directory ladder' {
+      #implemented
+      description '''
+        LOCAL_RAG_BIN_DIR (final — a miss is an error, never a fall-through),
+        then a source checkout's target/release and target/debug (also final:
+        build it, do not download something else), then the package bin
+        directory, then the per-user cache. The last two additionally require a
+        current install manifest, so "new wrapper, old native code" is
+        unrepresentable.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §4'
+        code 'npm/memory/src/locate.js'
+      }
+    }
+
+    freebsdTarget = component 'FreeBSD target' {
+      #deferred
+      description 'Explicitly out of v0 scope.'
+      metadata {
+        spec 'docs/specification/01-overview.md §2'
+      }
+    }
+
+    win32Arm64Target = component 'win32-arm64 target' {
+      #deferred
+      description 'Deferred with FreeBSD; the platform table names it as such rather than omitting it.'
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §1'
+      }
+    }
+
+    platformResolver -[calls]-> releaseDownloader 'names the assets to fetch'
+    releaseDownloader -[writes]-> binDirLadder 'installs flat and records the manifest'
+  }
+
+  extend localRag.ccPlugin {
+
+    mcpLauncher = component 'MCP launcher' {
+      #implemented
+      description '''
+        Registered as the MCP server command. Keeps stdout byte-empty whatever
+        happens — that stream IS the JSON-RPC channel — writes any diagnostic to
+        stderr naming both the install command and the override variable, and
+        exits non-zero so the client shows a failed server rather than a silent
+        one. Demands co-location: a proxy without a daemon beside it is not a
+        usable rung.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §2'
+        code 'plugin/bin/local-rag-mcp-launcher.js'
+      }
+    }
+
+    hookResolver = component 'Hook resolver' {
+      #implemented
+      #pillar-observations
+      description '''
+        POSIX shell, built-ins only, on a sub-50-ms budget. Exits 127 on a miss
+        on purpose, so the SessionStart hook can tell there was nothing to run
+        and say so through additionalContext; the other six stay silent. Exit 0
+        always, from the caller's point of view.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §3.2'
+        code 'plugin/bin/local-rag-resolve-hook.sh'
+      }
+    }
+
+    executableLadder = component 'Executable resolution ladder' {
+      #implemented
+      description '''
+        LOCAL_RAG_BIN_DIR, then every PATH entry in order, then the directory
+        beside the node binary, then env-exported package-manager homes and
+        their bin children, then the well-known global bin directories. Held
+        byte-identical between the launcher and the shell resolver, and modelled
+        as one component for that reason: the two copies diverged once — the
+        pnpm rung named the parent of the directory that actually holds the
+        commands — and an interactive PATH hid it completely.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §2'
+        code 'plugin/bin/local-rag-mcp-launcher.js'
+      }
+    }
+
+    memorySkill = component 'memory-first-workflow skill' {
+      #implemented
+      #post-v0
+      description 'Carries the recall to search to remember loop, but only on explicit invocation — one of six adoption channels, and not the always-on one.'
+      metadata {
+        spec 'docs/specification/11-interfaces.md §5'
+        plan 'docs/implementation-plan/groups/19-mcp-adoption.md'
+        code 'plugin/skills/memory-first-workflow/SKILL.md'
+      }
+    }
+
+    mcpLauncher -[calls]-> executableLadder 'finds local-rag-proxy'
+    hookResolver -[calls]-> executableLadder 'finds local-rag-hook'
+  }
+
+  localRag.ccPlugin.mcpLauncher -[spawns]-> localRag.mcpProxy 'exec, stdio inherited'
+  localRag.ccPlugin.hookResolver -[spawns]-> localRag.hookBinary 'exec spool-write'}

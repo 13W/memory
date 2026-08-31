@@ -1,0 +1,19 @@
+// The deployment view. One machine, one OS user, one store — see
+// model/deployment.c4 for why that is the whole topology.
+
+views {
+
+  deployment view devMachineView {
+    title 'Deployment — a developer machine'
+    description '''
+      Process counts are the thing to read here: one proxy per Claude Code
+      session, one short-lived hook process per event, and exactly one daemon
+      holding the store lock. Everything else on the machine reaches the same
+      store through SQLite rather than through the daemon.
+    '''
+
+    include *, devMachine.**
+
+    global style status
+  }
+}
