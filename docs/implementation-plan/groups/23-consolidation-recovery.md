@@ -32,11 +32,18 @@ one iteration — one commit.
 Every figure below is reproducible against a live store with `sqlite3 "file:<state.sqlite>?mode=ro"`.
 They are recorded here so a later reader can tell what this group was actually looking at.
 
-1. **Consolidation is stopped, and the backlog is not spread out.**
-   `throughput_observations_per_min` is `0.0` with `pending_backlog_total` 1386. All 1386
-   observations sit behind **four** sessions whose latest run is `failed`. Twenty-five sessions
-   carry a failed run; twenty-one of them are harmless — their cursor is already past, backlog 0 —
-   and two of the remaining four hold 1368 of the 1386.
+1. **Consolidation is stopped for two sessions, not globally — and the correction matters,
+   because it changes which mechanism is at fault.** Remeasured while writing `T23-01`, and this
+   supersedes the first reading recorded in `T23-00`'s evidence, which said "consolidation is
+   stopped" on the strength of an instantaneous `throughput_observations_per_min` of `0.0`. That
+   was wider than the evidence. Over one session the backlog moved 1386 → 1373, `applied` went
+   11515 → 11522, and one session went from 17 un-consolidated observations to 4: **`D-058`'s
+   shrink ladder works**, halving an overflowing 20-observation window to 10, and windows of 10
+   have been applying every ~25 seconds since.
+
+   What is genuinely stuck is narrower and worse: **two sessions are blocked permanently and hold
+   1368 of the 1373 — 99.6 %**. Twenty-five sessions carry a failed run; twenty-one are harmless,
+   their cursor already past.
 
 2. **Two of those four are blocked permanently, and it is provable rather than suspected.** Their
    latest run is a `mechanical` dead-letter that is **not** a context overflow (`optimistic
@@ -82,6 +89,16 @@ They are recorded here so a later reader can tell what this group was actually l
    re-read; and the router's output was truncated mid-string at 4430 characters, against a fixed
    `MAX_GENERATION_TOKENS = 1024` (`crates/memory/src/router.rs`) that does not scale with the
    window it must describe.
+
+7. **A failed run's trace costs the session forever, and nobody had named it.**
+   `latest_non_applied_run` selects `WHERE state != 'applied' ORDER BY created_at DESC LIMIT 1`,
+   and nothing ever clears a `failed` row — so the run that overflowed once stays the blocking row
+   for the life of the session, and `dead_letter_shrink_decision` keeps computing
+   `previous_count / 2` against that same frozen window. A session that overflowed **once**
+   therefore opens half-size windows permanently: verified, the recovering session's recent
+   windows are all exactly 10 against a configured `consolidation_batch_size` of 20 — twice the
+   runs and twice the generator calls, forever. `T23-03` lifts this as a side effect of clearing
+   the row, which is a second reason the repair is not only for the permanently blocked.
 
 ## Baseline, recorded before any card runs
 
@@ -248,6 +265,27 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
   distinct-text count is the invariant, not the total.
 - **Evidence:** the `T23-08` row.
 
+## T23-09 — The payload TTL sweep is actually scheduled
+
+- **Depends on:** `T23-03`. **The order is load-bearing and is not a preference:** this sweep
+  deletes exactly the payloads of the observations `T23-03` exists to rescue. Run it first and
+  there is nothing left to consolidate.
+- **Specification:** spec 12 §3 `[FIXED]` — "`observation_payload` under real TTL
+  (`payload_ttl_hours`), enforced by a sweeper"; `D-066`'s precedent for a sweep with no caller.
+- **Result:** the TTL is enforced by something other than a human remembering to type a command.
+- **In scope:** giving `run_payload_ttl_sweep` (T13-05) a scheduler. `crates/local-rag/src/daemon/gc.rs`
+  already runs the generation-retention sweep at daemon startup for `D-066` and carries the
+  reasoning for why that trigger was chosen; this is the same shape and the same place.
+- **Not in scope:** changing `payload_ttl_hours`, the sweep's own logic, or the other sweeps that
+  `local-rag gc` runs — whether they too want a schedule is a separate question this card must not
+  answer by accident.
+- **Tests:** an overdue payload is removed without a manual command; an envelope whose payload was
+  removed is untouched (envelope survival past payload expiry is structural, T13-05's own words);
+  a mutation proving the schedule fires rather than the test calling the sweep itself.
+- **Acceptance:** on the owner's store the overdue count falls from its measured 45651 without
+  `local-rag gc` being typed, **after** `T23-03` has rescued the backlog.
+- **Evidence:** the `T23-09` row, with the overdue count before and after.
+
 ## G23 — Consolidation and candidate review gate
 
 - **Depends on:** every card of the group.
@@ -256,7 +294,7 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
 - **In scope:** reread the named sections; build the requirement → code → test trace; check every
   `[FIXED]`/`[SPEC]`/`[OPEN]` the group touched — in particular spec 08 §4's accepted-cost
   paragraph, which this group's premise contradicts and which must end up saying what is true;
-  confirm `D-117`…`D-122` are all `resolved`; run both JS suites and `cargo xtask ci`; and
+  confirm `D-117`…`D-123` are all `resolved`; run both JS suites and `cargo xtask ci`; and
   **remeasure the baseline table above on the live store**, since a group opened from a live store
   is answerable to it.
 - **Not in scope:** reopening `G00`–`G22`.
