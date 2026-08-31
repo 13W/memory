@@ -27,6 +27,8 @@
 //! T15-07 but had never been exercised by a genuine two-process race before
 //! this test.
 
+#![cfg(unix)]
+
 mod support;
 
 use std::path::{Path, PathBuf};

@@ -14,6 +14,8 @@
 //! `tests/offline_search_recall.rs`'s `with_real_model` module (real
 //! inference) already cover from their own ends.
 
+#![cfg(unix)]
+
 mod support;
 
 use std::path::PathBuf;

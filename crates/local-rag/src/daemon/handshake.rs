@@ -422,7 +422,7 @@ async fn write_message<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> std::
     w.write_all(&bytes).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use local_rag_test_support::TempHome;

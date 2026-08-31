@@ -19,6 +19,8 @@
 //! `LOCAL_RAG_TEST_MODEL_HOME` are set to a machine that already has the
 //! default model's ~295 MB of weights on disk.
 
+#![cfg(unix)]
+
 mod support;
 
 use std::path::{Path, PathBuf};

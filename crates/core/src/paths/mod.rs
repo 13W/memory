@@ -807,6 +807,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn audit_permissions_finds_a_widened_managed_directory() {
         use local_rag_test_support::TempHome;

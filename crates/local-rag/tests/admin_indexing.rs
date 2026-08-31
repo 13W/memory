@@ -9,6 +9,8 @@
 //! registration/reload/shutdown semantics are covered by
 //! `tests/indexing_supervisor.rs` and are not re-proven here.
 
+#![cfg(unix)]
+
 mod support;
 
 use std::path::{Path, PathBuf};

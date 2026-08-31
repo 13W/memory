@@ -1,6 +1,8 @@
 //! T15-03 store-backed MCP tool tests: explicit context routing, unknown
 //! worktree behavior, and no synchronous indexing on the MCP path.
 
+#![cfg(unix)]
+
 mod support;
 
 use std::time::Duration;

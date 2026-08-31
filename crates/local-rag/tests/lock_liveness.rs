@@ -11,6 +11,8 @@
 //! runs, mirroring `crates/store/tests/lock.rs`'s own channel-based idiom for
 //! proving real concurrency without a race.
 
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
