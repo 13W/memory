@@ -633,6 +633,17 @@ impl DaemonHandle {
                     consolidation_poll_interval,
                     data_policy,
                     router_conflict_token_budget,
+                    // T23-04: the model's own context window is the only place
+                    // `32_768` is written down (`GeneratorCatalogEntry::
+                    // context_length`), and the budget is derived from it here
+                    // rather than configured. No catalog entry means
+                    // `build_best_effort_pool` found no local provider either,
+                    // so nothing will consolidate anyway; bound the window by
+                    // rows as before rather than by a budget derived from a
+                    // context that does not exist.
+                    local_rag_generate::find(local_rag_generate::DEFAULT_MODEL_ID)
+                        .map(|e| local_rag_memory::budget::PromptBudget::derive(e.context_length))
+                        .unwrap_or_else(local_rag_memory::budget::PromptBudget::unbounded),
                     stop_rx,
                 ));
                 (Some(stop_tx), Some(join))
@@ -984,6 +995,7 @@ async fn spawn_consolidation_trigger(
     poll_interval: Duration,
     data_policy: DataPolicy,
     conflict_token_budget: u32,
+    prompt_budget: local_rag_memory::budget::PromptBudget,
     stop: oneshot::Receiver<()>,
 ) {
     let generate = {
@@ -1001,6 +1013,7 @@ async fn spawn_consolidation_trigger(
                     &*uuids,
                     window,
                     conflict_token_budget,
+                    prompt_budget,
                 )
                 .await?;
                 // T21-14: the router's own output crosses the same write
@@ -1023,6 +1036,7 @@ async fn spawn_consolidation_trigger(
         lease_ms,
         renew_interval_ms,
         batch_size,
+        window_chars: prompt_budget.window_chars(),
         queue_threshold,
         payload_ttl_hours,
         idle_checkpoint_hours,

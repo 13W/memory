@@ -180,6 +180,32 @@ impl GeneratorPool {
         Err(GenError::AllProvidersFailed { failures })
     }
 
+    /// How many prompt tokens the provider that would serve this policy makes
+    /// of `req`, when one of them can say (`D-125`).
+    ///
+    /// Same guard-before-selection order as [`Self::generate`], and the same
+    /// primary/fallback order, so the answer comes from the provider the next
+    /// `generate` would actually reach. `None` means nobody could tell — an
+    /// empty pool, a policy that blocks every entry, or providers that own no
+    /// tokenizer — and a caller sizing a prompt must treat that as "assume
+    /// nothing" rather than "it fits".
+    ///
+    /// The redaction pass [`Self::generate`] applies per provider is applied
+    /// here too, for the same reason it exists there: under a redacting policy
+    /// the string a remote provider receives is not the string the caller
+    /// built, and a count of the wrong body is worse than no count.
+    /// Deliberately no retry: counting touches no network and mutates nothing.
+    pub fn count_prompt_tokens(&self, policy: DataPolicy, req: &GenRequest) -> Option<usize> {
+        self.entries
+            .iter()
+            .filter(|e| allows(policy, e.locality))
+            .find_map(|e| {
+                let redacted = redact_for_transmission(policy, e.locality, req);
+                e.provider
+                    .count_prompt_tokens(redacted.as_ref().unwrap_or(req))
+            })
+    }
+
     /// Attempt one provider up to the retry budget.
     fn try_provider(
         &self,

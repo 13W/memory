@@ -127,6 +127,11 @@ pub async fn run(options: &Options) -> Result<MemoryBenchReport, String> {
             &uuids,
             window,
             local_rag_core::config::MemoryConfig::default().router_conflict_token_budget,
+            // T23-04: and the same prompt budget, derived from the same
+            // catalog entry the pool above was built from — a bench that
+            // measured an unbudgeted router would stop measuring the shipped
+            // one.
+            local_rag_memory::budget::PromptBudget::derive(entry.context_length),
         )
         .await;
         durations_ms.push(start.elapsed().as_secs_f64() * 1000.0);

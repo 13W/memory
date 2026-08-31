@@ -189,8 +189,16 @@ const GEMMA4_E2B_IT_Q4_0_FILES: &[AssetFile] = &[AssetFile {
 /// reuse across calls today), so requesting the full 128K would allocate a
 /// vastly oversized cache for every short router prompt this crate ever
 /// sends — 32K matches the Qwen entries exactly (a fair, apples-to-apples
-/// context budget for the ADR-0006 comparison) and is already generous
-/// next to what `local_rag_memory::prompt`'s actual prompts need.
+/// context budget for the ADR-0006 comparison).
+///
+/// The sentence that used to end this paragraph — "already generous next to
+/// what `local_rag_memory::prompt`'s actual prompts need" — was measured and
+/// is false (`T23-04`/`D-125`). A real router prompt for a twenty-observation
+/// window costs 32 377 to 36 709 tokens, so 32 768 is not generous, it is the
+/// binding constraint, and `local_rag_memory::budget::PromptBudget::derive`
+/// reads this field to decide how much of it a window may spend. Raising it
+/// would trade KV-cache memory for window width; that is a real option, and
+/// it is a measurement rather than an edit to this comment.
 ///
 /// Note for whoever revisits this: HuggingFace gates `google/gemma-3-*`
 /// (manual approval required — its tree API masks the LFS digest for an

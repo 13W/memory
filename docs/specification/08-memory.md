@@ -301,6 +301,34 @@ layout" home as `recall_token_budget`). Chosen deliberately smaller than the com
 `consolidation_queue_threshold = 50` — see `docs/specification/07-observations-spool.md` §6's own
 as-built note for why the relative sizing matters, not just the absolute numbers.
 
+As-built note (`T23-04`/`D-120`/`D-125`, `[SPEC]`): step 1's `to_received_seq` is now
+`min(cursor + batch, max_seq)` **and** the last observation whose excerpt text fits a character
+budget, whichever comes first — always at least one observation, so the floor `D-058`'s ladder
+ends at is unchanged. Rows were the wrong unit for the same reason `D-095` found them to be the
+wrong unit for the conflict set, and this time it was the larger half of the prompt: measured with
+the model's own tokenizer on six windows a running daemon had failed on, the observations cost
+17 599 to 23 127 tokens of a 32 768-token context, against 8 791 to 14 159 for the conflict set and
+1 213 for the system prompt. An excerpt is capped at 4 KiB by the hook and averages a fifth of
+that, so twenty of them span 12 KiB to 80 KiB; `estimate_tokens`' four-characters-per-token
+heuristic holds for prose and for memory entries (3.66 measured) and not for excerpts, which are
+tool output, JSON and code (2.93 aggregate, 1.87 at the worst).
+
+The budget itself is not configuration: `local_rag_memory::budget::PromptBudget::derive` subtracts
+the answer reserve, the one corrective re-prompt's own cost, the system prompt and the conflict
+set's promised floor from `GeneratorCatalogEntry::context_length`, and what remains is the window.
+`consolidation_batch_size` stays as the upper bound it always was. Which of the two binds is
+therefore a property of the model, not of the config — a larger context spends the difference on a
+wider window without any value being edited.
+
+Two things follow that step 3 should be read with. The set of existing entries is cut a second
+time, by the model's own tokenizer, to exactly what the assembled prompt has room for: the
+`router_conflict_token_budget` prefix decides what is *worth* showing, and this decides what
+*fits*. The conflict set is the term that yields because it is the only one that may — a window is
+a promise to the cursor, which step 4 advances to `to_received_seq` whatever the router read. And
+when even an empty conflict set will not fit, the window fails as a deterministic context overflow
+**without** a generator call: the tokenizer has already answered, and `D-058`'s ladder narrows the
+window on the next tick exactly as it does when `llama.cpp` answers instead.
+
 `idempotency_key = H(memory_op, run_id, op_index)` is realized as
 `format!("consolidation:{run_id}:{op_index}:{op_kind}")` — a plain deterministic string, mirroring
 `approve_candidate`'s own `"candidate:<id>"` precedent (08 §3's own as-built note), not a

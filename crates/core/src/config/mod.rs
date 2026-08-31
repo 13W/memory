@@ -272,17 +272,30 @@ pub struct MemoryConfig {
     /// room for the window it was supposed to be compared against, and every
     /// consolidation for that session failed with a deterministic overflow.
     ///
-    /// The default is arithmetic, not taste: 32 768 context − 1024 reserved for
-    /// the answer (`MAX_GENERATION_TOKENS`) − roughly 1500 for the system
-    /// prompt and JSON schema leaves ≈30 000 for the user prompt, and a window
-    /// is `consolidation_batch_size` (20) short excerpts. 12 000 for the
-    /// entries keeps the set generous while leaving the window more room than
-    /// it can use.
+    /// The arithmetic that used to be restated here now lives in exactly one
+    /// place, `local_rag_memory::budget::PromptBudget` (`T23-04`/`D-125`).
+    /// What stood here was wrong twice over, and both errors are recorded
+    /// there: it reserved for one answer where the corrective re-prompt needs
+    /// two, and it concluded that 12 000 for the entries "leaves the window
+    /// more room than it can use" — false even in its own estimated unit,
+    /// since twenty 4 KiB excerpts are ≈20 480 estimated tokens against the
+    /// ≈18 500 that subtraction left them.
+    ///
+    /// This value keeps its own job, which is a different one: it decides how
+    /// much *existing memory* is worth showing at all, as a prefix of
+    /// `D-080`'s order. What fits is decided afterwards and exactly, by
+    /// `router::route` asking the model's own tokenizer.
     pub router_conflict_token_budget: u32,
     /// The continuous consolidation-trigger worker's window size
     /// (`open_next_run`'s `batch`, D-024, spec 08 §4) — no default is
     /// specified anywhere normative, so this is a `[SPEC]`-chosen value, not
     /// derived.
+    ///
+    /// Since `T23-04` it is an *upper* bound and no longer the operative one:
+    /// the window is bounded by `PromptBudget::window_chars` as well, because
+    /// rows were measured to be the wrong unit — twenty excerpts span 12 KiB
+    /// to 80 KiB, and on six real windows the observations cost 17 599 to
+    /// 23 127 tokens of a 32 768-token context.
     pub consolidation_batch_size: i64,
     /// The backlog size that alone opens a fresh consolidation window, even
     /// with no `Stop`/`SessionEnd` checkpoint (D-024, spec 07 §6's

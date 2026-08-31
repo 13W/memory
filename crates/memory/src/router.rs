@@ -21,10 +21,11 @@ use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::UuidSource;
 use local_rag_embed::{GenError, GenMessage, GenRequest, GenRole, GeneratorPool};
 use local_rag_store::{
-    ClassifiedFailure, ConsolidationWindow, GeneratedOp, StateDb, WindowObservation,
-    effective_data_policy,
+    ClassifiedFailure, ConsolidationWindow, GeneratedOp, MemoryEntrySummary, StateDb,
+    WindowObservation, effective_data_policy,
 };
 
+use crate::budget::PromptBudget;
 use crate::{guard, parse, prompt, recall, schema};
 
 /// `[SPEC]` placeholder upper bound on generated tokens per router call —
@@ -112,6 +113,7 @@ pub async fn route(
     uuids: &(dyn UuidSource + Send + Sync),
     window: ConsolidationWindow,
     conflict_token_budget: u32,
+    budget: PromptBudget,
 ) -> Result<Vec<GeneratedOp>, ClassifiedFailure> {
     let conn = state_db
         .open_read()
@@ -128,6 +130,8 @@ pub async fn route(
     let repo_ids: Vec<&str> = repo_ids.into_iter().collect();
     let policy = effective_data_policy(global_policy, &conn, &repo_ids)
         .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
+
+    let existing = fit_conflict_set(pool, policy, &window, existing, &budget)?;
 
     let messages = prompt::initial_messages(&window, &existing);
     let request = GenRequest::new(messages.clone(), MAX_GENERATION_TOKENS)
@@ -187,6 +191,85 @@ pub async fn route(
     Ok(ops)
 }
 
+/// Cut the conflict set to what the model's own tokenizer says will fit
+/// (`T23-04`/`D-125`).
+///
+/// `D-095` already bounds this set by an *estimated* budget, and that bound
+/// stays: it is what decides which entries are worth showing at all. This is
+/// the second, exact bound underneath it, and it exists because the estimate
+/// is the wrong unit for the other half of the prompt. Measured on six real
+/// windows, the observations cost 2.02 to 2.78 characters per token where the
+/// estimator assumes four, so a prompt the estimator called comfortable was
+/// 33 401 to 37 254 tokens against a 32 768-token context.
+///
+/// The conflict set is the term that yields, and that is not arbitrary: the
+/// window is a promise to the cursor (`apply_run` advances it to
+/// `to_received_seq` regardless of what the router read), while `D-095`
+/// settled that showing fewer entries is legal — "the router can route with
+/// no conflict set, but not with a prompt that does not fit". `T23-04` bounds
+/// the window in the store so this cut has something to give back.
+///
+/// Binary search rather than a per-entry sum: tokenizers are not additive
+/// across a JSON boundary, so summing each entry's own count would be an
+/// estimate again. Each probe assembles the real prompt, and there are
+/// `log2(n)` of them — six for a set of fifty.
+///
+/// A provider that cannot count (every remote endpoint, every test double)
+/// answers `None`, and the set is left exactly as `D-095` cut it — this
+/// function is then invisible, which is why the pre-existing tests still
+/// assert what they always asserted.
+fn fit_conflict_set(
+    pool: &GeneratorPool,
+    policy: DataPolicy,
+    window: &ConsolidationWindow,
+    existing: Vec<MemoryEntrySummary>,
+    budget: &PromptBudget,
+) -> Result<Vec<MemoryEntrySummary>, ClassifiedFailure> {
+    let ceiling = budget.prompt_ceiling_tokens() as usize;
+    let cost = |entries: &[MemoryEntrySummary]| -> Option<usize> {
+        let req = GenRequest::new(
+            prompt::initial_messages(window, entries),
+            MAX_GENERATION_TOKENS,
+        )
+        .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
+        pool.count_prompt_tokens(policy, &req)
+    };
+
+    let Some(full) = cost(&existing) else {
+        return Ok(existing);
+    };
+    if full <= ceiling {
+        return Ok(existing);
+    }
+    // Even with nothing to compare against, this window does not fit. Say so
+    // without spending a generation on it: the failure is the same
+    // deterministic context overflow `llama.cpp` would report, and
+    // `open_next_run`'s `D-058` ladder narrows the window on the next tick
+    // exactly as it does today.
+    if cost(&[]).is_none_or(|empty| empty > ceiling) {
+        return Err(ClassifiedFailure::mechanical_context_overflow(format!(
+            "deterministic context overflow for this window, retrying will not help: \
+             the window alone needs more than the {ceiling} prompt tokens this model's \
+             {} of context leaves after the answer and one corrective re-prompt",
+            budget.context_tokens
+        )));
+    }
+
+    // Cost is monotonic in the prefix length (entries are appended to one
+    // JSON array), so the largest prefix that fits is a binary search.
+    let (mut lo, mut hi) = (0usize, existing.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        match cost(&existing[..mid]) {
+            Some(tokens) if tokens <= ceiling => lo = mid,
+            _ => hi = mid - 1,
+        }
+    }
+    let mut existing = existing;
+    existing.truncate(lo);
+    Ok(existing)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -204,6 +287,19 @@ mod tests {
     /// A budget no fixture here can reach — these tests predate `D-095` and are
     /// about routing, not about how much memory the prompt may carry.
     const NO_BUDGET_LIMIT: u32 = u32::MAX;
+
+    /// The same idiom for `T23-04`'s prompt budget. Every generator in this
+    /// module is a scripted double that cannot count tokens, so
+    /// `fit_conflict_set` is invisible to these tests either way; passing an
+    /// unbounded budget says that on purpose rather than by accident.
+    const NO_PROMPT_LIMIT: PromptBudget = PromptBudget {
+        context_tokens: u32::MAX,
+        answer_reserve_tokens: 0,
+        retry_reserve_tokens: 0,
+        system_tokens: 0,
+        conflict_floor_tokens: 0,
+        window_tokens: u32::MAX,
+    };
 
     struct SeqUuidV7 {
         counter: AtomicU64,
@@ -255,6 +351,127 @@ mod tests {
                 Some(Err(message)) => Err(GenError::permanent(message)),
                 None => Err(GenError::permanent("scripted generator exhausted")),
             }
+        }
+    }
+
+    /// `T23-04`: a scripted generator that also owns a tokenizer, so
+    /// `fit_conflict_set` has something to ask. One token per four characters
+    /// of every message — the point of these tests is the cut, not the
+    /// tokenizer, and a deterministic counter makes the expected prefix
+    /// arithmetic rather than a guess. Counts calls, so a test can assert the
+    /// generator was never reached.
+    #[derive(Debug, Clone)]
+    struct CountingGenerator {
+        inner: ScriptedGenerator,
+        calls: Arc<AtomicU64>,
+        /// The user message of the last prompt actually submitted. Without it
+        /// a test asserting "the set was cut" would be asserting nothing: a
+        /// scripted generator answers the same whatever it is shown.
+        last_prompt: Arc<Mutex<Option<String>>>,
+    }
+
+    impl CountingGenerator {
+        fn new(responses: Vec<&str>) -> Self {
+            Self {
+                inner: ScriptedGenerator::new(responses),
+                calls: Arc::new(AtomicU64::new(0)),
+                last_prompt: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    /// How many existing entries a submitted user prompt carries.
+    fn entries_shown(prompt: &Option<String>) -> usize {
+        let Some(text) = prompt else { return 0 };
+        let value: serde_json::Value = serde_json::from_str(text).expect("the prompt is JSON");
+        value["existing_entries"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    impl Generator for CountingGenerator {
+        fn generate(&self, req: local_rag_embed::GenRequest) -> Result<GenResponse, GenError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(user) = req.messages.iter().find(|m| m.role == GenRole::User) {
+                *self.last_prompt.lock().expect("lock") = Some(user.content.clone());
+            }
+            self.inner.generate(req)
+        }
+
+        fn count_prompt_tokens(&self, req: &local_rag_embed::GenRequest) -> Option<usize> {
+            Some(
+                req.messages
+                    .iter()
+                    .map(|m| m.content.chars().count().div_ceil(4))
+                    .sum(),
+            )
+        }
+    }
+
+    /// A pool whose provider can count, plus the call counter.
+    fn counting_pool_with(
+        responses: Vec<&str>,
+    ) -> (GeneratorPool, Arc<AtomicU64>, Arc<Mutex<Option<String>>>) {
+        use local_rag_embed::GeneratorEntry;
+        let generator = CountingGenerator::new(responses);
+        let calls = Arc::clone(&generator.calls);
+        let last_prompt = Arc::clone(&generator.last_prompt);
+        (
+            GeneratorPool::new(vec![GeneratorEntry::local("counting", Arc::new(generator))]),
+            calls,
+            last_prompt,
+        )
+    }
+
+    /// The same recording double, minus the tokenizer: a provider that
+    /// answers and cannot count, which is what every remote endpoint and every
+    /// other double in this module is.
+    #[derive(Debug, Clone)]
+    struct BlindGenerator(CountingGenerator);
+
+    impl Generator for BlindGenerator {
+        fn generate(&self, req: local_rag_embed::GenRequest) -> Result<GenResponse, GenError> {
+            self.0.generate(req)
+        }
+    }
+
+    fn blind_pool_with(
+        responses: Vec<&str>,
+    ) -> (GeneratorPool, Arc<AtomicU64>, Arc<Mutex<Option<String>>>) {
+        use local_rag_embed::GeneratorEntry;
+        let inner = CountingGenerator::new(responses);
+        let calls = Arc::clone(&inner.calls);
+        let last_prompt = Arc::clone(&inner.last_prompt);
+        (
+            GeneratorPool::new(vec![GeneratorEntry::local(
+                "blind",
+                Arc::new(BlindGenerator(inner)),
+            )]),
+            calls,
+            last_prompt,
+        )
+    }
+
+    /// A budget whose ceiling is exactly `tokens`, with no reserves in the
+    /// way — the tests below are about the cut, not about the derivation,
+    /// which `budget`'s own tests assert.
+    /// A stable UUIDv7 per seed, ordered by seed — the same helper
+    /// `recall`'s tests use, so entries come back in a predictable order.
+    fn uuid(seed: u8) -> String {
+        let mut rand = [0u8; 10];
+        rand[9] = seed;
+        uuidv7_from(1_000 + u64::from(seed), rand).to_string()
+    }
+
+    fn budget_with_ceiling(tokens: u32) -> PromptBudget {
+        PromptBudget {
+            context_tokens: tokens,
+            answer_reserve_tokens: 0,
+            retry_reserve_tokens: 0,
+            system_tokens: 0,
+            conflict_floor_tokens: 0,
+            window_tokens: tokens,
         }
     }
 
@@ -327,6 +544,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await
         .expect("routes cleanly");
@@ -347,6 +565,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await
         .expect("recovers on the second attempt");
@@ -372,6 +591,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await;
         let failure = result.expect_err("still malformed after the corrective re-prompt");
@@ -386,6 +606,168 @@ mod tests {
     /// is not expected to reproduce on an unchanged retry the way a parse
     /// defect does — it must classify `Transient`, eligible for
     /// exponential-backoff retry rather than a fingerprint-gated dead-letter.
+    async fn seed_global_entry(db: &StateDb, memory_id: &str, text: &str) {
+        let (id, text) = (memory_id.to_string(), text.to_string());
+        db.writer()
+            .transaction(move |tx| {
+                local_rag_store::create_memory_entry(
+                    tx,
+                    &local_rag_store::NewMemoryEntry {
+                        memory_id: &id,
+                        kind: local_rag_store::MemoryKind::Fact,
+                        text: &text,
+                        canonical_key: None,
+                        scope_kind: local_rag_store::ScopeKind::Global,
+                        scope_owner_id: local_rag_store::GLOBAL_SCOPE_OWNER_ID,
+                        confidence: 0.5,
+                        importance: 0.5,
+                        valid_from_tree: None,
+                        last_verified_tree: None,
+                        supersedes_id: None,
+                    },
+                    1_000,
+                )
+            })
+            .await
+            .expect("create memory tx")
+            .expect("create memory domain");
+    }
+
+    /// How many entries the router actually showed the model, read back out of
+    /// the prompt it built.
+    fn entries_in_prompt(db: &StateDb, window: &ConsolidationWindow, budget: u32) -> usize {
+        let conn = db.open_read().expect("read conn");
+        recall::candidate_conflict_set(&conn, &window.observations, budget)
+            .expect("conflict set")
+            .len()
+    }
+
+    /// `T23-04`/`D-125`: when the assembled prompt does not fit, the conflict
+    /// set is cut to the prefix that does — not the window, which the cursor
+    /// has already been promised.
+    #[tokio::test]
+    async fn a_conflict_set_that_does_not_fit_is_cut_to_the_prefix_that_does() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        for i in 0..6u8 {
+            seed_global_entry(&db, &uuid(60 + i), &"e".repeat(400)).await;
+        }
+        let window = window_with("o1");
+        let unbounded = entries_in_prompt(&db, &window, NO_BUDGET_LIMIT);
+        assert_eq!(unbounded, 6, "all six are worth showing before any budget");
+
+        let (pool, calls, last_prompt) = counting_pool_with(vec!["{\"op\":\"noop\"}"]);
+        let uuids = SeqUuidV7::new();
+        // The system prompt and window cost whatever they cost; give the whole
+        // prompt room for three of the 400-character entries on top, and not a
+        // fourth. Derived from the same counter the provider uses, so the
+        // expected prefix is arithmetic rather than a number to re-tune when
+        // the prompt text changes.
+        let system_and_window = prompt::initial_messages(&window, &[])
+            .iter()
+            .map(|m| m.content.chars().count().div_ceil(4))
+            .sum::<usize>() as u32;
+        let ceiling = system_and_window + 3 * 400_u32.div_ceil(4);
+
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window.clone(),
+            NO_BUDGET_LIMIT,
+            budget_with_ceiling(ceiling),
+        )
+        .await
+        .expect("routes with a cut conflict set");
+        assert_eq!(ops.len(), 1, "the window still routes: {ops:?}");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "exactly one generation, on a prompt that fits"
+        );
+        let shown = entries_shown(&last_prompt.lock().expect("lock"));
+        assert!(
+            shown < unbounded,
+            "the prompt the model actually received must be shorter than the set \
+             `D-095` selected: showed {shown} of {unbounded}"
+        );
+        assert!(
+            shown > 0,
+            "and the cut is a prefix, not a purge: showed {shown}"
+        );
+    }
+
+    /// The window alone does not fit, so no generation is spent finding that
+    /// out: the failure is the deterministic overflow `D-058`'s ladder already
+    /// knows how to narrow, reported without a local inference run.
+    #[tokio::test]
+    async fn a_window_that_cannot_fit_alone_fails_without_calling_the_generator() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let (pool, calls, _last_prompt) = counting_pool_with(vec!["{\"op\":\"noop\"}"]);
+        let uuids = SeqUuidV7::new();
+
+        let failure = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            budget_with_ceiling(1),
+        )
+        .await
+        .expect_err("a one-token ceiling cannot hold the system prompt");
+        assert_eq!(failure.kind, FailureKind::Mechanical);
+        assert!(
+            failure.context_overflow,
+            "classified so `open_next_run`'s shrink ladder still applies: {failure:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the generator is never asked to prove what the tokenizer already said"
+        );
+    }
+
+    /// A provider that owns no tokenizer — every remote endpoint, every double
+    /// in this module — leaves the set exactly as `D-095` cut it.
+    #[tokio::test]
+    async fn a_provider_that_cannot_count_leaves_the_conflict_set_alone() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        for i in 0..6u8 {
+            seed_global_entry(&db, &uuid(70 + i), &"e".repeat(400)).await;
+        }
+        // The scripted generator of every other test in this module: it
+        // answers, and it cannot count. Wrapped so the prompt is still
+        // observable, which is the whole assertion.
+        let (pool, _calls, last_prompt) = blind_pool_with(vec!["{\"op\":\"noop\"}"]);
+        let uuids = SeqUuidV7::new();
+
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            // A ceiling far below what six 400-character entries cost: it is
+            // ignored, because nobody can say what they cost.
+            budget_with_ceiling(1),
+        )
+        .await
+        .expect("routes unchanged when the provider cannot count");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            entries_shown(&last_prompt.lock().expect("lock")),
+            6,
+            "all six still reach the model: an unanswerable budget must not \
+             silently shrink the prompt"
+        );
+    }
+
     #[tokio::test]
     async fn a_generator_error_surfaces_as_the_window_error() {
         let (_home, db) = open_state();
@@ -399,6 +781,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await;
         let failure = result.expect_err("no provider configured for an empty pool");
@@ -446,6 +829,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await;
         let failure = result.expect_err("context overflow never succeeds");
@@ -499,6 +883,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await;
         let failure = result.expect_err("context overflow never succeeds");
@@ -518,6 +903,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await
         .expect("empty is valid");
@@ -543,6 +929,7 @@ mod tests {
             &uuids,
             window_with("o1"),
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await
         .expect("the valid prefix is accepted, not treated as a failure");
@@ -606,6 +993,7 @@ mod tests {
             &uuids,
             window,
             NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
         )
         .await;
         assert!(

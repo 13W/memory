@@ -29,7 +29,10 @@ use local_rag_store::memory::{
     memory_evidence_for, open_next_run, processing_cursor, run_once, stale_runs,
 };
 use local_rag_store::rusqlite::{Connection, params};
-use local_rag_store::{LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, MemoryKind, ScopeKind, StateDb};
+use local_rag_store::{
+    LEASE_DURATION_MS, LEASE_RENEW_INTERVAL_MS, MemoryKind, ScopeKind, StateDb,
+    UNBOUNDED_WINDOW_CHARS,
+};
 use local_rag_test_support::TempHome;
 use tokio::sync::Mutex;
 
@@ -97,6 +100,7 @@ async fn open_run(
                 &rid,
                 &sid,
                 batch,
+                UNBOUNDED_WINDOW_CHARS,
                 "v1",
                 LEASE_DURATION_MS,
                 now_ms,

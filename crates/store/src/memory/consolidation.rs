@@ -583,15 +583,38 @@ fn read_window(tx: &Transaction<'_>, run_id: &str) -> rusqlite::Result<RunWindow
 /// shrink-and-retry path. Never checks for a blocking existing row; callers
 /// establish that themselves.
 ///
-/// `from = cursor + 1`, `to` = the `received_seq` of the `batch`-th of *this
-/// session's own* envelopes at or past `from` (capped at `max_received_seq`
-/// when fewer than `batch` remain); [`SnapshotOutcome::NothingPending`] if
-/// there is no envelope past the cursor at all.
+/// `from = cursor + 1`, `to` = the `received_seq` of the last of *this
+/// session's own* envelopes that fits **both** bounds — at most `batch` rows,
+/// and at most `window_chars` characters of excerpt text
+/// ([`SnapshotOutcome::NothingPending`] if there is no envelope past the
+/// cursor at all).
+///
+/// `window_chars` is `T23-04`'s half of `D-120`: a window used to be bounded
+/// by rows alone, and measured on six windows a real daemon failed on, the
+/// window was the **largest** term in the router's prompt — 17 599 to 23 127
+/// tokens of a 32 768-token context. Rows are the wrong unit because an
+/// excerpt is capped at 4 KiB by the hook and averages a fifth of that, so
+/// twenty of them span 12 KiB to 80 KiB. The characters are counted the same
+/// way `local_rag_memory::prompt::user_prompt` will spend them, placeholder
+/// included, and priced by `local_rag_memory::budget` where a tokenizer
+/// exists to check the price.
+///
+/// The first row is always included, however long it is: a window of one is
+/// the floor `D-058`'s ladder already ends at, and turning "too long to
+/// consolidate" into "nothing to consolidate" would strand the session
+/// silently instead of reporting it as `Unconsolidatable`.
+// Eight, one past clippy's threshold, and grouping two of them would not get
+// under it either: `open_next_run` already carries the same allow at nine.
+// Both parameter lists are the window's own definition — rows, characters,
+// lease, clock, build — and a struct would name the pairing without removing
+// a single argument from the caller.
+#[allow(clippy::too_many_arguments)]
 fn open_window(
     tx: &Transaction<'_>,
     run_id: &str,
     session_id: &str,
     batch: i64,
+    window_chars: i64,
     router_version: &str,
     lease_ms: i64,
     now_ms: i64,
@@ -614,12 +637,27 @@ fn open_window(
     // real local LLM call, `router::route()` never short-circuits an empty
     // window — to walk through). Falls back to `max_seq` when fewer than
     // `batch` of this session's own rows remain past `from`.
+    //
+    // T23-04: and `to` stops early when the excerpts have spent
+    // `window_chars`. `n = 1` keeps the first row unconditionally (the floor
+    // above); `LENGTH` counts characters, the same unit
+    // `local_rag_memory::budget::conservative_tokens` prices, and the
+    // `COALESCE` placeholder is verbatim the one `prompt::user_prompt`
+    // substitutes for an envelope whose payload the TTL sweep has taken.
     let to = tx
         .query_row(
-            "SELECT received_seq FROM observation_envelope \
-             WHERE session_id = ?1 AND received_seq >= ?2 \
-             ORDER BY received_seq LIMIT 1 OFFSET ?3",
-            params![session_id, from, batch.max(1) - 1],
+            "SELECT received_seq FROM ( \
+               SELECT received_seq, \
+                      ROW_NUMBER() OVER (ORDER BY received_seq) AS n, \
+                      SUM(LENGTH(COALESCE(short_evidence_excerpt, '(no excerpt)'))) \
+                        OVER (ORDER BY received_seq ROWS UNBOUNDED PRECEDING) AS cum \
+                 FROM (SELECT received_seq, short_evidence_excerpt \
+                         FROM observation_envelope \
+                        WHERE session_id = ?1 AND received_seq >= ?2 \
+                        ORDER BY received_seq LIMIT ?3) \
+             ) WHERE n = 1 OR cum <= ?4 \
+             ORDER BY received_seq DESC LIMIT 1",
+            params![session_id, from, batch.max(1), window_chars.max(0)],
             |r| r.get(0),
         )
         .optional()?
@@ -734,6 +772,15 @@ fn dead_letter_shrink_decision(
     }
 }
 
+/// A window character budget no window can reach — "bound this by rows
+/// alone", the shape every call had before `T23-04`.
+///
+/// Its only production caller is a store whose model reports no context at
+/// all; its main use is tests that are not about the budget, which pass it so
+/// they keep asserting exactly what they asserted before the budget existed
+/// (the idiom `D-095` established with its own `NO_BUDGET_LIMIT`).
+pub const UNBOUNDED_WINDOW_CHARS: i64 = i64::MAX;
+
 /// Open the next consolidation window for `session_id`, or report why not
 /// (spec 08 §4 step 1, `[FIXED]`; D-058 amendment below) — one transaction:
 ///
@@ -747,13 +794,19 @@ fn dead_letter_shrink_decision(
 ///    [`crate::StateWriter`]'s single-writer queue, so the second caller's
 ///    own transaction already observes the first's committed row here — no
 ///    separate read-then-write pre-check, and no TOCTOU gap.
-/// 2. Else [`open_window`] with the configured `batch`.
+/// 2. Else [`open_window`] with the configured `batch` and `window_chars`.
+///
+/// `window_chars` (`T23-04`) bounds the same window in the unit that actually
+/// runs out — see [`open_window`]. It applies to the shrink path too: a
+/// halved window is still cut to what fits, so the ladder narrows a window
+/// that is already inside the budget rather than racing it.
 #[allow(clippy::too_many_arguments)]
 pub fn open_next_run(
     tx: &Transaction<'_>,
     run_id: &str,
     session_id: &str,
     batch: i64,
+    window_chars: i64,
     router_version: &str,
     lease_ms: i64,
     now_ms: i64,
@@ -766,6 +819,7 @@ pub fn open_next_run(
                 run_id,
                 session_id,
                 narrower_batch,
+                window_chars,
                 router_version,
                 lease_ms,
                 now_ms,
@@ -787,6 +841,7 @@ pub fn open_next_run(
         run_id,
         session_id,
         batch,
+        window_chars,
         router_version,
         lease_ms,
         now_ms,
@@ -1479,6 +1534,38 @@ mod tests {
             .expect("seed envelopes");
     }
 
+    /// `T23-04`: the same seeding, with control over the one field the window
+    /// budget spends — `short_evidence_excerpt`. `None` seeds SQL `NULL`, the
+    /// shape a TTL-swept or envelope-only observation really has.
+    async fn seed_envelopes_with_excerpts(
+        db: &crate::StateDb,
+        session_id: &str,
+        excerpts: &[Option<String>],
+    ) {
+        let session_id = session_id.to_string();
+        let excerpts = excerpts.to_vec();
+        db.writer()
+            .transaction(move |tx| {
+                for (i, excerpt) in excerpts.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO observation_envelope \
+                           (observation_id, source_event_id, payload_hash, event_type, \
+                            evidence_kind, trust, session_id, short_evidence_excerpt) \
+                         VALUES (?1, ?2, 'deadbeef', 'Stop', 'user_statement', 'normal', ?3, ?4)",
+                        params![
+                            format!("obs-{session_id}-{i}"),
+                            format!("evt-{i}"),
+                            session_id,
+                            excerpt
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed envelopes with excerpts");
+    }
+
     #[test]
     fn lease_expired_boundary_and_none() {
         assert!(!lease_expired(1_999, Some(2_000)), "not yet due");
@@ -1502,6 +1589,7 @@ mod tests {
                     "run-1",
                     "sess-1",
                     10,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -1529,6 +1617,7 @@ mod tests {
                     "run-2",
                     "sess-2",
                     10,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -1557,6 +1646,7 @@ mod tests {
                     "run-1",
                     "sess-1",
                     3,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -1581,6 +1671,176 @@ mod tests {
             consolidation_run_state(&read, "run-1").expect("state"),
             Some(RunState::Running),
             "opened run is already running with a lease"
+        );
+    }
+
+    /// `T23-04`/`D-120`: the window stops when the excerpts have spent their
+    /// characters, long before it has spent its rows.
+    ///
+    /// The shape is the live one: `consolidation_batch_size` is 20 and every
+    /// excerpt is well under the hook's 4 KiB cap, yet twenty of them cost
+    /// 17 599 to 23 127 tokens of a 32 768-token context on the six windows
+    /// this card measured.
+    #[tokio::test]
+    async fn open_next_run_bounds_the_window_by_characters_not_only_by_rows() {
+        let (_home, db) = open_state();
+        let excerpts: Vec<Option<String>> = (0..10).map(|_| Some("x".repeat(100))).collect();
+        seed_envelopes_with_excerpts(&db, "sess-1", &excerpts).await;
+
+        // Room for three excerpts and not a character more.
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    20,
+                    300,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-1".to_string(),
+                session_id: "sess-1".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 3,
+            }),
+            "the character budget decides the window, not the batch of 20",
+        );
+
+        // The control, in the test rather than in a mutation: the identical
+        // fixture bounded by rows alone takes all ten. Without it the
+        // assertion above could pass for a reason that has nothing to do with
+        // the budget.
+        seed_envelopes_with_excerpts(&db, "sess-2", &excerpts).await;
+        let unbounded = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-2",
+                    "sess-2",
+                    20,
+                    UNBOUNDED_WINDOW_CHARS,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            unbounded,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-2".to_string(),
+                session_id: "sess-2".to_string(),
+                // `from` is `cursor + 1` and this session's cursor is 0, so
+                // the window opens at 1 even though sess-2's own first row is
+                // at global `received_seq` 11 — D-053's point exactly.
+                from_received_seq: 1,
+                to_received_seq: 20,
+            }),
+            "bounded by rows alone the same ten observations are one window",
+        );
+    }
+
+    /// The floor, and why it is not "skip the window": a single observation
+    /// too long for the whole budget still opens, still fails, and still
+    /// reaches `D-058`'s `Unconsolidatable` — reported, not silently dropped.
+    #[tokio::test]
+    async fn open_next_run_always_opens_at_least_one_observation_however_long() {
+        let (_home, db) = open_state();
+        seed_envelopes_with_excerpts(
+            &db,
+            "sess-1",
+            &[Some("y".repeat(9_000)), Some("y".repeat(9_000))],
+        )
+        .await;
+
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    20,
+                    100,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-1".to_string(),
+                session_id: "sess-1".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 1,
+            }),
+            "a budget of 100 against a 9000-character excerpt still opens that one row",
+        );
+    }
+
+    /// The budget counts what the prompt will actually carry: an envelope
+    /// whose payload the TTL sweep took still costs
+    /// `prompt::user_prompt`'s `"(no excerpt)"` placeholder, and a two-byte
+    /// character costs one character, not two — `LENGTH` and
+    /// `chars().count()` must agree or the budget drifts from what it prices.
+    #[tokio::test]
+    async fn the_window_budget_counts_placeholders_and_characters_not_bytes() {
+        let (_home, db) = open_state();
+        seed_envelopes_with_excerpts(
+            &db,
+            "sess-1",
+            &[
+                None,                           // "(no excerpt)" -> 12
+                Some("ыыыыыыыыыы".to_string()), // 10 characters, 20 bytes
+                Some("z".repeat(50)),
+            ],
+        )
+        .await;
+
+        let outcome = db
+            .writer()
+            .transaction(|tx| {
+                open_next_run(
+                    tx,
+                    "run-1",
+                    "sess-1",
+                    20,
+                    22,
+                    "v1",
+                    LEASE_DURATION_MS,
+                    1_000,
+                    "build-test",
+                )
+            })
+            .await
+            .expect("open tx");
+        assert_eq!(
+            outcome,
+            SnapshotOutcome::Opened(RunWindow {
+                run_id: "run-1".to_string(),
+                session_id: "sess-1".to_string(),
+                from_received_seq: 1,
+                to_received_seq: 2,
+            }),
+            "12 for the placeholder + 10 for ten Cyrillic characters = 22, exactly the budget; \
+             counting bytes would make the second row cost 20 and stop at one",
         );
     }
 
@@ -1620,6 +1880,7 @@ mod tests {
                     "run-a",
                     "sess-a",
                     2,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -1670,6 +1931,7 @@ mod tests {
                     "run-1",
                     "sess-1",
                     2,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -1687,6 +1949,7 @@ mod tests {
                     "run-2",
                     "sess-1",
                     2,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     2_000,
@@ -1757,6 +2020,7 @@ mod tests {
                     "run-8",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -1786,6 +2050,7 @@ mod tests {
                     "run-4",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     3_000,
@@ -1815,6 +2080,7 @@ mod tests {
                     "run-2",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     5_000,
@@ -1843,6 +2109,7 @@ mod tests {
                     "run-1b",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     7_000,
@@ -1872,6 +2139,7 @@ mod tests {
                     "run-final",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     9_000,
@@ -1933,6 +2201,7 @@ mod tests {
                     "run-1",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -1965,6 +2234,7 @@ mod tests {
                     "run-2",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     3_000,
@@ -2002,6 +2272,7 @@ mod tests {
                     "run-1",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,
@@ -2034,6 +2305,7 @@ mod tests {
                     "run-2",
                     "sess-1",
                     8,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     3_000,
@@ -2061,6 +2333,7 @@ mod tests {
                     "run-1",
                     "sess-1",
                     3,
+                    UNBOUNDED_WINDOW_CHARS,
                     "v1",
                     LEASE_DURATION_MS,
                     1_000,

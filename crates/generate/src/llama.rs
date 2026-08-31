@@ -395,6 +395,24 @@ impl Generator for LlamaGenerator {
         self.generate_greedy(&prompt, req.max_tokens.max(1))
             .map_err(Into::into)
     }
+
+    /// `D-125`: the same two calls [`Self::generate`] makes before it can
+    /// fail — render the chat template, then tokenize — minus the decode. So
+    /// the number returned here is exactly `tokens.len()` in
+    /// [`Self::generate_greedy`]'s own `requested = tokens.len() + max_tokens`
+    /// overflow check, and a caller that keeps `count + max_tokens` under
+    /// `context_length` cannot be surprised by `ContextOverflow`.
+    ///
+    /// `None` on a template that will not render: that is a permanent failure
+    /// `generate` reports properly, and answering "0 tokens" here would let a
+    /// caller conclude the prompt fits.
+    fn count_prompt_tokens(&self, req: &GenRequest) -> Option<usize> {
+        let prompt = self.build_prompt(&req.messages).ok()?;
+        self.model
+            .str_to_token(&prompt, AddBos::Always)
+            .ok()
+            .map(|t| t.len())
+    }
 }
 
 /// Where the default catalog entry's GGUF file would live under `layout` —

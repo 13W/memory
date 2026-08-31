@@ -189,11 +189,12 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
 - **Depends on:** `T23-01`.
 - **Specification:** spec 08 §4; `config.memory.router_conflict_token_budget`'s own derivation.
 - **Result:** a window that cannot deterministically overflow the model's context.
-- **In scope:** the same treatment the conflict set already gets — `D-080` capped that at 12 000
-  tokens with `estimate_tokens` after measuring the identical failure — applied to the window
-  itself, which is currently bounded only by `consolidation_batch_size` (20) on the assumption of
-  "short excerpts". Removing the class at its source, not shrinking after the failure: `D-058`'s
-  ladder stays as the backstop it was designed to be.
+- **In scope:** the same treatment the conflict set already gets — **`D-095`** capped that at
+  12 000 tokens with `estimate_tokens` after measuring the identical failure (this card first
+  credited `D-080`, which is the *ordering* fix; corrected while executing `T23-04`) — applied to
+  the window itself, which is currently bounded only by `consolidation_batch_size` (20) on the
+  assumption of "short excerpts". Removing the class at its source, not shrinking after the
+  failure: `D-058`'s ladder stays as the backstop it was designed to be.
 - **Not in scope:** changing what a window means, or the trigger's cadence.
 - **Tests:** a window of oversized observations is split rather than failed; the arithmetic
   (context − answer reserve − prompt) is asserted, not hard-coded twice.

@@ -41,6 +41,7 @@
 //! module entirely. Both layers exist on purpose; this crate is not the only
 //! place spec 12 §4 is real.
 
+pub mod budget;
 pub mod guard;
 pub mod normalize;
 pub mod parse;

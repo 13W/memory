@@ -577,6 +577,34 @@ impl std::error::Error for GenError {}
 /// reactor.
 pub trait Generator: Send + Sync {
     fn generate(&self, req: GenRequest) -> Result<GenResponse, GenError>;
+
+    /// How many tokens this provider's own tokenizer makes of `req`'s prompt,
+    /// when it can say (`D-125`).
+    ///
+    /// The question is asked about a whole [`GenRequest`], not about a string,
+    /// so the answer counts what the provider will really submit — chat
+    /// template, role markers, BOS and all. Counting the raw message texts
+    /// instead would leave the template's own tokens unaccounted, which is the
+    /// same "close enough" reasoning that produced the defect below.
+    /// `max_tokens` is *not* included: it is the caller's reserve to add.
+    ///
+    /// Defaulted to `None` so the `[FIXED]` contract above is unchanged for
+    /// every existing provider: a remote endpoint that bills in tokens it
+    /// never reveals, and every test double, keep answering "I cannot tell
+    /// you". A caller that needs a bound must stay conservative on `None`
+    /// rather than assume the prompt fits.
+    ///
+    /// The point of asking at all is that the estimate everything else uses
+    /// (`local_rag_memory::recall::pipeline::estimate_tokens`, four characters
+    /// per token) was measured to undercount real prompt text by roughly half,
+    /// which is how a window of one observation came to ask for 41 720 tokens
+    /// of a 32 768-token context. A provider that owns a tokenizer can answer
+    /// exactly, and `local_rag_memory::router` cuts the conflict set to what
+    /// actually fits instead of to what was guessed.
+    fn count_prompt_tokens(&self, req: &GenRequest) -> Option<usize> {
+        let _ = req;
+        None
+    }
 }
 
 #[cfg(test)]

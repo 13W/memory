@@ -112,6 +112,12 @@ pub struct ConsolidationTriggerParams {
     pub lease_ms: i64,
     pub renew_interval_ms: i64,
     pub batch_size: i64,
+    /// `T23-04`: the same window, bounded in the unit that actually runs out.
+    /// Derived once from the model's own context window
+    /// (`local_rag_memory::budget::PromptBudget::window_chars`), never
+    /// configured — a second knob is a second place for the arithmetic to
+    /// drift from the model it is about.
+    pub window_chars: i64,
     pub queue_threshold: i64,
     pub payload_ttl_hours: u64,
     /// X-005: a session whose newest observation is at least this old, with
@@ -271,6 +277,7 @@ where
         let _job = jobs.begin(JobKind::ConsolidationTrigger);
         let run_id = uuids.next_uuid().to_string();
         let (batch, lease_ms) = (params.batch_size, params.lease_ms);
+        let window_chars = params.window_chars;
         let (rid, sid, bid) = (run_id.clone(), session_id.clone(), build_id.to_string());
         let snapshot = db
             .writer()
@@ -280,6 +287,7 @@ where
                     &rid,
                     &sid,
                     batch,
+                    window_chars,
                     ROUTER_VERSION,
                     lease_ms,
                     now_ms,
@@ -659,6 +667,10 @@ mod tests {
             lease_ms: LEASE_DURATION_MS,
             renew_interval_ms: LEASE_RENEW_INTERVAL_MS,
             batch_size: 20,
+            // A budget no fixture here can reach, so a test that is not about
+            // `T23-04` keeps asserting exactly what it asserted before the
+            // window budget existed (`D-095`'s `NO_BUDGET_LIMIT` idiom).
+            window_chars: local_rag_store::UNBOUNDED_WINDOW_CHARS,
             queue_threshold: 50,
             payload_ttl_hours: 72,
             idle_checkpoint_hours: 24,
