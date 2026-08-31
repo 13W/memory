@@ -1,4 +1,4 @@
-//! T20-06's own mandatory acceptance scenario (group card, "Тесты"): two
+//! T20-06's own mandatory acceptance scenario (group card, "Tests"): two
 //! `managed_worktree` rows indexed **in parallel by a real, second OS
 //! process** — the direct test of the group's original complaint (two
 //! concurrently-managed projects, one daemon). Everything else in this

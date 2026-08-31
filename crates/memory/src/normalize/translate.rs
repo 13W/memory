@@ -982,7 +982,7 @@ mod tests {
         );
     }
 
-    // ---- adversarial set (spec 12 §4 п.5) ----------------------------------
+    // ---- adversarial set (spec 12 §4 item 5) -------------------------------
 
     /// Seven payloads, each named for the thing it tries to do. Two assertions
     /// per payload: the message the model receives is still one JSON object

@@ -1,4 +1,4 @@
-//! T09-04 "load/failpoint" acceptance test (the card's own Результат):
+//! T09-04 "load/failpoint" acceptance test (the card's own Outcome):
 //! injects the existing `projection.switch.before_commit` failpoint
 //! (`crates/projection/src/switch.rs`, T07-05, spec 05 §10 F4 — fires after
 //! the shard write already landed, before the final `state.sqlite` commit,
@@ -309,7 +309,7 @@ async fn do_one_search(
 }
 
 /// **"load/failpoint tests alternate generation/model switch against
-/// searches"** (the card's own Результат): a switch that fails via an
+/// searches"** (the card's own Outcome): a switch that fails via an
 /// injected failpoint right before its commit must leave every concurrently
 /// running search seeing only the one tuple that was ever actually
 /// committed (genA) — never genB (whose commit never ran), never a

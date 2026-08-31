@@ -652,7 +652,7 @@ async fn recall_dense_leg_unavailable_is_visible_in_the_response() {
 /// A [`QueryEmbedder`] returning a fixed vector for one exact key — the
 /// memory-side counterpart of the `FixedEmbedder` fixture
 /// `daemon::query_embedder`'s own unit tests use, here driving a real
-/// end-to-end daemon (D-036's own "regression-тест" bullet).
+/// end-to-end daemon (D-036's own "regression test" bullet).
 struct FixedMemoryEmbedder {
     key: RepresentationKey,
     vector: Vec<f32>,

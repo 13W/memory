@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// Poll cadence (card's own "~1с"), and doubles as the reconnect delay after a broken/failed
+/// Poll cadence (the card's own "~1s"), and doubles as the reconnect delay after a broken/failed
 /// connection.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 

@@ -144,7 +144,7 @@ local-rag-test-support = { path = "../test-support" }
 # T20-05: also forwards to `local-rag-index/failpoints` (`reconcile.build.*`)
 # and `local-rag-projection/failpoints` (`projection.switch.*`) — the
 # per-worktree indexing task's own tests need a deterministic reconcile
-# failure ("падение reconcile не останавливает цикл") without depending on a
+# failure ("a failed reconcile does not stop the cycle") without depending on a
 # real filesystem fault, reusing named injection points those crates already
 # declared for exactly this purpose.
 #
