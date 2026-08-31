@@ -151,20 +151,71 @@ fn write_line(stdin: &mut ChildStdin, line: &str) {
 /// reader (rather than `&mut`) so the blocking read can run on a dedicated
 /// thread: a hung proxy must fail the test with a clear timeout, not hang
 /// the whole suite waiting on a synchronous read with no bound.
+/// What the proxy has to say for itself, for a failure message that would
+/// otherwise name a symptom and hide the mechanism (D-115).
+///
+/// `spawn_proxy` pipes stderr and nothing ever reads it, so when this file's
+/// tests fail in CI the one artefact that would explain why is discarded. The
+/// stderr is only drained once the caller already knows the process is going
+/// (an EOF on stdout, or a blown timeout), so this cannot block a healthy run.
+fn proxy_diagnosis(proxy: &mut Child) -> String {
+    use std::io::Read as _;
+    let status = match proxy.try_wait() {
+        Ok(Some(status)) => format!("{status}"),
+        Ok(None) => "still running".to_string(),
+        Err(e) => format!("try_wait failed: {e}"),
+    };
+    let stderr = match proxy.stderr.take() {
+        Some(mut handle) => {
+            let mut buf = String::new();
+            let _ = handle.read_to_string(&mut buf);
+            buf
+        }
+        None => "<already taken>".to_string(),
+    };
+    let stderr = if stderr.trim().is_empty() {
+        "    <empty>".to_string()
+    } else {
+        stderr
+            .lines()
+            .map(|l| format!("    {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!("\n  proxy exit: {status}\n  proxy stderr:\n{stderr}")
+}
+
 fn read_line(
+    proxy: &mut Child,
     mut stdout: BufReader<ChildStdout>,
     timeout: Duration,
 ) -> (BufReader<ChildStdout>, String) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        let result = stdout.read_line(&mut line).map(|_| line);
+        let result = stdout.read_line(&mut line).map(|read| (read, line));
         let _ = tx.send((stdout, result));
     });
-    let (stdout, result) = rx
-        .recv_timeout(timeout)
-        .expect("proxy did not answer within the timeout");
-    (stdout, result.expect("read stdout line"))
+    let (stdout, result) = match rx.recv_timeout(timeout) {
+        Ok(pair) => pair,
+        Err(_) => panic!(
+            "proxy did not answer within {timeout:?}{}",
+            proxy_diagnosis(proxy)
+        ),
+    };
+    let (read, line) = result.expect("read stdout line");
+    // D-115: zero bytes is EOF, not an answer. Left unchecked it reached the
+    // caller as an empty string and surfaced as `parse response: EOF while
+    // parsing a value` — a message that names the symptom and says nothing
+    // about the proxy having exited before it answered, which is the only way
+    // to get here. CI produced exactly that once, in 0.016 s, on the upgrade
+    // flow, and the run carried no evidence of why.
+    assert!(
+        read > 0,
+        "the proxy closed stdout without answering{}",
+        proxy_diagnosis(proxy)
+    );
+    (stdout, line)
 }
 
 /// Shut a daemon down and wait for it to actually exit — test cleanup, not
@@ -214,7 +265,7 @@ fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
-    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(20));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(response["result"]["serverInfo"]["name"], "local-rag");
@@ -234,7 +285,7 @@ fn cold_start_spawns_a_daemon_and_completes_a_real_mcp_handshake() {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     );
-    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(20));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(response["id"], serde_json::json!(2));
@@ -317,7 +368,7 @@ fn sigterm_to_the_proxy_does_not_reach_the_daemon_it_spawned() {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
-    let _ = read_line(stdout, Duration::from_secs(20));
+    let _ = read_line(&mut proxy, stdout, Duration::from_secs(20));
 
     wait_until_daemon_ready(&layout, Duration::from_secs(5));
     let daemon = daemon_pid(&layout);
@@ -452,7 +503,7 @@ fn daemon_version_mismatch_triggers_the_upgrade_flow_and_completes_against_the_n
     );
     // Generous budget: this handshake pays for the fake round-trip *and* a
     // real daemon spawn, unlike the plain cold-start test's 20s.
-    let (stdout, line) = read_line(stdout, Duration::from_secs(25));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(25));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(
@@ -528,7 +579,7 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
         &mut stdin1,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
-    let (stdout1, _line) = read_line(stdout1, Duration::from_secs(20));
+    let (stdout1, _line) = read_line(&mut proxy1, stdout1, Duration::from_secs(20));
     let _ = stdout1;
     wait_until_daemon_ready(&layout, Duration::from_secs(5));
 
@@ -561,7 +612,7 @@ fn a_fresh_proxy_recovers_after_the_daemon_it_used_is_killed() {
         &mut stdin2,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
-    let (stdout2, line) = read_line(stdout2, Duration::from_secs(20));
+    let (stdout2, line) = read_line(&mut proxy2, stdout2, Duration::from_secs(20));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(
@@ -631,7 +682,7 @@ fn a_live_proxy_reconnects_after_its_daemon_is_restarted_mid_session() {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
-    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(20));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(response["id"], serde_json::json!(1));
@@ -673,7 +724,7 @@ fn a_live_proxy_reconnects_after_its_daemon_is_restarted_mid_session() {
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     );
-    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(20));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(
@@ -779,7 +830,7 @@ fn a_request_in_flight_when_the_daemon_dies_fails_cleanly_and_the_session_contin
     );
     // The bounded read is the assertion that matters most here: without the
     // synthesized error this call would hang until the test's own timeout.
-    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(20));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(response["id"], serde_json::json!(1));
@@ -799,7 +850,7 @@ fn a_request_in_flight_when_the_daemon_dies_fails_cleanly_and_the_session_contin
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#,
     );
-    let (stdout, line) = read_line(stdout, Duration::from_secs(30));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(30));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(response["id"], serde_json::json!(2));
@@ -920,7 +971,7 @@ fn a_daemon_advertising_an_older_spool_format_produces_a_stderr_warning_and_neve
         &mut stdin,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
-    let (stdout, line) = read_line(stdout, Duration::from_secs(20));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(20));
     // stdout carries exactly the fake daemon's response and nothing else —
     // proving the warning never touched the JSON-RPC stream.
     let response: serde_json::Value =
@@ -1016,7 +1067,7 @@ fn a_real_older_daemon_binary_drains_and_a_real_new_daemon_migrates_the_store_to
     );
     // Generous budget: pays for the old daemon's drain *and* a real new
     // daemon spawn+migration.
-    let (stdout, line) = read_line(stdout, Duration::from_secs(30));
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(30));
     let response: serde_json::Value =
         serde_json::from_str(line.trim_end()).expect("parse response");
     assert_eq!(
