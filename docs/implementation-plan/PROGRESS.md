@@ -1340,8 +1340,8 @@ ADR-0005 «verified against the **compiled-in catalog**» к `latest` непри
 - [x] T22-14 Паритет резолверов, доказательство отсутствия сети, синхронизация доков
 - [x] T22-15 ORT в установщик первого запуска (закрывает `D-104`)
 - [x] T22-16 Поверхность `init`/`doctor` и судьба `xtask dist-ort`
-- [~] T22-17 Релизный пайплайн и контракт имён ассетов
-- [ ] G22 Сверка доставки и резолва
+- [x] T22-17 Релизный пайплайн и контракт имён ассетов
+- [x] G22 Сверка доставки и резолва
 
 ### Живая приёмка D-096…D-101 на сторе владельца (2026-08-25, после `825321a`)
 
@@ -1414,6 +1414,7 @@ structural sharing для ~2 900 впервые пригодных файлов.
 | G19 | PASS | строка G19 в «Task evidence» + трейс «G19 — трейс требование → artifact/test» ниже |
 | G20 | PASS | строка G20 в «Task evidence» ниже |
 | G21 | PASS after D-091, D-092, D-093 | строка G21 в «Task evidence» + трейс «G21 — трейс требование → artifact/test» ниже |
+| G22 | PASS | строка G22 в «Task evidence» + трейс «G22 — трейс требование → artifact/test» ниже |
 
 **Устаревающие строки трасс `G17` и `G19` (зарегистрировано `T22-00`, 2026-08-25).** Оба гейта
 остаются `PASS` и **не переоткрываются** — прецедент групп 18–21 однозначен, а история evidence не
@@ -1722,6 +1723,8 @@ requirement→test-звенья четырёх удаляемых тестов `
 | `D-114` — the flaky indexing class (appendix, 2026-08-31) | commit `D-114: a torn manifest, and three tests that sampled an instant` plus this line | `cargo xtask ci` on the fixed tree — **`all 18 jobs passed`**, `root:test` 161.9 s (the run before it failed on nothing but a `clippy::let_and_return` in the new diagnostic helper, and its `root:test` was already green at 213.8 s). Then five consecutive full-suite runs under the default parallelism: **2813/2813 five times out of five** (35.3 / 35.5 / 33.0 / 26.5 / 26.8 s), zero failures of any of the four. The four named tests green together (1.4 s). `cargo nextest list --workspace` still **2813**. Four two-way mutation proofs, each reverted after: (1) a 500 ms sleep between the walk's stat and the content read in `crates/index/src/scan/mod.rs`, with the test's edit steered into that window — **FAIL, 3 generations** without the fix, **PASS** with it; (2) `std::mem::forget` on `project_one`'s `Reconcile` guard — **FAIL** at the bound; (3) deleting the in-memory `s.last_generation_id = ...` write — **FAIL** at the bound after 30.7 s, printing the incomplete body; (4) taking and leaking a `ConsolidationTrigger` guard at the top of the tick — **FAIL** at the bound | **The class split three-to-one, and the split is the finding.** (1) `repeated_triggers_over_an_unchanged_tree_build_one_generation` was catching a **product** defect: `ManifestEntry.size` came from the walk's `stat` and `content_hash` from a separate read in a later pass, so an edit landing between them produced an entry pairing the old size with the new hash — a manifest for a state the tree was never in. It matches neither neighbour, the `driver.rs:263` skip cannot fire, and the next reconcile rebuilds identical bytes into another generation; every generation is a permanent pin root (spec 06 §5), which is the cost `D-089` exists to prevent. **Two earlier hypotheses were killed by measurement, not by argument** — the zero-byte window of `fs::write`'s truncate (a 300 ms forced window changed nothing; no reconcile is in flight there) and a stale `Fast` manifest from the watcher (a `Strict` scan records into the same advisory cache, so `Fast` re-hashes and agrees). **The instrumentation is what decided it:** the assertion now dumps every generation with hash and size, and the reproduction printed `#2 hash=2173738576fe size=32` next to `#3 hash=2173738576fe size=32` — two builds of identical content, possible only if the manifests differed while the bytes did not. (2), (3), (4) are **test** defects of one shape: sampling a momentary background state. Each now asserts over a window instead of at an instant — never by widening a sleep. Worth keeping: mutation (4)'s first attempt was **inert**, because that guard is only taken when there is work and the test is idle by construction; a mutation that cannot fail proves nothing, and it had to be moved to the top of the tick before it meant anything. **Not claimed:** (1) has no deterministic regression test of its own — the tear needs an edit inside a single scan, the failpoint registry has no blocking or callback action, and `CLAUDE.md` forbids leaning on a real wall-clock sleep. It is guarded instead by the invariant living in one commented expression, by the gate's denied warnings rejecting the unused `read_len` a revert would leave, and by the `D-089` test now failing with a message that names the mechanism | Claude Opus 5 / 2026-08-31 |
 | Repository language + history rewrite (appendix, 2026-08-31) | commit `Rewrite every Russian commit message into English` plus this line, on top of `Repository language is English; nine comments translated, the rule written down` | 305 commits before and after; `git diff` between the pre-rewrite tip and the new one is **empty**, so every tree is byte-identical; `Co-Authored-By`/`Claude-Session` trailers compared per commit — 0 divergences; `git log --pretty=%B | grep -P '[\x{0400}-\x{04FF}]'` leaves only 13 deliberate lines in 3 commits; all 78 remapped hashes resolve uniquely in the new history, 0 ambiguous, 0 stale; `cargo xtask ci` on the rewritten tree | **Owner decision, 2026-08-31: Russian belongs to the conversation and does not enter the repository.** The scope is the owner's too: the real violations in code plus the commit messages — the Russian plan corpus (`docs/implementation-plan/**` ~6500 Cyrillic lines, `docs/idea.md` 447) is deliberately NOT retranslated, and new text there is written in English so those files converge instead of being rewritten. 102 of 305 commit messages (2858 lines) were translated and applied with `git filter-branch --msg-filter`; `git-filter-repo` is not installed on this machine. **The cost was stated before the decision and is paid here rather than left to rot:** a rewrite invalidates every short hash recorded as immutable evidence. The old→new map was rebuilt from the two linear histories and validated pairwise on tree, author, and both dates; 78 references in `PROGRESS.md`, `DEVIATIONS.md`, two group cards, `spec 14`, `.config/nextest.toml` and `docs/research/tools/adoption-scan.mjs` were remapped in **this** commit, on top of the rewrite — never inside it, because a reference cannot name the hash it changes. **Deliberately left alone, and this is the line that matters for anyone auditing:** everything under `fixtures/**` and `docs/research/artifacts/**` still carries the OLD hashes. Those are machine-recorded measurements — a `build_id` from `git describe` states which binary produced a number, and editing it would falsify the record of a run that really happened. Same for the `cf50a5c` inside the translation few-shots in `crates/memory/src/normalize/translate.rs` and `crates/local-rag/tests/memory_translate_real_model.rs`, where the hash is test data proving hashes survive translation. In code, 9 Russian comments were translated (the first sweep found 3 because it sampled 8 files of 25); what remains in `crates/` is 5 illustrative samples where the sample IS the input being described | Claude Opus 5 / 2026-08-31 |
 | Environment observation: one `SQLITE_IOERR` under full-suite parallelism (appendix, 2026-08-31) | no commit of its own; recorded with the run it appeared in | `xtask::memory_recall_bench::run::tests::two_runs_of_one_config_agree_on_every_query` failed once in 0.090 s with `run: "backfill: sqlite error during backfill: disk I/O error"`. Alone: PASS in 0.060 s. Nine full-suite runs on this tree the same day, this is the **only** failure — the five confirmation runs after `D-114` were 2813/2813 each, and the immediately following `cargo xtask ci` was `all 18 jobs passed` with `root:test` 165.8 s | Recorded as an environment observation, **not** as a deviation, and the reasoning is stated so the next reader can disagree with it. The resources were checked rather than assumed at the moment of the failure: 330 GiB free, 3.5 G free inodes, `ulimit -n` 1048576, `ulimit -u` 4000 — so it is neither out of space, out of inodes, nor out of descriptors at the OS level. `SQLITE_IOERR` under ~2800 tests each opening its own store is the same family as this machine's already-documented `env-macos-exec-hang`: a host-resource symptom, not an assertion that samples a race (`D-114`) and not a product path. **The escalation criterion is fixed here rather than left to judgement: a second occurrence makes it a deviation**, because one unexplained failure in nine runs is an observation and two is a pattern. It is named again in the `G22` evidence so the gate does not silently inherit it | Claude Opus 5 / 2026-08-31 |
+| T22-17 acceptance against a real release (appendix, 2026-08-31) | commit `G22: delivery and resolution reviewed` plus this line; the card moves `[~]` -> `[x]` here, not when it was written, because its acceptance needed a release that did not exist then | `node npm/memory/scripts/install.js --dir <tmp>` against the published `0.1.0` (release run `33387801150`, every job green including `host` and `announce`): **four binaries installed**, each answering `--version` with `0.1.0`, and each archive's recorded `archiveSha256` compared against the release's own `.sha256` sidecar downloaded separately — **all four agree**. Asset arithmetic reconciled against the real release rather than asserted: 4 binaries × 4 unix targets = 16 `.tar.gz`, 4 × 1 windows = 4 `.zip`, plus `source.tar.gz`, a `.sha256` for each of those 21, `dist-manifest.json` and `sha256.sum` = **44**, which is exactly what the release carries | The card's acceptance — "the installer, pointed at a real new release, installs all four binaries" — is met. `local-rag-tui` is among them, which is the whole point: tag `0.0.0` predates that crate and carries three. **Two findings the gate made by looking at the release instead of at the config.** (1) `source.tar.gz` is published and was published at `0.0.0` too, and the specification's as-built asset contract did not name it — which made the documented set impossible to reconcile with a real release (44 assets against a description covering 42). Named now, with the arithmetic. (2) That archive carries `LICENSE` and `NOTICE`, verified by extracting it: so a release *does* distribute the licence, even though a binary archive cannot. My own `dist-workspace.toml` comment, written hours earlier, said the release carried no licence copy; it understated the truth and is corrected. **Note on ordering, recorded because it explains why this row is dated after the licence commit:** the tag was cut, then re-cut once more so the first public release would be built from a tree containing `LICENSE`. This acceptance ran against the final assets only — the earlier run was a rehearsal and is not the evidence | Claude Opus 5 / 2026-08-31 |
+| G22 | commit `G22: delivery and resolution reviewed` (evidence line in that same commit) | `cargo xtask ci` — **all 18 jobs passed** (`root:test` 373.6 s); `npm/memory` **185/185**; `plugin` **53/53**; `cargo test -p xtask --test adr_links` **11/11**; `dist generate --check` exit 0; live acceptance of `T22-17` against the published `0.1.0` — four binaries, four digests matching the release sidecars | Requirement → code → test trace over spec 13 §1/§2/§4, 01 §1/§2, 12 §1, 11 §3.1/§3.2, plus the `G17`/`G19` rows `T22-00` declared obsolete — every one of those re-traced to what replaced it rather than dropped. Read personally, no subagents, no as-built sentence taken on faith: `hooks.json` was parsed to confirm seven events all ending `\|\| true` and `SessionStart` differing by exactly one environment variable; `dist_ort.rs` was opened to confirm it *imports* the catalog it used to define. **Four findings, all documentation over already-correct code, all closed in the gate without a `D-NNN`** (the `G17`/`G19`/`G20` precedent): three live references to a file `T22-15` moved; an asset contract describing 42 assets where a real release carries 44 (`cargo-dist`'s `source.tar.gz` and its sidecar were unnamed); a licence comment of mine that said a release carries no licence copy, when `source.tar.gz` carries `LICENSE` and `NOTICE` — checked by extracting it; and `D-110`, closed by amending ADR-0013 rather than by moving a status, because what remained was a text claiming a verification the code deliberately does not do. `D-102`…`D-107` all `resolved`, checked mechanically. The only deviation open anywhere is `D-042` (`blocked`, group 19, owner decision), not reopened here. **Boundary stated rather than left implied:** every platform claim but `darwin-arm64` rests on CI compiling and `dist` producing an archive, not on running a binary — the same line `D-029` drew | Claude Opus 5 / 2026-08-31 |
 
 ### G00 — трейс требование → artifact/test
 
@@ -4253,3 +4256,109 @@ busy-handler не зовётся при промоушене read-lock → write
 **Итог по трём находкам, и он про метод.** Ни одна из трёх не про English normalization: `D-091` — группа 20, `D-092` — группа 18 (и продукт), `D-093` — снова группа 20. Сверка самой группы 21 расхождений нормативного уровня не нашла — нашёл их **прогон гейтовой команды целиком**, которого на этой машине не было с `D-036`. Причём каждая следующая пряталась за предыдущей: `nextest` останавливает прогон на первом падении (`Cancelling due to test failure`), поэтому одна краснота за раз — это не совпадение, а устройство. Отсюда практический вывод для будущих гейтов: усиленная замена `cargo check --workspace --all-targets --all-features` держит компиляцию, но не заменяет прогон тестов, и цена такой замены измерима — три дефекта.
 
 Gate results: `G21` — `PASS after D-091, D-092, D-093`.
+
+
+### G22 — трейс требование → artifact/test
+
+Date 2026-08-31, executor Claude Opus 5. Does not reopen `G00–G21`. Scope: `T22-00…T22-17` against
+the sections the card names — spec 13 §1/§2/§4, 01 §1/§2, 12 §1, 11 §3.1/§3.2 — plus the rows of
+the `G17`/`G19` traces this group declared obsolete (`T22-00`'s paragraph under Gate results).
+Method: every requirement was checked by reading the file and the named test personally; no
+as-built sentence was taken on faith, and no subagents were used. Where the trace's right-hand
+column names a test, that test's title is quoted from its own source, not paraphrased.
+
+**Spec 13 §1 (Packaging) `[FIXED, ADR-0013]`:**
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| One npm package, `@13w/memory`, that obtains rather than contains the binaries | `npm/memory/` — one package; the five `npm/memory-*` directories were removed by `T22-11` | `package-contents.test.js` — 5 tests, including one that derives the expected file list from the directory rather than from a literal | OK |
+| The binaries are the project's own GitHub release assets, produced by the tagged CI release | `.github/workflows/release.yml` (generated), `dist-workspace.toml` | live: release run `33387801150`, all jobs green through `host`/`announce`; `dist generate --check` exit 0 | OK |
+| Four binaries per target: `local-rag`, `local-rag-proxy`, `local-rag-hook`, `local-rag-tui` | `[package.metadata.dist] dist = true` on exactly those four crates | `release-urls.test.js` — «PRODUCT_BINARIES is exactly what cargo-dist would ship (T22-17)»; the switch is that metadata and not `publish`, since every crate is `publish = false` | OK |
+| Five targets, `win32-arm64` deferred | `dist-workspace.toml`'s `targets` | `platform.test.js` — «TARGET_TRIPLES is exactly dist-workspace.toml's target list», «win32-arm64 is deferred, not supported» | OK |
+| Asset-name contract `<binary>-<target>.<ext>`, `.tar.gz` / `.zip`, one member, `.sha256` sidecar | `unix-archive`/`windows-archive`/`auto-includes` in `dist-workspace.toml` | `release-urls.test.js` — «assetName's extensions are exactly dist-workspace.toml's archive formats», «asset, sidecar and executable names agree with each other», «the real sidecar form parses: <64 hex> *<name>, trailing blank line and all» | OK, **note below** |
+| `latest` resolves through a redirect naming the concrete tag | `npm/memory/src/release.js` | `release-urls.test.js` — «the resolved tag is recovered from a real redirect Location», «a mirror's Location parses too, not just github.com's (D-109)», «a Location that is not a release download is an error, never a silent null» | OK |
+| Hooks path exec-fast, `< 50 ms` cold `[SPEC]` | `plugin/bin/local-rag-resolve-hook.sh`, POSIX sh on builtins only | `cold-start.test.js`; remeasured by `T22-13` over a whole `hooks.json` line rather than a bare exec — p95 18.9 / 16.9 / 11.1 ms | OK |
+| Launcher-only resolution overhead `p95 < 100 ms` cold `[SPEC]` | `plugin/bin/local-rag-mcp-launcher.js` | `mcp-cold-start.test.js` — «a resolved server starts inside the p95 budget», «the not-installed path is bounded by the same budget» | OK |
+
+**Spec 13 §2 (Launcher requirements) `[FIXED list]`:**
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| Signal forwarding, reliable termination of the stdio child, orphan cleanup | `npm/memory/bin/*` stubs; the launcher keeps the proxy attached | `subprocess.test.js` (7); `mcp-launcher-resolution.test.js` — «a resolved server starts, and SIGTERM reaches the grandchild» | OK |
+| Resolution of an **executable**: `LOCAL_RAG_BIN_DIR`, then `PATH` in order, then well-known global-bin directories | `npm/memory/src/locate.js`; `plugin/bin/local-rag-mcp-launcher.js`; `plugin/bin/local-rag-resolve-hook.sh` | `locate-order.test.js` (14), `mcp-launcher-resolution.test.js` — «the order is the override, then PATH in order, then the well-known directories», «a truncated PATH still finds a global install — the launchd case»; `hook-resolution.test.js` — «LOCAL_RAG_BIN_DIR wins over PATH — 13 §2's order, for the hook path too», «--print-candidates agrees with candidateBinDirs(), entry for entry» | OK |
+| The plugin never downloads anything | both shipped files use built-ins only | `no-network.test.js` — 6 tests, and the first one, «the trap is armed — a downloader on this PATH really does record itself», is why the other five mean anything | OK |
+| Clear, actionable error when the server is not installed — MCP: stdout byte-empty, stderr names the way out, non-zero exit | `local-rag-mcp-launcher.js` | `mcp-launcher-resolution.test.js` — «nothing installed: stdout stays byte-empty, stderr names the way out, exit 1»; `locate-order.test.js` — «nothing anywhere is a typed failure that names the way out» | OK |
+| …Hooks: exit 0 always, `SessionStart` speaks through `additionalContext`, the other six stay silent | `plugin/hooks/hooks.json` — read directly: seven events, every command ends `2>/dev/null \|\| true`, and `SessionStart` differs from the other six by exactly one environment variable (`LOCAL_RAG_NOT_INSTALLED_JSON`) in front of the same command | `hook-resolution.test.js` — «all seven commands exit 0 when nothing resolves — spec 11 §3.1 [FIXED]», «SessionStart is the only event that speaks when the binary is missing», «SessionStart says nothing of its own once the binary resolves», «the resolver itself exits 127 on a miss — hooks.json's `\|\| true` is what makes it 0» | OK |
+| Fully offline after `local-rag init --download-models` | `crates/models` | `-p local-rag-models` suite; `no-network.test.js` for the plugin half | OK |
+| Checksum/manifest + atomic download, ORT on the same terms as weights | `crates/models/src/{install,fetch,archive}.rs`, `ort_catalog.rs` | `install-verify.test.js` (12) for the npm half; `crates/models` tests incl. the `models.install.ort_before_marker` failpoint for the Rust half | OK |
+| The ONNX Runtime is an artifact of first run, beside the weights | `T22-15`/`T22-16`: `init --download-models` installs it third, `doctor` reports the resolved rung | `-p local-rag-models` suite; live install verified in `T22-15` | OK |
+
+**Spec 13 §4 (Upgrade flow) `[SPEC]`:**
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| The trigger is a new binary on disk, not a package swap | `npm/memory/src/install.js` replaces files in place | `install-verify.test.js` — «a moved tag reinstalls, and an unmoved one does not», «the manifest is written last: a failure on the final asset leaves none» | OK |
+| The daemon binary MUST sit beside the proxy that spawns it — now a layout requirement, bought by the installer's flat directory | `T22-10`; confirmed live by this gate's own acceptance run: all four binaries land in one directory | `bin-replacement.test.js` (7); `locate-order.test.js` — «a directory holding the proxy but not the daemon is not a rung at all» | OK |
+| The mechanism itself (handshake retry, `SHUTDOWN_REQUEST`, drain, migration, `MAX_UPGRADE_ROUNDS = 2`) unchanged | `local-rag-proxy::handshake::establish_session` | `local-rag-proxy/tests/subprocess.rs` (D-026's loop, and T17-04's real-migration case) | OK, untouched by this group |
+
+**Spec 01 §1/§2, 12 §1, 11 §3.1/§3.2:**
+
+| Требование | Artifact | Verifying test | Статус |
+| --- | --- | --- | --- |
+| 01 §1: installation is one npm package, binaries are release assets `[FIXED, ADR-0013]`; no mandatory external daemons | amendment note present and matches 13 §1 | — (normative text; the code side is traced above) | OK |
+| 01 §2: five platform targets `[FIXED]` | `dist-workspace.toml` + `SUPPORTED_PLATFORMS` | `platform.test.js` — «exactly the five v0 platform targets are supported (spec 13 §1/15 §2)» | OK |
+| 12 §1: fetching the product binaries and the ONNX Runtime is not subject to `data_policy` | `T22-04`'s as-built note in 12 §1, which states it explicitly rather than by analogy, and separates the two: the runtime keeps the pinned-digest standard, the product binaries cannot under `latest` | — (normative text); the pin itself is `ort_catalog.rs::ORT_ASSETS` | OK, **stale reference fixed, below** |
+| 11 §3.1: seven ingestion hooks, always exit 0 `[FIXED]` | `plugin/hooks/hooks.json` | `hook-resolution.test.js`, `hooks-list.test.js` | OK |
+| 11 §3.2: recall injection; the recall RPC never spawns a daemon | `crates/local-rag-hook/src/recall.rs` | `plugin/hooks/not-installed.json` golden — «the not-installed envelope matches what print_hook_output actually emits» | OK |
+
+**Re-tracing the rows `T22-00` declared obsolete.** Each old link is replaced, not merely deleted:
+
+| Obsolete link (G17/G19) | What replaces it | Verifying test |
+| --- | --- | --- |
+| 13 §1 → five `npm/memory-*` packages and their `bin/` | one package + release assets | `platform.test.js`'s target parity, `release-urls.test.js`'s binary parity |
+| 13 §2 → `npm/memory/src/resolve.js`, «resolution under pnpm / npm / yarn layouts» | executable resolution, three rungs | `locate-order.test.js`, `mcp-launcher-resolution.test.js`, `hook-resolution.test.js` |
+| 13 §2 → «clear error when the **platform package** is missing» | strengthened to «no server at all», stated per channel | `mcp-launcher-resolution.test.js`'s byte-empty-stdout case; `hook-resolution.test.js`'s seven-exit-0 and SessionStart cases |
+| 13 §2 → ORT bundled inside a platform package | first-run artifact in the store | `crates/models` suite; `T22-15`'s live install |
+| 13 §4 → «npm's own package swap» | in-place file replacement | `install-verify.test.js`, `bin-replacement.test.js` |
+| G19 → `tier1()`/`tier2()`/`tier3()` and `plugin/test/mcp-launcher-tiers.test.js` | one ordered resolution, no npx tier | `mcp-launcher-resolution.test.js` — «the launcher never runs npx, whatever the environment» |
+| G19 → `p95 < 100 ms` measured on the cache tier, `< 50 ms` on a bare symlink exec | both remeasured on what actually runs | `mcp-cold-start.test.js`; `T22-13`'s whole-`hooks.json`-line measurement |
+
+**Findings, all closed inside the gate; none is a behavioural divergence, all are documentation over already-correct code — the `G17`/`G19`/`G20` precedent, no `D-NNN`.**
+
+1. **Three live references to a moved file.** `10 §5`, `12 §1` and `13 §2` each named
+   `crates/xtask/src/dist_ort.rs::ORT_ASSETS` in the present tense as the home of the pinned ORT
+   catalog. `T22-15` moved it to `crates/models/src/ort_catalog.rs`, and `dist_ort.rs` now *imports*
+   it — its own module doc says so. Corrected, and the canonical location is now stated once, at
+   `10 §5`, which owns it. The fourth occurrence, inside `13 §2`'s superseded `T17-03` note, is
+   history and was left alone.
+2. **The asset set was not fully described.** `13 §1`'s as-built contract named the archives, the
+   sidecars, `dist-manifest.json` and `sha256.sum` — 42 assets — while a real release carries 44.
+   The difference is `cargo-dist`'s own `source.tar.gz` and its sidecar, published at `0.0.0` too.
+   Named now, with the arithmetic, so the documented set reconciles against a real release.
+3. **A licence statement of mine that understated the truth.** The `auto-includes = false` comment
+   said a release carries no licence copy. True of a *binary* archive; false of the release, because
+   `source.tar.gz` contains `LICENSE` and `NOTICE` — verified by extracting it from the real
+   `0.1.0`, not inferred. Corrected.
+4. **`D-110` closed by amendment rather than by status.** ADR-0013 Decision 2 read «the mitigation
+   is GitHub artifact attestation, verified in addition to the digest». The producing half shipped;
+   the consuming half was decided against on 2026-08-28. Leaving the row `open` would have implied
+   unfinished work, and `blocked` a pending decision — neither was true. What remained was a text
+   claiming what the code does not do, so ADR-0013 gains **Amendment: attestations are produced, not
+   verified**, in the form its own `D-108` amendment established, including a «what this invalidates»
+   clause. `13 §1` already carried the same statement, so ADR, specification and code now agree.
+
+**`D-102`…`D-107` are all `resolved`** — checked mechanically, not by memory. The only deviation
+left open anywhere is `D-042` (`blocked`), which belongs to group 19 and whose disposition `G19`
+already fixed: an owner decision, not reopened by a later gate.
+
+**Checks.** `cargo xtask ci` — **all 18 jobs passed** (`root:test` 373.6 s). `cd npm/memory &&
+node --test test/*.test.js` — **185/185**. `node --test plugin/test/*.test.js` — **53/53**.
+`cargo test -p xtask --test adr_links` — **11/11**. `dist generate --check` — exit 0. Live
+acceptance of `T22-17` against the published `0.1.0`: four binaries, four matching digests.
+
+**One thing this gate did not do, stated so it is not read as coverage it does not have.** Every
+platform claim other than `darwin-arm64` rests on CI compiling and on `dist` producing an archive,
+not on running a binary: there is no Windows, Intel-Mac or Linux host here. That is the same
+boundary `D-029` drew and `T22-15` restated for the runtime, and this group did not move it.
+
+Gate results: `G22` — `PASS`.

@@ -51,7 +51,7 @@ enforces the policy.
 The exemption is narrow in a way the reader must be able to check, and here the two classes differ,
 so they are stated separately rather than lumped together. The ONNX Runtime keeps the T11-06
 standard exactly: its source URL and per-platform SHA-256 are pinned in the binary
-(`crates/xtask/src/dist_ort.rs::ORT_ASSETS`, 10 §5), so "fetch the runtime" cannot become "fetch
+(`crates/models/src/ort_catalog.rs::ORT_ASSETS`, 10 §5), so "fetch the runtime" cannot become "fetch
 arbitrary bytes". The product binaries **cannot** keep it. The owner chose to track the newest
 release rather than a pinned tag (ADR-0013 §Decision 2), and no digest of an unreleased artifact
 can be compiled in, so verification is against the checksum sidecar published **in the same

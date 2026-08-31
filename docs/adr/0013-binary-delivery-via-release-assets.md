@@ -257,6 +257,36 @@ ORT into the first-run installer, not a claim made here.
 
 No decision, alternative or consequence other than that one bullet is affected.
 
+## Amendment: attestations are produced, not verified (2026-08-31, D-110)
+
+Decision 2 says, of the digest's limits, that "the mitigation is GitHub artifact attestation,
+verified in addition to the digest". It reads as part of the decision, and it is not what shipped.
+The record is corrected here rather than left to be discovered by the next person comparing this
+text with `npm/memory/`.
+
+**What shipped.** The producing half: `github-attestations = true` in `dist-workspace.toml`, which
+regenerates `.github/workflows/release.yml` with `attestations: write` / `id-token: write` and an
+`actions/attest` step, and every tagged release now emits attestations.
+
+**What did not, and why it is a decision rather than an omission.** The installer does not verify
+them. Doing so needs either the `gh` CLI or a sigstore library inside `npm/memory`, and that is a
+direct reversal of the stance group 22 built and then pinned with a test: `archive.js` and
+`http.js` use Node built-ins only, and `plugin/test/no-network.test.js` asserts that neither
+shipped file can reach the network without an external command. Buying attestation verification
+means paying that stance, and the owner's decision of 2026-08-28 was not to.
+
+**What the residual risk actually is, stated so it is not overclaimed in either direction.** It is
+exactly what Decision 2 already described *before* naming the mitigation: verification is against a
+sidecar published in the same release as the asset, which defends against corruption in transit and
+tampering on the wire, and not against a compromised release. The attestations exist and a reader
+can check one by hand with `gh attestation verify`, which `cargo-dist` prints into the release body
+— so the property is available to a human, just not enforced by the installer.
+
+**What this invalidates in the text above.** One clause of Decision 2: "verified in addition to the
+digest" describes an intention, not the as-built. Read it as "produced in addition to the digest,
+and verifiable by hand". No other decision, alternative or consequence is affected; `13 §1`'s
+as-built note already carries the same statement for the specification side.
+
 ## Alternatives rejected
 
 - **Pin the asset to the package version** — `@13w/memory@X.Y.Z` fetching the release tagged

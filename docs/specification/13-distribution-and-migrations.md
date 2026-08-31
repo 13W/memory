@@ -40,9 +40,17 @@ every target but Windows and `.zip` on Windows (`dist-workspace.toml`'s `unix-ar
 `windows-archive`, T22-07), each archive carrying exactly one member — the executable itself,
 `auto-includes = false` — and each accompanied by a `<asset>.sha256` sidecar in coreutils form
 (`<64 lowercase hex> *<asset name>`, trailing blank line included: read off the real release, not
-assumed). A `dist-manifest.json` and a `sha256.sum` sit alongside. `latest` resolves through a
-redirect whose `Location` names the concrete tag, which is what makes an unpinned install
-reproducible after the fact (§2, 12 §1).
+assumed). A `dist-manifest.json` and a `sha256.sum` sit alongside, and so does a `source.tar.gz` of the
+whole repository with its own `.sha256`. That last one is `cargo-dist`'s, not this project's, and
+it is named here because leaving it out made the documented set impossible to reconcile with a
+real release: the arithmetic on `0.1.0` is 4 binaries × 4 unix targets = 16 `.tar.gz`, plus
+4 × 1 windows target = 4 `.zip`, plus `source.tar.gz`, plus a `.sha256` for each of those 21,
+plus `dist-manifest.json` and `sha256.sum` — **44** assets, which is what the release carries.
+It also carries a consequence worth stating where the reader is already counting members: the
+source archive contains `LICENSE` and `NOTICE`, so a release does distribute the licence even
+though a *binary* archive cannot (`auto-includes = false`, one member per archive).
+`latest` resolves through a redirect whose `Location` names the concrete tag, which is what makes
+an unpinned install reproducible after the fact (§2, 12 §1).
 
 Producer and consumer are held together by tests rather than by this paragraph, in both of the
 places they can drift. The target triples: `npm/memory/test/platform.test.js` reads
@@ -265,7 +273,7 @@ the same verify-before-trust machinery those weights already use (10 §5), which
 Everything else in that note still holds, and that is why it is kept rather than rewritten: the
 resolution order at process start, the prohibition on ever falling through to `ort`'s own implicit
 search (`D-028`, which showed it can hang the calling thread instead of erroring), the pinned URL
-and SHA-256 per platform in `crates/xtask/src/dist_ort.rs::ORT_ASSETS`, the per-platform runtime
+and SHA-256 per platform in the pinned catalog, the per-platform runtime
 versions with the reason `darwin-x64` pins the older one, and the record of what was actually
 verified end to end versus only structurally. The pinned table in particular is untouched — under
 `latest` the product binaries lose the compiled-in-digest standard (ADR-0013 §Decision 2), and the

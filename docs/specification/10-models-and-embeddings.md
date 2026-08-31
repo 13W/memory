@@ -418,9 +418,13 @@ verified before the final CI matrix" — assumed the library would ride inside a
 package, and those packages are gone (13 §1). It now travels the route this section already
 describes for weights, because a release archive carries only its executable and the library has
 nowhere else to be. This is the one artifact class where the compiled-in-catalog standard below
-survives intact: `crates/xtask/src/dist_ort.rs::ORT_ASSETS` keeps its pinned URL and SHA-256 per
-platform, unlike the product binaries, which track `latest` and pay for it (ADR-0013 §Decision 2).
+survives intact: the pinned catalog keeps its URL and SHA-256 per platform, unlike the product binaries, which track `latest` and pay for it (ADR-0013 §Decision 2).
 The runtime resolution order and `D-028`'s prohibition are unchanged; the code is `T22-15`'s.
+That catalog is `crates/models/src/ort_catalog.rs::ORT_ASSETS` as built — `T22-15` moved it out
+of `crates/xtask/src/dist_ort.rs`, which now imports it, because `xtask` already depended on
+`local-rag-models` and the reverse edge would have been a cycle. Three live references in this
+specification still named the old path after that move and were corrected by `G22`; the ones
+inside the superseded `T17-03` notes are history and are left alone.
 
 As-built note (T11-03, `[SPEC]`): the **default model choice** half of that `[OPEN]` is resolved —
 **`embeddinggemma-300m`, 768 dimensions, cosine** (ADR-0004, which records the measured candidate
