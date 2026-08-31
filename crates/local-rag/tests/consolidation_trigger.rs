@@ -190,10 +190,22 @@ async fn the_trigger_worker_alive_between_ticks_does_not_block_idle_shutdown() {
     // duration of one tick's active work (D-024), never across the wait
     // between ticks, so idle eligibility must survive.
     tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(
-        handle.is_idle_eligible(),
-        "the trigger worker being alive between ticks must not block idle shutdown"
-    );
+    // D-114: assert over a window, not on one sample. What D-024 forbids is
+    // holding the guard ACROSS the wait between ticks; it says nothing about
+    // any single instant, and a tick's own active work legitimately holds it.
+    // A bare `assert!(handle.is_idle_eligible())` here therefore fails whenever
+    // a tick lands on the sampling instant, which is what a loaded machine
+    // makes likely -- it failed exactly that way in CI run 33371332306 in
+    // 0.251 s, far too fast to be a spent budget. Waiting for the between-ticks
+    // state still fails, at the bound, if the guard is never dropped, which is
+    // the defect this test exists for.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !handle.is_idle_eligible() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the trigger worker being alive between ticks must not block idle shutdown");
 
     handle.shutdown().await;
 }

@@ -194,15 +194,42 @@ async fn admin_projects_list_joins_durable_and_live_status_end_to_end() {
     .await;
 
     let (enabled_id_str, disabled_id_str) = (enabled_id.to_string(), disabled_id.to_string());
-    let body = tokio::task::spawn_blocking(move || {
-        let mut client = Client::connect(&socket_path);
-        client.call_and_read(
-            r#"{"jsonrpc":"2.0","id":1,"method":"admin/projects_list"}"#,
-            None,
-        )
-    })
-    .await
-    .expect("blocking task");
+    // D-114: the wait above is on a *durable* fact -- the projection switch has
+    // landed in `state.sqlite` -- while the assertion below is on the worktree
+    // task's *in-memory* status, which is what this RPC reads. Those are two
+    // different writes of the same cycle and nothing orders them for an outside
+    // observer, so on a loaded machine the RPC can legitimately answer before
+    // the status carries the generation. Asking once and asserting on the first
+    // answer is what made this test flaky; ask until the answer is complete,
+    // bounded, and fail at the bound if it never is.
+    let body = {
+        let deadline = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        loop {
+            let socket_path = socket_path.clone();
+            let body = tokio::task::spawn_blocking(move || {
+                let mut client = Client::connect(&socket_path);
+                client.call_and_read(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"admin/projects_list"}"#,
+                    None,
+                )
+            })
+            .await
+            .expect("blocking task");
+            let complete = body["result"]["projects"]
+                .as_array()
+                .is_some_and(|projects| {
+                    projects.iter().any(|p| {
+                        p["worktree_id"] == enabled_id_str
+                            && p["task"]["last_generation_id"].is_string()
+                    })
+                });
+            if complete || started.elapsed() >= deadline {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
 
     assert_eq!(body["result"]["available"], true, "{body}");
     let projects = body["result"]["projects"]
