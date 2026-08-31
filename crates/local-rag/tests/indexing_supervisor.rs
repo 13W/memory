@@ -352,6 +352,18 @@ async fn reload_starts_and_stops_exactly_the_delta() {
 
     let mut opts = start_options(layout.clone());
     opts.embedder_provider = ready_embedder_provider();
+    // D-116: this is the one test in the file that asserts on the delta an
+    // EXPLICIT `reload()` computed, and the supervisor deliberately has a
+    // second observer of the same table — a backstop poll, 50 ms in
+    // `support::start_options`. Between the two registry writes below and the
+    // `reload()` call sit two awaited transactions; on a loaded machine 50 ms
+    // is nothing, the backstop tick lands in that gap, starts the new row
+    // itself, and the explicit reload correctly reports `started: 0` for a
+    // delta somebody else already applied. That is the product working, so the
+    // fix is to make the reload the only observer for the duration of this
+    // test rather than to widen an assertion. Every other test here asserts on
+    // the end state, where either observer is a legitimate answer.
+    opts.indexing_backstop_poll_interval = Duration::from_secs(3600);
     let handle = DaemonHandle::start(opts).await.expect("start");
 
     let state = StateDb::open(layout.state_db()).expect("reopen state.sqlite for polling");
