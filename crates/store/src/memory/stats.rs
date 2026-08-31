@@ -249,6 +249,11 @@ fn truncate_reason(reason: Option<String>) -> Option<String> {
 /// runs and then two on an unchanged store. A health report that flickers is
 /// worse than one that says nothing.
 ///
+/// **Minus**, since `T23-03`, any run whose window the session's cursor has
+/// already passed: an abandoned window is behind the session and blocks
+/// nothing, so reporting it forever as a dead-letter would turn every future
+/// `stats` and `doctor` into noise about a decision somebody already made.
+///
 /// Ordered worst-first (`attempt_count` descending, then `run_id`) so a
 /// truncated human report still shows the loudest row.
 pub fn stuck_consolidation_runs(
@@ -263,6 +268,9 @@ pub fn stuck_consolidation_runs(
                  AND COALESCE(c.last_failure_fingerprint, '') = ?1) AS dead_lettered \
          FROM consolidation_run c \
          WHERE c.state = 'failed' \
+           AND c.to_received_seq > COALESCE( \
+                 (SELECT p.last_consolidated_received_seq FROM processing_cursor p \
+                   WHERE p.session_id = c.session_id), 0) \
            AND ( \
                  c.attempt_count >= ?2 \
                  OR ( \

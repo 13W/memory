@@ -286,6 +286,28 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
   `local-rag gc` being typed, **after** `T23-03` has rescued the backlog.
 - **Evidence:** the `T23-09` row, with the overdue count before and after.
 
+## T23-10 — A truncated generation is not a mechanical failure
+
+- **Depends on:** `T23-03` (which is how it was found) and `T23-06` (whose budget fix makes the
+  case rarer; this one makes it recoverable when it still happens).
+- **Specification:** `D-124`; spec 04 §4; spec 08 §4's two-tier malformed-output handling;
+  `FailureKind`'s own contract.
+- **Result:** a failure that is a property of one sampling stops being parked as if it were a
+  property of the code.
+- **In scope:** the classification. `Mechanical` claims a failure "reproduces identically on an
+  unchanged rebuild", which licenses `stale_runs` to abandon it until the binary changes. A
+  router answer truncated at `MAX_GENERATION_TOKENS` does not reproduce identically — proved live:
+  a single retry of a session parked for a day applied, and its backlog moved 287 → 277. `Transient`
+  already carries a bounded backoff and the `TRANSIENT_ATTEMPT_CAP` escalation, so moving this class
+  there does not reintroduce `D-050`'s storm.
+- **Not in scope:** the answer budget (`T23-06`), and any other failure that genuinely is a code
+  defect — a schema violation still reproduces identically and must stay `Mechanical`.
+- **Tests:** a parse failure of generated output classifies as recoverable; a SQLite constraint
+  violation still classifies as mechanical; the attempt cap still escalates, so nothing retries
+  unboundedly. Proved by mutation both ways.
+- **Acceptance:** a session parked on a truncated answer recovers without an operator command.
+- **Evidence:** the `T23-10` row.
+
 ## G23 — Consolidation and candidate review gate
 
 - **Depends on:** every card of the group.
@@ -294,7 +316,7 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
 - **In scope:** reread the named sections; build the requirement → code → test trace; check every
   `[FIXED]`/`[SPEC]`/`[OPEN]` the group touched — in particular spec 08 §4's accepted-cost
   paragraph, which this group's premise contradicts and which must end up saying what is true;
-  confirm `D-117`…`D-123` are all `resolved`; run both JS suites and `cargo xtask ci`; and
+  confirm `D-117`…`D-124` are all `resolved`; run both JS suites and `cargo xtask ci`; and
   **remeasure the baseline table above on the live store**, since a group opened from a live store
   is answerable to it.
 - **Not in scope:** reopening `G00`–`G22`.

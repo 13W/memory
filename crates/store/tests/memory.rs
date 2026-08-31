@@ -34,10 +34,11 @@ use local_rag_store::memory::{
 };
 use local_rag_store::rusqlite::params;
 use local_rag_store::{
-    CURRENT_NORMALIZER_VERSION, FailureKind, LEASE_DURATION_MS, MAX_NORMALIZATION_ATTEMPTS,
-    NormalizationCountRow, NormalizationStatus, NormalizationWrite, StuckRunRow, UpsertOutcome,
-    entries_needing_normalization, normalization_counts, normalization_for, record_run_failure,
-    retry_run, upsert_normalization,
+    AUDIT_ENTITY_CONSOLIDATION_RUN, AbandonOutcome, CURRENT_NORMALIZER_VERSION, FailureKind,
+    LEASE_DURATION_MS, MAX_NORMALIZATION_ATTEMPTS, NormalizationCountRow, NormalizationStatus,
+    NormalizationWrite, StuckRunRow, UpsertOutcome, abandon_run, entries_needing_normalization,
+    normalization_counts, normalization_for, record_run_failure, retry_parked_run, retry_run,
+    stale_runs, upsert_normalization,
 };
 use local_rag_store::{StateDb, WriteError};
 use local_rag_test_support::TempHome;
@@ -2201,6 +2202,259 @@ async fn seed_backlog_sessions(db: &StateDb) {
         })
         .await
         .expect("seed envelopes across two sessions");
+}
+
+/// `T23-03`: the operator's retry is one attempt, delivered through the
+/// machinery that already exists — `failed -> running` with a lease that has
+/// already expired, which is exactly the row `stale_runs` selects.
+#[tokio::test]
+async fn a_retried_parked_run_becomes_eligible_again() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        3,
+        5,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        "boom",
+        2,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    assert!(
+        stale_runs(&read, 2_000, "build-1")
+            .expect("stale runs")
+            .is_empty(),
+        "parked: D-050's guard excludes it before the repair"
+    );
+    drop(read);
+
+    db.writer()
+        .transaction(|tx| retry_parked_run(tx, "run-a", 2_000))
+        .await
+        .expect("retry")
+        .expect("failed -> running is legal");
+
+    let read = db.open_read().expect("read conn");
+    let stale = stale_runs(&read, 2_000, "build-1").expect("stale runs");
+    assert_eq!(
+        stale.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run-a"],
+        "a lease that has already expired is precisely what `stale_runs` picks up"
+    );
+}
+
+/// The regression this card is most at risk of causing: a repair that made the
+/// run permanently retry-eligible would be `D-050`'s circuit breaker deleted by
+/// another name. One attempt, then parked again — asking twice takes two
+/// commands.
+#[tokio::test]
+async fn a_retried_run_that_fails_again_parks_again() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        3,
+        5,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        "boom",
+        1,
+        1_000,
+    )
+    .await;
+    db.writer()
+        .transaction(|tx| retry_parked_run(tx, "run-a", 2_000))
+        .await
+        .expect("retry")
+        .expect("failed -> running");
+    // The attempt runs and fails the same way — the root cause is unchanged.
+    db.writer()
+        .transaction(|tx| {
+            record_run_failure(
+                tx,
+                "run-a",
+                FailureKind::Mechanical,
+                "boom",
+                false,
+                Some("build-1"),
+                3_000,
+            )
+        })
+        .await
+        .expect("record the second failure")
+        .expect("running -> failed");
+
+    let read = db.open_read().expect("read conn");
+    assert!(
+        stale_runs(&read, 4_000, "build-1")
+            .expect("stale runs")
+            .is_empty(),
+        "one shot, not a storm: the guard closes again behind the operator"
+    );
+}
+
+/// `T23-03`: abandoning moves the session past the window and records what was
+/// skipped. The run stays `failed`, because it did fail — no new state, no
+/// migration, and no lie in the machine spec 04 §4 defines.
+#[tokio::test]
+async fn abandoning_moves_the_cursor_past_the_window_and_audits_it() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    // The window covers 3..=4 and sess-a owns 3..=5, so one observation is left
+    // BEYOND it. That is the case the whole predicate exists for and the shape
+    // the live store has: abandoning one window must let the session open the
+    // next one. A fixture whose window swallows the session's every row would
+    // pass whether or not the blocking rule changed, because the session drops
+    // out of the backlog report either way — a mutation caught exactly that.
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        3,
+        4,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        "boom",
+        2,
+        1_000,
+    )
+    .await;
+
+    let outcome = db
+        .writer()
+        .transaction(|tx| abandon_run(tx, "run-a", 2_000))
+        .await
+        .expect("abandon")
+        .expect("the run is failed and blocking");
+    assert_eq!(
+        outcome,
+        AbandonOutcome::Abandoned {
+            session_id: "sess-a".to_string(),
+            observations_skipped: 2,
+        }
+    );
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        processing_cursor(&read, "sess-a").expect("cursor"),
+        Some(4),
+        "the session has moved past the window"
+    );
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    let a = rows
+        .iter()
+        .find(|r| r.session_id == "sess-a")
+        .expect("sess-a still has its remaining observation");
+    assert_eq!(a.backlog, 1, "one row beyond the abandoned window");
+    assert_eq!(
+        a.blocker,
+        BacklogBlocker::None,
+        "the abandoned run is behind the cursor and must block nothing"
+    );
+    assert!(
+        stuck_consolidation_runs(&read, "build-1", 3)
+            .expect("stuck runs")
+            .is_empty(),
+        "an abandoned run must stop being reported forever — it blocks nothing"
+    );
+
+    let audit = read_audit_events_for_entity(&read, AUDIT_ENTITY_CONSOLIDATION_RUN, "run-a")
+        .expect("audit rows");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].op, "abandon");
+    let payload: serde_json::Value =
+        serde_json::from_str(audit[0].payload.as_deref().expect("payload")).expect("valid json");
+    assert_eq!(payload["observations_skipped"], 2);
+    assert_eq!(payload["to_received_seq"], 4);
+    assert_eq!(payload["last_failure_reason"], "boom");
+}
+
+#[tokio::test]
+async fn abandoning_twice_is_a_no_op_rather_than_a_unique_violation() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        3,
+        5,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        "boom",
+        2,
+        1_000,
+    )
+    .await;
+    db.writer()
+        .transaction(|tx| abandon_run(tx, "run-a", 2_000))
+        .await
+        .expect("first abandon")
+        .expect("blocking");
+
+    let again = db
+        .writer()
+        .transaction(|tx| abandon_run(tx, "run-a", 3_000))
+        .await
+        .expect("second abandon")
+        .expect("still readable");
+    assert_eq!(again, AbandonOutcome::AlreadyPast);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        read_audit_events_for_entity(&read, AUDIT_ENTITY_CONSOLIDATION_RUN, "run-a")
+            .expect("audit rows")
+            .len(),
+        1,
+        "the second call wrote nothing"
+    );
+}
+
+/// The predicate must not break the ordinary path: a failed run whose window
+/// the cursor has **not** passed still blocks its session, which is the whole
+/// reason `open_next_run` consults it.
+#[tokio::test]
+async fn a_failed_run_the_cursor_has_not_passed_still_blocks() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        3,
+        5,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        "boom",
+        2,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    let a = rows
+        .iter()
+        .find(|r| r.session_id == "sess-a")
+        .expect("sess-a is still blocked");
+    assert!(
+        matches!(&a.blocker, BacklogBlocker::Parked { run_id, .. } if run_id == "run-a"),
+        "got {:?}",
+        a.blocker
+    );
 }
 
 #[tokio::test]

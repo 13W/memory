@@ -67,6 +67,7 @@ fn main() -> ExitCode {
         cli::Command::Watch => cli::watch::run_watch(),
         cli::Command::Repo { command } => cli::repo::run(command),
         cli::Command::Worktree { command } => cli::worktree::run(command),
+        cli::Command::Consolidation { command } => cli::consolidation::run(command),
         cli::Command::Project { command } => cli::project::run(command),
         cli::Command::Rebuild(args) => cli::rebuild::run(args),
         cli::Command::Memory { command } => cli::memory::run(command),

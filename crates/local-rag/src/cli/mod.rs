@@ -30,6 +30,7 @@
 //! construction (concurrent indexers of the *same* worktree are wasteful,
 //! never unsafe).
 
+pub mod consolidation;
 pub mod coverage;
 pub mod delivery;
 pub mod doctor;
@@ -109,6 +110,11 @@ pub enum Command {
     Worktree {
         #[command(subcommand)]
         command: worktree::WorktreeCommand,
+    },
+    /// Repair a consolidation run nothing else will move (spec 11 §6, T23-03).
+    Consolidation {
+        #[command(subcommand)]
+        command: consolidation::ConsolidationCommand,
     },
     /// Daemon-managed background indexing (spec 11 §8, T20-08).
     Project {

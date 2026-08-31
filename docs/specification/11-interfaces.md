@@ -742,11 +742,44 @@ local-rag rebuild --worktree <id> [--fts] [--dense]
 local-rag memory list|approve|reject|edit|retract|confirm|refute|merge|rescope|evidence …
 local-rag inspect <observation|memory|generation> <id>
 local-rag export [--scope …] | purge [--memory <id>|--session <id>|--all]
+local-rag consolidation retry|abandon <session-id>   # T23-03: repair a parked run, see below
 local-rag gc [--dry-run]
 local-rag vacuum [--dry-run]  # X-012: reclaim the space gc freed inside the file
 local-rag doctor            # store lock, versions, heads, orphan artifacts
 local-rag stats
 ```
+
+As-built note (`T23-03`, `[SPEC]`, [ADR-0014](../adr/0014-consolidation-recovery-and-candidate-dedup.md)).
+`local-rag consolidation` exists because until it there was no supported way to move a parked
+consolidation run at all — `doctor` and `stats` report one, `purge` deletes the session's data
+rather than consolidating it, and nothing else in the product touched a run. 08 §4 accepted that
+cost with an escape, "until the binary is rebuilt", which a released binary does not have: its
+`BUILD_ID` is fixed for the life of the release (`D-117`).
+
+Two verbs, both an operator's and neither a schedule's. `retry` gives the blocking run exactly one
+more attempt — `failed → running` with an already-expired lease, which is the row `stale_runs`
+selects, so the next trigger tick executes it — and it is one shot by construction rather than by
+promise: a second failure re-parks it, because `record_run_failure` writes the running build's
+fingerprint back unconditionally. `D-050`'s circuit breaker is untouched, and asking twice takes
+two commands. `abandon` declares the window unconsolidatable and advances `processing_cursor` past
+it; the run stays `failed`, because it did fail, and a window the cursor has passed is behind the
+session and blocks nothing — so this needs neither a new run state nor a migration. It is
+destructive and says so: those observations never become memory, though their envelopes survive
+(12 §3). Per session only, never in bulk — ADR-0014 requires a person to decide with the failure in
+front of them.
+
+The argument is a **session id**, because that is what `stats` prints (`T23-02`); the command finds
+the blocking run itself and names it back. It needs no daemon and writes straight to
+`state.sqlite`, the same direct access `project` uses (`T20-08`) — a store that is wedged may well
+be one whose daemon is unhealthy, and a repair that required a healthy daemon would be unavailable
+exactly when it is needed. Nothing is notified either: `consolidation_trigger_tick` begins with its
+own resume sweep.
+
+Abandoning writes an `audit_event` under a new `entity_kind`, `consolidation_run` — the first in
+that table that is not `memory_entry`. ADR-0014 named the extension in advance because 08 §3's
+`[FIXED]` transaction contract is written around an entry mutation, and an abandoned window has
+none. `entity_version` carries the run's `attempt_count`: a run has no version column, and that is
+its one monotonic number.
 
 As-built note (`X-012`, `[SPEC]`). `gc` and `vacuum` are different jobs and the split is
 deliberate: `gc` deletes rows, `vacuum` gives the resulting holes back to the filesystem, and

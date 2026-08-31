@@ -3,8 +3,12 @@
 //! the plain row primitives; lease acquisition/renewal against a clock
 //! (120s/30s, spec 04 §4) and the router call itself are T14-06's runner.
 
+use std::fmt;
+
 use rusqlite::types::Type;
 use rusqlite::{Connection, Error, OptionalExtension, Transaction, params};
+
+use super::audit::{Actor, NewAuditEvent, insert_audit_event};
 
 /// `consolidation_run.state` (spec 03 §2.5 CHECK domain, spec 04 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,8 +529,19 @@ pub(crate) fn latest_non_applied_run(
     session_id: &str,
 ) -> rusqlite::Result<Option<(String, RunState, Option<i64>)>> {
     conn.query_row(
+        // T23-03: a run whose window the cursor has already passed is behind
+        // this session, not in front of it, so it blocks nothing. Today that
+        // state is unreachable by accident — the cursor advances only when a
+        // run reaches `applied`, and `open_next_run` refuses to open a second
+        // run while a non-`applied` one exists — so the only way to produce it
+        // is [`abandon_run`], which is exactly the point: abandoning needs no
+        // new run state and no migration, because "the session has moved past
+        // this window" is already a fact the schema can express.
         "SELECT run_id, state, lease_until FROM consolidation_run \
          WHERE session_id = ?1 AND state != 'applied' \
+           AND to_received_seq > COALESCE( \
+                 (SELECT c.last_consolidated_received_seq FROM processing_cursor c \
+                   WHERE c.session_id = ?1), 0) \
          ORDER BY created_at DESC LIMIT 1",
         params![session_id],
         |r| {
@@ -797,6 +812,187 @@ pub fn retry_run(
         }
         Err(e) => Ok(Err(e)),
     }
+}
+
+/// The audit `entity_kind` an operator's repair of a consolidation run is
+/// recorded under (`T23-03`, ADR-0014 Decision 1).
+///
+/// The first kind in this table that is not `memory_entry`. ADR-0014 named the
+/// extension in advance rather than letting a card discover it, because
+/// spec 08 §3's `[FIXED]` transaction contract is written around an entry
+/// mutation, and an abandoned window has none.
+pub const AUDIT_ENTITY_CONSOLIDATION_RUN: &str = "consolidation_run";
+
+/// Why a parked run could not be repaired the way the caller asked
+/// (`T23-03`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairError {
+    /// No run is blocking this session — either it has none, or its blocker
+    /// was already cleared. Reported rather than treated as success, so a
+    /// caller who mistyped a session id hears about it.
+    NotBlocked,
+    /// The blocking run is `pending`/`running`, not `failed`: something is
+    /// already acting on it, and forcing a second actor onto the same window
+    /// is not a repair.
+    NotFailed { run_id: String, state: RunState },
+}
+
+impl fmt::Display for RepairError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RepairError::NotBlocked => {
+                write!(f, "no consolidation run is blocking this session")
+            }
+            RepairError::NotFailed { run_id, state } => write!(
+                f,
+                "run {run_id} is {}, not failed — nothing to repair while it is in flight",
+                state.as_str()
+            ),
+        }
+    }
+}
+
+/// Give a parked run exactly one more attempt, on an operator's say-so
+/// (`T23-03`, ADR-0014 Decision 1).
+///
+/// `failed -> running` with a lease that has **already expired**, which is
+/// precisely the row [`stale_runs`] selects, so the next
+/// `consolidation_trigger_tick` — which begins with its own resume sweep —
+/// executes it. Nothing is erased: the failure kind, reason and fingerprint
+/// stay exactly as recorded.
+///
+/// **One shot, not a storm, and that is structural rather than promised.** If
+/// the run fails again, [`record_run_failure`] writes the current build's
+/// fingerprint back and `stale_runs` excludes it once more — `D-050`'s circuit
+/// breaker is untouched, and an operator who wants a second attempt has to ask
+/// for it again. That distinction is the whole reason this is a command and
+/// not a timer.
+pub fn retry_parked_run(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Result<(), RunTransitionError>> {
+    // A zero-length lease: `stale_runs` tests `lease_until <= now`, so this
+    // row is stale the instant it is written. Named here rather than left as a
+    // bare `0` at a call site.
+    retry_run(tx, run_id, 0, now_ms)
+}
+
+/// Declare a window unconsolidatable and move the session past it
+/// (`T23-03`, ADR-0014 Decision 1).
+///
+/// The run stays `failed` — it did fail, and inventing a state to say
+/// otherwise would put a lie in the machine spec 04 §4 defines. What changes is
+/// the cursor: it advances to this window's end, which
+/// [`latest_non_applied_run`] reads as "behind the session" and therefore no
+/// longer blocking. No migration, no new run state.
+///
+/// **This is destructive and the audit row is not decoration.** Those
+/// observations are never turned into memory. Their envelopes survive
+/// (spec 12 §3: envelope survival past payload expiry is structural), so the
+/// record that they happened remains — but the loss has a clock, because
+/// `observation_payload` lives under a TTL and re-consolidating them later is
+/// only possible while their payloads exist.
+///
+/// Idempotent: abandoning a window the cursor has already passed changes
+/// nothing and writes nothing, so a repeated command is a no-op rather than a
+/// `UNIQUE` violation on `audit_event`.
+pub fn abandon_run(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Result<AbandonOutcome, RepairError>> {
+    let row: Option<(String, String, i64, i64, i64, Option<String>)> = tx
+        .query_row(
+            "SELECT session_id, state, from_received_seq, to_received_seq, attempt_count, \
+                    last_failure_reason \
+             FROM consolidation_run WHERE run_id = ?1",
+            params![run_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((session_id, raw_state, from_seq, to_seq, attempt_count, reason)) = row else {
+        return Ok(Err(RepairError::NotBlocked));
+    };
+    let state = RunState::from_db(&raw_state).ok_or_else(|| {
+        Error::FromSqlConversionFailure(
+            1,
+            Type::Text,
+            format!("invalid consolidation_run.state {raw_state:?}").into(),
+        )
+    })?;
+    if state != RunState::Failed {
+        return Ok(Err(RepairError::NotFailed {
+            run_id: run_id.to_string(),
+            state,
+        }));
+    }
+
+    let cursor = processing_cursor(tx, &session_id)?.unwrap_or(0);
+    if cursor >= to_seq {
+        return Ok(Ok(AbandonOutcome::AlreadyPast));
+    }
+
+    let skipped: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM observation_envelope \
+         WHERE session_id = ?1 AND received_seq > ?2 AND received_seq <= ?3",
+        params![session_id, cursor, to_seq],
+        |r| r.get(0),
+    )?;
+
+    upsert_processing_cursor(tx, &session_id, to_seq)?;
+
+    // `entity_version` has no natural value for a run — it carries no version
+    // column. `attempt_count` is the one monotonic number it does have, which
+    // both dates the act and keeps repeated repairs distinguishable under
+    // `UNIQUE (entity_kind, entity_id, entity_version)`.
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "from_received_seq": from_seq,
+        "to_received_seq": to_seq,
+        "cursor_advanced_from": cursor,
+        "observations_skipped": skipped,
+        "last_failure_reason": reason,
+    })
+    .to_string();
+    insert_audit_event(
+        tx,
+        &NewAuditEvent {
+            entity_kind: AUDIT_ENTITY_CONSOLIDATION_RUN,
+            entity_id: run_id,
+            entity_version: attempt_count,
+            op: "abandon",
+            actor: Actor::User,
+            idempotency_key: None,
+            payload: Some(&payload),
+        },
+        now_ms,
+    )?;
+    Ok(Ok(AbandonOutcome::Abandoned {
+        session_id,
+        observations_skipped: skipped,
+    }))
+}
+
+/// What [`abandon_run`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbandonOutcome {
+    Abandoned {
+        session_id: String,
+        observations_skipped: i64,
+    },
+    /// The cursor was already past this window — a repeat of an abandon that
+    /// already happened. Nothing written.
+    AlreadyPast,
 }
 
 /// `consolidation_run.last_failure_kind` (D-050's retry-storm circuit
