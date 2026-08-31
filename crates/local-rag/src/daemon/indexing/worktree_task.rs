@@ -1202,6 +1202,49 @@ mod tests {
         handle.stop().await;
     }
 
+    /// Every generation with the content it actually recorded, one line each.
+    ///
+    /// D-114: a bare `COUNT(*)` turns every failure of the test below into the
+    /// same `left: 3, right: 2` and says nothing about *which* extra generation
+    /// was minted — and the three candidate mechanisms are told apart by
+    /// exactly that. A duplicate of the previous content means the `D-089` skip
+    /// lost its `last_built`; a generation carrying the *pre-edit* bytes means a
+    /// `Fast` reconcile put a stale manifest on top of a `Strict` one; a
+    /// zero-byte one means a scan observed the tree mid-write. So the assertion
+    /// carries the content hash and size of every file in every generation.
+    fn generation_contents(state: &StateDb) -> Vec<String> {
+        let conn = state.open_read().expect("read conn");
+        let mut stmt = conn
+            .prepare(
+                "SELECT g.generation_number, g.generation_id, g.created_at, \
+                        gf.normalized_path, fr.content_hash, fr.source_size \
+                 FROM generation g \
+                 LEFT JOIN generation_file gf ON gf.generation_id = g.generation_id \
+                 LEFT JOIN file_revision fr ON fr.file_revision_id = gf.file_revision_id \
+                 ORDER BY g.generation_number, gf.normalized_path",
+            )
+            .expect("prepare generation dump");
+        stmt.query_map([], |r| {
+            let number: i64 = r.get(0)?;
+            let id: String = r.get(1)?;
+            let created_at: i64 = r.get(2)?;
+            let path: Option<String> = r.get(3)?;
+            let hash: Option<String> = r.get(4)?;
+            let size: Option<i64> = r.get(5)?;
+            Ok(format!(
+                "  #{number} {id} created_at={created_at} path={} hash={} size={}",
+                path.unwrap_or_else(|| "<none>".into()),
+                hash.map(|h| h[..h.len().min(12)].to_string())
+                    .unwrap_or_else(|| "<none>".into()),
+                size.map(|s| s.to_string())
+                    .unwrap_or_else(|| "<none>".into()),
+            ))
+        })
+        .expect("query generation dump")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect generation dump")
+    }
+
     /// D-089: repeated triggers over an unchanged tree cost one generation, not
     /// one per trigger.
     ///
@@ -1249,15 +1292,13 @@ mod tests {
         })
         .await;
 
-        let generations: i64 = state
-            .open_read()
-            .expect("read conn")
-            .query_row("SELECT COUNT(*) FROM generation", [], |r| r.get(0))
-            .expect("count generations");
+        let built = generation_contents(&state);
         assert_eq!(
-            generations, 2,
+            built.len(),
+            2,
             "one generation for the cold start and one for the edit; the three \
-             triggers over an unchanged tree must have minted nothing"
+             triggers over an unchanged tree must have minted nothing. Built:\n{}",
+            built.join("\n")
         );
 
         handle.stop().await;
@@ -1549,9 +1590,13 @@ mod tests {
         })
         .await;
         // The tick that set `last_generation_id` has, by definition, already
-        // dropped its guard (T20-05's own project_one drops `_job` before
-        // updating `status`).
-        assert_eq!(jobs.len(), 0, "idle again once the tick has finished");
+        // dropped its guard (T20-05's own `project_one` drops `_job` before
+        // updating `status`) — but nothing stops the *next* tick from having
+        // started by the moment this line runs (D-114). A registry that is
+        // momentarily non-empty is a legitimate state and says nothing about
+        // the invariant; a registry that never empties again is the actual
+        // defect. So wait for the empty state rather than sampling for it.
+        wait_for(Duration::from_secs(10), || jobs.is_empty()).await;
 
         handle.stop().await;
     }

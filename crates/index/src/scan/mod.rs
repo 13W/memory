@@ -73,7 +73,11 @@ pub struct ManifestEntry {
     pub normalized_path: String,
     /// The path's preserved original spelling.
     pub display_path: String,
-    /// File size in bytes (from stat).
+    /// File size in bytes, of the same observation `content_hash` describes:
+    /// the length of the bytes this scan read, or the walk's stat size when it
+    /// read none (`huge`, or a hash reused from the advisory cache whose key
+    /// already matched that stat). D-114: taking it unconditionally from the
+    /// walk let an entry pair an old size with a new hash.
     pub size: u64,
     /// Exact-content `H(file_content)` (spec 03 §1.2), directly comparable to
     /// `file_revision.content_hash`. `None` iff the file exceeds the size cap
@@ -136,19 +140,30 @@ pub fn scan(
     let mut entries = Vec::new();
 
     for candidate in walk_candidates(root, kind, case, prune_roots)? {
-        let size = candidate.metadata.len();
-        let content_hash = if size > max_file_size_bytes {
+        let stat_size = candidate.metadata.len();
+        // D-114: `size` must describe the very bytes `content_hash` describes.
+        // The walk's stat and the content read are two separate observations of
+        // a live filesystem, and an edit landing between them used to produce an
+        // entry pairing the *old* size with the *new* hash — a manifest for a
+        // state the tree was never in. It differs from both neighbours, so the
+        // `D-089` skip cannot fire, and the very next reconcile rebuilds the
+        // identical content into a second generation. Every generation is a
+        // permanent pin root (spec 06 §5), which is exactly the cost `D-089`
+        // exists to avoid. So when this scan reads the bytes, their length wins;
+        // the stat size is kept only where no read happened.
+        let (size, content_hash) = if stat_size > max_file_size_bytes {
             // `huge`: stat-only, bytes never read (spec 06 §2.2 reason 2).
-            None
+            (stat_size, None)
         } else {
-            Some(resolve_content_hash(
+            let (hash, read_len) = resolve_content_hash(
                 &candidate.path,
                 &candidate.normalized_path,
                 &candidate.metadata,
                 mode,
                 cache,
                 &mut stats,
-            )?)
+            )?;
+            (read_len.unwrap_or(stat_size), Some(hash))
         };
 
         entries.push(ManifestEntry {
@@ -303,6 +318,10 @@ fn walk_candidates(
 
 /// Resolve a candidate's `content_hash`, using the advisory cache in
 /// [`ScanMode::Fast`] and always reading in [`ScanMode::Strict`] (spec 06 §1).
+/// Returns the hash and, when this scan actually read the bytes, their length —
+/// so the caller can record a `size` that belongs to the same observation as the
+/// hash (D-114). `None` means the hash came from the advisory cache, whose key
+/// already carried the matching stat size.
 fn resolve_content_hash(
     path: &Path,
     normalized_path: &str,
@@ -310,7 +329,7 @@ fn resolve_content_hash(
     mode: ScanMode,
     cache: &mut StatCache,
     stats: &mut ScanStats,
-) -> io::Result<String> {
+) -> io::Result<(String, Option<u64>)> {
     let key = StatKey::from_metadata(metadata);
 
     // Fast consults the advisory cache; Strict always reads (spec 06 §1).
@@ -320,7 +339,7 @@ fn resolve_content_hash(
     };
     if let Some(hash) = cached {
         stats.reused += 1;
-        return Ok(hash.to_string());
+        return Ok((hash.to_string(), None));
     }
 
     // Miss / doubt / strict → read the exact bytes and hash them with the store's
@@ -330,7 +349,7 @@ fn resolve_content_hash(
     let hash = content_hash(&bytes);
     cache.record(normalized_path.to_string(), key, hash.clone());
     stats.hashed += 1;
-    Ok(hash)
+    Ok((hash, Some(bytes.len() as u64)))
 }
 
 /// The set of subtree roots the walk must prune: the internal `.git` plus any
