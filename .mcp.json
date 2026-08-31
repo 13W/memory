@@ -3,7 +3,7 @@
     "likec4": {
       "type": "stdio",
       "command": "likec4",
-      "args": ["mcp", "--stdio", "${CLAUDE_PROJECT_DIR}/docs/architecture"],
+      "args": ["mcp", "--stdio", "docs/architecture"],
       "env": {
         "GEMINI_API_KEY": ""
       }
