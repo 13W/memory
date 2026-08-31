@@ -506,11 +506,25 @@ pub enum SnapshotOutcome {
 }
 
 /// The most recently created non-`applied` run for `session_id`, if any.
-fn latest_non_applied_run(
-    tx: &Transaction<'_>,
+/// The row that blocks this session right now: its latest non-`applied` run.
+///
+/// `pub(crate)` and taking a `&Connection` rather than a `&Transaction` so the
+/// rule has exactly one definition (`T23-02`). `open_next_run` asks it inside a
+/// transaction — a `Transaction` derefs to `Connection`, so that call is
+/// unchanged — and [`stats::pending_backlog_by_session`](super::stats::pending_backlog_by_session)
+/// asks it on a read connection to name what a session is waiting on.
+///
+/// D-072 is the reason this is a different question from
+/// [`stuck_consolidation_runs`](super::stats::stuck_consolidation_runs)'s, which
+/// keys off the latest **`failed`** run instead: that report asks whether
+/// anything will ever act on a row again, and a transient `running` neighbour
+/// must not change its answer. This one asks what stands in the way of opening
+/// the next window, and there a `running` neighbour is precisely the answer.
+pub(crate) fn latest_non_applied_run(
+    conn: &Connection,
     session_id: &str,
 ) -> rusqlite::Result<Option<(String, RunState, Option<i64>)>> {
-    tx.query_row(
+    conn.query_row(
         "SELECT run_id, state, lease_until FROM consolidation_run \
          WHERE session_id = ?1 AND state != 'applied' \
          ORDER BY created_at DESC LIMIT 1",

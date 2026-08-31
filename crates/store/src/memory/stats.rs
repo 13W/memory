@@ -11,7 +11,9 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, Error, params};
 
 use super::candidate::CandidateState;
-use super::consolidation::{RunState, pending_backlog, sessions_with_pending_backlog};
+use super::consolidation::{
+    RunState, latest_non_applied_run, pending_backlog, sessions_with_pending_backlog,
+};
 use super::entry::{MemoryKind, MemoryState};
 
 /// One `(kind, state, count)` bucket of [`memory_entry_counts`].
@@ -297,4 +299,189 @@ pub fn stuck_consolidation_runs(
         })
     })?
     .collect()
+}
+
+/// What is standing between a session's backlog and the next window
+/// (`T23-02`, `D-119`).
+///
+/// The point of naming these is that four of the six resolve themselves and two
+/// do not, and until this type existed no report said which was which: `stats`
+/// printed one backlog total, and the distribution — the thing that answers
+/// "is this system slow or stopped" — was reachable only by hand-written SQL.
+/// On the store that prompted `D-119`, 1368 of 1373 backlogged observations sat
+/// behind two [`BacklogBlocker::Parked`] sessions while every other number
+/// looked healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BacklogBlocker {
+    /// Nothing. Every run this session has ever opened reached `applied`, so
+    /// the next trigger tick opens a window and the backlog moves. The
+    /// ordinary answer for a live session.
+    None,
+    /// A run is executing, or holds a lease that has not yet expired. Wait.
+    InProgress { run_id: String },
+    /// A `failed` run that [`stale_runs`](super::consolidation::stale_runs)
+    /// will pick up again — either not yet dead-lettered, or dead-lettered by
+    /// a *different* build, which is the escape spec 08 §4 describes. Resolves
+    /// itself.
+    Retryable { run_id: String, attempt_count: i64 },
+    /// A context-overflow dead-letter with room left in `D-058`'s ladder:
+    /// `open_next_run` opens a window half this one's size on the next tick.
+    /// Resolves itself, and the field says how far there is left to fall.
+    Shrinking {
+        run_id: String,
+        window_observations: i64,
+    },
+    /// `D-058`'s floor — a window already down to a single observation that
+    /// still overflows the model's context. The same set
+    /// [`unconsolidatable_sessions`](super::consolidation::unconsolidatable_sessions)
+    /// reports. Needs a human.
+    Floored { run_id: String },
+    /// `D-117`: a `mechanical` dead-letter on the running build that is **not**
+    /// a context overflow. Nothing retries it —
+    /// [`stale_runs`](super::consolidation::stale_runs) excludes it by design
+    /// (`D-050`'s guard against the retry storm) — and nothing shrinks it,
+    /// because `D-058`'s ladder only applies to overflows. In a released
+    /// binary, whose `BUILD_ID` is fixed for the life of the release, the
+    /// rebuild spec 08 §4 offers as the escape does not exist, so this session
+    /// is stopped permanently.
+    Parked {
+        run_id: String,
+        attempt_count: i64,
+        /// Truncated to [`STUCK_RUN_REASON_MAX_CHARS`], like
+        /// [`StuckRunRow::last_failure_reason`].
+        reason: Option<String>,
+    },
+}
+
+/// One session's un-consolidated observations and what is holding them
+/// (`T23-02`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBacklog {
+    pub session_id: String,
+    /// Observations past this session's `processing_cursor` — the same figure
+    /// [`pending_backlog`] returns, and the same unit
+    /// [`total_pending_backlog`] sums.
+    pub backlog: i64,
+    pub blocker: BacklogBlocker,
+}
+
+/// [`total_pending_backlog`], broken down by session and by cause (`T23-02`,
+/// `D-119`).
+///
+/// Composes the same two primitives [`total_pending_backlog`] does —
+/// [`sessions_with_pending_backlog`] and [`pending_backlog`] — so the rows sum
+/// to that total by construction rather than by a second aggregate that could
+/// drift from it. `sessions_with_pending_backlog` already returns only sessions
+/// whose newest observation is past their cursor, so a session with nothing
+/// outstanding never appears: on the store that prompted this, 21 of the 25
+/// sessions carrying a `failed` run are simply absent, because their cursor has
+/// long since passed them and their leftover row blocks nothing.
+///
+/// The blocker comes from
+/// [`latest_non_applied_run`](super::consolidation::latest_non_applied_run) —
+/// the same row `open_next_run` consults — so this reports what actually stands
+/// in the way, not a second opinion about it.
+///
+/// Ordered by backlog descending, then by `session_id`: an operator reading a
+/// truncated report needs the worst session first, and the tiebreak keeps the
+/// output stable across calls on an unchanged store.
+pub fn pending_backlog_by_session(
+    conn: &Connection,
+    current_build_id: &str,
+) -> rusqlite::Result<Vec<SessionBacklog>> {
+    let mut out = Vec::new();
+    for session_id in sessions_with_pending_backlog(conn)? {
+        let backlog = pending_backlog(conn, &session_id)?;
+        let blocker = blocker_for(conn, &session_id, current_build_id)?;
+        out.push(SessionBacklog {
+            session_id,
+            backlog,
+            blocker,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.backlog
+            .cmp(&a.backlog)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    Ok(out)
+}
+
+/// Classify the row `open_next_run` would find in this session's way.
+fn blocker_for(
+    conn: &Connection,
+    session_id: &str,
+    current_build_id: &str,
+) -> rusqlite::Result<BacklogBlocker> {
+    let Some((run_id, state, _lease_until)) = latest_non_applied_run(conn, session_id)? else {
+        return Ok(BacklogBlocker::None);
+    };
+    if state != RunState::Failed {
+        return Ok(BacklogBlocker::InProgress { run_id });
+    }
+
+    let (kind, fingerprint, overflow, attempt_count, reason, from_seq, to_seq): (
+        Option<String>,
+        Option<String>,
+        bool,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+    ) = conn.query_row(
+        "SELECT last_failure_kind, last_failure_fingerprint, last_failure_context_overflow, \
+                attempt_count, last_failure_reason, from_received_seq, to_received_seq \
+         FROM consolidation_run WHERE run_id = ?1",
+        params![run_id],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        },
+    )?;
+
+    // The same two conditions `stale_runs` tests, in the same order: a failure
+    // that is not `mechanical`, or one fingerprinted by a build other than the
+    // one running, is still retry-eligible.
+    let dead_lettered =
+        kind.as_deref() == Some("mechanical") && fingerprint.as_deref() == Some(current_build_id);
+    if !dead_lettered {
+        return Ok(BacklogBlocker::Retryable {
+            run_id,
+            attempt_count,
+        });
+    }
+    if !overflow {
+        return Ok(BacklogBlocker::Parked {
+            run_id,
+            attempt_count,
+            reason: truncate_reason(reason),
+        });
+    }
+
+    // An overflow dead-letter: `dead_letter_shrink_decision` halves it while
+    // more than one observation remains, and floors otherwise. Counted the way
+    // that function counts it — rows in the window, not the `received_seq`
+    // span, which is a store-wide sequence and says nothing about this
+    // session's row count (`D-052`).
+    let window_observations: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM observation_envelope \
+         WHERE session_id = ?1 AND received_seq BETWEEN ?2 AND ?3",
+        params![session_id, from_seq, to_seq],
+        |r| r.get(0),
+    )?;
+    if window_observations <= 1 {
+        Ok(BacklogBlocker::Floored { run_id })
+    } else {
+        Ok(BacklogBlocker::Shrinking {
+            run_id,
+            window_observations,
+        })
+    }
 }

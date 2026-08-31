@@ -17,17 +17,18 @@ use local_rag_core::hash::sha256_hex;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
-    Actor, CandidateState, CandidateTransitionError, CreateMemoryEntryError, GLOBAL_SCOPE_OWNER_ID,
-    IllegalCandidateTransition, IllegalMemoryTransition, IllegalRunTransition, MemoryCountRow,
-    MemoryKind, MemoryState, MemoryTransitionError, NewAuditEvent, NewCandidate,
-    NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence, RunCountRow, RunState,
-    RunTransitionError, STUCK_RUN_ATTEMPT_THRESHOLD, STUCK_RUN_REASON_MAX_CHARS, ScopeKind,
-    active_entries_for_scope, active_entry_with_text, candidate_state, canonical_key_owner,
-    consolidation_run_counts, consolidation_run_state, create_candidate, create_consolidation_run,
-    create_memory_entry, insert_audit_event, insert_candidate_evidence, insert_memory_evidence,
-    list_memory_entries_for_scope, memory_entry_by_id, memory_entry_counts, memory_entry_state,
-    memory_entry_summary, memory_evidence_for, observations_applied_since,
-    oldest_open_run_created_at, processing_cursor, read_audit_events_for_entity,
+    Actor, BacklogBlocker, CandidateState, CandidateTransitionError, CreateMemoryEntryError,
+    GLOBAL_SCOPE_OWNER_ID, IllegalCandidateTransition, IllegalMemoryTransition,
+    IllegalRunTransition, MemoryCountRow, MemoryKind, MemoryState, MemoryTransitionError,
+    NewAuditEvent, NewCandidate, NewConsolidationRun, NewMemoryEntry, NewMemoryEvidence,
+    RunCountRow, RunState, RunTransitionError, STUCK_RUN_ATTEMPT_THRESHOLD,
+    STUCK_RUN_REASON_MAX_CHARS, ScopeKind, active_entries_for_scope, active_entry_with_text,
+    candidate_state, canonical_key_owner, consolidation_run_counts, consolidation_run_state,
+    create_candidate, create_consolidation_run, create_memory_entry, insert_audit_event,
+    insert_candidate_evidence, insert_memory_evidence, list_memory_entries_for_scope,
+    memory_entry_by_id, memory_entry_counts, memory_entry_state, memory_entry_summary,
+    memory_evidence_for, observations_applied_since, oldest_open_run_created_at,
+    pending_backlog_by_session, processing_cursor, read_audit_events_for_entity,
     recall_candidates_for_scope, stuck_consolidation_runs, total_pending_backlog,
     transition_candidate, transition_memory_entry, transition_run, upsert_processing_cursor,
 };
@@ -1990,6 +1991,216 @@ async fn total_pending_backlog_sums_pending_backlog_across_every_session() {
         3,
         "sess-b caught up (backlog 0, drops out of the sum); sess-a's 3 own rows remain"
     );
+}
+
+/// `T23-02`: the breakdown is the total, split. If these two ever disagree, one
+/// of them is lying to an operator about whether the system is slow or stopped,
+/// and `D-119` exists because the total alone could not tell them apart.
+#[tokio::test]
+async fn pending_backlog_by_session_sums_to_the_total() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+
+    let read = db.open_read().expect("read conn");
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    let total = total_pending_backlog(&read).expect("total backlog");
+
+    assert_eq!(
+        rows.iter().map(|r| r.backlog).sum::<i64>(),
+        total,
+        "the per-session rows must sum to the reported total, got {rows:?}"
+    );
+    assert_eq!(total, 5, "2 own rows (sess-b) + 3 own rows (sess-a)");
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sess-a", "sess-b"],
+        "worst backlog first, then session_id -- an operator reads the top row"
+    );
+}
+
+/// A session whose cursor has caught up drops out entirely rather than
+/// appearing with a zero: on the store that prompted `D-119`, 21 of the 25
+/// sessions carrying a leftover `failed` run are in exactly this state, and
+/// listing them would bury the four that matter.
+#[tokio::test]
+async fn a_caught_up_session_is_absent_rather_than_zero() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    db.writer()
+        .transaction(|tx| upsert_processing_cursor(tx, "sess-b", 2))
+        .await
+        .expect("catch sess-b up");
+
+    let read = db.open_read().expect("read conn");
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sess-a"],
+        "sess-b has nothing outstanding, so it is not waiting on anything"
+    );
+}
+
+/// The distinction the whole card buys: a `mechanical` dead-letter that is not
+/// a context overflow is `Parked` -- nothing retries it, nothing shrinks it --
+/// while the same row with the overflow flag set is `Shrinking`, because
+/// `D-058`'s ladder will open a narrower window on the next tick. Calling the
+/// first one retryable is how 1368 observations sat still while every number
+/// above them looked healthy.
+#[tokio::test]
+async fn a_mechanical_non_overflow_dead_letter_is_parked_not_retryable() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        1,
+        3,
+        FailureKind::Mechanical,
+        false,
+        "build-1",
+        "boom",
+        2,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    let a = rows
+        .iter()
+        .find(|r| r.session_id == "sess-a")
+        .expect("sess-a present");
+    match &a.blocker {
+        BacklogBlocker::Parked {
+            run_id,
+            attempt_count,
+            reason,
+        } => {
+            assert_eq!(run_id, "run-a");
+            assert_eq!(*attempt_count, 2);
+            assert_eq!(reason.as_deref(), Some("boom"));
+        }
+        other => panic!("expected Parked, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_context_overflow_dead_letter_is_shrinking_while_the_window_has_room() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    // sess-a owns rows 3..=5, so this window holds three observations.
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        3,
+        5,
+        FailureKind::Mechanical,
+        true,
+        "build-1",
+        "overflow",
+        1,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    let a = rows
+        .iter()
+        .find(|r| r.session_id == "sess-a")
+        .expect("sess-a present");
+    assert_eq!(
+        a.blocker,
+        BacklogBlocker::Shrinking {
+            run_id: "run-a".to_string(),
+            window_observations: 3,
+        },
+        "three observations left to halve, so `open_next_run` still has room"
+    );
+}
+
+/// A dead-letter fingerprinted by a *different* build is retryable, and saying
+/// so matters: that is exactly the escape spec 08 §4 offers, and it is the one
+/// `D-117` establishes does not exist in a released binary.
+#[tokio::test]
+async fn a_dead_letter_from_another_build_is_retryable() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+    seed_failed_run(
+        &db,
+        "run-a",
+        "sess-a",
+        1,
+        3,
+        FailureKind::Mechanical,
+        false,
+        "build-0",
+        "boom",
+        1,
+        1_000,
+    )
+    .await;
+
+    let read = db.open_read().expect("read conn");
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    let a = rows
+        .iter()
+        .find(|r| r.session_id == "sess-a")
+        .expect("sess-a present");
+    assert_eq!(
+        a.blocker,
+        BacklogBlocker::Retryable {
+            run_id: "run-a".to_string(),
+            attempt_count: 1,
+        },
+        "`stale_runs` picks this row up, so it is not parked"
+    );
+}
+
+#[tokio::test]
+async fn a_session_with_no_open_run_is_blocked_by_nothing() {
+    let (_home, db) = open_state();
+    seed_backlog_sessions(&db).await;
+
+    let read = db.open_read().expect("read conn");
+    let rows = pending_backlog_by_session(&read, "build-1").expect("by session");
+    assert!(
+        rows.iter().all(|r| r.blocker == BacklogBlocker::None),
+        "no run has been opened for either session, got {rows:?}"
+    );
+}
+
+/// Two sessions, one global `received_seq`: sess-b takes 1..=2, sess-a 3..=5.
+/// The same shape `total_pending_backlog`'s own test uses, for the same `D-052`
+/// reason -- `received_seq` is one sequence shared by every session.
+async fn seed_backlog_sessions(db: &StateDb) {
+    db.writer()
+        .transaction(|tx| {
+            for (oid, evt, sess) in [
+                ("obs-b1", "evt-b1", "sess-b"),
+                ("obs-b2", "evt-b2", "sess-b"),
+                ("obs-a1", "evt-a1", "sess-a"),
+                ("obs-a2", "evt-a2", "sess-a"),
+                ("obs-a3", "evt-a3", "sess-a"),
+            ] {
+                tx.execute(
+                    "INSERT INTO observation_envelope \
+                       (observation_id, source_event_id, payload_hash, event_type, \
+                        evidence_kind, trust, session_id) \
+                     VALUES (?1, ?2, 'deadbeef', 'Stop', 'user_statement', 'normal', ?3)",
+                    [oid, evt, sess],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed envelopes across two sessions");
 }
 
 #[tokio::test]

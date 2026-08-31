@@ -8,13 +8,13 @@ use std::process::ExitCode;
 
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
-    CURRENT_NORMALIZER_VERSION, NormalizationBacklog, NormalizationCountRow, RequestRoot,
-    Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, StuckRunRow, UnconsolidatableSession,
-    consolidation_run_counts, generation_meta_for_worktree, memory_entry_counts,
-    normalization_backlog, normalization_counts, observation_envelope_count,
-    observations_applied_since, oldest_open_run_created_at, pending_candidate_counts,
-    projection_state, resolve, store_instance_uuid, stuck_consolidation_runs,
-    total_pending_backlog, unconsolidatable_sessions,
+    BacklogBlocker, CURRENT_NORMALIZER_VERSION, NormalizationBacklog, NormalizationCountRow,
+    RequestRoot, Resolution, STUCK_RUN_ATTEMPT_THRESHOLD, SessionBacklog, StuckRunRow,
+    UnconsolidatableSession, consolidation_run_counts, generation_meta_for_worktree,
+    memory_entry_counts, normalization_backlog, normalization_counts, observation_envelope_count,
+    observations_applied_since, oldest_open_run_created_at, pending_backlog_by_session,
+    pending_candidate_counts, projection_state, resolve, store_instance_uuid,
+    stuck_consolidation_runs, total_pending_backlog, unconsolidatable_sessions,
 };
 
 use local_rag::daemon::gitroot;
@@ -64,6 +64,24 @@ struct ConsolidationStats {
     /// run was on its 627th attempt — this is the line that would have said
     /// so.
     stuck_runs: Vec<StuckRunRow>,
+    /// T23-02 (`D-119`): `pending_backlog_total`, split by session and by
+    /// cause. The total alone cannot tell a slow store from a stopped one —
+    /// on the store that prompted this, 1368 of 1373 backlogged observations
+    /// sat behind two permanently parked sessions, and finding that out took
+    /// hand-written SQL.
+    backlog_by_session: Vec<SessionBacklog>,
+    /// The build every `blocker` above is relative to (`T23-02`).
+    ///
+    /// Not decoration. Whether a dead-letter is `Parked` or `Retryable` turns
+    /// on whether its fingerprint matches the *running* build, and this report
+    /// answers for the binary printing it — which in a source checkout is not
+    /// the binary the daemon is running. Caught live: a freshly built CLI
+    /// called two permanently parked sessions "retryable", correctly for
+    /// itself and misleadingly for the daemon. Naming the frame of reference
+    /// costs one line and removes the ambiguity; `stuck_consolidation_runs`
+    /// and `unconsolidatable_sessions` have had the same dependence since
+    /// D-071/D-058 and never said so.
+    blocker_build_id: String,
 }
 
 fn compute_consolidation_stats(
@@ -93,6 +111,7 @@ fn compute_consolidation_stats(
     let unconsolidatable = unconsolidatable_sessions(conn, local_rag_core::BUILD_ID)?;
     let stuck_runs =
         stuck_consolidation_runs(conn, local_rag_core::BUILD_ID, STUCK_RUN_ATTEMPT_THRESHOLD)?;
+    let backlog_by_session = pending_backlog_by_session(conn, local_rag_core::BUILD_ID)?;
     Ok(ConsolidationStats {
         runs_by_state,
         pending_backlog_total,
@@ -102,7 +121,82 @@ fn compute_consolidation_stats(
         oldest_pending_run_created_at,
         unconsolidatable,
         stuck_runs,
+        backlog_by_session,
+        blocker_build_id: local_rag_core::BUILD_ID.to_string(),
     })
+}
+
+/// One [`SessionBacklog`] as a single human-readable line (`T23-02`).
+///
+/// The blocker is the point of the line, so it comes last and in words: an
+/// operator scanning this needs to know whether to wait or to act, and four of
+/// the six cases resolve themselves.
+fn describe_session_backlog(s: &SessionBacklog) -> String {
+    let what = match &s.blocker {
+        BacklogBlocker::None => "waiting for the next tick".to_string(),
+        BacklogBlocker::InProgress { run_id } => format!("run {run_id} in flight"),
+        BacklogBlocker::Retryable {
+            run_id,
+            attempt_count,
+        } => format!("run {run_id} failed {attempt_count}x, will be retried"),
+        BacklogBlocker::Shrinking {
+            run_id,
+            window_observations,
+        } => format!(
+            "run {run_id} overflowed the model context; next window halves {window_observations} \
+             observations"
+        ),
+        BacklogBlocker::Floored { run_id } => format!(
+            "run {run_id} overflows on a single observation — needs a human, nothing narrower left"
+        ),
+        BacklogBlocker::Parked {
+            run_id,
+            attempt_count,
+            reason,
+        } => format!(
+            "PARKED on run {run_id} after {attempt_count} attempts — nothing retries or shrinks \
+             it: {}",
+            reason.as_deref().unwrap_or("(no reason recorded)")
+        ),
+    };
+    format!(
+        "session {} — {} observation(s) — {what}",
+        s.session_id, s.backlog
+    )
+}
+
+/// [`BacklogBlocker`] as JSON: a `kind` discriminator plus only the fields that
+/// case carries, rather than a wide row of nulls (`T23-02`).
+pub(super) fn blocker_json(b: &BacklogBlocker) -> serde_json::Value {
+    match b {
+        BacklogBlocker::None => serde_json::json!({ "kind": "none" }),
+        BacklogBlocker::InProgress { run_id } => {
+            serde_json::json!({ "kind": "in_progress", "run_id": run_id })
+        }
+        BacklogBlocker::Retryable {
+            run_id,
+            attempt_count,
+        } => serde_json::json!({
+            "kind": "retryable", "run_id": run_id, "attempt_count": attempt_count,
+        }),
+        BacklogBlocker::Shrinking {
+            run_id,
+            window_observations,
+        } => serde_json::json!({
+            "kind": "shrinking", "run_id": run_id, "window_observations": window_observations,
+        }),
+        BacklogBlocker::Floored { run_id } => {
+            serde_json::json!({ "kind": "floored", "run_id": run_id })
+        }
+        BacklogBlocker::Parked {
+            run_id,
+            attempt_count,
+            reason,
+        } => serde_json::json!({
+            "kind": "parked", "run_id": run_id, "attempt_count": attempt_count,
+            "reason": reason,
+        }),
+    }
 }
 
 /// One [`StuckRunRow`] as a single human-readable line (D-071) — the run, its
@@ -348,6 +442,12 @@ pub fn run(args: StatsArgs) -> ExitCode {
                     "from_received_seq": s.from_received_seq,
                     "to_received_seq": s.to_received_seq,
                 })).collect::<Vec<_>>(),
+                "blocker_build_id": consolidation.blocker_build_id,
+                "backlog_by_session": consolidation.backlog_by_session.iter().map(|s| serde_json::json!({
+                    "session_id": s.session_id,
+                    "backlog": s.backlog,
+                    "blocker": blocker_json(&s.blocker),
+                })).collect::<Vec<_>>(),
                 "stuck_runs": consolidation.stuck_runs.iter().map(|r| serde_json::json!({
                     "run_id": r.run_id,
                     "session_id": r.session_id,
@@ -438,6 +538,19 @@ pub fn run(args: StatsArgs) -> ExitCode {
     match consolidation.oldest_pending_run_created_at {
         Some(ms) => println!("consolidation oldest pending run created_at: {ms}"),
         None => println!("consolidation oldest pending run: none (fully caught up)"),
+    }
+    // T23-02: where the backlog actually is. Silent on a caught-up store,
+    // because `pending_backlog_by_session` only lists sessions with something
+    // outstanding — so this costs a healthy store no lines at all.
+    if !consolidation.backlog_by_session.is_empty() {
+        println!(
+            "consolidation backlog by session: {} session(s) (blockers as seen by build {})",
+            consolidation.backlog_by_session.len(),
+            consolidation.blocker_build_id,
+        );
+        for s in &consolidation.backlog_by_session {
+            println!("  {}", describe_session_backlog(s));
+        }
     }
     // D-058: silent when empty — the overwhelmingly common case — so this
     // never adds noise to a healthy store; every line printed here names a

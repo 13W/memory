@@ -44,15 +44,16 @@ use local_rag_projection::{
     BruteForceProjectionStore, DenseCheckOutcome, ModelSwitchError, check_dense,
 };
 use local_rag_store::{
-    CURRENT_NORMALIZER_VERSION, CacheDb, CacheDiagnosis, DEFAULT_MODEL_SPACE_ID,
+    BacklogBlocker, CURRENT_NORMALIZER_VERSION, CacheDb, CacheDiagnosis, DEFAULT_MODEL_SPACE_ID,
     DeadLetteredNormalization, FtsAvailability, FtsCheckOutcome, HousekeepingError,
     NormalizationBacklog, NormalizationCountRow, SHARD_DESTROY_GRACE_MS,
-    STUCK_RUN_ATTEMPT_THRESHOLD, ShardSweepReport, StateDb, StuckRunRow, ValidationDepth,
-    VersionDiagnosis, WorktreeIndexingStatus, all_worktree_ids, check_fts, current_worktree_path,
-    dead_lettered_normalizations, generation_meta_for_worktree, indexing_status, managed_worktrees,
-    normalization_backlog, normalization_counts, requires_index_unavailable,
-    run_expired_shard_sweep, run_orphan_shard_sweep, run_unreferenced_space_sweep,
-    store_instance_uuid, stuck_consolidation_runs,
+    STUCK_RUN_ATTEMPT_THRESHOLD, SessionBacklog, ShardSweepReport, StateDb, StuckRunRow,
+    ValidationDepth, VersionDiagnosis, WorktreeIndexingStatus, all_worktree_ids, check_fts,
+    current_worktree_path, dead_lettered_normalizations, generation_meta_for_worktree,
+    indexing_status, managed_worktrees, normalization_backlog, normalization_counts,
+    pending_backlog_by_session, requires_index_unavailable, run_expired_shard_sweep,
+    run_orphan_shard_sweep, run_unreferenced_space_sweep, store_instance_uuid,
+    stuck_consolidation_runs,
 };
 
 use local_rag::daemon::{StoreLockFileState, read_store_lock_file};
@@ -191,8 +192,18 @@ const DETECTOR_LIMITATION: &str = "detects scripts, not languages: Latin-script 
 /// report still said `clean`. Non-empty means a human has to look: every row
 /// is either not converging or permanently parked.
 pub enum ConsolidationFinding {
-    Skipped { reason: String },
-    Checked(Vec<StuckRunRow>),
+    Skipped {
+        reason: String,
+    },
+    Checked {
+        stuck_runs: Vec<StuckRunRow>,
+        /// `T23-02` (`D-119`): where the un-consolidated backlog actually is,
+        /// and what is holding each session. Reported beside the stuck runs
+        /// rather than as a section of its own, because they answer two halves
+        /// of one question — a stuck run says a unit of work failed, this says
+        /// how much is waiting behind it and whether anything will move it.
+        backlog: Vec<SessionBacklog>,
+    },
 }
 
 /// X-008: the background-indexing section — one entry per worktree.
@@ -346,9 +357,14 @@ impl DoctorReport {
         // stuck generation is — work the system performed and could not
         // land. A dead-lettered run additionally blocks its whole session's
         // backlog until the binary is rebuilt.
+        // T23-02 deliberately does NOT widen this: the backlog breakdown names
+        // a cause, it does not add a fault. A session parked behind a
+        // dead-letter already appears in `stuck_runs` above and already makes
+        // this red, so keying the verdict on the new list too would change
+        // nothing except the blast radius of this card.
         let consolidation_ok = matches!(
             &self.consolidation,
-            ConsolidationFinding::Checked(list) if list.is_empty()
+            ConsolidationFinding::Checked { stuck_runs, .. } if stuck_runs.is_empty()
         );
         // T21-08, the owner's explicit decision: of everything the two new
         // sections report, only a **dead-lettered** entry is a fault — work the
@@ -670,11 +686,27 @@ fn build_runtime(layout: &StoreLayout) -> RuntimeFinding {
 /// read that fails degrades this one section to `Skipped`, exactly as its
 /// neighbours do, rather than blinding the whole report.
 fn build_consolidation(read: &rusqlite::Connection) -> ConsolidationFinding {
-    match stuck_consolidation_runs(read, local_rag_core::BUILD_ID, STUCK_RUN_ATTEMPT_THRESHOLD) {
-        Ok(runs) => ConsolidationFinding::Checked(runs),
-        Err(e) => ConsolidationFinding::Skipped {
-            reason: format!("could not read consolidation runs: {e}"),
-        },
+    let stuck_runs =
+        match stuck_consolidation_runs(read, local_rag_core::BUILD_ID, STUCK_RUN_ATTEMPT_THRESHOLD)
+        {
+            Ok(runs) => runs,
+            Err(e) => {
+                return ConsolidationFinding::Skipped {
+                    reason: format!("could not read consolidation runs: {e}"),
+                };
+            }
+        };
+    let backlog = match pending_backlog_by_session(read, local_rag_core::BUILD_ID) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return ConsolidationFinding::Skipped {
+                reason: format!("could not read the consolidation backlog: {e}"),
+            };
+        }
+    };
+    ConsolidationFinding::Checked {
+        stuck_runs,
+        backlog,
     }
 }
 
@@ -1012,7 +1044,18 @@ fn report_json(report: &DoctorReport) -> serde_json::Value {
 
     let consolidation = match &report.consolidation {
         ConsolidationFinding::Skipped { reason } => serde_json::json!({"skipped": reason}),
-        ConsolidationFinding::Checked(list) => serde_json::json!({
+        ConsolidationFinding::Checked {
+            stuck_runs: list,
+            backlog,
+        } => serde_json::json!({
+            "backlog_by_session": backlog
+                .iter()
+                .map(|s| serde_json::json!({
+                    "session_id": s.session_id,
+                    "backlog": s.backlog,
+                    "blocker": super::stats::blocker_json(&s.blocker),
+                }))
+                .collect::<Vec<_>>(),
             "stuck_runs": list
                 .iter()
                 .map(|r| serde_json::json!({
@@ -1504,6 +1547,49 @@ fn print_space(finding: &SpaceFinding) {
     );
 }
 
+/// `T23-02`: the backlog's distribution, printed above the stuck runs because
+/// it is the wider question — a stuck run is one failed unit of work, this is
+/// how much is waiting behind it. Silent on a caught-up store, since
+/// `pending_backlog_by_session` lists only sessions with something
+/// outstanding.
+fn print_backlog_by_session(backlog: &[SessionBacklog]) {
+    for s in backlog {
+        let what = match &s.blocker {
+            BacklogBlocker::None => "waiting for the next tick".to_string(),
+            BacklogBlocker::InProgress { run_id } => format!("run {run_id} in flight"),
+            BacklogBlocker::Retryable {
+                run_id,
+                attempt_count,
+            } => format!("run {run_id} failed {attempt_count}x, will be retried"),
+            BacklogBlocker::Shrinking {
+                run_id,
+                window_observations,
+            } => format!(
+                "run {run_id} overflowed the model context; the next window halves \
+                 {window_observations} observations"
+            ),
+            BacklogBlocker::Floored { run_id } => {
+                format!("run {run_id} overflows on a single observation — nothing narrower left")
+            }
+            BacklogBlocker::Parked {
+                run_id,
+                attempt_count,
+                reason,
+            } => format!(
+                "PARKED on run {run_id} after {attempt_count} attempt(s) — nothing retries or \
+                 shrinks it: {}",
+                reason.as_deref().unwrap_or("(no reason recorded)")
+            ),
+        };
+        println!(
+            "consolidation backlog: session {} — {} observation(s) — {what} (as seen by build {})",
+            s.session_id,
+            s.backlog,
+            local_rag_core::BUILD_ID,
+        );
+    }
+}
+
 /// D-071's `consolidation:` section — the memory pillar's own "is anything
 /// wedged?" line. Silent-but-present when healthy (one `ok` line, like
 /// `permissions:`), loud and per-run when not: during the D-069 incident this
@@ -1513,10 +1599,18 @@ fn print_consolidation(finding: &ConsolidationFinding) {
         ConsolidationFinding::Skipped { reason } => {
             println!("consolidation: skipped — {reason}")
         }
-        ConsolidationFinding::Checked(list) if list.is_empty() => {
-            println!("consolidation: ok — no run is stuck or dead-lettered")
+        ConsolidationFinding::Checked {
+            stuck_runs,
+            backlog,
+        } if stuck_runs.is_empty() => {
+            println!("consolidation: ok — no run is stuck or dead-lettered");
+            print_backlog_by_session(backlog);
         }
-        ConsolidationFinding::Checked(list) => {
+        ConsolidationFinding::Checked {
+            stuck_runs: list,
+            backlog,
+        } => {
+            print_backlog_by_session(backlog);
             for r in list {
                 let verdict = if r.dead_lettered {
                     "DEAD-LETTERED on this build — nothing retries it until the binary changes"

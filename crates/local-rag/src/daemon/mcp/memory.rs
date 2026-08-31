@@ -625,6 +625,63 @@ struct ConsolidationStatsWire {
     /// D-071: empty on a healthy store; every entry is a run no amount of
     /// waiting will fix on its own.
     stuck_runs: Vec<StuckRunWire>,
+    /// `T23-02` (`D-119`): `pending_backlog_total` split by session and by
+    /// cause. Empty on a caught-up store. The CLI's own `stats` renders the
+    /// identical shape from the identical store primitive.
+    backlog_by_session: Vec<SessionBacklogWire>,
+    /// The build every `blocker` above is relative to (`T23-02`): whether a
+    /// dead-letter reads as parked or retryable turns on whether its
+    /// fingerprint matches the running build, so the answer is only meaningful
+    /// against a named one.
+    blocker_build_id: &'static str,
+}
+
+/// `T23-02`: one session's outstanding observations and what is holding them.
+/// `blocker` carries a `kind` discriminator plus only that case's own fields,
+/// rather than a wide row of nulls.
+#[derive(Debug, Serialize)]
+struct SessionBacklogWire {
+    session_id: String,
+    backlog: i64,
+    blocker: serde_json::Value,
+}
+
+impl From<local_rag_store::SessionBacklog> for SessionBacklogWire {
+    fn from(s: local_rag_store::SessionBacklog) -> Self {
+        use local_rag_store::BacklogBlocker as B;
+        let blocker = match s.blocker {
+            B::None => serde_json::json!({ "kind": "none" }),
+            B::InProgress { run_id } => {
+                serde_json::json!({ "kind": "in_progress", "run_id": run_id })
+            }
+            B::Retryable {
+                run_id,
+                attempt_count,
+            } => serde_json::json!({
+                "kind": "retryable", "run_id": run_id, "attempt_count": attempt_count,
+            }),
+            B::Shrinking {
+                run_id,
+                window_observations,
+            } => serde_json::json!({
+                "kind": "shrinking", "run_id": run_id, "window_observations": window_observations,
+            }),
+            B::Floored { run_id } => serde_json::json!({ "kind": "floored", "run_id": run_id }),
+            B::Parked {
+                run_id,
+                attempt_count,
+                reason,
+            } => serde_json::json!({
+                "kind": "parked", "run_id": run_id, "attempt_count": attempt_count,
+                "reason": reason,
+            }),
+        };
+        SessionBacklogWire {
+            session_id: s.session_id,
+            backlog: s.backlog,
+            blocker,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -794,6 +851,12 @@ pub async fn stats(
         Ok(v) => v,
         Err(e) => return Ok(infra_err(e)),
     };
+    // T23-02: where that backlog actually is, by session and by cause.
+    let backlog_by_session =
+        match local_rag_store::pending_backlog_by_session(&state_read, local_rag_core::BUILD_ID) {
+            Ok(v) => v,
+            Err(e) => return Ok(infra_err(e)),
+        };
     let throughput_observations_per_min =
         applied_recently as f64 / (CONSOLIDATION_THROUGHPUT_WINDOW_MS as f64 / 60_000.0);
     let progress_pct = if observations_total > 0 {
@@ -876,6 +939,11 @@ pub async fn stats(
             eta_seconds,
             oldest_pending_run_created_at,
             stuck_runs: stuck_runs.into_iter().map(StuckRunWire::from).collect(),
+            backlog_by_session: backlog_by_session
+                .into_iter()
+                .map(SessionBacklogWire::from)
+                .collect(),
+            blocker_build_id: local_rag_core::BUILD_ID,
         },
         scope: scope_label,
         worktree,

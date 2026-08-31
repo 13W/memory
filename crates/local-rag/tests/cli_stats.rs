@@ -473,6 +473,64 @@ async fn stats_reports_the_index_age_and_any_stuck_generation() {
 /// a full local-model generation. The run must now be named, in both output
 /// modes, without a single manual SQL query.
 #[tokio::test]
+/// `T23-02` (`D-119`): the backlog stops being one number. The two assertions
+/// that matter are that the breakdown names the *cause* — a parked session is
+/// called parked, not "stuck" — and that its rows sum to the total printed
+/// beside them, because two figures in one report that disagree are worse than
+/// one figure that says too little.
+async fn stats_reports_where_the_backlog_is_and_what_is_holding_it() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_observation_envelope(&state, "obs-1", "sess-parked").await;
+        seed_observation_envelope(&state, "obs-2", "sess-parked").await;
+        seed_observation_envelope(&state, "obs-3", "sess-waiting").await;
+        seed_stuck_run(&state, "run-parked", "sess-parked", 1, 2, 9, 1_000).await;
+    }
+
+    let output = run_cli(&home, home.path(), &["stats"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(
+        text.contains("consolidation backlog by session: 2 session(s) (blockers as seen by build "),
+        "the report must name the build its verdicts are relative to: {text}"
+    );
+    assert!(
+        text.contains("session sess-parked — 2 observation(s) — PARKED on run run-parked"),
+        "the cause, not just the count: {text}"
+    );
+    assert!(
+        text.contains("session sess-waiting — 1 observation(s) — waiting for the next tick"),
+        "a session with no open run is not a fault: {text}"
+    );
+
+    let output = run_cli(&home, home.path(), &["stats", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let rows = json["consolidation"]["backlog_by_session"]
+        .as_array()
+        .expect("backlog_by_session is an array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["session_id"], "sess-parked", "worst backlog first");
+    assert_eq!(rows[0]["blocker"]["kind"], "parked");
+    assert_eq!(rows[0]["blocker"]["run_id"], "run-parked");
+    assert_eq!(rows[1]["blocker"]["kind"], "none");
+    assert!(
+        json["consolidation"]["blocker_build_id"]
+            .as_str()
+            .is_some_and(|b| !b.is_empty()),
+        "a blocker verdict is only meaningful against a named build: {json}"
+    );
+    let summed: i64 = rows.iter().map(|r| r["backlog"].as_i64().unwrap()).sum();
+    assert_eq!(
+        summed,
+        json["consolidation"]["pending_backlog_total"]
+            .as_i64()
+            .unwrap(),
+        "the breakdown must sum to the total printed beside it: {json}"
+    );
+}
+
+#[tokio::test]
 async fn stats_reports_a_stuck_consolidation_run_with_its_attempt_count() {
     let (home, layout) = open_layout();
     {
