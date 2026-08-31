@@ -44,9 +44,18 @@ jobs:
     # `lto = "thin"`. Building anything else here would make this job an
     # approximation of the thing it exists to predict.
     #
-    # Scope is the four shipped binaries. Test targets are knowingly excluded:
-    # they carry their own instances of the same `cfg` defect (D-113), and
-    # widening this job belongs with fixing those, not before.
+    # Two steps, because the two failures they catch are not the same failure.
+    #
+    # The `dist` build covers the four shipped binaries and is the only thing
+    # here that links. The `check --all-targets` step covers everything else in
+    # the workspace, tests included, and deliberately does NOT use `--profile
+    # dist`: the defect class it exists for (D-113) is `#[cfg(unix)]` items
+    # reached from ungated code, which surfaces as `E0433`/`E0425` during name
+    # resolution. `cargo check` sees those, and building every test binary with
+    # `lto = "thin"` to see the same errors would cost minutes for nothing.
+    #
+    # Do not collapse these into one `cargo build --all-targets --profile dist`.
+    # It would be slower and would catch nothing the pair does not.
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
@@ -55,3 +64,5 @@ jobs:
         run: >
           cargo build --profile dist
           -p local-rag -p local-rag-proxy -p local-rag-hook -p local-rag-tui
+      - name: Check every target, tests included
+        run: cargo check --workspace --all-targets

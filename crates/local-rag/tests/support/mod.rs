@@ -573,6 +573,13 @@ pub async fn seed_pending_candidate(
 // ---------------------------------------------------------------------
 
 use std::io::{BufRead, BufReader as StdBufReader, Write};
+// D-113: the only unix-only surface this module has is `Client`, which talks to
+// the daemon over a unix-domain socket. Everything else here (`open_layout`,
+// `start_options`, the seeding helpers) is portable, and `DaemonHandle` itself
+// is not `cfg`-gated — so the gate belongs on the socket half, not on the
+// module. Ungated, this `use` alone was an `E0433` in all ten of the test
+// binaries that include this module without a `#![cfg(unix)]` of their own.
+#[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 
 use local_rag::daemon::{DaemonHandle, LazyEmbedderProvider, StartOptions};
@@ -641,12 +648,14 @@ pub async fn start(layout: &StoreLayout) -> DaemonHandle {
 /// would silently drop whatever an earlier read already buffered but did
 /// not consume). Mirrors `daemon::handshake`'s own test idiom (a
 /// `spawn_blocking` std client against a real listener).
+#[cfg(unix)]
 pub struct Client {
     stream: StdUnixStream,
     reader: StdBufReader<StdUnixStream>,
     session_id: String,
 }
 
+#[cfg(unix)]
 impl Client {
     pub fn connect(socket_path: &Path) -> Self {
         Self::connect_with_session(socket_path, "sess-1")

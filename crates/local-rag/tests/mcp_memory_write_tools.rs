@@ -5,6 +5,8 @@
 //! tool, `expected_version` conflicts, actor/trust semantics, feedback
 //! duplicate request.
 
+#![cfg(unix)]
+
 mod support;
 
 use serde_json::Value;

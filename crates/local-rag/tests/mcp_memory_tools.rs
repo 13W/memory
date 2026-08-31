@@ -4,6 +4,8 @@
 //! global-scope degrade (never an error, unlike the code-query tools), and
 //! the no-writes guarantee.
 
+#![cfg(unix)]
+
 mod support;
 
 use std::sync::Arc;

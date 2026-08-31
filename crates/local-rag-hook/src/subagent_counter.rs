@@ -207,6 +207,7 @@ mod tests {
         assert!(matches!(err, CounterError::Corrupt(_)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn data_and_lock_files_are_0600() {
         use std::os::unix::fs::PermissionsExt;

@@ -3,6 +3,8 @@
 //! list`, malformed JSON-RPC, unknown method/tool/params, `id` preservation,
 //! `MigrationOnly` behavior.
 
+#![cfg(unix)]
+
 mod support;
 
 use local_rag::daemon::{DaemonMode, MigrationOnlyReason};

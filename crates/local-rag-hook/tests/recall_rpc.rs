@@ -12,6 +12,8 @@
 //! — its only job is to seed memory entries before invoking the hook as an
 //! opaque compiled binary.
 
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;

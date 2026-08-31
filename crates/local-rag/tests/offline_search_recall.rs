@@ -11,6 +11,8 @@
 //! model whose fetch source is long gone (tier B, opt-in, mirrors
 //! `tests/cli_index.rs`'s own `with_real_model` convention).
 
+#![cfg(unix)]
+
 mod support;
 
 use serde_json::Value;
