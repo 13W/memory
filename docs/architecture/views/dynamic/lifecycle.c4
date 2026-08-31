@@ -1,0 +1,144 @@
+// Flows that decide who owns the store, and for how long.
+//
+// Ownership is the subject of this file. Three deviations were spent
+// establishing the current rules, and each is a step you can point at here:
+// a contended lock is never reclaimed (the contention itself proves a live
+// holder); the lock is released by the PROCESS, not by the shutdown sequence;
+// and a departing daemon unlinks its record only while the path still resolves
+// to the inode it holds open.
+
+views {
+
+  dynamic view daemonLifecycle {
+    title 'Daemon lifecycle — start, upgrade, drain'
+    description '''
+      Ownership of the store is the subject here. A successful lock proves no
+      live process holds it, because the kernel releases a flock when its holder
+      dies; contention proves the opposite, so the contending path waits and
+      never reclaims. The release at the end is conditional: if a worker
+      outlived the drain budget the lock is deliberately kept until the process
+      exits, because releasing it would claim something untrue.
+    '''
+
+    localRag.mcpProxy -> localRag.daemon 'connect; on failure spawn once, detached'
+    localRag.daemon -> localRag.storeControlFiles 'acquire store.lock, or wait out the incumbent'
+    localRag.daemon.migrationRunner -> localRag.storeControlFiles 'take the migration lock'
+    localRag.daemon.migrationRunner -> localRag.stateDb 'forward-only, checksummed, resumable'
+    localRag.daemon -> localRag.cacheDb 'validate; drop and recreate if it does not match this store'
+    localRag.daemon -> localRag.storeControlFiles 'bind the socket, mark ready, start workers'
+    localRag.daemon.spoolImporter -> localRag.spoolStore 'resume the pending import from the durable cursor'
+    localRag.daemon.consolidationTrigger -> localRag.stateDb 'first tick reclaims runs with expired leases'
+    localRag.mcpProxy -> localRag.daemon 'SHUTDOWN_REQUEST when the versions differ'
+    localRag.daemon.indexingSupervisor -> localRag.daemon.reconcileDriver 'cancel at a safe point, then join, bounded'
+    localRag.daemon -> localRag.storeControlFiles 'checkpoint, then release — or keep it until the process exits'
+
+    global style status
+  }
+
+  dynamic view proxyHandshake {
+    title 'Session handshake — proxy to daemon'
+    description '''
+      What happens before any tool call. The proxy resolves its session
+      parameters exactly once at launch and clones them into every later
+      request, so a session cannot drift mid-connection. INCOMPATIBLE is raised
+      only by a proto-range mismatch: the two other version fields WELCOME
+      carries are informational and never reject, because a version difference
+      is the upgrade case, not an incompatibility.
+    '''
+
+    claudeCode -> localRag.mcpProxy 'spawns one proxy per session'
+    localRag.mcpProxy -> localRag.daemon 'connect; on failure spawn once, detached, then retry — 250 ms doubling, 20 s budget'
+    localRag.mcpProxy -> localRag.daemon.daemonHandshake 'HELLO {proto, proxy_version, session_id, worktree_root, harness}'
+    localRag.daemon.daemonHandshake -> localRag.mcpProxy 'WELCOME {daemon_version, store_instance_uuid, capabilities, mode}, or INCOMPATIBLE on a proto mismatch'
+    localRag.daemon.daemonHandshake -> localRag.daemon.mcpDispatcher 'register the session; the guard lives as long as the connection'
+    localRag.mcpProxy -> localRag.daemon.mcpDispatcher 'each request wraps the opaque MCP payload with the explicit context'
+
+    global style status
+  }
+
+  dynamic view binaryUpgrade {
+    title 'Binary upgrade — draining the old daemon'
+    description '''
+      Triggered by a new binary on disk, noticed as a version difference in an
+      otherwise compatible WELCOME. The request does not close the connection:
+      the proxy must observe EOF, and EOF arrives only after the drain has
+      actually finished, which is what makes reconnecting safe rather than
+      hopeful. The proxy never force-kills — on a timeout it reports the
+      conflict instead.
+    '''
+
+    localRag.mcpProxy -> localRag.daemon 'WELCOME names a different daemon_version'
+    localRag.mcpProxy -> localRag.daemon.daemonHandshake 'SHUTDOWN_REQUEST, on the same connection'
+    localRag.daemon -> localRag.storeControlFiles 'drain, checkpoint, release the lock'
+    localRag.daemon -> localRag.mcpProxy 'EOF — only now, after the drain finished'
+    localRag.mcpProxy -> localRag.daemon 'connect again; this spawns the current on-disk binary (bounded at 2 rounds)'
+
+    global style status
+  }
+
+  dynamic view storeLockHandover {
+    title 'Store lock — acquire, wait, release'
+    description '''
+      Two branches that are deliberately not symmetric. A successful flock
+      proves no live process holds the lock, because the kernel releases one
+      when its holder dies — so that branch may overwrite a stale record and
+      unlink an orphaned socket. Contention proves the opposite, so that branch
+      never reclaims for any reason and simply waits it out. Release is
+      conditional in turn: if a worker outlived the drain budget the guard is
+      leaked, and the kernel drops the lock at process exit — the first instant
+      no writer is left.
+    '''
+
+    localRag.daemon -> localRag.storeControlFiles 'flock(LOCK_EX | LOCK_NB)'
+    localRag.storeControlFiles -> localRag.daemon 'success: no live holder — overwrite the record, unlink an orphaned socket'
+    localRag.storeControlFiles -> localRag.daemon 'WouldBlock: a live holder exists — wait up to 10 s, never reclaim'
+    localRag.daemon -> localRag.storeControlFiles 'mark ready once the socket is bound'
+    localRag.daemon -> localRag.storeControlFiles 'on shutdown: unlink only while the path still resolves to the held inode'
+    localRag.daemon -> localRag.storeControlFiles 'workers not drained: keep the lock until the process exits'
+
+    global style status
+  }
+
+  dynamic view migrationRun {
+    title 'Migration — forward-only, resumable, refusable'
+    description '''
+      Runs under its own lock with the daemon otherwise quiescent. A simple
+      migration is one transaction, so a crash leaves it entirely unapplied; a
+      complex one is a fixed sequence of independently committed units, each
+      with a progress row, so a crash resumes at the unit rather than at the
+      start. A store newer than this binary, or one whose applied checksums
+      drifted, is refused before any write — and the daemon still binds, in
+      migration-only mode, so a client gets a diagnosable answer instead of
+      nothing reachable at all.
+    '''
+
+    localRag.mcpProxy -> localRag.daemon 'spawn or connect — startup begins'
+    localRag.daemon.migrationRunner -> localRag.storeControlFiles 'take the migration lock'
+    localRag.daemon.migrationRunner -> localRag.stateDb 'compare applied versions against the frozen checksums'
+    localRag.daemon.migrationRunner -> localRag.backupStore 'VACUUM INTO a backup before any destructive step'
+    localRag.daemon.migrationRunner -> localRag.stateDb 'apply each unit, writing its progress row'
+    localRag.daemon.migrationRunner -> localRag.cacheDb 'never migrated — dropped and rebuilt on a version bump'
+    localRag.daemon.migrationRunner -> localRag.daemon.mcpDispatcher 'on refusal: bind anyway and answer INCOMPATIBLE_STORE with details'
+
+    global style status
+  }
+
+  dynamic view idleShutdown {
+    title 'Idle shutdown — the three-input gate'
+    description '''
+      A pure conjunction: no live MCP sessions, no unimported spool bytes, no
+      running jobs. One non-idle input refuses regardless of the other two. The
+      discipline that makes it correct lives in the workers rather than here:
+      every job guard is held across active work only and dropped before the
+      next wait, so an enrolled but quiet worktree is exactly as idle-eligible
+      as none at all — watching a filesystem is not running.
+    '''
+
+    localRag.daemon.idleGate -> localRag.daemon.mcpDispatcher 'live MCP sessions?'
+    localRag.daemon.idleGate -> localRag.spoolStore 'unimported spool bytes?'
+    localRag.daemon.idleGate -> localRag.daemon.indexingSupervisor 'any reconcile, consolidation, normalization or GC job running?'
+    localRag.daemon.idleGate -> localRag.storeControlFiles 'all three idle for the window: run the ordinary drain'
+
+    global style status
+  }
+}

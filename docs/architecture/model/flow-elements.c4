@@ -1,0 +1,186 @@
+// Elements the flows need and the structural views did not.
+//
+// Each one exists because a dynamic view has to point at it: a budget that
+// decides what fits in a prompt, the counter that makes a SubagentStop id
+// stable, the two directories whose retention policies differ from the control
+// files they were lumped in with. Structure alone did not need them; behaviour
+// does.
+
+model {
+
+  extend localRag.daemon.memoryRouter {
+
+    promptBudget = component 'Prompt budget' {
+      #implemented
+      #pillar-memory
+      description '''
+        Derives what fits from the model's own context length minus the answer
+        reserve, one corrective re-prompt, the system prompt and the conflict
+        set's promised floor. Which bound binds — the row count or the token
+        budget — is therefore a property of the model, not a config value. The
+        window is measured with the real tokenizer, because observation
+        excerpts are tool output and JSON at about 2.9 characters per token,
+        where the four-characters heuristic is wrong by up to a factor of two.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §4'
+        plan 'docs/implementation-plan/groups/23-consolidation-recovery.md'
+        code 'crates/memory/src/budget.rs'
+      }
+    }
+
+    conflictSet = component 'Candidate conflict set' {
+      #partial
+      #pillar-memory
+      description '''
+        The existing entries shown to the router so it can notice a duplicate:
+        lexical matches against the window first, then newest-first, cut to a
+        token budget and cut again by the real tokenizer. It is the term that
+        yields when the prompt will not fit, because a window is a promise to
+        the cursor. Partial: it is built from active entries only, so a
+        proposal identical to hundreds of pending candidates is never shown as
+        a conflict and cannot be named as one.
+      '''
+      metadata {
+        spec 'docs/specification/08-memory.md §4'
+        plan 'docs/implementation-plan/groups/23-consolidation-recovery.md'
+        code 'crates/memory/src/recall/mod.rs'
+      }
+    }
+  }
+
+  extend localRag.daemon {
+
+    idleGate = component 'Idle gate' {
+      #implemented
+      description '''
+        A pure predicate over three inputs — live MCP sessions, unimported
+        spool bytes, running jobs — conjoined, so one non-idle input refuses
+        regardless of the other two. It owns no state of its own; the
+        correctness lives in every worker holding its job guard across active
+        work only.
+      '''
+      metadata {
+        spec 'docs/specification/02-architecture.md §4.3'
+        code 'crates/local-rag/src/daemon/idle.rs'
+      }
+    }
+  }
+
+  extend localRag.daemon.memoryOps {
+
+    candidateReview = component 'Candidate review' {
+      #implemented
+      #pillar-memory
+      description '''
+        pending → approved | rejected | expired. Approval materializes the
+        proposed operation through the same transactional path the router uses,
+        with actor=user, inside the same transaction as the state change — so a
+        candidate cannot be marked approved without its operation landing.
+        Candidates carry no version, so the edit precondition is state-based:
+        legal only while pending.
+      '''
+      metadata {
+        spec 'docs/specification/04-state-machines.md §6'
+        code 'crates/store/src/memory/review.rs'
+      }
+    }
+  }
+
+  extend localRag.hookBinary {
+
+    subagentCounter = component 'Subagent stop counter' {
+      #implemented
+      #pillar-observations
+      description '''
+        The per-session, per-agent occurrence number that makes a SubagentStop
+        identity stable. Kept in its own file under its own lock, replaced by
+        write-new plus fsync plus atomic rename — never truncate-in-place. A
+        corrupt counter skips that one observation rather than resetting to
+        zero: reissuing an occurrence already used by stored history would
+        collide against permanent data, which is worse than losing one event.
+      '''
+      metadata {
+        spec 'docs/specification/07-observations-spool.md §4'
+        code 'crates/local-rag-hook/src/subagent_counter.rs'
+      }
+    }
+  }
+
+  extend localRag.npmInstaller {
+
+    shimStubs = component 'Bin shims & lazy heal' {
+      #implemented
+      description '''
+        Extensionless JS stubs at the paths npm's .bin entries point at,
+        replaced in place by the native binaries at install time — so a normal
+        install leaves Node out of the execution path entirely. When lifecycle
+        scripts were suppressed the stubs survive and heal on first use, in
+        three structurally different modes: a hook cannot wait for a download
+        and starts a detached repair, the MCP proxy must wait and repairs
+        synchronously with every byte on stderr, the CLI waits without the
+        stdout taboo.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §1'
+        plan 'docs/implementation-plan/groups/22-binary-delivery-and-resolution.md'
+        code 'npm/memory/src/shim.js'
+      }
+    }
+  }
+
+  extend localRag {
+
+    quarantineStore = store 'quarantine/' {
+      #implemented
+      description '''
+        Where a shard that could not be opened at all goes, by directory rename
+        — an unopenable shard yields no handle to destroy. Kept for at most two
+        rebuild cycles per worktree and then deleted; names are UUIDv7-suffixed
+        so a repeat never collides and lexicographic order is chronological.
+      '''
+      metadata {
+        spec 'docs/specification/05-projection.md §8'
+        code 'crates/projection/src/rebuild.rs'
+      }
+    }
+
+    backupStore = store 'backups/' {
+      #partial
+      description '''
+        A VACUUM INTO copy of state.sqlite taken before any destructive
+        migration step, which is what makes a rollback possible at all: restore
+        the file, run the previous binary, and the store still forward-migrates
+        cleanly afterwards. Partial in the honest sense — a tripwire asserts
+        every released migration is still non-destructive, so this path has
+        never fired outside synthetic tests.
+      '''
+      metadata {
+        spec 'docs/specification/13-distribution-and-migrations.md §3'
+        code 'crates/store/src/migrate/mod.rs'
+      }
+    }
+
+    daemon.projectionSwitch -[writes]-> quarantineStore 'renames an unopenable shard aside before rebuilding'
+    daemon.migrationRunner -[writes]-> backupStore 'copies the store before a destructive step'
+  }
+
+  // --- Wiring, so each of these appears where it belongs -------------------
+
+  localRag.daemon.consolidationRunner -[calls]-> localRag.daemon.memoryRouter.promptBudget 'derives what fits before the prompt is assembled'
+  localRag.daemon.consolidationRunner -[calls]-> localRag.daemon.memoryRouter.conflictSet 'loads the entries the router must compare against'
+  localRag.daemon.memoryRouter.conflictSet -[reads]-> localRag.stateDb 'related-first, then newest-first, cut to a token budget'
+  localRag.daemon.memoryRouter.promptBudget -[reads]-> localRag.modelStore 'the model catalog supplies the context length'
+
+  localRag.daemon.mcpDispatcher -[calls]-> localRag.daemon.memoryOps.candidateReview 'approve, reject and edit a pending candidate'
+  localRag.daemon.memoryOps.candidateReview -[writes]-> localRag.stateDb 'the state change and the materialized op, one transaction'
+
+  localRag.daemon.idleGate -[reads]-> localRag.spoolStore 'unimported bytes are one of the three inputs'
+  localRag.daemon.idleGate -[reads]-> localRag.stateDb 'live sessions and running jobs are the other two'
+
+  localRag.hookBinary.subagentCounter -[writes]-> localRag.spoolStore 'its counter file sits beside the segments, under its own lock'
+
+  localRag.npmInstaller.shimStubs -[calls]-> localRag.npmInstaller.releaseDownloader 'lazy heal when lifecycle scripts were suppressed'
+  localRag.npmInstaller.shimStubs -[calls]-> localRag.npmInstaller.binDirLadder 'exec the native binary once it is there'
+}
+

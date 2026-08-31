@@ -1,0 +1,62 @@
+// Flows that answer a query, and the ways an answer arrives smaller than asked.
+//
+// One read lock spans the whole pipeline, so the two legs can never read
+// different generations. Everything that can go wrong is either an explicit
+// degradation carrying its reason or a typed refusal — never a silently empty
+// result.
+
+views {
+
+  dynamic view searchRequest {
+    title 'Hybrid search request'
+    description '''
+      The read lock is taken after the worktree is resolved and released only
+      after the results are shaped — it prevents the two legs from reading
+      different generations. An unsupported mode is refused before resolution
+      and before any lock. If the lexical head does not validate, the answer is
+      an explicitly degraded dense_only with the reason stated; if both legs are
+      unavailable it is INDEX_UNAVAILABLE, never an empty success.
+    '''
+
+    claudeCode -> localRag.mcpProxy 'tools/call search_code'
+    localRag.mcpProxy -> localRag.daemon.mcpDispatcher 'request envelope with the explicit context'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.searchEngine 'dispatch'
+    localRag.daemon.searchEngine -> localRag.daemon.lockRegistry 'take the worktree read lock, bounded wait'
+    localRag.daemon.searchEngine -> localRag.stateDb 'resolve the active generation and model space'
+    localRag.daemon.lexicalLeg -> localRag.cacheDb 'BM25, only if the FTS head validates'
+    localRag.daemon.denseLeg -> localRag.daemon.providerPool 'embed the query'
+    localRag.daemon.denseLeg -> localRag.projectionStore 'brute-force cosine over the shard'
+    localRag.daemon.fusion -> localRag.daemon.enrichment 'reciprocal rank fusion, k = 60'
+    localRag.daemon.enrichment -> localRag.stateDb 'cut snippets from the stored source_blob'
+    localRag.daemon.searchEngine -> localRag.daemon.lockRegistry 'release the read lock'
+    localRag.daemon.mcpDispatcher -> localRag.mcpProxy 'results, generation, degraded flag, diagnostics'
+    localRag.mcpProxy -> claudeCode 'tool result'
+
+    global style status
+  }
+
+  dynamic view searchDegradation {
+    title 'Search — the ways an answer arrives smaller'
+    description '''
+      Every reduction is explicit and carries its reason, so an acceptance test
+      can assert WHY rather than only that something was missing. Note what is
+      NOT a degradation: a single-leg mode that served is not degraded, because
+      degraded means "less than you asked for"; when its one leg cannot serve,
+      the answer is a refusal instead. Nothing on this path repairs anything —
+      the shard the request opens is given a vector source that never answers,
+      which is how "no tool call performs synchronous indexing" becomes a
+      property of the type rather than a rule to remember.
+    '''
+
+    claudeCode -> localRag.daemon.mcpDispatcher 'search_code'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.searchEngine 'mode=semantic: UNSUPPORTED_MODE, before resolution and before any lock'
+    localRag.daemon.searchEngine -> localRag.stateDb 'no active tuple: WORKTREE_NOT_INDEXED, before either leg'
+    localRag.daemon.searchEngine -> localRag.daemon.lockRegistry 'read lock wait exhausted: BUSY_RETRY — the only retryable code'
+    localRag.daemon.ftsMaterializer -> localRag.daemon.searchEngine 'head invalid: degraded dense_only, the leg is not run at all'
+    localRag.daemon.shardManager -> localRag.daemon.searchEngine 'shard unavailable: degraded lexical_only, no internal retry'
+    localRag.daemon.searchEngine -> localRag.daemon.mcpDispatcher 'both legs down: INDEX_UNAVAILABLE with both diagnostics — never an empty success'
+    localRag.daemon.mcpDispatcher -> claudeCode 'isError content carrying the code, never a bare JSON-RPC -32603'
+
+    global style status
+  }
+}

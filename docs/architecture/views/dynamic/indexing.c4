@@ -1,0 +1,151 @@
+// Flows that build and swap what the code search reads.
+//
+// The recurring shape is write-ahead plus desired-set reconciliation: the
+// intent is committed to SQLite before any backend mutation, the shard is
+// reconciled to the set it should hold rather than replaying a command log,
+// and the head is written strictly last. That is what makes every crash window
+// detectable at the next open instead of requiring history.
+
+views {
+
+  dynamic view indexingCycle {
+    title 'Indexing cycle — building a generation'
+    description '''
+      One cycle under one write lock. The order of the last four steps is not
+      arbitrary: superseding the stragglers before the backfill stops abandoned
+      generations from accumulating as permanent pin roots, and the projection
+      head is written strictly after every point mutation, which is what makes a
+      crash detectable at the next open rather than silent.
+    '''
+
+    localRag.daemon.watcher -> localRag.daemon.reconcileDriver 'an event schedules a cycle (a hint, not truth)'
+    localRag.daemon.indexingSupervisor -> localRag.daemon.reconcileDriver 'or the enrolment table starts one'
+    localRag.daemon.reconcileDriver -> localRag.daemon.lockRegistry 'take the worktree write lock'
+    localRag.daemon.reconcileDriver -> repoUnderIndex 'authoritative gitignore-aware scan'
+    localRag.daemon.reconcileDriver -> localRag.daemon.redactionScanner 'classify: ignored, huge, lfs, binary, encoding, secret'
+    localRag.daemon.reconcileDriver -> localRag.stateDb 'write generation N+1: files, skips, occurrences'
+    localRag.daemon.reconcileDriver -> localRag.stateDb 'supersede lower-numbered stragglers'
+    localRag.daemon.reconcileDriver -> localRag.daemon.embeddingBackfill 'embed only what is new'
+    localRag.daemon.embeddingBackfill -> localRag.cacheDb 'fill the embedding cache'
+    localRag.daemon.reconcileDriver -> localRag.daemon.projectionSwitch 'write-ahead intent, then reconcile the desired point set'
+    localRag.daemon.projectionSwitch -> localRag.projectionStore 'upsert, delete, then write the head LAST'
+    localRag.daemon.reconcileDriver -> localRag.daemon.ftsMaterializer 'materialize the lexical view'
+    localRag.daemon.ftsMaterializer -> localRag.cacheDb 'one transaction, head written last'
+    localRag.daemon.reconcileDriver -> localRag.daemon.lockRegistry 'release, checkpoint the WAL'
+
+    global style status
+  }
+
+  dynamic view projectionSwitch {
+    title 'Projection switch — write-ahead, desired set, head last'
+    description '''
+      The protocol both switch axes share, and the reason a crash anywhere in it
+      is recoverable without history. The intent is committed before any backend
+      mutation; the shard is then reconciled to the set it should hold rather
+      than by replaying commands, so recovery after an unknown partial delta
+      needs no log; the head is written strictly last, which is what makes an
+      interrupted switch detectable at the next open. Retrying is calling the
+      same switch again — the existing set is recomputed fresh, so only the
+      missing part is redone.
+    '''
+
+    localRag.daemon.reconcileDriver -> localRag.daemon.projectionSwitch 'generation N+1 reached projection_ready'
+    localRag.daemon.projectionSwitch -> localRag.stateDb 'tx 1, write-ahead: status=updating, target tuple, fresh op id'
+    localRag.daemon.projectionSwitch -> localRag.cacheDb 'read the vectors; unchanged content is never re-embedded'
+    localRag.daemon.projectionSwitch -> localRag.projectionStore 'upsert expected minus existing, delete existing minus expected'
+    localRag.daemon.projectionSwitch -> localRag.projectionStore 'write the head LAST'
+    localRag.daemon.projectionSwitch -> localRag.stateDb 'tx 2, commit: active := target, N+1 active and N retiring in one transaction'
+
+    global style status
+  }
+
+  dynamic view projectionRebuild {
+    title 'Shard divergence — detect at open, rebuild'
+    description '''
+      The single recovery path every projection fault funnels into, which is why
+      the twelve-row fault matrix has one repair rather than twelve. The stored
+      status is itself untrusted until validated: any observation contradicting
+      the invariants means dirty regardless of what the row claims. Three
+      separate commits, because the state machine only allows dirty to
+      rebuilding — and a crash between any two of them simply re-enters the same
+      path. A rebuild targets the ACTIVE tuple and abandons any in-flight switch
+      rather than resuming it.
+    '''
+
+    localRag.daemon.shardManager -> localRag.daemon.projectionSwitch 'open a shard — validation runs before it may serve'
+    localRag.daemon.projectionSwitch -> localRag.stateDb 'check status, projected vs active, head op id, point count, manifest hash'
+    localRag.daemon.projectionSwitch -> localRag.stateDb 'commit 1: mark dirty, recording the divergence reason'
+    localRag.daemon.projectionSwitch -> localRag.stateDb 'commit 2: dirty to rebuilding, fresh op id, target cleared'
+    localRag.daemon.projectionSwitch -> localRag.quarantineStore 'unopenable only: rename aside, keep at most two per worktree'
+    localRag.daemon.projectionSwitch -> localRag.cacheDb 'collect every vector BEFORE any shard write'
+    localRag.daemon.projectionSwitch -> localRag.projectionStore 'recreate from the expected set, head last'
+    localRag.daemon.projectionSwitch -> localRag.stateDb 'commit 3: clean, projected := active'
+
+    global style status
+  }
+
+  dynamic view ftsValidateAndRebuild {
+    title 'Lexical view — validate per search, rebuild on divergence'
+    description '''
+      Cheap predicates run on every search inside the held read lock; the strong
+      manifest check runs at open and after rebuilds. The split is enforced by
+      the function signature rather than by convention — the cheap variant is
+      not given a manifest to check. Both predicates read the cache's ACTUAL
+      content, not what state.sqlite expects: sourcing them from state once made
+      a direct corruption invisible to both. An empty FTS is never treated as a
+      correct lexical result.
+    '''
+
+    localRag.daemon.searchEngine -> localRag.daemon.ftsMaterializer 'validate the head for this worktree'
+    localRag.daemon.ftsMaterializer -> localRag.cacheDb 'head present? generation, schema and tokenizer versions, occurrence count'
+    localRag.daemon.ftsMaterializer -> localRag.daemon.lexicalLeg 'valid: run BM25'
+    localRag.daemon.ftsMaterializer -> localRag.daemon.searchEngine 'invalid: degrade to dense_only, carrying the reason verbatim'
+    localRag.daemon.ftsMaterializer -> localRag.cacheDb 'rebuild in one transaction: recompute text, delete stale rows, insert, head last'
+
+    global style status
+  }
+
+  dynamic view modelSpaceMigration {
+    title 'Model space — double-buffer migration'
+    description '''
+      Changing the embedding model, its dimensions, metric or normalization.
+      There is no global write barrier and no in-place re-embedding: until step
+      four commits for a given worktree, that worktree still runs the old space
+      entirely — literally, not merely recoverably, because the old shard lives
+      in its own per-space directory and is never touched. The last two steps
+      are order-enforced rather than merely recommended: retiring the old space
+      while it is still the default would silently strand every worktree that
+      has not migrated yet.
+    '''
+
+    localRag.cli -> localRag.stateDb 'register the new representations and space B as building'
+    localRag.daemon.embeddingBackfill -> localRag.cacheDb 'embed the expected subjects under B'
+    localRag.daemon.embeddingBackfill -> localRag.stateDb 'write coverage, then B to projection_ready and on to active'
+    localRag.daemon.projectionSwitch -> localRag.projectionStore 'per worktree, the same switch protocol on the model axis only'
+    localRag.daemon.projectionSwitch -> localRag.stateDb 'default_model_space := B'
+    localRag.daemon.retentionGc -> localRag.projectionStore 'A to retiring; its now-unreferenced shard directories are swept'
+
+    global style status
+  }
+
+  dynamic view supervisorReconcile {
+    title 'Managed indexing — reconciling the enrolment table'
+    description '''
+      Notification is a hint, the table is the truth. The registry is durable,
+      the supervisor only caches a live projection of it, so an enrolment made
+      while the daemon was down is picked up at the next start and one made by
+      another process while it is up arrives by an explicit reload or the slow
+      backstop poll. This is a list of background work, never an ambient current
+      project — every request still resolves its own context from scratch.
+    '''
+
+    localRag.cli -> localRag.stateDb 'project add or enable writes the row, one transaction'
+    localRag.cli -> localRag.daemon.adminVerbs 'best-effort notify; the result is ignored in both directions'
+    localRag.daemon.adminVerbs -> localRag.daemon.indexingSupervisor 'reload'
+    localRag.daemon.indexingSupervisor -> localRag.stateDb 'read every enrolled row'
+    localRag.daemon.indexingSupervisor -> localRag.daemon.reconcileDriver 'start one task per enabled row, stop the rest'
+    localRag.daemon.reconcileDriver -> repoUnderIndex 'each task forces one immediate startup reconcile'
+
+    global style status
+  }
+}

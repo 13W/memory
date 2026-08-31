@@ -1,0 +1,78 @@
+// Flows that put binaries and weights on a machine, and enrol a repository.
+//
+// Two resolution problems that must not be conflated: the npm package resolves
+// a DIRECTORY holding every binary, the plugin resolves ONE executable. Their
+// failure contracts differ too — the MCP channel exits non-zero with an empty
+// stdout, the hook channel exits 0 and only SessionStart speaks.
+
+views {
+
+  dynamic view installAndHeal {
+    title 'Install — download, verify, and heal a suppressed install'
+    description '''
+      The release tag is resolved once through the redirect that names it, so an
+      unpinned install is still reproducible after the fact, and every binary
+      lands in ONE directory because the daemon must sit beside the proxy that
+      spawns it. Verification is against a sidecar published in the same
+      release: that defends against corruption in transit and tampering on the
+      wire, and explicitly not against a compromised release, since whoever can
+      publish the asset can publish its digest. When lifecycle scripts were
+      suppressed nothing downloads at install time at all, and the shims heal on
+      first use instead.
+    '''
+
+    npmRegistry -> localRag.npmInstaller 'npm install -g @13w/memory'
+    localRag.npmInstaller.platformResolver -> githubReleases 'resolve latest through the redirect naming the concrete tag'
+    localRag.npmInstaller.releaseDownloader -> githubReleases 'download one archive per binary, verify against its .sha256 sidecar'
+    localRag.npmInstaller.releaseDownloader -> localRag.npmInstaller.binDirLadder 'install flat, record the manifest beside them'
+    localRag.npmInstaller.shimStubs -> localRag.npmInstaller.binDirLadder 'replace the stubs in place — Node leaves the execution path entirely'
+    localRag.npmInstaller.shimStubs -> localRag.npmInstaller.releaseDownloader 'scripts suppressed: heal on first use — detached for a hook, synchronous for the proxy'
+
+    global style status
+  }
+
+  dynamic view modelDownload {
+    title 'Models and runtime — atomic install, marker last'
+    description '''
+      Three independent artifacts, none of which aborts the others. Every file
+      is streamed to a partial name while hashing, verified against the digest
+      compiled into the binary, renamed, and only then is the directory fsynced
+      — with the ready marker written last, so everything before it is
+      indistinguishable from "not installed". There is no journal: a rerun
+      re-derives what is missing by hashing what is on disk. Downloading is not
+      gated by the data policy, because the guard governs what leaves the
+      machine, and gating it would leave a local-only install unable to fetch
+      the binary that enforces the policy.
+    '''
+
+    operator -> localRag.cli 'local-rag init --download-models'
+    localRag.cli -> modelWeightHost 'ONNX Runtime first — before the embedder gate returns early'
+    localRag.cli -> modelWeightHost 'the embedding model, then the generative router model'
+    localRag.cli -> localRag.modelStore 'part file, hash while streaming, verify size and digest, rename, fsync the directory'
+    localRag.cli -> localRag.modelStore 'manifest.json, then the .ok marker LAST'
+    localRag.daemon.providerPool -> localRag.modelStore 'a directory without the marker reads as missing — no network, a typed error'
+
+    global style status
+  }
+
+  dynamic view projectEnrollment {
+    title 'Enrolling a repository for background indexing'
+    description '''
+      The durable effect never touches a socket. A brand-new path is registered
+      and enrolled in the SAME transaction, closing the window two separate
+      transactions would leave — a worktree registered but never marked managed.
+      The daemon is then notified best-effort, result ignored in both
+      directions, because the table is the truth and the backstop poll would
+      find it anyway. Enrolment is keyed by worktree id, never by a path.
+    '''
+
+    operator -> localRag.cli 'local-rag project add <path>'
+    localRag.cli -> localRag.stateDb 'resolve the path; ambiguous is refused with the candidates listed'
+    localRag.cli -> localRag.stateDb 'one transaction: register the repository and worktree AND enrol them'
+    localRag.cli -> localRag.daemon.adminVerbs 'best-effort notify — the result is ignored'
+    localRag.daemon.adminVerbs -> localRag.daemon.indexingSupervisor 'reload, or the backstop poll finds it later'
+    localRag.daemon.indexingSupervisor -> localRag.daemon.reconcileDriver 'start the worktree task'
+
+    global style status
+  }
+}

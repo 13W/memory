@@ -155,10 +155,43 @@ for (const file of c4Files(here)) {
   }
 }
 
+// --- Rule 4: paths quoted in this directory's markdown resolve too ----------
+//
+// FLOWS.md names the module that executes each flow. Those are the same claim a
+// `code` metadata value makes, and they rot the same way, so they are checked
+// the same way. Only strings that look like repository paths are considered —
+// a backtick around `retryable` is prose, not a reference.
+
+const REPO_PREFIX = /^(crates|npm|plugin|docs|fixtures|spike)\//
+
+function expandBraces(path) {
+  // `crates/store/src/cache/{fts,validate}.rs` names two files.
+  const m = path.match(/^(.*)\{([^}]+)\}(.*)$/)
+  if (!m) return [path]
+  return m[2].split(',').map((part) => `${m[1]}${part.trim()}${m[3]}`)
+}
+
+for (const entry of readdirSync(here)) {
+  if (!entry.endsWith('.md')) continue
+  const text = readFileSync(join(here, entry), 'utf8')
+  for (const m of text.matchAll(/`([^`\n]+)`/g)) {
+    const raw = m[1].trim()
+    if (!REPO_PREFIX.test(raw) || /\s/.test(raw)) continue
+    for (const path of expandBraces(raw)) {
+      const clean = path.replace(/[.,;)]+$/, '')
+      if (!existsSync(join(repoRoot, clean))) {
+        findings.push(`${entry}:${lineOf(text, m.index)}  '${clean}' does not exist`)
+      } else {
+        seenRefs.add(`md ${clean}`)
+      }
+    }
+  }
+}
+
 if (findings.length) {
   for (const f of findings) console.error(f)
   console.error(`\n${findings.length} finding(s).`)
   process.exit(1)
 }
 
-console.log(`references ok: ${seenRefs.size} distinct spec/plan/code targets, all resolve`)
+console.log(`references ok: ${seenRefs.size} distinct targets across .c4 metadata and markdown, all resolve`)

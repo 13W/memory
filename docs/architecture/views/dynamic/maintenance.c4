@@ -1,0 +1,77 @@
+// Flows an operator runs, or that run on their behalf, to keep the store honest.
+//
+// Two rules recur: diagnose and repair are separate commands, and a sweep is
+// resumable by recomputation rather than by a progress table.
+
+views {
+
+  dynamic view retentionSweep {
+    title 'Retention — mark, sweep, and give the space back'
+    description '''
+      Resumable by recomputation rather than by a progress table: the sweepable
+      sets are derived from the live database on every call, deletions are
+      monotone, and re-running converges. Deletion order is not cosmetic — the
+      self-referential parse-unit foreign key holds at every statement boundary
+      only if children go first. Shard and lexical rows are not touched here at
+      all; they disappear through desired-set reconciliation. Freeing rows and
+      returning disk are separate: SQLite never does the second on its own.
+    '''
+
+    localRag.daemon.retentionGc -> localRag.stateDb 'mark: active, building and projection_ready always; retiring within K generations OR the window'
+    localRag.daemon.retentionGc -> localRag.stateDb 'candidates: retiring or failed, and unpinned'
+    localRag.daemon.retentionGc -> localRag.stateDb 'delete in order: edges, occurrences, membership, generation, revisions, blobs'
+    localRag.daemon.retentionGc -> localRag.stateDb 'at most 500 rows per transaction, through the single writer'
+    operator -> localRag.cli 'local-rag gc --dry-run — the same sweeps, planning only'
+    operator -> localRag.cli 'local-rag vacuum — refuses while a daemon holds the store'
+    localRag.cli -> localRag.stateDb 'rewrite the file, returning the freed pages to the filesystem'
+
+    global style status
+  }
+
+  dynamic view purgeMemory {
+    title 'Purge — the only hard delete'
+    description '''
+      Every other path preserves history; this one removes it, so it demands an
+      explicit selector and a confirmation, and a single memory additionally
+      demands the version the operator just inspected. The order inverts this
+      system''s usual state-first rule for a specific reason: the cache key is
+      derived from the text being deleted, so once the state transaction commits
+      nothing could ever derive that key again. Deleting the vector first leaves,
+      at worst, a recomputable row — the reverse order would leave one nothing
+      can find. The audit trail is rewritten rather than deleted: payloads become
+      null and a terminal purge row is appended.
+    '''
+
+    operator -> localRag.cli 'local-rag purge --memory <id> --expected-version N --yes'
+    localRag.cli -> localRag.cacheDb 'delete the vector FIRST, in its own transaction'
+    localRag.cli -> localRag.stateDb 'delete the normalization row explicitly — a cascade cannot be counted'
+    localRag.cli -> localRag.stateDb 'delete the entry and its evidence; relink descendants to null'
+    localRag.cli -> localRag.stateDb 'rewrite the audit trail: payloads to null, plus a terminal purge row'
+
+    global style status
+  }
+
+  dynamic view doctorDiagnosis {
+    title 'doctor — diagnose without repairing'
+    description '''
+      The call order is fixed rather than incidental, because every ordinary
+      constructor in this system repairs something as a side effect of opening:
+      opening the state applies pending migrations, opening the cache rebuilds
+      an incompatible one, ensuring the layout re-asserts permissions. Those are
+      exactly the faults this command exists to report. So it reads the lock as
+      a plain file, stats permissions before anything else can fix them, checks
+      versions over a raw read-only connection, and only then opens anything
+      real. There is no repair flag, deliberately.
+    '''
+
+    operator -> localRag.cli 'local-rag doctor'
+    localRag.cli -> localRag.storeControlFiles 'read the lock as a file — absent distinguished from corrupt, no liveness probe'
+    localRag.cli -> localRag.storeControlFiles 'stat permissions BEFORE any step could re-assert them'
+    localRag.cli -> localRag.stateDb 'versions over a raw read-only connection, never the normal open'
+    localRag.cli -> localRag.cacheDb 'cache binding, likewise raw'
+    localRag.cli -> localRag.projectionStore 'only if compatible: heads and orphan sweeps, always dry'
+    localRag.cli -> operator 'unclean only for stuck generations, stuck runs, dead-lettered normalization — never for a bootstrap state'
+
+    global style status
+  }
+}

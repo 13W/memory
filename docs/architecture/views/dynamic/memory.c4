@@ -1,0 +1,173 @@
+// Flows that turn observations and explicit writes into durable memory.
+//
+// The shape worth reading here is that an expensive, non-deterministic model
+// call sits between two cheap transactions and inside neither, and that every
+// mechanical guarantee lives above or below it — never in the prompt.
+
+views {
+
+  dynamic view consolidationRun {
+    title 'Consolidation — observations into memory'
+    description '''
+      The shape of this flow is the whole design: an expensive, non-deterministic
+      model call sits between two cheap transactions and inside neither. The
+      window and the conflict set are bounded in tokens; the guard is what stands
+      between a model's output and the canonical store; and the apply is atomic
+      across the entire ops list, cursor advance included, so one rejected op
+      rolls back the window rather than half-applying it.
+    '''
+
+    localRag.daemon.consolidationTrigger -> localRag.daemon.consolidationRunner 'checkpoint, backlog threshold or idle interval'
+    localRag.daemon.consolidationRunner -> localRag.stateDb 'tx 1: open the run, take a lease, snapshot the window'
+    localRag.daemon.consolidationRunner -> localRag.stateDb 'load the window and the candidate conflict set'
+    localRag.daemon.consolidationRunner -> localRag.daemon.memoryRouter 'route — outside any transaction'
+    localRag.daemon.memoryRouter -> localRag.daemon.providerPool 'local generator, greedy, one corrective re-prompt'
+    localRag.daemon.memoryRouter -> localRag.daemon.memoryGuard 'materialize, downgrade, collapse the plan'
+    localRag.daemon.memoryGuard -> localRag.daemon.memoryOps 'apply the ordered ops'
+    localRag.daemon.memoryOps -> localRag.stateDb 'tx 2: ops, evidence, audit, cursor — all or nothing'
+    localRag.daemon.normalizationWorker -> localRag.daemon.memoryOps 'later: rewrite the canon to English, audited'
+
+    global style status
+  }
+
+  dynamic view recallInjection {
+    title 'Recall — memory back into a session'
+    description '''
+      Two entry points, one pipeline. The hook path is fail-open by
+      construction: it runs only after its own append succeeded, it must not
+      start a daemon, and a timeout prints nothing. Recall holds no lock at all
+      and compensates with a fresh per-entry lifecycle re-read before
+      formatting, so a retracted memory cannot be served from a stale candidate
+      list.
+    '''
+
+    claudeCodeHooks -> localRag.hookBinary 'SessionStart or UserPromptSubmit'
+    localRag.hookBinary -> localRag.daemon.mcpDispatcher 'read-only recall RPC, 1500 ms budget'
+    claudeCode -> localRag.mcpProxy 'or an explicit recall tool call'
+    localRag.mcpProxy -> localRag.daemon.mcpDispatcher 'request envelope'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.recallPipeline 'dispatch'
+    localRag.daemon.recallPipeline -> localRag.stateDb 'scope: global union repository union worktree'
+    localRag.daemon.recallPipeline -> localRag.cacheDb 'fuse lexical and dense over memory text'
+    localRag.daemon.recallPipeline -> localRag.stateDb 're-read each entry lifecycle state fresh'
+    localRag.daemon.recallPipeline -> localRag.hookBinary 'ranked prefix within the token budget'
+    localRag.hookBinary -> claudeCodeHooks 'additionalContext, or nothing at all when empty'
+
+    global style status
+  }
+
+  dynamic view rememberWrite {
+    title 'remember — an explicit write crosses the English boundary'
+    description '''
+      The canon is decided before the store sees the text, and the canon and the
+      record of what the author actually wrote commit in ONE transaction — so an
+      entry can never exist in English with no record of its origin. The replay
+      check runs before the translator is asked, so a retry does not spend a
+      second of local GPU producing an answer the create would discard. A
+      translation refusal is not a failure: the author text is stored unchanged
+      and rewritten later, because losing a note to a model failure is not an
+      acceptable degradation.
+    '''
+
+    claudeCode -> localRag.daemon.mcpDispatcher 'remember(text, kind, scope?)'
+    localRag.daemon.mcpDispatcher -> localRag.stateDb 'resolve the write scope; check the idempotency key FIRST'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.normalizationWorker 'not a replay: decide the canon (script detection, then translate only if needed)'
+    localRag.daemon.normalizationWorker -> localRag.daemon.providerPool 'translate under spawn_blocking — about a second, off the async workers'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.memoryOps 'apply the create with actor=user'
+    localRag.daemon.memoryOps -> localRag.stateDb 'one transaction: entry, evidence, audit, and the provenance row together'
+
+    global style status
+  }
+
+  dynamic view candidateReview {
+    title 'Candidate — proposed, reviewed, materialized'
+    description '''
+      What the router may not decide alone. A create or supersede of a durable
+      kind whose every citation is a model claim is downgraded to a candidate
+      rather than written — enforced twice independently, proactively in the
+      guard and as a backstop in the op engine that no future generator can
+      bypass. Approval materializes the proposed operation through the same
+      transactional path the router uses, inside the same transaction as the
+      state change, so a candidate cannot be marked approved without its
+      operation landing.
+    '''
+
+    localRag.daemon.memoryGuard -> localRag.daemon.memoryOps.candidateReview 'model-claim-only provenance: propose instead of create'
+    localRag.daemon.memoryOps.candidateReview -> localRag.stateDb 'insert the candidate, evidence by reference rather than a copy'
+    operator -> localRag.daemon.mcpDispatcher 'list_memory_candidates, then approve / reject / edit'
+    localRag.daemon.mcpDispatcher -> localRag.daemon.memoryOps.candidateReview 'approve'
+    localRag.daemon.memoryOps.candidateReview -> localRag.stateDb 'materialize the proposed op with actor=user'
+    localRag.daemon.memoryOps -> localRag.stateDb 'one transaction: the state change and the materialized op together'
+    localRag.daemon.retentionGc -> localRag.stateDb 'unreviewed after 30 days: pending to expired'
+
+    global style status
+  }
+
+  dynamic view consolidationFailureLadder {
+    title 'Consolidation failure — classify, back off, park'
+    description '''
+      No failure class retries unboundedly, and that rule was bought twice: once
+      by a deterministically malformed window retried every fifteen seconds for
+      hours at a real inference each, and once by a citation duplicate retried
+      627 times. A mechanical failure is fingerprinted with the running build,
+      so a rebuild earns exactly one more attempt; a transient one backs off and
+      escalates into the same dead letter at eight attempts. The context
+      overflow is separate again: the tokenizer answers before any generator
+      call, and the next tick halves the window.
+    '''
+
+    localRag.daemon.consolidationRunner -> localRag.daemon.memoryRouter 'route the window'
+    localRag.daemon.consolidationRunner -> localRag.daemon.memoryRouter.promptBudget 'will it fit? if not, fail as a deterministic overflow with no model call'
+    localRag.daemon.consolidationRunner -> localRag.daemon.memoryRouter.conflictSet 'trim the conflict set first — a window is a promise to the cursor'
+    localRag.daemon.consolidationRunner -> localRag.stateDb 'mechanical: record the build fingerprint; excluded while it matches'
+    localRag.daemon.consolidationRunner -> localRag.stateDb 'transient: back off exponentially, escalate to a dead letter at 8 attempts'
+    localRag.daemon.consolidationTrigger -> localRag.stateDb 'overflow: the next tick opens half the previous window'
+    localRag.daemon.consolidationTrigger -> localRag.daemon.consolidationRunner 'a parked run blocks that session backlog until a human acts'
+
+    global style status
+  }
+
+  dynamic view operatorRepair {
+    title 'Operator repair — retry and abandon a parked run'
+    description '''
+      The escape the specification assumed was a rebuild, which a published
+      release does not have: its build id is fixed for the life of the release,
+      so the first mechanical non-overflow failure parks a session forever. Both
+      verbs write straight to the store and need no daemon — a wedged store is
+      likely one whose daemon is unhealthy, and a repair that required a healthy
+      daemon would be unavailable exactly when it is needed. retry is one
+      attempt by construction, not by promise: a second failure re-parks it.
+      abandon is bounded data loss and says so.
+    '''
+
+    operator -> localRag.cli 'stats or doctor names the blocked session'
+    operator -> localRag.cli 'consolidation retry <session>'
+    localRag.cli -> localRag.stateDb 'failed to running with an already-expired lease — exactly what the sweep selects'
+    localRag.daemon.consolidationTrigger -> localRag.stateDb 'the next tick picks it up through its own resume sweep'
+    operator -> localRag.cli 'consolidation abandon <session>'
+    localRag.cli -> localRag.stateDb 'advance the cursor past the window; the run stays failed, and an audit row records it'
+
+    global style status
+  }
+
+  dynamic view normalizationTick {
+    title 'English canon — detect, translate, install in order'
+    description '''
+      Two halves with very different costs. Detection settles every
+      already-English entry in one transaction and spends no inference at all —
+      and that marker is structural rather than cosmetic, because the queue
+      excludes by stored status, so without it the batch limit fills with
+      English entries and starves the rest. Installing a translation crosses
+      both databases, which no transaction may span, so the order IS the
+      substitute for atomicity: the vector first, then the row.
+    '''
+
+    localRag.daemon.normalizationWorker -> localRag.stateDb 'detect: settle already-English entries, one transaction, zero model calls'
+    localRag.daemon.normalizationWorker -> localRag.daemon.consolidationTrigger 'yield to consolidation for the shared model — but only three ticks running'
+    localRag.daemon.normalizationWorker -> localRag.daemon.providerPool 'translate one bounded batch'
+    localRag.daemon.normalizationWorker -> localRag.cacheDb 'commit the vector FIRST'
+    localRag.daemon.normalizationWorker -> localRag.daemon.memoryOps 'then install the canon as an audited system edit'
+    localRag.daemon.memoryOps -> localRag.stateDb 'one transaction: the canon and its provenance row, in that order'
+
+    global style status
+  }
+}

@@ -12,7 +12,15 @@ piece go, what does it have to talk to, and which invariants does it cross.
 likec4 start docs/architecture      # interactive, hot-reloads on save
 likec4 validate docs/architecture   # must exit 0
 node docs/architecture/check-refs.mjs
+node docs/architecture/check-flows.mjs
 ```
+
+The model is also registered as an MCP server in the repository's `.mcp.json`,
+so it can be queried rather than read. Two things to know: the tools need an
+explicit `project` argument (`"default"`) or they answer empty, which reads
+exactly like an unloaded model; and the server's path is passed positionally,
+because `LIKEC4_WORKSPACE` loses to the working directory and sends it scanning
+the whole repository.
 
 The CLI is not vendored here — no `package.json`, no `node_modules`. Install it
 once (`pnpm add -g likec4@1.59.2` or `npx likec4@1.59.2 …`); CI pins the version
@@ -32,8 +40,11 @@ reading the model.
 | `model/daemon.c4` | Components inside the daemon |
 | `model/delivery.c4` | The npm package and the Claude Code plugin |
 | `model/deployment.c4` | One machine, one OS user, one store |
-| `views/*.c4` | Fifteen views: landscape, containers, six component slices, six flows, deployment |
+| `views/*.c4` | Landscape, containers, six component slices, deployment |
+| `views/dynamic/*.c4` | Thirty flows, one file per subsystem |
+| `FLOWS.md` | All hundred flows: trigger, steps, locks, durability, failure |
 | `check-refs.mjs` | Every element traces to a spec section, and every path resolves |
+| `check-flows.mjs` | Views and FLOWS.md name each other consistently |
 
 ## Conventions
 
@@ -75,6 +86,36 @@ many views as it belongs to.
 
 **English only**, including descriptions — the repository rule, not a style
 preference.
+
+## Flows
+
+Behaviour lives in two places that must agree: a dynamic view per flow, and
+`FLOWS.md`. The split is not duplication — the view carries shape and order, the
+document carries what an arrow cannot hold: budgets, thresholds, the exact
+durability point, and the failure taxonomy.
+
+**When a flow earns its own view.** When it crosses a boundary a reader cannot
+infer from structure — a lock taken or released, a transaction opened or
+committed, a point after which a kill is survivable, or an ordering that looks
+arbitrary and is not. `projectionSwitch` earns one because the head is written
+last for a reason. A CLI subcommand that reads a table does not.
+
+**When a row in FLOWS.md is enough.** When the flow is a step inside another,
+or one of a family whose members differ only in their detection signal. The two
+fault matrices are tables for exactly that reason: twenty near-identical
+diagrams would hide the fact that they share one recovery.
+
+**The rule.** A new flow means a view *and* a row, in the same commit.
+`check-flows.mjs` enforces both directions: a view with no index row fails, and
+an index row naming a view that does not exist fails. A flow deliberately
+without a diagram writes `no view` in its View column — the absence becomes a
+statement rather than an omission.
+
+**Six recovery shapes.** FLOWS.md opens with them, and they are the document's
+real table of contents: re-read from a durable cursor; detect at open and
+rebuild; wait out a lock; classify and back off; refuse with a typed code; ask a
+human. A new flow that fits none of them is worth a second look before it is
+worth a diagram.
 
 ## LikeC4 1.59.2 traps, all of them measured
 

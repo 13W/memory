@@ -1,0 +1,77 @@
+// Flows that carry a Claude Code event into durable memory's raw material.
+//
+// The hook half must survive a dead daemon, so it ends at fdatasync and exits 0
+// whatever happened. The daemon half is transactional: dedup at import, one
+// transaction per batch, and the cursor advances inside that same transaction.
+
+views {
+
+  dynamic view observationCapture {
+    title 'Observation capture — hook to durable envelope'
+    description '''
+      Two independent halves. The hook's half must survive a dead daemon, so it
+      ends at fdatasync and exits 0 whatever happened. The daemon's half is
+      transactional and idempotent: dedup at import, one transaction per batch,
+      and the cursor advances in that same transaction — so a crash re-imports,
+      it never loses or double-counts.
+    '''
+
+    claudeCodeHooks -> localRag.ccPlugin.hookResolver 'one of seven events, JSON on stdin'
+    localRag.ccPlugin.hookResolver -> localRag.hookBinary 'exec spool-write'
+    localRag.hookBinary -> localRag.daemon.redactionScanner 'redact BEFORE anything touches disk, then cap'
+    localRag.hookBinary -> localRag.spoolStore 'flock, append, fdatasync — the durable moment'
+    localRag.hookBinary -> claudeCodeHooks 'exit 0, always'
+    localRag.daemon.consolidationTrigger -> localRag.daemon.spoolImporter 'import the session tail'
+    localRag.daemon.spoolImporter -> localRag.spoolStore 'read frames from the durable cursor, verify CRC'
+    localRag.daemon.spoolImporter -> localRag.stateDb 'one transaction: envelopes, paths, payloads, cursor'
+
+    global style status
+  }
+
+  dynamic view spoolImport {
+    title 'Spool import — dedup, torn tail, cursor, cleanup'
+    description '''
+      Where at-least-once delivery becomes exactly-once storage. The cursor
+      advances inside the same transaction as the envelopes it accounts for,
+      which is the whole of the idempotence argument. A torn tail is not an
+      error — the appending hook holds its lock until the frame is complete, so
+      no valid frame can follow a torn one — while an impossible length is
+      corruption, reported rather than skipped, and the cursor never advances
+      past it. Cleanup is deliberately not atomic with the transaction: deleting
+      only what is already behind the cursor is safe to repeat and safe to
+      abandon.
+    '''
+
+    localRag.daemon.consolidationTrigger -> localRag.daemon.spoolImporter 'import this session tail'
+    localRag.daemon.spoolImporter -> localRag.spoolStore 'read from the durable cursor, across a rotation boundary if needed'
+    localRag.daemon.spoolImporter -> localRag.spoolStore 'verify each frame: length against the cap FIRST, then CRC'
+    localRag.daemon.spoolImporter -> repoUnderIndex 'git-probe the frame root BEFORE the write transaction opens'
+    localRag.daemon.spoolImporter -> localRag.stateDb 'stable identity: insert, a unique conflict is an exact-dedup skip'
+    localRag.daemon.spoolImporter -> localRag.stateDb 'best-effort identity: skip within 512 envelopes OR 10 minutes of its own capture time'
+    localRag.daemon.spoolImporter -> localRag.stateDb 'one transaction: envelopes, paths, payloads with a TTL, and the cursor'
+    localRag.daemon.spoolImporter -> localRag.spoolStore 'after the commit: delete every segment strictly behind the cursor'
+
+    global style status
+  }
+
+  dynamic view giveFeedback {
+    title 'give_feedback — the one exception to spool-only'
+    description '''
+      The MCP-callable equivalent of a hook append. It never calls the memory op
+      engine: durable consequences, if any, arrive later through ordinary
+      consolidation. The spool-only guardrail binds HOOKS, not daemon-internal
+      writes, and this is the documented exception — with a real architectural
+      consequence, since no spool directory ever represents a session whose
+      envelopes all arrived this way, which is why the consolidation tick unions
+      the sessions it knows from disk with the sessions that have a backlog in
+      the database.
+    '''
+
+    claudeCode -> localRag.daemon.mcpDispatcher 'give_feedback(text)'
+    localRag.daemon.mcpDispatcher -> localRag.stateDb 'one insert: envelope with source id mcp:<session>:<request_id>, doubling as the dedup key'
+    localRag.daemon.consolidationTrigger -> localRag.stateDb 'sessions with a backlog — the only source that sees a feedback-only session'
+    localRag.daemon.consolidationTrigger -> localRag.daemon.consolidationRunner 'consolidated later, like any other observation'
+
+    global style status
+  }
+}

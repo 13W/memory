@@ -87,3 +87,5 @@ jobs:
         run: npx -y likec4@1.59.2 validate docs/architecture
       - name: Check that every spec, plan and code reference resolves
         run: node docs/architecture/check-refs.mjs
+      - name: Check that the flow catalogue and the dynamic views agree
+        run: node docs/architecture/check-flows.mjs
