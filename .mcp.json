@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "likec4": {
+      "type": "stdio",
+      "command": "likec4",
+      "args": ["mcp", "--stdio", "${CLAUDE_PROJECT_DIR}/docs/architecture"],
+      "env": {
+        "GEMINI_API_KEY": ""
+      }
+    }
+  }
+}
