@@ -253,7 +253,7 @@ for every one of the five configurations; `store_en` and `both_en` both sat at a
 every language pair, so a ceiling was being asked to rank two things; and each cross-language pair
 had only four queries, moving a per-pair hit@1 in steps of 0.25 — which is why the recorded
 `baseline` figure for `en-ru` is exactly 0.25. The harness itself was not at fault: the recorded
-reports carry `v2_commit: eb4c6c9`, which is *after* `D-068`'s determinism fix, so they were
+reports carry `v2_commit: 4989536`, which is *after* `D-068`'s determinism fix, so they were
 reproducible — they were simply measuring a task too easy to tell the configurations apart.
 
 The new corpus keeps the relevance model (`single-relevant`, one judgment per query) and the

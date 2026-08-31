@@ -9,7 +9,7 @@
 # `local-rag` each start a **real daemon** or run a **real indexing cycle**, and
 # they cannot do that at the same time as each other.
 #
-# MEASURED, on the committed tree with no other change (`37713b2`):
+# MEASURED, on the committed tree with no other change (`e012620`):
 #   five of them run in parallel  -> 5 FAIL  (45 s, 120 s, 120 s, 120 s, 123 s)
 #   the same five with `-j 1`     -> 5 PASS  (17.6 / 22.0 / 21.2 / 0.1 / 41.5 s)
 #   each one alone                -> PASS    (15.9 s, 16.7 s)

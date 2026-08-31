@@ -26,7 +26,7 @@ import { createInterface } from 'node:readline';
 
 const SCRIPT_VERSION = '1.1.0';
 
-// The day D-041 and every task of group 19 landed (672edb6..26eab41, all 2026-08-07).
+// The day D-041 and every task of group 19 landed (24e48a4..3325854, all 2026-08-07).
 const EPOCH_BOUNDARY = '2026-08-08T00:00:00.000Z';
 
 // ---------------------------------------------------------------- tool classes
@@ -549,7 +549,7 @@ const report = {
     memory_block_injections: equipped.reduce((a, s) => a + s.memory_block_injections, 0),
   },
   cuts: {
-    note: 'Every cut is over equipped sessions only. EPOCH_BOUNDARY is the day D-041 and all of group 19 landed (commits 672edb6..26eab41, all 2026-08-07), so "after" is the first full day on which every one of the six adoption channels was shipped.',
+    note: 'Every cut is over equipped sessions only. EPOCH_BOUNDARY is the day D-041 and all of group 19 landed (commits 24e48a4..3325854, all 2026-08-07), so "after" is the first full day on which every one of the six adoption channels was shipped.',
     epoch_boundary: EPOCH_BOUNDARY,
     by_epoch: {
       before: adherenceOver(equipped.filter((s) => s.first_ts && s.first_ts < EPOCH_BOUNDARY).map((s) => s.segments[0]).filter(Boolean)),
