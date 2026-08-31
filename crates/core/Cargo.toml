@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # Identity primitives (spec 03 §1.2/§1.3). See the dependency policy in
 # CONTRIBUTING.md for the per-crate justification and license check.

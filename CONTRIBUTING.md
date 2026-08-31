@@ -192,6 +192,29 @@ ordinary `cargo test -p xtask` and therefore does run in `ci`.
   above): `cargo install cargo-nextest --locked`. Not a `rustup` component and
   not resolved by `cargo fetch` — install it once per machine.
 
+## Licence
+
+This project is **Apache-2.0** (owner decision, 2026-08-31). The full text is in
+`LICENSE`, and `NOTICE` carries the attribution a redistributor must keep, as
+section 4(d) requires.
+
+Two things follow for anyone working here:
+
+- Every crate inherits `license.workspace = true`; adding a new one means adding
+  that line, and `cargo metadata --no-deps` is the check.
+- Nothing in the dependency set constrains the choice. An audit of all 313
+  external crates found **zero copyleft**: 176 `MIT OR Apache-2.0`, 57 MIT, the
+  rest ISC / BSD / Zlib / CC0 / Unlicense. Apache-2.0 was chosen over MIT for the
+  explicit patent grant (§3) and its retaliation clause, and over the Rust
+  ecosystem's usual `MIT OR Apache-2.0` because a dual licence lets a consumer
+  take MIT and skip that grant.
+
+One consequence is deliberate and recorded next to the code that causes it: a
+release archive carries exactly one member — the executable — so it carries no
+licence copy. `dist-workspace.toml`'s `auto-includes = false` explains why, and
+why the npm package (which does ship `LICENSE`) is what the recipient of a binary
+actually installs.
+
 ## Dependency policy
 
 - `Cargo.lock` is committed for reproducible builds.

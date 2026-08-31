@@ -48,6 +48,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 publish = false
+# Owner decision, 2026-08-31. Permissive, so nothing here constrains a consumer;
+# chosen over MIT for the explicit patent grant (§3) and its retaliation clause,
+# and over `MIT OR Apache-2.0` because a dual licence lets a consumer take MIT and
+# skip that grant entirely. Nothing forced the hand: an audit of all 313 external
+# crates found zero copyleft.
+license = "Apache-2.0"
 # T17-03: required by `cargo dist generate` to emit a GitHub Actions release
 # workflow (release-artifact download URLs, badge links). The repo is public
 # — GitHub's own "Trade controls restricted owner" account-level restriction

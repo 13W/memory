@@ -51,6 +51,17 @@ github-attestations = true
 # archive with more than one member, and without this that rule would hold only
 # because this repository happens to have no such files at its root: adding one
 # would silently put a second member into every release archive.
+#
+# Since 2026-08-31 the repository DOES have a root `LICENSE` and `NOTICE`
+# (Apache-2.0), so this line is now load-bearing rather than latent, and the
+# licence consequence is stated here rather than discovered later. A release
+# archive carries exactly one member — the executable — and therefore no licence
+# copy. That is acceptable because the archive is not what a user installs: it is
+# fetched by `npm/memory`, whose published package carries `LICENSE` (npm includes
+# it regardless of the `files` allowlist), so the recipient of a binary does
+# receive the licence alongside it. If the archives ever become a direct download
+# channel, this decision has to be revisited together with `archive.js`'s
+# single-member rule.
 auto-includes = false
 
 # Build only what is actually shipped. Without this, `cargo-dist` builds with

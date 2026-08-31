@@ -33,6 +33,9 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"
 publish = false
+# Same licence as the root workspace (owner decision, 2026-08-31); this spike is
+# part of the same repository even though it builds separately.
+license = "Apache-2.0"
 
 # Mirror the root workspace's centralized lints (CONTRIBUTING.md).
 [workspace.lints.rust]
