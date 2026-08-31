@@ -74,6 +74,7 @@ views {
     include localRag.spoolStore, localRag.modelStore, localRag.storeControlFiles
     include localRag.daemon, localRag.cli, localRag.tui, localRag.hookBinary
     include localRag.daemon.writeQueues, localRag.daemon.lockRegistry
+    include localRag.daemon.searchEngine, localRag.daemon.reconcileDriver
     include localRag.daemon.migrationRunner, localRag.daemon.retentionGc
 
     global style status

@@ -100,7 +100,7 @@ model {
         '''
         metadata {
           spec 'docs/specification/09-search.md §2'
-          code 'crates/search/src/lexical.rs'
+          code 'crates/store/src/cache/fts_query.rs'
         }
       }
 
@@ -110,7 +110,7 @@ model {
         description 'Embeds the query and scans the worktree shard. Searches the code_raw representation only.'
         metadata {
           spec 'docs/specification/09-search.md §3'
-          code 'crates/search/src/dense.rs'
+          code 'crates/search/src/pipeline.rs'
         }
       }
 
@@ -417,7 +417,7 @@ model {
       '''
       metadata {
         spec 'docs/specification/08-memory.md §3'
-        plan 'docs/implementation-plan/groups/21-english-normalization.md'
+        plan 'docs/implementation-plan/groups/21-memory-english-normalization.md'
         code 'crates/local-rag/src/daemon/normalization/boundary.rs'
         interval_secs '60'
       }
@@ -571,6 +571,45 @@ model {
     memoryOps -[calls]-> writeQueues 'every mutation goes through the queue'
     reconcileDriver -[calls]-> writeQueues 'every mutation goes through the queue'
     reconcileDriver -[calls]-> lockRegistry 'holds the worktree write lock for the cycle'
+    adminVerbs -[reads]-> telemetry 'recent calls and per-tool counters'
+
+    // --- Which component touches which store -------------------------------
+    //
+    // Stated at component level as well as at container level, because "the
+    // daemon writes state.sqlite" is true and useless: what matters is that
+    // exactly two queues do the writing, that the lexical and dense legs read
+    // different stores, and that a snippet comes from the canonical bytes
+    // rather than from disk.
+
+    lexicalLeg -[reads]-> localRag.cacheDb 'BM25 over the materialized view'
+    denseLeg -[reads]-> localRag.projectionStore 'scans the worktree shard'
+    fusion -[calls]-> enrichment 'hands over the fused ranking'
+    enrichment -[reads]-> localRag.stateDb 'snippets cut from the stored source_blob'
+
+    reconcileDriver -[writes]-> localRag.stateDb 'the new generation'
+    embeddingBackfill -[writes]-> localRag.cacheDb 'vectors for new content only'
+    ftsMaterializer -[writes]-> localRag.cacheDb 'the lexical view and its head'
+    projectionSwitch -[writes]-> localRag.projectionStore 'points first, head last'
+    spoolImporter -[reads]-> localRag.spoolStore 'frames from the durable cursor'
+    spoolImporter -[writes]-> localRag.stateDb 'envelopes and the cursor, one transaction'
+    memoryOps -[writes]-> localRag.stateDb 'entry, evidence and audit together'
+    recallPipeline -[reads]-> localRag.stateDb 'scoped candidates and a fresh lifecycle re-read'
+    retentionGc -[writes]-> localRag.stateDb 'sweeps what no pin root protects'
+    migrationRunner -[writes]-> localRag.stateDb 'schema steps under the migration lock'
+    writeQueues -[writes]-> localRag.stateDb 'the only writer (L4a)'
+    writeQueues -[writes]-> localRag.cacheDb 'the only writer (L4b)'
+
+    // --- Where deferred work would attach ----------------------------------
+    //
+    // One edge each, so a reader planning a feature can see the seam rather
+    // than a floating box.
+
+    fusion -[calls]-> reranker 'post-v0: rerank the fused list'
+    descriptionLeg -[calls]-> providerPool 'post-v0: would embed a generated description'
+    symbolGraphTools -[reads]-> localRag.stateDb 'v0.x: resolved graph edges, once their semantics are fixed'
+    recallPipeline -[calls]-> annMemoryBackend 'post-v0: replaces brute force only on cardinality evidence'
+    recallPipeline -[calls]-> fullRecall 'post-v0: the full ranking stage'
+    v1MemoryImporter -[writes]-> localRag.stateDb 'only if GA ships an importer at all (O5 is open)'
   }
 
   // The hook shares the scanner with the daemon: the same rule set, the same

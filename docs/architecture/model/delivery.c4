@@ -56,22 +56,6 @@ model {
       }
     }
 
-    freebsdTarget = component 'FreeBSD target' {
-      #deferred
-      description 'Explicitly out of v0 scope.'
-      metadata {
-        spec 'docs/specification/01-overview.md §2'
-      }
-    }
-
-    win32Arm64Target = component 'win32-arm64 target' {
-      #deferred
-      description 'Deferred with FreeBSD; the platform table names it as such rather than omitting it.'
-      metadata {
-        spec 'docs/specification/13-distribution-and-migrations.md §1'
-      }
-    }
-
     platformResolver -[calls]-> releaseDownloader 'names the assets to fetch'
     releaseDownloader -[writes]-> binDirLadder 'installs flat and records the manifest'
   }

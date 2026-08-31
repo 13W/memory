@@ -28,6 +28,12 @@ Use this precedence order:
 5. `docs/implementation-plan/groups/NN-*.md` — scope and tests for an individual task.
 6. Existing code and tests — the as-built state, which must conform to the sources above.
 
+`docs/architecture/` holds a LikeC4 model of the as-built system. It is a **navigator, not a
+source of norms**: every element cites the specification section that governs it, plus the owning
+module and plan group. Open it to find where a change lands and what it touches; never resolve a
+normative question from it. It is outside the precedence list on purpose — a diagram never wins an
+argument against the specification.
+
 If code, tests, plan, and specification disagree, do not silently choose one. Follow the
 deviation workflow below.
 
@@ -79,6 +85,15 @@ For every implementation task:
 9. Append immutable evidence to `PROGRESS.md`: the commit reference (short hash, or the commit
    subject when the evidence line ships inside that same commit), exact commands, result,
    artifact/report path, executor, and date.
+10. Update `docs/architecture/` in the **same commit** when the task changes an architectural
+    surface: a process or shipped artifact, a store or what it is authoritative for, a background
+    loop or its trigger, an MCP tool / hook event / CLI verb that changes the interface surface,
+    an external dependency or network call, or an inter-process channel, lock, or transaction
+    boundary. Moving or renaming a cited file counts — `node docs/architecture/check-refs.mjs`
+    will say so. Then run `likec4 validate docs/architecture` and that script; both must pass.
+    A detail behind an unchanged boundary needs no model change. When the code and the model
+    diverge and closing the gap is not this task's scope, tag the element `#partial` and state
+    what is missing in its description rather than deleting or silently correcting it.
 
 **Worktree policy:** until specification work is complete, do not isolate task work in a git
 worktree for this project. Work directly in the primary checkout and commit directly to

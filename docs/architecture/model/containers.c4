@@ -118,7 +118,7 @@ model {
       '''
       metadata {
         spec 'docs/specification/13-distribution-and-migrations.md §1'
-        plan 'docs/implementation-plan/groups/22-binary-delivery.md'
+        plan 'docs/implementation-plan/groups/22-binary-delivery-and-resolution.md'
         code 'npm/memory/scripts/postinstall.js'
       }
     }
@@ -370,6 +370,11 @@ model {
       spec 'docs/specification/07-observations-spool.md §1'
       code 'plugin/hooks/hooks.json'
     }
+  }
+
+  claudeCode -[reads]-> localRag.ccPlugin.memorySkill 'on explicit invocation only'
+  multiHarness -[calls]-> localRag.mcpProxy 'would speak the same MCP surface — nothing in the protocol is Claude-specific' {
+    #deferred
   }
 
   operator -[calls]-> localRag.cli 'runs subcommands'

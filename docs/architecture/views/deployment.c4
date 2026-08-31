@@ -13,7 +13,5 @@ views {
     '''
 
     include *, devMachine.**
-
-    global style status
   }
 }

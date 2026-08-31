@@ -66,3 +66,24 @@ jobs:
           -p local-rag -p local-rag-proxy -p local-rag-hook -p local-rag-tui
       - name: Check every target, tests included
         run: cargo check --workspace --all-targets
+
+  architecture:
+    name: architecture model
+    runs-on: ubuntu-latest
+    # The LikeC4 model in docs/architecture is only useful while it is true, and
+    # both ways it goes stale are silent. A malformed view still renders in the
+    # editor the author had open; a renamed module leaves a `code` reference
+    # pointing at nothing, which no Rust check and no linter looks at.
+    #
+    # No package.json is vendored for this (an explicit decision — the model is
+    # authored with a globally installed CLI), so the version is pinned here
+    # instead. Keep it in step with the one named in docs/architecture/README.md.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate the model
+        run: npx -y likec4@1.59.2 validate docs/architecture
+      - name: Check that every spec, plan and code reference resolves
+        run: node docs/architecture/check-refs.mjs
