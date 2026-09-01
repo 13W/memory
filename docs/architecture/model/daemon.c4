@@ -460,13 +460,16 @@ model {
     }
 
     retentionGc = component 'Retention sweeps & housekeeping' {
-      #partial
+      #implemented
       description '''
         Mark-and-sweep against pin roots, batched through the writer queue, plus
         orphan shard directories, cache eviction, spool session GC and candidate
-        expiry. Driven by metrics and by explicit commands, never by a schedule.
-        Partial for one reason: the observation-payload TTL sweep exists as a
-        primitive that nothing currently schedules.
+        expiry — driven by metrics and by explicit commands (`local-rag gc`),
+        never by a schedule of their own. The one exception is the
+        observation-payload TTL sweep (T23-09): it alone has a real schedule, an
+        hourly daemon-side tick whose first tick doubles as its startup sweep,
+        because its policy is a real wall-clock deadline a human cannot be
+        relied on to enforce by typing a command.
       '''
       metadata {
         spec 'docs/specification/06-reconcile-and-fts.md §5'

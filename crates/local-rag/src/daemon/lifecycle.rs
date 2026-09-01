@@ -205,6 +205,13 @@ pub struct StartOptions {
     /// lifecycle-level tests can drive it directly — same rationale as
     /// `consolidation_poll_interval` above.
     pub indexing_backstop_poll_interval: Duration,
+    /// How often the payload TTL sweep worker ticks (`T23-09`, `D-123`). Same
+    /// bucket as `consolidation_poll_interval`/`normalization_poll_interval`
+    /// above: a plain parameter, not a config field, so a lifecycle-level test
+    /// can drive it directly. The worker's *first* tick is immediate
+    /// (`tokio::time::interval`'s own default), which is why the daemon does
+    /// not separately sweep payloads at startup the way it sweeps generations.
+    pub gc_poll_interval: Duration,
 }
 
 /// A running daemon instance, in-process (spec 02 §4.1 steps 1–5 complete;
@@ -264,6 +271,12 @@ pub struct DaemonHandle {
     consolidation_trigger_join: Option<JoinHandle<()>>,
     normalization_stop: Option<oneshot::Sender<()>>,
     normalization_join: Option<JoinHandle<()>>,
+    /// The payload TTL sweep worker (`T23-09`, `D-123`) — a `loop { tick }`
+    /// like the consolidation-trigger and normalization workers above, so it
+    /// gets the same signal-then-await shutdown rather than
+    /// `resume_handles`'s blind-await.
+    gc_stop: Option<oneshot::Sender<()>>,
+    gc_join: Option<JoinHandle<()>>,
     /// The daemon-managed indexing supervisor (T20-06) — one background task
     /// per `enabled` `managed_worktree` row. `None` exactly in
     /// `DaemonMode::MigrationOnly` (same `state_db.as_ref()` gate as
@@ -334,6 +347,7 @@ impl DaemonHandle {
             retention,
             classifier,
             indexing_backstop_poll_interval,
+            gc_poll_interval,
         } = opts;
 
         // T20-03: derive the two query-facing embedders from the shared
@@ -687,6 +701,28 @@ impl DaemonHandle {
                 _ => (None, None),
             };
 
+        // T23-09/D-123: the payload TTL sweep's own worker — a continuous
+        // tick, not a startup-only pass, and deliberately not folded into
+        // `spawn_startup_gc` (see that module's doc). Same `state_db`-present
+        // guard as the two loops above; reads the live clock per tick, the
+        // same choice the consolidation trigger makes (D-024) and the frozen
+        // `now_ms` above does not.
+        let (gc_stop, gc_join) = match state_db.as_ref() {
+            Some(db) => {
+                tracing::info!(job = "payload_ttl_sweep", "background job spawned");
+                let (stop_tx, stop_rx) = oneshot::channel();
+                let join = tokio::spawn(super::gc::run_payload_ttl_worker(
+                    Arc::clone(db),
+                    jobs.clone(),
+                    gc_poll_interval,
+                    system_now_ms,
+                    stop_rx,
+                ));
+                (Some(stop_tx), Some(join))
+            }
+            None => (None, None),
+        };
+
         Ok(DaemonHandle {
             socket_path: layout.socket_path(),
             layout,
@@ -707,6 +743,8 @@ impl DaemonHandle {
             consolidation_trigger_join,
             normalization_stop,
             normalization_join,
+            gc_stop,
+            gc_join,
             indexing_supervisor,
         })
     }
@@ -806,6 +844,9 @@ impl DaemonHandle {
         if let Some(stop) = self.normalization_stop.take() {
             let _ = stop.send(());
         }
+        if let Some(stop) = self.gc_stop.take() {
+            let _ = stop.send(());
+        }
 
         // The indexing supervisor is cancelled ahead of the waits for the same
         // reason, and it is the one that matters most: it is the only worker
@@ -843,6 +884,7 @@ impl DaemonHandle {
             std::mem::take(&mut self.resume_handles),
             self.consolidation_trigger_join.take(),
             self.normalization_join.take(),
+            self.gc_join.take(),
         )
         .await;
         tracing::debug!("background jobs stopped");
@@ -882,12 +924,14 @@ async fn await_workers_bounded(
     mut resume_handles: Vec<JoinHandle<()>>,
     consolidation_join: Option<JoinHandle<()>>,
     normalization_join: Option<JoinHandle<()>>,
+    gc_join: Option<JoinHandle<()>>,
 ) -> bool {
     let aborts: Vec<tokio::task::AbortHandle> = resume_handles
         .iter()
         .map(JoinHandle::abort_handle)
         .chain(consolidation_join.iter().map(JoinHandle::abort_handle))
         .chain(normalization_join.iter().map(JoinHandle::abort_handle))
+        .chain(gc_join.iter().map(JoinHandle::abort_handle))
         .collect();
     let waits = async move {
         // The startup resume passes are catch-up work with no stop signal of
@@ -904,6 +948,12 @@ async fn await_workers_bounded(
         // whenever it can do so inside the budget.
         if let Some(join) = normalization_join {
             log_if_task_panicked("the memory-normalization worker", join.await);
+        }
+        // Same reasoning, `JobKind::Gc` guard: a payload sweep in flight is a
+        // single `DELETE` inside the write queue, not a query planner over
+        // the whole table, so it finishes well inside the budget.
+        if let Some(join) = gc_join {
+            log_if_task_panicked("the payload TTL sweep worker", join.await);
         }
     };
     if tokio::time::timeout(budget, waits).await.is_err() {
@@ -1300,7 +1350,8 @@ mod tests {
 
         let budget = Duration::from_millis(150);
         let started = std::time::Instant::now();
-        let finished_on_own = await_workers_bounded(budget, Vec::new(), Some(hung), None).await;
+        let finished_on_own =
+            await_workers_bounded(budget, Vec::new(), Some(hung), None, None).await;
         let elapsed = started.elapsed();
 
         assert!(!finished_on_own, "the hung worker cannot have finished");
@@ -1333,7 +1384,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let finished_on_own =
-            await_workers_bounded(Duration::from_secs(30), resume, Some(quick), None).await;
+            await_workers_bounded(Duration::from_secs(30), resume, Some(quick), None, None).await;
 
         assert!(finished_on_own, "every worker finished on its own");
         assert!(

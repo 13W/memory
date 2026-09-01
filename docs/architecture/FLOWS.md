@@ -133,7 +133,7 @@ family whose members differ only in their detection signal.
 | spool-torn-tail-vs-corruption | observations | `spoolImport` | 07 §3, §5 |
 | segment-cleanup | observations | `spoolImport` | 07 §5, §6 |
 | spool-session-gc | maintenance | no view | 07 §6 |
-| payload-ttl-sweep | maintenance | no view | 12 §3 |
+| payload-ttl-sweep | maintenance | `retentionSweep` | 12 §3 |
 | spool-kill-matrix (S1–S8) | observations | table below | 07 §7 |
 | consolidation-trigger-tick | memory | `consolidationRun` | 07 §6, 08 §4 |
 | startup-consolidation-resume | memory | `daemonLifecycle` | 02 §4.1, 04 §4 |
@@ -777,6 +777,35 @@ family whose members differ only in their detection signal.
   separate steps, and `vacuum` refuses while a daemon holds the store.
 - **CODE** `crates/store/src/retention.rs`, `crates/local-rag/src/cli/{gc,vacuum}.rs`
 
+### payload-ttl-sweep
+**view** `retentionSweep` · **spec** 12 §3
+
+- **TRIGGER** A daemon-side tick, hourly, whose first tick is immediate — not
+  folded into the generation sweep's own startup-only job (`T23-09`, `D-123`).
+  Unlike every sibling sweep above, this one keeps running for the daemon's
+  whole uptime rather than once at start: its policy is a wall-clock deadline
+  (`payload_ttl_hours`, default 72h), and a start-only trigger would enforce it
+  only across restarts — measured on the owner's store as 45651 of 46737
+  payload rows already past `expires_at` with the sweeper compiled in but never
+  scheduled the whole time.
+- **STEPS** One `DELETE FROM observation_payload WHERE expires_at <= now`, read
+  against the live wall clock every tick, never the clock frozen at daemon
+  start.
+- **LOCKS+TX** One transaction per tick, through the single writer; the
+  `JobKind::Gc` guard is held only for the tick's own `DELETE`, never across the
+  wait to the next one — held across the wait would mean the daemon never sees
+  `running_jobs == 0` again and 02 §4.3's idle-shutdown gate would never fire.
+- **DURABILITY** Per tick. `observation_envelope`/`observation_path` are never
+  touched — envelope survival past payload expiry is structural (12 §3), not a
+  decision this sweep makes.
+- **FAILURE** A failed sweep is a warning, never fatal, the same discipline the
+  generation sweep states: the next tick resumes it. **Order matters on a live
+  store, and it is ADR-0014's constraint, not this sweep's own logic:**
+  rescuing a parked session's backlog (`T23-03`) must run before this sweep
+  ever executes against that store, or it deletes exactly the payloads the
+  repair exists to consolidate.
+- **CODE** `crates/store/src/observation/payload_ttl.rs`, `crates/local-rag/src/daemon/gc.rs`
+
 ### privacy-inspect-export-purge
 **view** `purgeMemory` · **spec** 12 §3, §5
 
@@ -871,7 +900,7 @@ direct byte manipulation instead.
 
 ## No recovery path today
 
-Twelve places where the system stops and cannot restart itself. Each is real,
+Eleven places where the system stops and cannot restart itself. Each is real,
 each has an owner or an explicit decision, and none is hidden in a happy path.
 
 1. **Approving two pre-existing duplicate candidates still mints two entries
@@ -891,39 +920,33 @@ each has an owner or an explicit decision, and none is hidden in a happy path.
    small follow-up reusing `active_entry_with_text` inside
    `approve_candidate`'s own transaction, the same check `T23-07` already
    uses at propose time.
-2. **The payload TTL sweep is scheduled by nothing.** Implemented, exported,
-   tested, and reachable only by a human typing `gc`. Measured: 45651 of 46737
-   payload rows already past expiry, the oldest by three weeks — a `[FIXED]`
-   privacy requirement enforced by hand. Four sibling sweeps share the gap.
-   *(T23-09, and it must land after the backlog rescue, or it deletes exactly
-   what the rescue exists to consolidate.)*
-3. **The router's answer budget is a constant** that does not follow the window
+2. **The router's answer budget is a constant** that does not follow the window
    it must describe. A truncated answer is indistinguishable from genuine
    malformation at the point the handler decides, so it consumes the one
    corrective re-prompt and then the window. *(T23-06)*
-4. **A truncated generation is classified as reproducible** and is not — proven
+3. **A truncated generation is classified as reproducible** and is not — proven
    by a live retry that applied, against the card's own written prediction.
    *(T23-10)*
-5. **The proxy upgrade EOF.** A CI failure in 0.016 s with the proxy closing
+4. **The proxy upgrade EOF.** A CI failure in 0.016 s with the proxy closing
    stdout without writing a byte; mechanism not established, only the
    diagnostics improved. This is the flow that took the owner's live MCP down.
-6. **No v1 memory importer.** Clean-start only, with no manual path either;
+5. **No v1 memory importer.** Clean-start only, with no manual path either;
    whether GA ships one is an open question, not an oversight.
-7. **Permanent window halving.** Nothing clears a failed run, so it stays the
+6. **Permanent window halving.** Nothing clears a failed run, so it stays the
    latest non-applied row and the shrink decision keeps halving against it — a
    session that overflowed once opens half-size windows forever, at twice the
    model calls. Only the operator verbs lift it, as a side effect.
-8. **The one-generator-pool rule has no mechanism.** A second pool in one
+7. **The one-generator-pool rule has no mechanism.** A second pool in one
    process fails and leaves that consumer silently empty for the daemon's whole
    uptime. A fourth careless consumer reintroduces it.
-9. **A corrupt subagent counter drops one observation** — by design, because
+8. **A corrupt subagent counter drops one observation** — by design, because
    reissuing an occurrence already used by stored history would collide against
    permanent data. Correct, and still an unrecoverable loss.
-10. **The hook's append budget is measured, never enforced** — killing mid-write
-    would risk an inconsistent lock and file state.
-11. **One deviation number cites two rows.** The clean repair means editing
+9. **The hook's append budget is measured, never enforced** — killing mid-write
+   would risk an inconsistent lock and file state.
+10. **One deviation number cites two rows.** The clean repair means editing
     committed evidence, which this repository forbids.
-12. **Byte-level torn writes are untested** (see above).
+11. **Byte-level torn writes are untested** (see above).
 
 ## Detected only by a human
 
@@ -933,7 +956,9 @@ Eleven conditions with no automatic signal — someone has to read `doctor`,
 - A parked consolidation run, and which sessions it blocks.
 - The permanent window halving — visible only as a run count.
 - Candidate-queue duplication.
-- Expired payload rows — no report at all; found by direct SQL.
+- The standing count of overdue payload rows — the sweep now logs what it
+  removed each hour, but no `doctor`/`stats` surface shows the count still
+  waiting; found by direct SQL.
 - The pin-set ratchet — visible only as cycle duration climbing, 88 s to 25 min.
 - WAL growth — visible only as the file, or as a full disk. It once reached
   324 GB against a 41 GB database.

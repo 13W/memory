@@ -269,9 +269,28 @@ remove now" convention `housekeeping::shard_destroy_due` established), plus a me
 (`payload_removed`/`payload_retained`/`total_envelopes`) alongside it. `observation_envelope` and
 `observation_path` are never touched by this sweep — envelope survival past payload expiry is
 structural, not a decision this code makes: an envelope with no payload row looks identical
-whether it never had one or its payload already expired. Ships with no scheduler, the same
-deferral every sweep in this crate carries (triggering it periodically is the daemon's job, group
-15).
+whether it never had one or its payload already expired.
+
+As-built note (T23-09, `D-123`, `[SPEC]`): the sweep **has a scheduler**. Until this card,
+`run_payload_ttl_sweep` had exactly one caller in the workspace — `local-rag gc`, a human typing a
+command — the same defect class `D-066` recorded for the generation sweep, measured here on the
+owner's live store as 45651 of 46737 payload rows already past `expires_at`, the oldest by three
+weeks. `crates/local-rag/src/daemon/gc.rs::run_payload_ttl_worker` gives it a daemon-side caller of
+its own: a `tokio::time::interval` on an hourly cadence (`GC_POLL_INTERVAL`, `main.rs`, no config
+key — `[storage].payload_ttl_hours` already sets the policy this enforces, the same choice `D-066`
+made for the generation sweep's own trigger), whose *first* tick is immediate and therefore doubles
+as the startup sweep — deliberately not a second call inside `spawn_startup_gc`, which sweeps
+generations only. Unlike that startup-only sweep, this one keeps running for the daemon's whole
+uptime, because `payload_ttl_hours` defaults to 72h and a real daemon runs for days: a start-only
+trigger would enforce the TTL only across restarts, which is how the rows above accumulated with
+the sweeper compiled in the whole time. Two properties are load-bearing: the `JobKind::Gc` guard is
+taken inside the tick, never across the wait between ticks (or an idle daemon would never see
+`running_jobs == 0` again and spec 02 §4.3's idle-shutdown gate would never fire); and the clock
+read each tick is the live wall clock, never the frozen `StartOptions.now_ms` the generation sweep
+reads once at startup. **Order matters on a live store, and it is ADR-0014's constraint, not this
+sweep's own logic:** rescuing a parked session's backlog (`T23-03`) must run before this sweep ever
+executes against that store, or the sweep deletes exactly the payloads the repair exists to
+consolidate — this code has no way to know whether that happened, and does not try to.
 - `inspect / export / purge` exist as first-class CLI operations (11 §6). `purge` is the only
   hard-delete path and tombstones audit references `[SPEC]`.
 - **The author's original text stays visible** `[FIXED, ADR-0011]`. Durable memory is stored in

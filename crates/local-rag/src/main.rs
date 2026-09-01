@@ -234,6 +234,7 @@ async fn serve() -> ServeOutcome {
         retention: local_rag_store::RetentionParams::from_storage_config(&config.storage),
         classifier: local_rag_index::classify::ClassifierConfig::from_index_config(&config.index),
         indexing_backstop_poll_interval: INDEXING_BACKSTOP_POLL_INTERVAL,
+        gc_poll_interval: GC_POLL_INTERVAL,
     };
     let idle_shutdown_secs = config.daemon.idle_shutdown_secs;
 
@@ -282,6 +283,15 @@ const NORMALIZATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// `managed_worktree` — the same "notify is a hint, table is truth" backstop
 /// cadence bucket, ~60s per the group card.
 const INDEXING_BACKSTOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the payload TTL sweep worker ticks (`T23-09`, `D-123`). No
+/// config key: `[storage].payload_ttl_hours` already sets the policy this
+/// enforces, the same choice `D-066` made for the generation sweep's own
+/// trigger — only the schedule is fixed here. An hour against a default 72h
+/// TTL enforces the deadline to within 1/72 of the budget for one `DELETE`
+/// per tick, which is cheap even against the tens of thousands of rows the
+/// owner's own store had accumulated with no sweeper running at all.
+const GC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// The current wall-clock time as Unix milliseconds (production seam).
 ///

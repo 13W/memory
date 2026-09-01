@@ -43,11 +43,15 @@ pub enum JobKind {
     /// actually doing that work — never across the wait between ticks, so an
     /// idle daemon stays idle-shutdown eligible (02 §4.3).
     Normalization,
-    /// The startup retention sweep (D-066, spec 06 §5) collecting unpinned
-    /// `retiring`/`failed` generations. Long-running on a store with a
-    /// backlog, and batched through the same global writer queue as every
-    /// other mutation — hence a job of its own, so `doctor`/`stats` can see
-    /// the daemon is busy collecting rather than idle.
+    /// GC work against `state.sqlite`: the startup retention sweep (D-066,
+    /// spec 06 §5) collecting unpinned `retiring`/`failed` generations —
+    /// long-running on a store with a backlog, batched through the same
+    /// global writer queue as every other mutation, hence a job of its own so
+    /// `doctor`/`stats` can see the daemon is busy collecting rather than
+    /// idle — and, per tick, the payload TTL sweep (T23-09, `D-123`). The
+    /// payload sweep's guard is held only for the tick's single `DELETE`, the
+    /// same "never across the wait" discipline [`JobKind::Normalization`]
+    /// states for its own tick.
     Gc,
 }
 

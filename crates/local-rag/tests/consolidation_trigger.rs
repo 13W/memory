@@ -97,6 +97,7 @@ fn start_options(layout: StoreLayout) -> StartOptions {
         },
         classifier: ClassifierConfig::new(1024 * 1024),
         indexing_backstop_poll_interval: Duration::from_millis(10),
+        gc_poll_interval: Duration::from_secs(3600),
     }
 }
 

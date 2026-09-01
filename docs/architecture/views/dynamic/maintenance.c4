@@ -15,12 +15,16 @@ views {
       only if children go first. Shard and lexical rows are not touched here at
       all; they disappear through desired-set reconciliation. Freeing rows and
       returning disk are separate: SQLite never does the second on its own.
+      Every sweep here is metric- and command-driven, except the payload TTL
+      sweep (T23-09): it alone runs on a real schedule, because its policy is a
+      wall-clock deadline, not a size or a count an operator can watch grow.
     '''
 
     localRag.daemon.retentionGc -> localRag.stateDb 'mark: active, building and projection_ready always; retiring within K generations OR the window'
     localRag.daemon.retentionGc -> localRag.stateDb 'candidates: retiring or failed, and unpinned'
     localRag.daemon.retentionGc -> localRag.stateDb 'delete in order: edges, occurrences, membership, generation, revisions, blobs'
     localRag.daemon.retentionGc -> localRag.stateDb 'at most 500 rows per transaction, through the single writer'
+    localRag.daemon.retentionGc -> localRag.stateDb 'payload TTL: DELETE observation_payload WHERE expires_at <= now — hourly, live clock, first tick immediate'
     operator -> localRag.cli 'local-rag gc --dry-run — the same sweeps, planning only'
     operator -> localRag.cli 'local-rag vacuum — refuses while a daemon holds the store'
     localRag.cli -> localRag.stateDb 'rewrite the file, returning the freed pages to the filesystem'
