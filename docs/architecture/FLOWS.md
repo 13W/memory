@@ -147,7 +147,7 @@ family whose members differ only in their detection signal.
 | transactional-memory-op | memory | `rememberWrite` | 08 §3 |
 | entry-lifecycle-state-machines | memory | no view | 04 §5 |
 | candidate-lifecycle | memory | `candidateReview` | 04 §6 |
-| candidate-dedup | memory | `candidateReview` | ADR-0014 |
+| candidate-dedup | memory | `candidateReview` | ADR-0014, 11 §6 |
 | review-verbs | memory | no view | 08 §3, 11 §2 |
 | give-feedback | memory | `giveFeedback` | 11 §2, 07 §1 |
 | recall-pipeline | memory | `recallInjection` | 08 §6 |
@@ -594,9 +594,10 @@ family whose members differ only in their detection signal.
 - **CODE** `crates/store/src/memory/op.rs`, `crates/local-rag/src/daemon/normalization/boundary.rs`
 
 ### guard-materialize · candidate-lifecycle · candidate-dedup
-**view** `candidateReview` · **spec** 08 §3, §4, 04 §6, 12 §4, ADR-0014
+**view** `candidateReview` · **spec** 08 §3, §4, 04 §6, 12 §4, 11 §6, ADR-0014
 
-- **TRIGGER** The router proposing an op; a human reviewing a candidate.
+- **TRIGGER** The router proposing an op; a human reviewing a candidate; a
+  human folding an exact-duplicate group already in the backlog.
 - **STEPS** Downgrade a create or supersede of a durable kind whose every
   citation is a model claim → rewrite a create of already-stored text into a
   reinforce → capture every expected version once → **propose a candidate:
@@ -605,7 +606,13 @@ family whose members differ only in their detection signal.
   writes no row, and a pending-twin hit links the new evidence onto the
   survivor instead** → on approval, materialize the proposed op through the
   same transactional path, with actor=user, inside the same transaction as
-  the state change.
+  the state change. **T23-08, the reduction half:** `local-rag memory list
+  --candidates --grouped` groups the still-pending backlog by the same key →
+  `local-rag memory dedup --candidate <id> | --all` folds one group (or every
+  group) — every twin but the group's oldest is transitioned pending →
+  rejected, its evidence linked onto the survivor first, one
+  `entity_kind=candidate` audit row per twin naming the survivor. CLI only,
+  never through MCP, never scheduled.
 - **FAILURE** The model-claim rule is enforced **twice, independently** —
   proactively in the guard, and as a backstop in the op engine that no future
   generator can bypass. Only the second is what the guarantee rests on. Exact
@@ -613,14 +620,23 @@ family whose members differ only in their detection signal.
   asked as byte equality it is a fact, and a fact is what a guard may act on
   silently — the same rule the dedup check reuses for "is this the same
   proposal", via a deterministic key that excludes a freshly minted id,
-  confidence and importance on purpose.
+  confidence and importance on purpose. A fold never approves and never
+  touches a group's survivor, so it can widen the backlog's exposure to
+  `D-131` (an unaudited duplicate pair both approved) no further than
+  approving is already able to on its own; a twin whose `conflicts` differs
+  from the survivor's is retained rather than merged, because merging two
+  conflict sets is a judgement this layer does not make.
 - **MEASURED** Past the conflict cap the model is blind to its own recent
   output and re-derives the same claim every window: 136 copies of one sentence,
   over half the durable memory (entries). Candidates went further before
   T23-07: 9605 pending rows over 3294 distinct texts, the worst proposed 476
   times, `conflicts` non-empty on none of them — the router was never shown a
-  pending candidate to notice at all.
-- **CODE** `crates/memory/src/guard.rs`, `crates/store/src/memory/review.rs`, `crates/store/src/memory/dedup.rs`
+  pending candidate to notice at all. Remeasured for T23-08: 11 236 pending
+  `create` rows over 4 393 distinct claims, worst duplicated 475 times, 957
+  `candidate_evidence` rows sitting on rows a naive fold would have dropped —
+  a full `--all` fold reduces the row count to the distinct-claim count
+  without changing it.
+- **CODE** `crates/memory/src/guard.rs`, `crates/store/src/memory/review.rs`, `crates/store/src/memory/dedup.rs`, `crates/store/src/memory/triage.rs`, `crates/local-rag/src/cli/memory.rs`
 
 ### recall-pipeline · recall-additionalcontext-formatting · recall-hook-injection
 **view** `recallInjection` · **spec** 08 §6, 11 §3.2, §5
@@ -858,18 +874,23 @@ direct byte manipulation instead.
 Twelve places where the system stops and cannot restart itself. Each is real,
 each has an owner or an explicit decision, and none is hidden in a happy path.
 
-1. **Duplicate candidates and duplicate entries — the mechanism is fixed
-   (T23-07), the backlog it left behind is not (T23-08).** The conflict set
-   now also shows the router the distinct proposals already pending in a
-   touched scope, and a deterministic store-side check (candidate-vs-
-   candidate, candidate-vs-entry, and — the sibling gap, D-127 — create-
-   vs-create within one plan) means the answer no longer depends on a 4B
-   model noticing. Measured before the fix: 9605 candidates over 3294
-   distinct texts, the worst proposed 476 times, conflicts empty on all of
-   them; 14 live runs had already minted two entries for one not-yet-stored
-   text. The queue **stops growing by duplication**; it does not shrink on
-   its own — reducing the existing rows, by the same distinct-text
-   invariant, is `T23-08`.
+1. **Approving two pre-existing duplicate candidates still mints two entries
+   (`D-131`, open).** `T23-07`'s deterministic check stops the queue growing
+   by duplication (candidate-vs-candidate, candidate-vs-entry, and — the
+   sibling gap, `D-127` — create-vs-create within one plan), and `T23-08`
+   shrinks the backlog that check does not touch retroactively
+   (`fold_pending_duplicates`/`fold_all_pending_duplicates`, `local-rag
+   memory dedup`, exact-duplicate groups folded to their oldest member —
+   measured before the fold: 11 236 pending rows over 4 393 distinct claims,
+   worst duplicated 475 times). Neither check runs at *approval* time:
+   `approve_candidate` never compares a `create`-shaped candidate's text
+   against an already-active entry before materializing it, so two
+   pre-existing duplicates an operator (or a bulk fold's own survivor,
+   against an unrelated already-approved twin) approves in sequence still
+   mint two entries. No corrective card assigned yet — natural home is a
+   small follow-up reusing `active_entry_with_text` inside
+   `approve_candidate`'s own transaction, the same check `T23-07` already
+   uses at propose time.
 2. **The payload TTL sweep is scheduled by nothing.** Implemented, exported,
    tested, and reachable only by a human typing `gc`. Measured: 45651 of 46737
    payload rows already past expiry, the oldest by three weeks — a `[FIXED]`

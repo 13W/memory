@@ -1,5 +1,7 @@
-//! `T23-07` / ADR-0014 Decision 2 / `D-118`: the card's own "distinct-vs-total
-//! figure remeasured" acceptance, against the owner's real backlog.
+//! `T23-07`/`T23-08`, ADR-0014 Decision 2 / `D-118`: the card's own
+//! "distinct-vs-total figure remeasured" acceptance, against the owner's
+//! real backlog — first the check that stops it growing (`T23-07`), then
+//! the fold that shrank what already existed (`T23-08`).
 //!
 //! Both tests are `#[ignore]`d and read `LOCAL_RAG_LIVE_ROOT` — a store root
 //! (the directory holding `state.sqlite`), opened **read only, through a
@@ -101,12 +103,17 @@ fn measure_distinct_versus_total_pending_claims() {
     );
 }
 
-/// The card's acceptance, offline and without a write: the text this store
-/// duplicated the most is exactly the shape `propose_candidate`'s check now
-/// declines a second row of.
+/// `T23-08`'s acceptance, live: after the historical backlog was folded
+/// (`local-rag memory dedup --all`, `T23-08`'s own evidence row —
+/// 11 236 pending rows over 4 393 distinct claims, worst duplicated 475
+/// times, folded to 4 393 pending rows over 4 393 distinct claims), the
+/// queue's forward guarantee (`T23-07`'s propose-time check) is what should
+/// keep it that way going forward: no distinct claim should ever again have
+/// more than one pending row. A failure here means either that check has
+/// regressed, or the backlog needs another fold.
 #[test]
 #[ignore = "needs LOCAL_RAG_LIVE_ROOT"]
-fn the_worst_duplicated_claim_would_now_be_dropped() {
+fn every_distinct_claim_has_at_most_one_pending_row() {
     let Some(root) = live_root() else {
         eprintln!("skipped: LOCAL_RAG_LIVE_ROOT not set");
         return;
@@ -114,18 +121,17 @@ fn the_worst_duplicated_claim_would_now_be_dropped() {
     let conn = open_live_read_only(&root);
     let groups = pending_create_groups(&conn);
 
-    let worst = groups
-        .iter()
-        .max_by_key(|(_, ids)| ids.len())
-        .expect("the store produced at least one pending create");
+    let worst = groups.values().map(Vec::len).max().unwrap_or(0);
+    println!("worst duplicated claim: {worst} copies");
 
-    println!(
-        "worst duplicated claim: {} copies, e.g. candidate_id {}",
-        worst.1.len(),
-        worst.1[0]
-    );
+    let duplicated: Vec<(&CandidateDedupKey, usize)> = groups
+        .iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(key, ids)| (key, ids.len()))
+        .collect();
     assert!(
-        worst.1.len() > 1,
-        "expected at least one claim proposed more than once on this store: {worst:?}"
+        duplicated.is_empty(),
+        "{} claim(s) still have more than one pending row: {duplicated:?}",
+        duplicated.len()
     );
 }

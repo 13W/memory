@@ -86,9 +86,21 @@ model {
         proposal already matches a pending twin or an active entry — a
         duplicate writes no row, and a pending-twin hit links the new
         evidence onto the survivor instead of discarding it.
+
+        T23-08: the check above stops the queue growing by duplication; it does
+        not shrink what already existed. fold_pending_duplicates collapses one
+        exact-duplicate group at a time — every twin but the group's oldest
+        (the survivor) is transitioned pending → rejected, its evidence linked
+        onto the survivor first, and one candidate-kind audit row records it,
+        because that same transition is what an operator's own reject already
+        produces and the audit row is the only thing telling the two apart.
+        The survivor is never touched. fold_all_pending_duplicates is the
+        multi-group driver, reachable only from the CLI, one explicit
+        invocation at a time — never scheduled, never reachable from gc.
       '''
       metadata {
         spec 'docs/specification/04-state-machines.md §6'
+        plan 'docs/implementation-plan/groups/23-consolidation-recovery.md'
         code 'crates/store/src/memory/review.rs'
       }
     }

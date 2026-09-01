@@ -24,9 +24,9 @@ use local_rag_core::paths::StoreLayout;
 use local_rag_core::spool::{FramePayload, encode_frame, encode_segment_header};
 use local_rag_store::registry::{GenerationState, transition_generation};
 use local_rag_store::{
-    CANDIDATE_EXPIRY_MS, NewCandidate, RequestRoot, SHARD_DESTROY_GRACE_MS,
+    CANDIDATE_EXPIRY_MS, CandidateState, NewCandidate, RequestRoot, SHARD_DESTROY_GRACE_MS,
     SPOOL_SESSION_ABSENCE_MS, StateDb, WorktreeKind, WorktreeState, allocate_generation,
-    create_candidate, create_repository, create_worktree, import_session_tail,
+    candidate_state, create_candidate, create_repository, create_worktree, import_session_tail,
     insert_projection_state, transition_worktree_state,
 };
 use local_rag_test_support::TempHome;
@@ -330,6 +330,59 @@ fn gc_rejects_an_unknown_argument() {
     let (home, _layout) = open_layout();
     let output = run_cli(&home, &["gc", "--bogus"]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+/// `T23-08`: `local_rag_store::memory::fold_all_pending_duplicates` is
+/// deliberately not one of `gc`'s six sweeps (see `cli/gc.rs`'s own module
+/// doc) — folding a duplicate candidate is an operator's explicit act
+/// (`memory dedup`), never a side effect of routine, unattended retention.
+/// This is the regression that keeps a future "complete the sweep list"
+/// change from reintroducing that automatic mass-decision.
+#[tokio::test]
+async fn gc_never_folds_duplicate_candidates() {
+    let (home, layout) = open_layout();
+    let json = "{\"op\":\"create\",\"kind\":\"fact\",\"text\":\"the same claim\",\
+                 \"canonical_key\":null,\"scope_kind\":\"worktree\",\"scope_owner_id\":\"owner\",\
+                 \"memory_id\":\"mem-a\",\"confidence\":0.5,\"importance\":0.5,\
+                 \"valid_from_tree\":null,\"last_verified_tree\":null}";
+    // Fresh, not `1_000`: the candidate-expiry sweep (also in `gc`) would
+    // otherwise expire both rows against the real wall clock before dedup
+    // ever entered the picture, which would prove nothing about folding.
+    let created_at = real_now_ms();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        for id in ["dup-a", "dup-b"] {
+            let (cid, json) = (id.to_string(), json.to_string());
+            state
+                .writer()
+                .transaction(move |tx| {
+                    create_candidate(
+                        tx,
+                        &NewCandidate {
+                            candidate_id: &cid,
+                            proposed_operation: &json,
+                            conflicts: None,
+                        },
+                        created_at,
+                    )
+                })
+                .await
+                .expect("seed duplicate candidate");
+        }
+    }
+
+    let output = run_cli(&home, &["gc"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    for id in ["dup-a", "dup-b"] {
+        assert_eq!(
+            candidate_state(&read, id).expect("state"),
+            Some(CandidateState::Pending),
+            "{id}: gc must never fold a duplicate candidate"
+        );
+    }
 }
 
 #[tokio::test]

@@ -137,6 +137,34 @@ section states less precisely than the code fixes:
   `local_rag_store::memory::propose_candidate` itself, and this guard's own boundary is unchanged:
   it still never turns a candidate into an automatic write, because declining to enqueue a
   duplicate *request* is not answering it.
+
+  `T23-07` prevents new duplicates; it does not shrink the backlog that already existed (11 236
+  pending `create` rows over 4 393 distinct claims, measured live). `T23-08` is the reduction:
+  `local_rag_store::memory::fold_pending_duplicates` collapses one exact-duplicate group at a
+  time — every member but the group's oldest ("the survivor") is transitioned `pending →
+  rejected`, exactly the state a lone `reject_candidate` call already produces, with the twin's
+  `candidate_evidence` linked onto the survivor first (`D-133`, closed: the pre-`T23-07` backlog
+  carried 957 evidence links that a naive fold would otherwise have dropped). The survivor is
+  never touched — folding decides how many copies of a claim are still waiting to be judged, never
+  the claim itself, and `approve`/`reject`/`edit` remain the only way a candidate becomes an entry.
+  `local_rag_store::memory::fold_all_pending_duplicates` is the multi-group driver over it, CLI-only
+  (`local-rag memory dedup`, spec 11 §6) and never scheduled or reachable from `local-rag gc` —
+  ADR-0014 Decision 1's "an operator's, not a schedule's" applies here exactly as it does to
+  `consolidation retry|abandon`.
+
+  This section's own contract — every operation in its list gets a single tx containing "the
+  entry mutation, `memory_evidence` rows, `audit_event`" — was, and outside this one new act still
+  is, unmet for the candidate machine's own transitions: `reject_candidate`/`edit_candidate` (both
+  named here as "review tools" `reject`/`edit`) and the candidate-expiry sweep all write no
+  `audit_event` at all (`D-132`, open — a pre-existing gap this task's own fold act cannot silently
+  inherit, not one it was asked to retrofit onto the other three). A fold's twins therefore get
+  what an operator's own `reject_candidate` call still does not: one `audit_event` per folded twin,
+  under a new `entity_kind = "candidate"` (`AUDIT_ENTITY_CANDIDATE`, `op = "fold_duplicate"`, the
+  second `entity_kind` in that table besides `memory_entry`, following `consolidation_run`'s own
+  precedent), naming the survivor. Without it a fold's `rejected` row would be byte-identical to an
+  operator's own considered "no" — `rejected` is terminal, so that distinction, once lost, is lost
+  for good; the audit row is what lets a later reader tell "a human judged this claim" from "this
+  was a byte-identical copy of a claim still awaiting judgement" apart.
 - **`noop` writes nothing at all** — no `memory_entry` mutation, no `memory_evidence`, no
   `audit_event`. The op envelope in §4 below lists `target/kind/text/scope/canonical_key/
   confidence inputs` for the op list generally; `noop` needs none of them, unlike every other
@@ -901,3 +929,12 @@ no `entry_version` (04 §6's as-built note), so `edit_memory_candidate`'s precon
 wired, is `review_state = 'pending'`, not a version match — `list_candidates` exposes
 `review_state`/`created_at` as this table's own staleness signal instead, paired with
 `candidate_evidence_for` for provenance.
+
+As-built note (`T23-08`, `[SPEC]`): bulk candidate triage — `pending_candidate_groups`,
+`fold_pending_duplicates`, `fold_all_pending_duplicates` — adds **no** MCP tool to this
+`[FIXED set]`. Not because it would widen a `[FIXED]` list (`--grouped` on the read side is an
+additive field on the existing `list_memory_candidates` shape, not a new tool, so that argument
+would not have held): a bulk reject an agent can call through MCP is a bulk reject an agent can
+call by mistake, and ADR-0014 Decision 1 already settled that class of act as "an operator's, not
+a schedule's" — the same reasoning that keeps `consolidation retry|abandon` (11 §6, `T23-03`)
+CLI-only rather than MCP-exposed. `local-rag memory dedup` (11 §6) is the whole surface.

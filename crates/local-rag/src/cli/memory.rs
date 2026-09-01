@@ -15,18 +15,46 @@
 //! --worktree`: `pending_memory_candidate` has no scope column (spec 03
 //! §2.5), so listing candidates is a flag rather than a second subcommand
 //! that would otherwise need its own scope-resolution dance for nothing.
+//!
+//! # `list --candidates --grouped` and `dedup` (`T23-08`)
+//!
+//! `local-rag memory list --candidates` prints only id/state/created_at —
+//! before `T23-08` an operator had no way to see that hundreds of pending
+//! rows said the same thing. `--grouped` prints one line per exact-duplicate
+//! group instead (`local_rag_store::pending_candidate_groups`), with a claim
+//! preview.
+//!
+//! `local-rag memory dedup` is the write half: `--candidate <id>` folds
+//! exactly the group the named candidate belongs to
+//! (`local_rag_store::fold_pending_duplicates`); `--all` folds every group in
+//! the pending queue (`local_rag_store::fold_all_pending_duplicates`).
+//! Exactly one of the two is required — there is no default mode, so this
+//! command can never touch a group its caller did not name. `--dry-run`
+//! reports what would be folded without writing anything (the `gc`-style
+//! flag: without it, the command applies — `--all` is itself the explicit
+//! opt-in word for a full-queue fold).
+//!
+//! Folding only ever transitions an exact duplicate `pending -> rejected`
+//! (the state [`reject_candidate`] already produces); it never approves
+//! anything, and the survivor of every group stays `pending` for the
+//! existing approve/reject/edit path, which remains the only way a
+//! candidate becomes an entry (ADR-0014 Decision 2, `D-131`). This command
+//! is deliberately not reachable from `local-rag gc` — see that command's
+//! own module doc.
 
 use std::process::ExitCode;
 
 use local_rag_core::identity::{SystemUuidV7, UuidSource};
 use local_rag_memory::recall as recall_pipeline;
 use local_rag_store::{
-    Actor, CandidateState, ConfirmMemoryOp, EditMemoryOp, GLOBAL_SCOPE_OWNER_ID, MemoryEntryRow,
-    MemoryKind, MemoryOpError, MemoryState, MergeLoser, MergeMemoryOp, RejectMemoryOp, RequestRoot,
-    RetractMemoryOp, ReviewError, ScopeKind, SupersedeMemoryOp, apply_confirm, apply_edit,
-    apply_merge, apply_reject, apply_retract, apply_supersede, approve_candidate, list_candidates,
-    list_memory_entries_for_scope, memory_entry_by_id, memory_evidence_for, reject_candidate,
-    resolve,
+    Actor, CANDIDATE_EXPIRY_MS, CandidateState, ConfirmMemoryOp, DedupTriageReport, EditMemoryOp,
+    FoldDuplicatesOutcome, FoldRetained, GLOBAL_SCOPE_OWNER_ID, MemoryEntryRow, MemoryKind,
+    MemoryOpError, MemoryState, MergeLoser, MergeMemoryOp, ProposedOperation, RejectMemoryOp,
+    RequestRoot, RetractMemoryOp, ReviewError, ScopeKind, SupersedeMemoryOp, apply_confirm,
+    apply_edit, apply_merge, apply_reject, apply_retract, apply_supersede, approve_candidate,
+    candidate_state, fold_all_pending_duplicates, fold_pending_duplicates, list_candidates,
+    list_memory_entries_for_scope, memory_entry_by_id, memory_evidence_for, pending_candidate_ages,
+    pending_candidate_groups, reject_candidate, resolve,
 };
 
 use local_rag::daemon::gitroot;
@@ -49,6 +77,10 @@ pub struct MemoryListArgs {
     /// List pending review candidates instead of durable memory entries.
     #[arg(long)]
     candidates: bool,
+    /// With `--candidates`: one line per exact-duplicate group instead of
+    /// one line per candidate (`T23-08`).
+    #[arg(long, requires = "candidates")]
+    grouped: bool,
     #[arg(long, value_parser = parse_memory_kind)]
     kind: Option<MemoryKind>,
     /// A memory state (active/superseded/retracted/…) or, with
@@ -139,6 +171,22 @@ pub enum MemoryCommand {
     Evidence {
         memory_id: String,
     },
+    /// Fold exact-duplicate pending candidates (`T23-08`, ADR-0014
+    /// Decision 2). Exactly one of `--candidate`/`--all` is required — see
+    /// the module doc.
+    Dedup {
+        /// Fold the exact-duplicate group this candidate belongs to (any
+        /// member of the group may be named, not necessarily the group's
+        /// oldest).
+        #[arg(long, conflicts_with = "all")]
+        candidate: Option<String>,
+        /// Fold every exact-duplicate group in the pending queue.
+        #[arg(long)]
+        all: bool,
+        /// Report what would be folded without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run(command: MemoryCommand) -> ExitCode {
@@ -172,6 +220,11 @@ pub fn run(command: MemoryCommand) -> ExitCode {
             root,
         } => run_rescope(memory_id, expected_version, scope, root),
         MemoryCommand::Evidence { memory_id } => run_evidence(memory_id),
+        MemoryCommand::Dedup {
+            candidate,
+            all,
+            dry_run,
+        } => run_dedup(candidate, all, dry_run),
     }
 }
 
@@ -221,6 +274,29 @@ fn review_error_message(e: &ReviewError) -> String {
     }
 }
 
+/// An 80-character preview of what a `pending_memory_candidate` row's
+/// `proposed_operation` JSON claims — `T23-08`'s reason `list --candidates
+/// --grouped` exists at all: plain `list --candidates` never shows this, so
+/// there was previously no way to see that two rows said the same thing.
+/// Unparsable JSON says so rather than panicking; `pending_candidate_groups`
+/// itself already excludes such rows from every group, so this only ever
+/// fires for a row this preview was handed out of band.
+fn candidate_claim_preview(proposed_operation_json: &str) -> String {
+    let preview80 = |s: &str| -> String { s.chars().take(80).collect() };
+    match serde_json::from_str::<ProposedOperation>(proposed_operation_json) {
+        Ok(ProposedOperation::Create { text, .. }) => preview80(&text),
+        Ok(ProposedOperation::Reinforce { memory_id, .. }) => format!("reinforce {memory_id}"),
+        Ok(ProposedOperation::Resolve { memory_id, .. }) => format!("resolve {memory_id}"),
+        Ok(ProposedOperation::Retract { memory_id, .. }) => format!("retract {memory_id}"),
+        Ok(ProposedOperation::Supersede {
+            old_memory_id,
+            new_text,
+            ..
+        }) => format!("supersede {old_memory_id} -> {}", preview80(&new_text)),
+        Err(_) => "<unparsable proposed_operation>".to_string(),
+    }
+}
+
 fn print_memory_entry(row: &MemoryEntryRow) {
     let text_preview: String = row.text.chars().take(80).collect();
     println!(
@@ -244,6 +320,7 @@ fn print_memory_entry(row: &MemoryEntryRow) {
 fn run_list(args: MemoryListArgs) -> ExitCode {
     let MemoryListArgs {
         candidates: candidates_mode,
+        grouped,
         kind: kind_filter,
         state: state_raw,
         scope: scope_filter,
@@ -278,6 +355,46 @@ fn run_list(args: MemoryListArgs) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(BIN, &format!("could not open state.sqlite: {e}")),
     };
+
+    if candidates_mode && grouped {
+        // `T23-08`: grouping is store-wide (no `review_state` filter to
+        // apply — `pending_candidate_groups` only ever sees `pending` rows)
+        // and the point is precisely to show what plain `list --candidates`
+        // cannot: how many rows say the same thing.
+        let groups = match pending_candidate_groups(&conn) {
+            Ok(g) => g,
+            Err(e) => return fail(BIN, &format!("could not group candidates: {e}")),
+        };
+        let distinct = groups.len();
+        let total: usize = groups.iter().map(|g| 1 + g.duplicate_ids.len()).sum();
+        let largest = groups
+            .iter()
+            .map(|g| 1 + g.duplicate_ids.len())
+            .max()
+            .unwrap_or(0);
+
+        let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+        let limit_usize = limit as usize;
+        let has_more = groups.len() > offset_usize.saturating_add(limit_usize);
+
+        for group in groups.iter().skip(offset_usize).take(limit_usize) {
+            println!(
+                "{}x  {}  created_at={}  {}",
+                1 + group.duplicate_ids.len(),
+                group.survivor.candidate_id,
+                group.survivor.created_at,
+                candidate_claim_preview(&group.survivor.proposed_operation),
+            );
+        }
+        if has_more {
+            println!(
+                "(more groups available; retry with --offset {})",
+                offset + limit
+            );
+        }
+        println!("{total} pending over {distinct} distinct claim(s) (largest group: {largest}x)");
+        return ExitCode::SUCCESS;
+    }
 
     if candidates_mode {
         let rows = match list_candidates(&conn, candidate_state_filter, limit + 1, offset) {
@@ -428,6 +545,198 @@ fn run_reject(id: String) -> ExitCode {
         }
         Ok(Err(e)) => fail(BIN, &review_error_message(&e)),
         Err(e) => fail(BIN, &format!("could not reject {id}: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dedup (`T23-08`, ADR-0014 Decision 2) — see the module doc.
+// ---------------------------------------------------------------------------
+
+fn fold_retained_message(reason: &FoldRetained) -> &'static str {
+    match reason {
+        FoldRetained::ConflictsDiffer => "its conflicts differ from the survivor's",
+        FoldRetained::UnparsableProposal => "its proposed_operation no longer parses",
+        FoldRetained::SurvivorNoLongerPending => {
+            "the survivor moved out of pending before this could apply"
+        }
+    }
+}
+
+fn print_fold_outcome(id: &str, outcome: &FoldDuplicatesOutcome) {
+    if outcome.folded.is_empty() {
+        println!(
+            "{BIN}: {id} has no exact duplicates — nothing to fold; use `memory approve`/`memory \
+             reject` to decide it"
+        );
+    } else {
+        println!(
+            "{BIN}: folded {} duplicate(s) of {id} into survivor {} (dedup key {}), linked {} \
+             evidence row(s)",
+            outcome.folded.len(),
+            outcome.survivor_candidate_id,
+            outcome.key.as_str(),
+            outcome.evidence_linked,
+        );
+        for twin in &outcome.folded {
+            println!("  rejected {twin}");
+        }
+    }
+    for (twin, reason) in &outcome.retained {
+        println!("  retained {twin}: {}", fold_retained_message(reason));
+    }
+}
+
+fn print_triage_report(report: &DedupTriageReport) {
+    let verb = if report.dry_run {
+        "would reject"
+    } else {
+        "rejected"
+    };
+    println!(
+        "{BIN}: {verb} {} duplicate candidate(s) across {} group(s) — {} distinct claim(s) \
+         {} pending",
+        report.folded.len(),
+        report.groups_folded,
+        report.distinct_claims_after,
+        if report.dry_run {
+            "would remain"
+        } else {
+            "remain"
+        },
+    );
+    if !report.dry_run {
+        println!(
+            "  linked {} evidence row(s) onto survivors",
+            report.evidence_linked
+        );
+    }
+    if !report.retained.is_empty() {
+        println!("  {} row(s) retained, not folded:", report.retained.len());
+        for (twin, reason) in &report.retained {
+            println!("    {twin}: {}", fold_retained_message(reason));
+        }
+    }
+}
+
+/// `CANDIDATE_EXPIRY_MS - 7 days`, in milliseconds: `local-rag gc`'s own
+/// expiry sweep threshold minus a week of headroom — a fold makes every
+/// surviving candidate the *oldest* of its group (`fold_pending_duplicates`'
+/// tie-break), so a reduction here can, without warning, hand a routine `gc`
+/// run a queue's worth of rows to expire (`T23-08`'s own design note).
+const NEAR_EXPIRY_WARNING_MS: i64 = CANDIDATE_EXPIRY_MS - 7 * 24 * 60 * 60 * 1_000;
+
+fn warn_if_pending_near_expiry(state: &local_rag_store::StateDb) {
+    let Ok(conn) = state.open_read() else {
+        return;
+    };
+    let Ok(ages) = pending_candidate_ages(&conn) else {
+        return;
+    };
+    let now_ms = system_now_ms();
+    let near_expiry = ages
+        .iter()
+        .filter(|(_, created_at)| now_ms.saturating_sub(*created_at) >= NEAR_EXPIRY_WARNING_MS)
+        .count();
+    if near_expiry > 0 {
+        eprintln!(
+            "{BIN}: note — {near_expiry} pending candidate(s) are within 7 days of the 30-day \
+             expiry budget; `local-rag gc` would expire them. Review them before running gc."
+        );
+    }
+}
+
+fn run_dedup(candidate: Option<String>, all: bool, dry_run: bool) -> ExitCode {
+    if candidate.is_none() && !all {
+        eprintln!("{BIN} memory dedup: one of --candidate <id> or --all is required");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let (layout, _config) = match resolve_layout_and_config() {
+        Ok(v) => v,
+        Err(e) => return fail(BIN, &e),
+    };
+    let state = match open_state(&layout) {
+        Ok(s) => s,
+        Err(e) => return fail(BIN, &e),
+    };
+
+    if let Some(id) = candidate {
+        if dry_run {
+            let conn = match state.open_read() {
+                Ok(c) => c,
+                Err(e) => return fail(BIN, &format!("could not open state.sqlite: {e}")),
+            };
+            match candidate_state(&conn, &id) {
+                Ok(Some(CandidateState::Pending)) => {}
+                Ok(Some(_)) => return fail(BIN, &review_error_message(&ReviewError::NotPending)),
+                Ok(None) => {
+                    return fail(BIN, &review_error_message(&ReviewError::UnknownCandidate));
+                }
+                Err(e) => return fail(BIN, &format!("could not read {id}: {e}")),
+            }
+            let groups = match pending_candidate_groups(&conn) {
+                Ok(g) => g,
+                Err(e) => return fail(BIN, &format!("could not group candidates: {e}")),
+            };
+            let Some(group) = groups
+                .iter()
+                .find(|g| g.survivor.candidate_id == id || g.duplicate_ids.contains(&id))
+            else {
+                // `pending_candidate_groups` never invents a group for a row
+                // it could not parse — same rule as a real fold.
+                return fail(
+                    BIN,
+                    "invalid proposed_operation: candidate could not be grouped",
+                );
+            };
+            if group.duplicate_ids.is_empty() {
+                println!(
+                    "{BIN}: {id} has no exact duplicates — nothing to fold; use `memory \
+                     approve`/`memory reject` to decide it"
+                );
+            } else {
+                println!(
+                    "{BIN}: would fold {} duplicate(s) into survivor {} (dedup key {})",
+                    group.duplicate_ids.len(),
+                    group.survivor.candidate_id,
+                    group.key.as_str(),
+                );
+            }
+            return ExitCode::SUCCESS;
+        }
+
+        let now_ms = system_now_ms();
+        let outcome = block_on({
+            let id = id.clone();
+            async move {
+                state
+                    .writer()
+                    .transaction(move |tx| fold_pending_duplicates(tx, &id, now_ms))
+                    .await
+            }
+        });
+        return match outcome {
+            Ok(Ok(outcome)) => {
+                print_fold_outcome(&id, &outcome);
+                ExitCode::SUCCESS
+            }
+            Ok(Err(e)) => fail(BIN, &review_error_message(&e)),
+            Err(e) => fail(BIN, &format!("could not fold duplicates of {id}: {e}")),
+        };
+    }
+
+    // `--all`.
+    let now_ms = system_now_ms();
+    let report = block_on(fold_all_pending_duplicates(&state, now_ms, dry_run));
+    match report {
+        Ok(report) => {
+            print_triage_report(&report);
+            if !dry_run {
+                warn_if_pending_near_expiry(&state);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(BIN, &format!("could not fold duplicate candidates: {e}")),
     }
 }
 

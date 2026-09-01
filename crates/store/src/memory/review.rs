@@ -81,14 +81,50 @@
 //! an entry has nothing left to review, and materializing anything for it
 //! would be exactly the automatic write [`local_rag_memory::guard`]'s own
 //! `D-078` boundary refuses to make.
+//!
+//! # Folding a pre-existing duplicate group is a recorded act, not a rejection
+//!
+//! (`T23-08`, ADR-0014 Decision 2.) [`propose_candidate`]'s check only guards
+//! proposals made *after* `T23-07` shipped; the backlog that already existed
+//! (11 236 rows over 4 393 distinct claims on the owner's own store, worst
+//! claim repeated 475 times) needed its own reduction, not a schema
+//! migration and not a rewrite of the check above. [`fold_pending_duplicates`]
+//! is that reduction, one exact-duplicate group at a time: every member but
+//! the group's oldest ("the survivor") is transitioned `pending → rejected`,
+//! exactly like a lone [`reject_candidate`] call — except this is **not**
+//! [`reject_candidate`]. `reject_candidate`/[`transition_candidate`] write no
+//! `audit_event` at all (there is nothing on `pending_memory_candidate` for
+//! them to version), so reusing that function for a machine-driven fold
+//! would leave a `rejected` row indistinguishable from an operator's own
+//! considered "no" — forever, since `rejected` is terminal. A fold instead
+//! writes one `audit_event` per folded twin, under [`AUDIT_ENTITY_CANDIDATE`]
+//! (the second `entity_kind` in that table besides `memory_entry`, following
+//! [`super::consolidation::AUDIT_ENTITY_CONSOLIDATION_RUN`]'s precedent —
+//! ADR-0014 named that extension in advance for exactly this situation),
+//! naming the survivor it was folded into. That is the whole distinction a
+//! later reader has between "a human judged this claim and said no" and
+//! "this was a byte-identical copy of a claim still awaiting judgement."
+//!
+//! The survivor itself is never touched by a fold: it stays `pending`, for
+//! the existing approve/reject/edit path, which remains the only way a
+//! candidate becomes an entry — folding decides nothing about the *claim*,
+//! only about how many copies of it are still waiting to be decided. Before
+//! rejecting a twin, its `candidate_evidence` is linked onto the survivor
+//! (the same "carry the evidence, that is the whole gain over a silent
+//! drop" step [`propose_candidate`]'s own pending-twin hit already takes) —
+//! without this, a fold would silently do the retroactive version of the
+//! evidence loss `T23-07` was built to prevent going forward. A twin whose
+//! `conflicts` differs from the survivor's is retained, not folded: merging
+//! two conflict sets is a judgement call, and this is not the layer that
+//! makes one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, Error, Transaction, params};
 use serde::{Deserialize, Serialize};
 
-use super::audit::Actor;
+use super::audit::{Actor, NewAuditEvent, insert_audit_event};
 use super::candidate::{
     CandidateState, CandidateTransitionError, IllegalCandidateTransition, NewCandidate,
     candidate_evidence_for, candidate_state, create_candidate, insert_candidate_evidence,
@@ -325,11 +361,69 @@ fn proposed_operation_tag(op: &ProposedOperation) -> &'static str {
 /// the claim forever. `ORDER BY created_at, candidate_id` gives the same
 /// "oldest wins" tie-break [`super::entry::active_entry_with_text`]
 /// documents, so the answer does not move under a caller.
+///
+/// Thin wrapper over [`pending_duplicates_of`] — kept so the two can never
+/// disagree about what "the first duplicate" means.
 fn find_pending_duplicate(
     tx: &Transaction<'_>,
     proposed_operation: &ProposedOperation,
     key: &CandidateDedupKey,
 ) -> rusqlite::Result<Option<String>> {
+    Ok(pending_duplicates_of(tx, proposed_operation, key)?
+        .into_iter()
+        .next())
+}
+
+/// Every still-`pending` candidate whose proposal is identical to
+/// `proposed_operation` under `candidate_dedup_key` — the plural form of
+/// [`find_pending_duplicate`], which is now this with `.into_iter().next()`.
+/// A row it cannot parse is silently skipped, never a false match — the
+/// same rule `find_pending_duplicate`'s own doc already states.
+/// [`fold_pending_duplicates`] does *not* build on this: an unparsable twin
+/// there must come back as [`FoldRetained::UnparsableProposal`], not vanish,
+/// so it classifies [`candidates_narrowed_by`]'s rows itself.
+fn pending_duplicates_of(
+    tx: &Transaction<'_>,
+    proposed_operation: &ProposedOperation,
+    key: &CandidateDedupKey,
+) -> rusqlite::Result<Vec<String>> {
+    let mut matches = Vec::new();
+    for row in candidates_narrowed_by(tx, proposed_operation)? {
+        let Ok(existing_op) = serde_json::from_str::<ProposedOperation>(&row.proposed_operation)
+        else {
+            continue;
+        };
+        if candidate_dedup_key(&existing_op) == *key {
+            matches.push(row.candidate_id);
+        }
+    }
+    Ok(matches)
+}
+
+/// One row [`candidates_narrowed_by`] read back, unparsed — the raw
+/// ingredients [`pending_duplicates_of`] and [`fold_pending_duplicates`]
+/// each classify their own way (silently skip vs. explicitly retain-and-say-
+/// why).
+struct NarrowedCandidateRow {
+    candidate_id: String,
+    proposed_operation: String,
+    conflicts: Option<String>,
+}
+
+/// Every still-`pending` candidate whose `op` tag (and, where the shape
+/// carries one, scope owner) matches `proposed_operation` — the coarse SQL
+/// narrowing [`find_pending_duplicate`]'s doc measures (73 ms full scan vs
+/// 41 ms narrowed, on the owner's 11 204-row backlog), factored out because
+/// two callers need it: [`pending_duplicates_of`], which then filters to an
+/// exact [`candidate_dedup_key`] match and silently skips a row it cannot
+/// parse (never a false match), and [`fold_pending_duplicates`], which
+/// cannot silently skip the same row — an unparsable twin is a twin that
+/// needs a human to look at it, so it must come back as
+/// [`FoldRetained::UnparsableProposal`], not vanish.
+fn candidates_narrowed_by(
+    tx: &Transaction<'_>,
+    proposed_operation: &ProposedOperation,
+) -> rusqlite::Result<Vec<NarrowedCandidateRow>> {
     let op_tag = proposed_operation_tag(proposed_operation);
     let scope_owner_id = match proposed_operation {
         ProposedOperation::Create { scope_owner_id, .. } => Some(scope_owner_id.as_str()),
@@ -341,7 +435,7 @@ fn find_pending_duplicate(
         | ProposedOperation::Retract { .. } => None,
     };
     let mut stmt = tx.prepare(
-        "SELECT candidate_id, proposed_operation FROM pending_memory_candidate \
+        "SELECT candidate_id, proposed_operation, conflicts FROM pending_memory_candidate \
          WHERE review_state = 'pending' \
            AND json_extract(proposed_operation, '$.op') = ?1 \
            AND (?2 IS NULL \
@@ -350,18 +444,13 @@ fn find_pending_duplicate(
          ORDER BY created_at, candidate_id",
     )?;
     let rows = stmt.query_map(params![op_tag, scope_owner_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok(NarrowedCandidateRow {
+            candidate_id: r.get(0)?,
+            proposed_operation: r.get(1)?,
+            conflicts: r.get(2)?,
+        })
     })?;
-    for row in rows {
-        let (existing_id, existing_json) = row?;
-        let Ok(existing_op) = serde_json::from_str::<ProposedOperation>(&existing_json) else {
-            continue;
-        };
-        if candidate_dedup_key(&existing_op) == *key {
-            return Ok(Some(existing_id));
-        }
-    }
-    Ok(None)
+    rows.collect()
 }
 
 /// Edit a candidate's `proposed_operation`/`conflicts` while it is still
@@ -413,6 +502,188 @@ pub fn reject_candidate(
         Err(CandidateTransitionError::UnknownCandidate) => Ok(Err(ReviewError::UnknownCandidate)),
         Err(CandidateTransitionError::Illegal(e)) => Ok(Err(ReviewError::IllegalTransition(e))),
     }
+}
+
+/// `audit_event.entity_kind` for a review candidate (`T23-08`) — the second
+/// kind in that table besides `memory_entry`, following
+/// [`super::consolidation::AUDIT_ENTITY_CONSOLIDATION_RUN`]'s precedent.
+pub const AUDIT_ENTITY_CANDIDATE: &str = "candidate";
+
+/// `audit_event.op` for [`fold_pending_duplicates`]. Deliberately not
+/// `"reject"`: see the module doc's "Folding a pre-existing duplicate group
+/// is a recorded act, not a rejection".
+pub const AUDIT_OP_FOLD_DUPLICATE: &str = "fold_duplicate";
+
+/// Why [`fold_pending_duplicates`] left a twin `pending` instead of folding
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldRetained {
+    /// The twin's `conflicts` differs from the survivor's — merging them is
+    /// a judgement call this layer does not make (see the module doc).
+    ConflictsDiffer,
+    /// The twin's `proposed_operation` no longer parses as
+    /// [`ProposedOperation`] — retained, not silently skipped: an unparsable
+    /// twin still occupies a row a human should look at, so
+    /// [`fold_pending_duplicates`] reports it rather than making it vanish
+    /// the way [`find_pending_duplicate`]'s lookup does for its own,
+    /// different purpose.
+    UnparsableProposal,
+    /// [`super::triage::fold_all_pending_duplicates`] only: the *survivor*
+    /// itself moved out of `pending` (approved, rejected, or edited into a
+    /// different claim) between that driver's read pass and this group's
+    /// write — the whole group is retained, not folded, and not a failure.
+    /// Never produced by [`fold_pending_duplicates`] itself, whose own group
+    /// is always derived inside its one transaction.
+    SurvivorNoLongerPending,
+}
+
+/// What [`fold_pending_duplicates`] did to one exact-duplicate group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldDuplicatesOutcome {
+    /// The candidate left `pending` — untouched by this call.
+    pub survivor_candidate_id: String,
+    /// The identity every folded twin shared with the survivor.
+    pub key: CandidateDedupKey,
+    /// Twins transitioned `pending → rejected`, sorted.
+    pub folded: Vec<String>,
+    /// `candidate_evidence` rows linked onto the survivor from folded twins
+    /// (deduplicated against what the survivor already carried).
+    pub evidence_linked: usize,
+    /// Twins left `pending`, with the reason — see [`FoldRetained`].
+    pub retained: Vec<(String, FoldRetained)>,
+}
+
+/// Collapse the exact-duplicate group `survivor_candidate_id` belongs to
+/// (`T23-08`, ADR-0014 Decision 2 — see the module doc's "Folding a
+/// pre-existing duplicate group"). Every *other* still-`pending` candidate
+/// sharing its [`candidate_dedup_key`] has its `candidate_evidence` linked
+/// onto the survivor, is transitioned `pending → rejected`
+/// ([`transition_candidate`] — the same state machine [`reject_candidate`]
+/// uses, so a fold can never reach a state a human rejection could not), and
+/// gets one [`AUDIT_ENTITY_CANDIDATE`] `audit_event` naming the survivor.
+/// `reject_candidate` and `transition_candidate` themselves are untouched by
+/// this function.
+///
+/// One transaction, and the group is derived *inside* it (via
+/// [`candidates_narrowed_by`], not a caller-supplied list): nothing can
+/// edit, approve, or reject a member between "which rows are twins" and
+/// "reject them" — the race a read-pass-then-write-loop sweep (the shape
+/// [`crate::housekeeping::run_candidate_expiry_sweep`] uses, safe there only
+/// because its predicate is `created_at`, which cannot change) would be
+/// exposed to.
+///
+/// `entity_version` is always `1`: a candidate has no version column and
+/// exactly one terminal transition ever reaches it (states past `pending`
+/// are terminal), so `UNIQUE (entity_kind, entity_id, entity_version)`
+/// becomes a free "at most one fold audit row per candidate" guarantee —
+/// the same reasoning [`super::consolidation::abandon_run`] documents for
+/// its own non-versioned entity, applied to a genuinely constant value here
+/// rather than a borrowed counter.
+pub fn fold_pending_duplicates(
+    tx: &Transaction<'_>,
+    survivor_candidate_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Result<FoldDuplicatesOutcome, ReviewError>> {
+    let Some((state, proposed_json)) = candidate_state_and_proposal(tx, survivor_candidate_id)?
+    else {
+        return Ok(Err(ReviewError::UnknownCandidate));
+    };
+    if state != CandidateState::Pending {
+        return Ok(Err(ReviewError::NotPending));
+    }
+    let proposed: ProposedOperation = match serde_json::from_str(&proposed_json) {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(ReviewError::InvalidProposedOperation(e.to_string()))),
+    };
+    let key = candidate_dedup_key(&proposed);
+
+    let survivor_conflicts: Option<String> = tx.query_row(
+        "SELECT conflicts FROM pending_memory_candidate WHERE candidate_id = ?1",
+        params![survivor_candidate_id],
+        |r| r.get(0),
+    )?;
+
+    let mut folded = Vec::new();
+    let mut retained = Vec::new();
+    let mut evidence_linked = 0usize;
+    // Mutable, and updated as each twin is folded (not just seeded once from
+    // the survivor's own evidence): two twins in the same group can carry
+    // the same `observation_id`, and inserting it onto the survivor twice
+    // would trip `candidate_evidence`'s `PRIMARY KEY (candidate_id,
+    // observation_id)`.
+    let mut already_linked: HashSet<String> = candidate_evidence_for(tx, survivor_candidate_id)?
+        .into_iter()
+        .collect();
+
+    for row in candidates_narrowed_by(tx, &proposed)? {
+        let twin_id = row.candidate_id;
+        if twin_id == survivor_candidate_id {
+            continue;
+        }
+
+        let Ok(twin_op) = serde_json::from_str::<ProposedOperation>(&row.proposed_operation) else {
+            retained.push((twin_id, FoldRetained::UnparsableProposal));
+            continue;
+        };
+        if candidate_dedup_key(&twin_op) != key {
+            // Same op tag and scope owner (the coarse SQL match), different
+            // claim — not this group.
+            continue;
+        }
+        if row.conflicts != survivor_conflicts {
+            retained.push((twin_id, FoldRetained::ConflictsDiffer));
+            continue;
+        }
+
+        for observation_id in candidate_evidence_for(tx, &twin_id)? {
+            if already_linked.insert(observation_id.clone()) {
+                insert_candidate_evidence(tx, survivor_candidate_id, &observation_id)?;
+                evidence_linked += 1;
+            }
+        }
+
+        match transition_candidate(tx, &twin_id, CandidateState::Rejected)? {
+            Ok(()) => {}
+            Err(CandidateTransitionError::UnknownCandidate) => continue,
+            Err(CandidateTransitionError::Illegal(_)) => {
+                // A concurrent approve/reject/expire won the race between the
+                // group read above and this write — retained, not a failure,
+                // matching every other sweep's read-then-write convention.
+                continue;
+            }
+        }
+
+        let payload = serde_json::json!({
+            "survivor_candidate_id": survivor_candidate_id,
+            "dedup_key": key.as_str(),
+            "dedup_key_version": super::dedup::CANDIDATE_DEDUP_KEY_VERSION,
+        })
+        .to_string();
+        insert_audit_event(
+            tx,
+            &NewAuditEvent {
+                entity_kind: AUDIT_ENTITY_CANDIDATE,
+                entity_id: &twin_id,
+                entity_version: 1,
+                op: AUDIT_OP_FOLD_DUPLICATE,
+                actor: Actor::User,
+                idempotency_key: None,
+                payload: Some(&payload),
+            },
+            now_ms,
+        )?;
+
+        folded.push(twin_id);
+    }
+
+    folded.sort();
+    Ok(Ok(FoldDuplicatesOutcome {
+        survivor_candidate_id: survivor_candidate_id.to_string(),
+        key,
+        folded,
+        evidence_linked,
+        retained,
+    }))
 }
 
 /// Approve a candidate (spec 04 §6): materialize `proposed_operation`
@@ -743,4 +1014,87 @@ pub fn list_candidates(
         })
     })?;
     rows.collect()
+}
+
+/// One exact-duplicate group among the still-`pending` candidates, as
+/// [`pending_candidate_groups`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateGroup {
+    pub key: CandidateDedupKey,
+    /// The oldest member — what [`fold_pending_duplicates`] would leave
+    /// `pending` if given any id in this group.
+    pub survivor: CandidateRow,
+    /// The rest of the group's candidate ids (`survivor` excluded).
+    pub duplicate_ids: Vec<String>,
+}
+
+/// Every still-`pending` candidate, grouped by [`candidate_dedup_key`]
+/// (`T23-08`'s store-wide read, next to [`list_candidates`] — see the
+/// module doc). A group of one (a proposal with no duplicate) is included:
+/// the card's "a group of one behaves like the existing path" needs a
+/// caller to be able to see that a candidate has no twins, not just find
+/// none when it looks for some.
+///
+/// Streams the table with `query_map` rather than materializing every
+/// [`CandidateRow`] before grouping (the live backlog this was measured
+/// against holds 11 236 rows): only the survivor of each group keeps its
+/// full row, every other member is a bare `String` id. A row whose
+/// `proposed_operation` will not deserialize is skipped and never grouped —
+/// the same rule [`pending_duplicates_of`] follows. Groups are ordered, and
+/// each group's `duplicate_ids` are ordered, by `(created_at,
+/// candidate_id)` — [`list_candidates`]'s own order, so a caller paging
+/// through both sees a consistent story. A read-only pass: takes
+/// `&Connection`, meant for [`crate::state::StateDb::open_read`], never a
+/// write transaction — grouping decides nothing, so it never needs the
+/// write lock.
+pub fn pending_candidate_groups(conn: &Connection) -> rusqlite::Result<Vec<CandidateGroup>> {
+    let mut stmt = conn.prepare(
+        "SELECT candidate_id, proposed_operation, conflicts, created_at \
+         FROM pending_memory_candidate \
+         WHERE review_state = 'pending' \
+         ORDER BY created_at, candidate_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    let mut groups: HashMap<CandidateDedupKey, CandidateGroup> = HashMap::new();
+    for row in rows {
+        let (candidate_id, proposed_json, conflicts, created_at) = row?;
+        let Ok(op) = serde_json::from_str::<ProposedOperation>(&proposed_json) else {
+            continue;
+        };
+        let key = candidate_dedup_key(&op);
+        match groups.get_mut(&key) {
+            Some(group) => group.duplicate_ids.push(candidate_id),
+            None => {
+                groups.insert(
+                    key.clone(),
+                    CandidateGroup {
+                        key,
+                        survivor: CandidateRow {
+                            candidate_id,
+                            proposed_operation: proposed_json,
+                            conflicts,
+                            review_state: CandidateState::Pending,
+                            created_at,
+                        },
+                        duplicate_ids: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    let mut out: Vec<CandidateGroup> = groups.into_values().collect();
+    out.sort_by(|a, b| {
+        (a.survivor.created_at, &a.survivor.candidate_id)
+            .cmp(&(b.survivor.created_at, &b.survivor.candidate_id))
+    });
+    Ok(out)
 }

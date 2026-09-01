@@ -739,7 +739,7 @@ local-rag index <path> | reindex | watch          # watch: standalone process, s
 local-rag project add|remove|enable|disable|list|status|reindex|coverage <path>  # daemon-managed, see §8
 local-rag repo list | repo attach <repo_id> [--path P] [--worktree <id>] | worktree list
 local-rag rebuild --worktree <id> [--fts] [--dense]
-local-rag memory list|approve|reject|edit|retract|confirm|refute|merge|rescope|evidence …
+local-rag memory list|approve|reject|edit|retract|confirm|refute|merge|rescope|evidence|dedup …
 local-rag inspect <observation|memory|generation> <id>
 local-rag export [--scope …] | purge [--memory <id>|--session <id>|--all]
 local-rag consolidation retry|abandon <session-id>   # T23-03: repair a parked run, see below
@@ -789,6 +789,27 @@ contribution is the bounded `PRAGMA incremental_vacuum` chunk it takes while idl
 which only becomes possible after this command has converted the store to
 `auto_vacuum = INCREMENTAL` (03 §2). `doctor` and `stats` report the ratio and name this command
 when it is worth running.
+
+As-built note (`T23-08`, `[SPEC]`, ADR-0014 Decision 2). `memory list --candidates --grouped`
+prints one line per exact-duplicate group (`local_rag_store::pending_candidate_groups`) instead of
+one per candidate, with a claim preview — before this, an operator had no way to see from the CLI
+that hundreds of pending rows said the same thing. `memory dedup --candidate <id>|--all
+[--dry-run]` is the write half: `--candidate <id>` folds exactly the group the named candidate
+belongs to (`local_rag_store::fold_pending_duplicates`; the id may name any member, not
+necessarily the group's oldest); `--all` folds every group in the pending backlog
+(`fold_all_pending_duplicates`). Exactly one of `--candidate`/`--all` is required — there is no
+default mode, so this command can never touch a group its caller did not name, mirroring
+`consolidation`'s own "per session only, never in bulk" register even though this act, unlike
+`abandon`, *is* offered in bulk (folding an exact duplicate destroys no information the way
+abandoning a window does — see 08 §3's amendment). `--dry-run` is the `gc`-style flag: without it
+the command applies, and `--all` is itself the explicit opt-in word for a full-queue fold.
+
+Folding only ever transitions a duplicate `pending → rejected` — the same terminal state a lone
+`memory reject` produces — and never approves anything; the survivor of every group stays
+`pending` for the existing `approve`/`reject`/`edit` path, which remains the only way a candidate
+becomes an entry. `local-rag gc` never runs this: ADR-0014's own rejected alternative ("grouping is
+a reading aid, not the fix" applied unattended) rules out any scheduled or default-invoked fold, so
+`fold_all_pending_duplicates` has no caller in `gc` and none should ever be added.
 
 As-built note (T11-06, `[SPEC]`). `init --download-models` exists as a **typed library API**
 (`local_rag_models::install_model`, 10 §5): pinned-digest atomic install, license notice written to

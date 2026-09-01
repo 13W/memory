@@ -88,7 +88,10 @@ views {
       bypass. Approval materializes the proposed operation through the same
       transactional path the router uses, inside the same transaction as the
       state change, so a candidate cannot be marked approved without its
-      operation landing.
+      operation landing. T23-08 adds the reduction half ADR-0014 Decision 2
+      designed in advance: an operator can fold a pre-existing exact-duplicate
+      group into its oldest member without approving anything, straight from
+      the CLI — never through MCP, and never scheduled.
     '''
 
     localRag.daemon.memoryGuard -> localRag.daemon.memoryOps.candidateReview 'model-claim-only provenance: propose instead of create'
@@ -98,6 +101,8 @@ views {
     localRag.daemon.memoryOps.candidateReview -> localRag.stateDb 'materialize the proposed op with actor=user'
     localRag.daemon.memoryOps -> localRag.stateDb 'one transaction: the state change and the materialized op together'
     localRag.daemon.retentionGc -> localRag.stateDb 'unreviewed after 30 days: pending to expired'
+    operator -> localRag.cli 'memory list --candidates --grouped, then memory dedup --candidate <id> | --all'
+    localRag.cli -> localRag.stateDb 'fold one group: twins pending -> rejected, evidence linked onto the survivor, one audit row each'
 
     global style status
   }

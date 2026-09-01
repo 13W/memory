@@ -109,6 +109,7 @@ mod op;
 mod review;
 mod runner;
 mod stats;
+mod triage;
 
 pub use audit::{
     Actor, AuditEventRow, NewAuditEvent, find_by_idempotency_key, insert_audit_event,
@@ -157,9 +158,10 @@ pub use op::{
     apply_noop, apply_reinforce, apply_reject, apply_resolve, apply_retract, apply_supersede,
 };
 pub use review::{
-    ApproveCandidateOutcome, CandidateRow, ProposeCandidateOutcome, ProposedOperation, ReviewError,
-    approve_candidate, edit_candidate, list_candidates, observation_evidence_source,
-    propose_candidate, reject_candidate,
+    AUDIT_ENTITY_CANDIDATE, AUDIT_OP_FOLD_DUPLICATE, ApproveCandidateOutcome, CandidateGroup,
+    CandidateRow, FoldDuplicatesOutcome, FoldRetained, ProposeCandidateOutcome, ProposedOperation,
+    ReviewError, approve_candidate, edit_candidate, fold_pending_duplicates, list_candidates,
+    observation_evidence_source, pending_candidate_groups, propose_candidate, reject_candidate,
 };
 pub use runner::{
     ApplyReport, ConsolidationWindow, GeneratedOp, RunOutcome, RunOutcomeError, RunnerApplyError,
@@ -172,6 +174,7 @@ pub use stats::{
     pending_backlog_by_session, pending_candidate_counts, stuck_consolidation_runs,
     total_pending_backlog,
 };
+pub use triage::{DedupTriageReport, TriageError, fold_all_pending_duplicates};
 
 /// Version-9 migration DDL: the durable-memory tables (spec 03 §2.5, the
 /// `memory_entry`/`memory_evidence`/`pending_memory_candidate`/

@@ -14,9 +14,10 @@ use std::process::{Output, Stdio};
 
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::{
-    EvidenceKind, GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewMemoryEntry, NewMemoryEvidence,
-    ProposedOperation, ScopeKind, StateDb, create_memory_entry, create_repository, create_worktree,
-    insert_memory_evidence, observe_worktree_path, propose_candidate,
+    CandidateState, EvidenceKind, GLOBAL_SCOPE_OWNER_ID, MemoryKind, NewCandidate, NewMemoryEntry,
+    NewMemoryEvidence, ProposedOperation, ScopeKind, StateDb, candidate_state, create_candidate,
+    create_memory_entry, create_repository, create_worktree, insert_memory_evidence,
+    observe_worktree_path, propose_candidate,
 };
 use local_rag_test_support::TempHome;
 
@@ -161,6 +162,49 @@ async fn seed_candidate_with_text(
         })
         .await
         .expect("seed candidate tx");
+}
+
+/// Seed one pending candidate directly via `create_candidate`, bypassing
+/// `propose_candidate`'s own dedup check (`T23-07`) — needed wherever a
+/// `T23-08` fixture wants more than one row sharing one exact identity, the
+/// shape that check declines going forward but the pre-`T23-07` backlog
+/// still holds.
+async fn seed_duplicate_candidate(
+    state: &StateDb,
+    candidate_id: &str,
+    target_memory_id: &str,
+    text: &str,
+    now_ms: i64,
+) {
+    let op = ProposedOperation::Create {
+        memory_id: target_memory_id.to_string(),
+        kind: "fact".to_string(),
+        text: text.to_string(),
+        canonical_key: None,
+        scope_kind: "global".to_string(),
+        scope_owner_id: GLOBAL_SCOPE_OWNER_ID.to_string(),
+        confidence: 0.5,
+        importance: 0.5,
+        valid_from_tree: None,
+        last_verified_tree: None,
+    };
+    let json = serde_json::to_string(&op).expect("op serializes");
+    let cid = candidate_id.to_string();
+    state
+        .writer()
+        .transaction(move |tx| {
+            create_candidate(
+                tx,
+                &NewCandidate {
+                    candidate_id: &cid,
+                    proposed_operation: &json,
+                    conflicts: None,
+                },
+                now_ms,
+            )
+        })
+        .await
+        .expect("seed duplicate candidate tx");
 }
 
 fn stdout(output: &Output) -> String {
@@ -488,6 +532,234 @@ async fn memory_list_candidates_then_approve_and_reject() {
     // silent success.
     let output = run_cli(&home, &["memory", "reject", "cand-approve"]);
     assert_ne!(output.status.code(), Some(0), "{output:?}");
+}
+
+// ---------------------------------------------------------------------
+// list --candidates --grouped / dedup (`T23-08`)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn memory_list_candidates_grouped_shows_the_group_size_and_the_claim() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_duplicate_candidate(&state, "dup-a", "mem-a", "a duplicated claim", 1_000).await;
+        seed_duplicate_candidate(&state, "dup-b", "mem-a", "a duplicated claim", 1_001).await;
+        seed_duplicate_candidate(&state, "dup-c", "mem-a", "a duplicated claim", 1_002).await;
+        seed_candidate_with_text(&state, "lonely", "mem-b", "a lone claim", 2_000).await;
+    }
+
+    let output = run_cli(&home, &["memory", "list", "--candidates", "--grouped"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("3x  dup-a"), "{text}");
+    assert!(text.contains("a duplicated claim"), "{text}");
+    assert!(text.contains("1x  lonely"), "{text}");
+    assert!(text.contains("4 pending over 2 distinct claim"), "{text}");
+}
+
+#[test]
+fn memory_list_candidates_grouped_without_candidates_is_a_usage_error() {
+    let (home, _layout) = open_layout();
+    let output = run_cli(&home, &["memory", "list", "--grouped"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+#[test]
+fn memory_dedup_without_a_target_is_a_usage_error() {
+    let (home, _layout) = open_layout();
+    let output = run_cli(&home, &["memory", "dedup"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        stderr(&output).contains("--candidate <id> or --all"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn memory_dedup_candidate_and_all_together_is_a_usage_error() {
+    let (home, _layout) = open_layout();
+    let output = run_cli(
+        &home,
+        &["memory", "dedup", "--candidate", "some-id", "--all"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+#[tokio::test]
+async fn memory_dedup_candidate_folds_only_that_group() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_duplicate_candidate(&state, "a-survivor", "mem-a", "claim a", 1_000).await;
+        seed_duplicate_candidate(&state, "a-twin", "mem-a", "claim a", 1_001).await;
+        seed_duplicate_candidate(&state, "b-survivor", "mem-b", "claim b", 1_000).await;
+        seed_duplicate_candidate(&state, "b-twin", "mem-b", "claim b", 1_001).await;
+    }
+
+    let output = run_cli(&home, &["memory", "dedup", "--candidate", "a-survivor"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("folded 1 duplicate"), "{text}");
+    assert!(text.contains("rejected a-twin"), "{text}");
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "a-survivor").expect("state"),
+        Some(CandidateState::Pending)
+    );
+    assert_eq!(
+        candidate_state(&read, "a-twin").expect("state"),
+        Some(CandidateState::Rejected)
+    );
+    assert_eq!(
+        candidate_state(&read, "b-survivor").expect("state"),
+        Some(CandidateState::Pending),
+        "a different group must be untouched"
+    );
+    assert_eq!(
+        candidate_state(&read, "b-twin").expect("state"),
+        Some(CandidateState::Pending),
+        "a different group must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn memory_dedup_of_a_group_of_one_succeeds_and_says_there_is_nothing_to_fold() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_candidate_with_text(&state, "lonely", "mem-a", "a lone claim", 1_000).await;
+    }
+
+    let output = run_cli(&home, &["memory", "dedup", "--candidate", "lonely"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("has no exact duplicates"),
+        "{output:?}"
+    );
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "lonely").expect("state"),
+        Some(CandidateState::Pending)
+    );
+}
+
+#[test]
+fn memory_dedup_of_an_unknown_candidate_fails_with_the_existing_message() {
+    let (home, _layout) = open_layout();
+    let output = run_cli(&home, &["memory", "dedup", "--candidate", "no-such-id"]);
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stderr(&output).contains("no candidate with that id"),
+        "{output:?}"
+    );
+}
+
+#[tokio::test]
+async fn memory_dedup_of_a_non_pending_candidate_fails_with_the_existing_message() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_candidate_with_text(&state, "already-rejected", "mem-a", "claim", 1_000).await;
+    }
+    let output = run_cli(&home, &["memory", "reject", "already-rejected"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let output = run_cli(
+        &home,
+        &["memory", "dedup", "--candidate", "already-rejected"],
+    );
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(stderr(&output).contains("no longer pending"), "{output:?}");
+}
+
+#[tokio::test]
+async fn memory_dedup_candidate_dry_run_changes_nothing() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_duplicate_candidate(&state, "survivor", "mem-a", "claim", 1_000).await;
+        seed_duplicate_candidate(&state, "twin", "mem-a", "claim", 1_001).await;
+    }
+
+    let output = run_cli(
+        &home,
+        &["memory", "dedup", "--candidate", "survivor", "--dry-run"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("would fold 1 duplicate"),
+        "{output:?}"
+    );
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "twin").expect("state"),
+        Some(CandidateState::Pending),
+        "a dry run must not transition anything"
+    );
+}
+
+#[tokio::test]
+async fn memory_dedup_all_folds_every_group() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_duplicate_candidate(&state, "a-survivor", "mem-a", "claim a", 1_000).await;
+        seed_duplicate_candidate(&state, "a-twin", "mem-a", "claim a", 1_001).await;
+        seed_candidate_with_text(&state, "lonely", "mem-b", "claim b", 2_000).await;
+    }
+
+    let output = run_cli(&home, &["memory", "dedup", "--all"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("rejected 1 duplicate candidate"), "{text}");
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "a-survivor").expect("state"),
+        Some(CandidateState::Pending)
+    );
+    assert_eq!(
+        candidate_state(&read, "a-twin").expect("state"),
+        Some(CandidateState::Rejected)
+    );
+    assert_eq!(
+        candidate_state(&read, "lonely").expect("state"),
+        Some(CandidateState::Pending),
+        "a group of one is never folded"
+    );
+}
+
+#[tokio::test]
+async fn memory_dedup_all_dry_run_changes_nothing() {
+    let (home, layout) = open_layout();
+    {
+        let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+        seed_duplicate_candidate(&state, "a-survivor", "mem-a", "claim a", 1_000).await;
+        seed_duplicate_candidate(&state, "a-twin", "mem-a", "claim a", 1_001).await;
+    }
+
+    let output = run_cli(&home, &["memory", "dedup", "--all", "--dry-run"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("would reject 1 duplicate"),
+        "{output:?}"
+    );
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    let read = state.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state(&read, "a-twin").expect("state"),
+        Some(CandidateState::Pending),
+        "a dry run must not transition anything"
+    );
 }
 
 // ---------------------------------------------------------------------

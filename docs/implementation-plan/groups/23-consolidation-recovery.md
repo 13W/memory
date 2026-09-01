@@ -296,8 +296,20 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
 - **In scope:** grouping identical and near-identical proposals so a decision applies to a group;
   the existing per-candidate review path (`approve`/`reject`/`edit`) stays and remains the only way
   a candidate becomes an entry.
+  **As-built:** "near-identical" is not implemented. ADR-0014 Decision 2's own "the price" paragraph
+  scopes dedup to exact text and its "Alternatives rejected" section rejects semantic/embedding
+  matching as premature; `candidate_dedup_key`'s own doc states the same rule for any future,
+  fuzzier key: "a new version and a new format, never a silent reinterpretation." Grouping here is
+  exactly `local_rag_store::memory::candidate_dedup_key` v1 — the same identity `T23-07`'s propose-
+  time check already uses, reused rather than reinvented for a store-wide read
+  (`pending_candidate_groups`).
 - **Not in scope:** automatic approval. A candidate exists because a human decides; bulk **reject**
   of exact duplicates is a different act from bulk accept, and the card must not blur them.
+  **As-built:** also no unattended or scheduled mode — `fold_all_pending_duplicates` is never wired
+  into `local-rag gc` (ADR-0014's own rejected alternative: "grouping is a reading aid, not the
+  fix" run automatically). Every fold is CLI-only, one explicit `local-rag memory dedup` invocation
+  at a time, naming either one candidate's group (`--candidate <id>`) or the whole backlog
+  (`--all`) — never a default mode.
 - **Tests:** a bulk decision touches exactly the group it names; a group of one behaves like the
   existing path.
 - **Acceptance:** the owner's queue is reducible without losing a distinct proposal — the

@@ -13,6 +13,14 @@
 //! here is already-established, already-gated retention/GC behavior (specs
 //! 05 §8, 07 §6, 12 §3), not the "destructive purge" class that
 //! confirmation requirement is aimed at (D-025 leaves `purge` to T16-02).
+//!
+//! `local_rag_store::memory::fold_all_pending_duplicates` (`T23-08`) is
+//! **deliberately not sequenced here**, and no future card should "complete"
+//! this list by adding it: every sweep above is unattended by design, and
+//! ADR-0014 requires a human to decide a candidate's fate — folding an exact
+//! duplicate is a bulk act on that same queue, gated behind `local-rag
+//! memory dedup`'s own explicit invocation, never behind this one. See that
+//! command's own module doc.
 
 use std::process::ExitCode;
 

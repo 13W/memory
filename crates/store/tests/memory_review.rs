@@ -12,15 +12,17 @@
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
-    ApproveCandidateOutcome, CandidateCountRow, CandidateRow, ProposeCandidateOutcome,
-    ProposedOperation, ReviewError, approve_candidate, candidate_evidence_for, edit_candidate,
-    list_candidates, memory_entry_state, memory_evidence_for, pending_candidate_counts,
-    propose_candidate, reject_candidate,
+    AUDIT_ENTITY_CANDIDATE, AUDIT_OP_FOLD_DUPLICATE, ApproveCandidateOutcome, CandidateCountRow,
+    CandidateRow, FoldDuplicatesOutcome, FoldRetained, ProposeCandidateOutcome, ProposedOperation,
+    ReviewError, approve_candidate, candidate_evidence_for, edit_candidate,
+    fold_pending_duplicates, list_candidates, memory_entry_state, memory_evidence_for,
+    pending_candidate_counts, pending_candidate_groups, propose_candidate, reject_candidate,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{
-    CandidateState, EvidenceKind, IllegalCandidateTransition, MemoryKind, MemoryOpOutcome,
-    MemoryState, ScopeKind, StateDb,
+    Actor, AuditEventRow, CandidateState, EvidenceKind, IllegalCandidateTransition, MemoryKind,
+    MemoryOpOutcome, MemoryState, NewCandidate, ScopeKind, StateDb, create_candidate,
+    insert_candidate_evidence, read_audit_events_for_entity,
 };
 use local_rag_test_support::TempHome;
 
@@ -114,6 +116,19 @@ async fn reject(db: &StateDb, candidate_id: &str) -> Result<(), ReviewError> {
         .transaction(move |tx| reject_candidate(tx, &id))
         .await
         .expect("reject tx (infrastructure)")
+}
+
+/// `T23-08`: fold `survivor_candidate_id`'s exact-duplicate group.
+async fn fold(
+    db: &StateDb,
+    survivor_candidate_id: &str,
+    now_ms: i64,
+) -> Result<FoldDuplicatesOutcome, ReviewError> {
+    let id = survivor_candidate_id.to_string();
+    db.writer()
+        .transaction(move |tx| fold_pending_duplicates(tx, &id, now_ms))
+        .await
+        .expect("fold tx (infrastructure)")
 }
 
 async fn edit(
@@ -1019,4 +1034,622 @@ async fn a_proposal_whose_text_is_already_an_active_entry_writes_no_row_and_touc
         Some((MemoryKind::Fact, MemoryState::Active)),
         "the entry itself is untouched"
     );
+}
+
+// -----------------------------------------------------------------
+// T23-08 / ADR-0014 Decision 2: folding a pre-existing duplicate group is a
+// recorded act, not a rejection.
+// -----------------------------------------------------------------
+
+/// Seed one exact-duplicate group of `ids.len()` pending candidates directly
+/// via `create_candidate`, bypassing `propose_candidate` — since `T23-07`,
+/// that check declines a second row sharing one identity, so a fixture
+/// wanting more than one still has to arise the same way the pre-T23-07
+/// backlog itself did. `ids[0]` gets the oldest `created_at`
+/// (`base_created_at`), each later id one millisecond later — so `ids[0]` is
+/// always the deterministic survivor `fold_pending_duplicates` should pick.
+async fn duplicate_group(db: &StateDb, ids: &[&str], op: &ProposedOperation, base_created_at: i64) {
+    let json = serde_json::to_string(op).expect("op serializes");
+    for (i, id) in ids.iter().enumerate() {
+        let (cid, json) = (id.to_string(), json.clone());
+        let created_at = base_created_at + i as i64;
+        db.writer()
+            .transaction(move |tx| {
+                create_candidate(
+                    tx,
+                    &NewCandidate {
+                        candidate_id: &cid,
+                        proposed_operation: &json,
+                        conflicts: None,
+                    },
+                    created_at,
+                )
+            })
+            .await
+            .expect("seed duplicate candidate");
+    }
+}
+
+fn audit_rows_for_candidate(conn: &Connection, candidate_id: &str) -> Vec<AuditEventRow> {
+    read_audit_events_for_entity(conn, AUDIT_ENTITY_CANDIDATE, candidate_id)
+        .expect("read audit rows")
+}
+
+#[tokio::test]
+async fn folding_rejects_every_twin_and_leaves_the_survivor_pending() {
+    let (_home, db) = open_state();
+    let owner = uuid(44);
+    let op = create_op_with_text(&uuid(45), MemoryKind::Fact, &owner, "the same claim");
+    duplicate_group(&db, &["survivor", "twin-a", "twin-b"], &op, 1_000).await;
+
+    let outcome = fold(&db, "survivor", 5_000).await.expect("fold");
+    let mut folded = outcome.folded.clone();
+    folded.sort();
+    assert_eq!(folded, vec!["twin-a".to_string(), "twin-b".to_string()]);
+    assert!(outcome.retained.is_empty(), "{:?}", outcome.retained);
+    assert_eq!(outcome.survivor_candidate_id, "survivor");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state_of(&read, "survivor"),
+        CandidateState::Pending
+    );
+    assert_eq!(
+        candidate_state_of(&read, "twin-a"),
+        CandidateState::Rejected
+    );
+    assert_eq!(
+        candidate_state_of(&read, "twin-b"),
+        CandidateState::Rejected
+    );
+}
+
+#[tokio::test]
+async fn folding_touches_no_candidate_outside_the_named_group() {
+    let (_home, db) = open_state();
+    let owner = uuid(54);
+    let claim_a = create_op_with_text(&uuid(55), MemoryKind::Fact, &owner, "claim a");
+    let claim_b = create_op_with_text(&uuid(56), MemoryKind::Fact, &owner, "claim b");
+    duplicate_group(&db, &["a-survivor", "a-twin"], &claim_a, 1_000).await;
+    duplicate_group(&db, &["b-survivor", "b-twin"], &claim_b, 1_000).await;
+
+    let outcome = fold(&db, "a-survivor", 5_000).await.expect("fold");
+    assert_eq!(outcome.folded, vec!["a-twin".to_string()]);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state_of(&read, "a-twin"),
+        CandidateState::Rejected
+    );
+    assert_eq!(
+        candidate_state_of(&read, "b-survivor"),
+        CandidateState::Pending,
+        "a different group must be untouched"
+    );
+    assert_eq!(
+        candidate_state_of(&read, "b-twin"),
+        CandidateState::Pending,
+        "a different group must be untouched"
+    );
+}
+
+/// The card's second test, restated: a candidate with no twins folds
+/// nothing, and the existing per-candidate path still materializes it.
+#[tokio::test]
+async fn folding_a_group_of_one_writes_nothing_and_the_existing_path_still_works() {
+    let (_home, db) = open_state();
+    let owner = uuid(64);
+    let memory_id = uuid(65);
+    let op = create_op_with_text(&memory_id, MemoryKind::Fact, &owner, "a lone claim");
+    duplicate_group(&db, &["lonely"], &op, 1_000).await;
+
+    let outcome = fold(&db, "lonely", 5_000).await.expect("fold");
+    assert!(outcome.folded.is_empty());
+    assert!(outcome.retained.is_empty());
+    assert_eq!(outcome.evidence_linked, 0);
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state_of(&read, "lonely"),
+        CandidateState::Pending,
+        "folding a group of one must not touch the candidate itself"
+    );
+    assert!(
+        audit_rows_for_candidate(&read, "lonely").is_empty(),
+        "no fold happened, so no audit row"
+    );
+    drop(read);
+
+    let approved = approve(&db, "lonely", 6_000)
+        .await
+        .expect("still approvable");
+    assert!(matches!(
+        approved,
+        ApproveCandidateOutcome::Materialized(MemoryOpOutcome::Applied(_))
+    ));
+}
+
+#[tokio::test]
+async fn folding_links_every_twins_evidence_onto_the_survivor_and_a_later_approve_carries_it() {
+    let (_home, db) = open_state();
+    let owner = uuid(74);
+    let memory_id = uuid(75);
+    let o1 = seed_observation(&db, 76, EvidenceKind::UserStatement, "sess-1").await;
+    let o2 = seed_observation(&db, 77, EvidenceKind::UserStatement, "sess-1").await;
+    let op = create_op_with_text(&memory_id, MemoryKind::Fact, &owner, "claim");
+    duplicate_group(&db, &["survivor", "twin"], &op, 1_000).await;
+
+    db.writer()
+        .transaction({
+            let survivor = "survivor".to_string();
+            let o1 = o1.clone();
+            move |tx| insert_candidate_evidence(tx, &survivor, &o1)
+        })
+        .await
+        .expect("seed survivor evidence");
+    db.writer()
+        .transaction({
+            let twin = "twin".to_string();
+            let o1 = o1.clone();
+            let o2 = o2.clone();
+            move |tx| {
+                insert_candidate_evidence(tx, &twin, &o1)?;
+                insert_candidate_evidence(tx, &twin, &o2)
+            }
+        })
+        .await
+        .expect("seed twin evidence");
+
+    let outcome = fold(&db, "survivor", 5_000).await.expect("fold");
+    assert_eq!(
+        outcome.evidence_linked, 1,
+        "only o2 is new; o1 was already on the survivor"
+    );
+
+    let read = db.open_read().expect("read conn");
+    let mut evidence = candidate_evidence_for(&read, "survivor").expect("evidence");
+    evidence.sort();
+    let mut expected = vec![o1, o2];
+    expected.sort();
+    assert_eq!(evidence, expected, "the survivor carries the union");
+    drop(read);
+
+    let approved = approve(&db, "survivor", 6_000).await.expect("materializes");
+    let ApproveCandidateOutcome::Materialized(MemoryOpOutcome::Applied(_)) = approved else {
+        panic!("expected Materialized(Applied), got {approved:?}");
+    };
+    let read = db.open_read().expect("read conn");
+    let mut materialized = memory_evidence_for(&read, &memory_id).expect("evidence");
+    materialized.sort();
+    assert_eq!(
+        materialized, expected,
+        "the approved entry carries every observation the fold rescued"
+    );
+}
+
+#[tokio::test]
+async fn folding_writes_one_candidate_audit_row_per_twin_naming_the_survivor() {
+    let (_home, db) = open_state();
+    let owner = uuid(84);
+    let op = create_op_with_text(&uuid(85), MemoryKind::Fact, &owner, "claim");
+    duplicate_group(&db, &["survivor", "twin-a", "twin-b"], &op, 1_000).await;
+
+    fold(&db, "survivor", 5_000).await.expect("fold");
+
+    let read = db.open_read().expect("read conn");
+    for twin in ["twin-a", "twin-b"] {
+        let rows = audit_rows_for_candidate(&read, twin);
+        assert_eq!(rows.len(), 1, "{twin}: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.entity_kind, AUDIT_ENTITY_CANDIDATE);
+        assert_eq!(row.entity_id, twin);
+        assert_eq!(row.entity_version, 1);
+        assert_eq!(row.op, AUDIT_OP_FOLD_DUPLICATE);
+        assert_eq!(row.actor, Actor::User);
+        assert_eq!(row.created_at, 5_000);
+        let payload = row.payload.as_deref().expect("payload");
+        assert!(
+            payload.contains("\"survivor_candidate_id\":\"survivor\""),
+            "{payload}"
+        );
+    }
+    assert!(
+        audit_rows_for_candidate(&read, "survivor").is_empty(),
+        "the survivor is never audited — it was not acted on"
+    );
+}
+
+/// The sharpest test in the set: an operator's own rejection and a
+/// machine-driven fold both leave `review_state = 'rejected'`, and the audit
+/// trail is the only thing that can still tell them apart.
+#[tokio::test]
+async fn an_operator_reject_and_a_fold_are_distinguishable_in_the_audit() {
+    let (_home, db) = open_state();
+    let owner = uuid(94);
+    let judged_op = create_op_with_text(&uuid(95), MemoryKind::Fact, &owner, "judged claim");
+    propose(&db, "judged", judged_op, vec![], vec![], 1_000).await;
+    reject(&db, "judged").await.expect("operator reject");
+
+    let folded_op = create_op_with_text(&uuid(96), MemoryKind::Fact, &owner, "folded claim");
+    duplicate_group(&db, &["survivor", "folded"], &folded_op, 2_000).await;
+    fold(&db, "survivor", 5_000).await.expect("fold");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state_of(&read, "judged"),
+        CandidateState::Rejected
+    );
+    assert_eq!(
+        candidate_state_of(&read, "folded"),
+        CandidateState::Rejected
+    );
+    assert!(
+        audit_rows_for_candidate(&read, "judged").is_empty(),
+        "an operator's own reject writes no audit row — it needs none to be itself"
+    );
+    assert_eq!(
+        audit_rows_for_candidate(&read, "folded").len(),
+        1,
+        "a fold writes exactly one, naming the survivor it was folded into"
+    );
+}
+
+/// `pending_candidate_groups`'s own survivor choice — the one `T23-08`'s CLI
+/// `dedup --all` and the "oldest wins" claim rest on. Distinct from
+/// [`fold_pending_duplicates`] itself, which takes the survivor as an
+/// explicit parameter and honors whichever member the caller names (the
+/// CLI's `--candidate <id>` mode: "any member of the group, not necessarily
+/// the group's oldest") — proven below by folding around a *non*-oldest,
+/// deliberately caller-named survivor.
+#[tokio::test]
+async fn the_survivor_is_the_oldest_member_deterministically_with_id_tiebreak() {
+    let (_home, db) = open_state();
+    let owner = uuid(104);
+    let op = create_op_with_text(&uuid(105), MemoryKind::Fact, &owner, "claim");
+    // Same `created_at`: the tie-break falls to `candidate_id` ordering.
+    let json = serde_json::to_string(&op).expect("op serializes");
+    for id in ["cand-z", "cand-a", "cand-m"] {
+        let (cid, json) = (id.to_string(), json.clone());
+        db.writer()
+            .transaction(move |tx| {
+                create_candidate(
+                    tx,
+                    &NewCandidate {
+                        candidate_id: &cid,
+                        proposed_operation: &json,
+                        conflicts: None,
+                    },
+                    1_000,
+                )
+            })
+            .await
+            .expect("seed");
+    }
+
+    let read = db.open_read().expect("read conn");
+    let groups = pending_candidate_groups(&read).expect("groups");
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(
+        groups[0].survivor.candidate_id, "cand-a",
+        "the earliest created_at wins; a tie falls to candidate_id order"
+    );
+    drop(read);
+
+    // `fold_pending_duplicates` itself does not second-guess the caller:
+    // naming "cand-z" (not the group's oldest) still folds everyone else,
+    // "cand-a" included, into "cand-z".
+    let outcome = fold(&db, "cand-z", 5_000).await.expect("fold");
+    let mut folded = outcome.folded.clone();
+    folded.sort();
+    assert_eq!(
+        folded,
+        vec!["cand-a".to_string(), "cand-m".to_string()],
+        "the caller's chosen survivor is honored, not overridden"
+    );
+    let read = db.open_read().expect("read conn");
+    assert_eq!(candidate_state_of(&read, "cand-z"), CandidateState::Pending);
+    assert_eq!(
+        candidate_state_of(&read, "cand-a"),
+        CandidateState::Rejected
+    );
+    assert_eq!(
+        candidate_state_of(&read, "cand-m"),
+        CandidateState::Rejected
+    );
+}
+
+#[tokio::test]
+async fn a_twin_with_unparsable_proposed_operation_is_retained_not_folded() {
+    let (_home, db) = open_state();
+    let owner = uuid(114);
+    let op = create_op_with_text(&uuid(115), MemoryKind::Fact, &owner, "claim");
+    duplicate_group(&db, &["survivor"], &op, 1_000).await;
+    // A twin whose `proposed_operation` is well-formed JSON (so the coarse
+    // SQL narrowing's own `json_extract` calls, which run over every row the
+    // scan visits, do not themselves error) but does not deserialize as
+    // `ProposedOperation` (missing required fields) — a future format
+    // neither this key version nor this enum recognizes, per the module
+    // doc's own "row this binary cannot deserialize" wording. Genuinely
+    // malformed JSON syntax is a different, SQL-layer failure this function
+    // does not classify at all (`json_extract` itself errors before Rust
+    // ever sees the row) — out of scope here, and already true of
+    // `propose_candidate`'s own narrowing query since `T23-07`.
+    let corrupt_json =
+        format!("{{\"op\":\"create\",\"scope_kind\":\"worktree\",\"scope_owner_id\":\"{owner}\"}}");
+    db.writer()
+        .transaction(move |tx| {
+            create_candidate(
+                tx,
+                &NewCandidate {
+                    candidate_id: "corrupt-twin",
+                    proposed_operation: &corrupt_json,
+                    conflicts: None,
+                },
+                1_001,
+            )
+        })
+        .await
+        .expect("seed corrupt twin");
+
+    let outcome = fold(&db, "survivor", 5_000).await.expect("fold");
+    assert!(outcome.folded.is_empty());
+    assert_eq!(
+        outcome.retained,
+        vec![("corrupt-twin".to_string(), FoldRetained::UnparsableProposal)]
+    );
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state_of(&read, "corrupt-twin"),
+        CandidateState::Pending,
+        "an unparsable row is retained, never folded"
+    );
+}
+
+#[tokio::test]
+async fn a_twin_whose_conflicts_differ_is_retained_not_folded() {
+    let (_home, db) = open_state();
+    let owner = uuid(124);
+    let op = create_op_with_text(&uuid(125), MemoryKind::Fact, &owner, "claim");
+    let json = serde_json::to_string(&op).expect("op serializes");
+    db.writer()
+        .transaction({
+            let json = json.clone();
+            move |tx| {
+                create_candidate(
+                    tx,
+                    &NewCandidate {
+                        candidate_id: "survivor",
+                        proposed_operation: &json,
+                        conflicts: None,
+                    },
+                    1_000,
+                )
+            }
+        })
+        .await
+        .expect("seed survivor");
+    db.writer()
+        .transaction(move |tx| {
+            create_candidate(
+                tx,
+                &NewCandidate {
+                    candidate_id: "twin-conflicted",
+                    proposed_operation: &json,
+                    conflicts: Some("[\"some-other-memory\"]"),
+                },
+                1_001,
+            )
+        })
+        .await
+        .expect("seed conflicted twin");
+
+    let outcome = fold(&db, "survivor", 5_000).await.expect("fold");
+    assert!(outcome.folded.is_empty());
+    assert_eq!(
+        outcome.retained,
+        vec![("twin-conflicted".to_string(), FoldRetained::ConflictsDiffer)]
+    );
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        candidate_state_of(&read, "twin-conflicted"),
+        CandidateState::Pending,
+        "merging conflict sets is a judgement call this layer does not make"
+    );
+}
+
+#[tokio::test]
+async fn folding_an_unknown_candidate_is_typed_unknown_candidate() {
+    let (_home, db) = open_state();
+    let outcome = fold(&db, "no-such-id", 1_000).await;
+    assert_eq!(outcome, Err(ReviewError::UnknownCandidate));
+}
+
+#[tokio::test]
+async fn folding_a_non_pending_candidate_is_typed_not_pending() {
+    let (_home, db) = open_state();
+    let owner = uuid(134);
+    let op = create_op_with_text(&uuid(135), MemoryKind::Fact, &owner, "claim");
+    duplicate_group(&db, &["already-rejected"], &op, 1_000).await;
+    reject(&db, "already-rejected")
+        .await
+        .expect("reject it first");
+
+    let outcome = fold(&db, "already-rejected", 5_000).await;
+    assert_eq!(outcome, Err(ReviewError::NotPending));
+}
+
+#[tokio::test]
+async fn folding_a_candidate_with_corrupt_json_is_typed_invalid_proposed_operation() {
+    let (_home, db) = open_state();
+    db.writer()
+        .transaction(move |tx| {
+            create_candidate(
+                tx,
+                &NewCandidate {
+                    candidate_id: "corrupt-survivor",
+                    proposed_operation: "not json at all",
+                    conflicts: None,
+                },
+                1_000,
+            )
+        })
+        .await
+        .expect("seed corrupt survivor");
+
+    let outcome = fold(&db, "corrupt-survivor", 5_000).await;
+    assert!(
+        matches!(outcome, Err(ReviewError::InvalidProposedOperation(_))),
+        "{outcome:?}"
+    );
+}
+
+/// Pins every op shape's own key form (`local_rag_store::memory::dedup`):
+/// `reinforce`/`resolve`/`retract` on one `memory_id` are three distinct
+/// groups (the op tag is part of the key), and two `supersede`s of one
+/// `old_memory_id` proposing different `new_text` are two distinct groups.
+#[tokio::test]
+async fn non_create_op_shapes_group_by_their_own_key_forms() {
+    let (_home, db) = open_state();
+    let target = uuid(144);
+
+    let reinforce = ProposedOperation::Reinforce {
+        memory_id: target.clone(),
+        expected_version: 1,
+        confidence: Some(0.9),
+    };
+    let resolve = ProposedOperation::Resolve {
+        memory_id: target.clone(),
+        expected_version: 1,
+    };
+    let retract = ProposedOperation::Retract {
+        memory_id: target.clone(),
+        expected_version: 1,
+    };
+    duplicate_group(&db, &["r-1"], &reinforce, 1_000).await;
+    duplicate_group(&db, &["r-2"], &resolve, 1_000).await;
+    duplicate_group(&db, &["r-3"], &retract, 1_000).await;
+
+    let old_id = uuid(145);
+    let supersede_a = ProposedOperation::Supersede {
+        old_memory_id: old_id.clone(),
+        old_expected_version: 1,
+        new_memory_id: uuid(146),
+        new_kind: MemoryKind::Fact.as_str().to_string(),
+        new_text: "replacement a".to_string(),
+        new_canonical_key: None,
+        new_scope_kind: ScopeKind::Worktree.as_str().to_string(),
+        new_scope_owner_id: "owner".to_string(),
+        new_confidence: 0.5,
+        new_importance: 0.5,
+        new_valid_from_tree: None,
+        new_last_verified_tree: None,
+    };
+    let supersede_b = ProposedOperation::Supersede {
+        old_memory_id: old_id.clone(),
+        old_expected_version: 1,
+        new_memory_id: uuid(147),
+        new_kind: MemoryKind::Fact.as_str().to_string(),
+        new_text: "replacement b".to_string(),
+        new_canonical_key: None,
+        new_scope_kind: ScopeKind::Worktree.as_str().to_string(),
+        new_scope_owner_id: "owner".to_string(),
+        new_confidence: 0.5,
+        new_importance: 0.5,
+        new_valid_from_tree: None,
+        new_last_verified_tree: None,
+    };
+    duplicate_group(&db, &["s-a"], &supersede_a, 1_000).await;
+    duplicate_group(&db, &["s-b"], &supersede_b, 1_000).await;
+
+    let read = db.open_read().expect("read conn");
+    let groups = pending_candidate_groups(&read).expect("groups");
+    assert_eq!(
+        groups.len(),
+        5,
+        "five distinct claims, none merged: {groups:?}"
+    );
+    for id in ["r-1", "r-2", "r-3", "s-a", "s-b"] {
+        let group = groups
+            .iter()
+            .find(|g| g.survivor.candidate_id == id)
+            .unwrap_or_else(|| panic!("{id} missing from groups: {groups:?}"));
+        assert!(group.duplicate_ids.is_empty(), "{id}: {group:?}");
+    }
+}
+
+#[tokio::test]
+async fn groups_never_include_a_non_pending_candidate() {
+    let (_home, db) = open_state();
+    let owner = uuid(154);
+    let op = create_op_with_text(&uuid(155), MemoryKind::Fact, &owner, "claim");
+    duplicate_group(
+        &db,
+        &["pending-a", "pending-b", "approved-c", "rejected-d"],
+        &op,
+        1_000,
+    )
+    .await;
+    approve(&db, "approved-c", 2_000)
+        .await
+        .expect("approve one twin out of band");
+    reject(&db, "rejected-d").await.expect("reject another");
+
+    let read = db.open_read().expect("read conn");
+    let groups = pending_candidate_groups(&read).expect("groups");
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let group = &groups[0];
+    assert_eq!(group.survivor.candidate_id, "pending-a");
+    assert_eq!(group.duplicate_ids, vec!["pending-b".to_string()]);
+
+    let outcome = fold(&db, "pending-a", 5_000).await.expect("fold");
+    assert_eq!(outcome.folded, vec!["pending-b".to_string()]);
+}
+
+#[tokio::test]
+async fn pending_candidate_groups_is_deterministic_and_skips_unparsable_rows() {
+    let (_home, db) = open_state();
+    let owner = uuid(164);
+    let claim_a = create_op_with_text(&uuid(165), MemoryKind::Fact, &owner, "claim a");
+    let claim_b = create_op_with_text(&uuid(166), MemoryKind::Fact, &owner, "claim b");
+    duplicate_group(&db, &["a-1", "a-2"], &claim_a, 1_000).await;
+    duplicate_group(&db, &["b-1"], &claim_b, 2_000).await;
+    db.writer()
+        .transaction(move |tx| {
+            create_candidate(
+                tx,
+                &NewCandidate {
+                    candidate_id: "unparsable",
+                    proposed_operation: "not json",
+                    conflicts: None,
+                },
+                3_000,
+            )
+        })
+        .await
+        .expect("seed unparsable row");
+
+    let read = db.open_read().expect("read conn");
+    let first = pending_candidate_groups(&read).expect("groups");
+    let second = pending_candidate_groups(&read).expect("groups again");
+    assert_eq!(first, second, "deterministic across repeated reads");
+    assert_eq!(
+        first.len(),
+        2,
+        "the unparsable row forms no group: {first:?}"
+    );
+    assert!(
+        first.iter().all(|g| g.survivor.candidate_id != "unparsable"
+            && !g.duplicate_ids.contains(&"unparsable".to_string())),
+        "{first:?}"
+    );
+}
+
+fn candidate_state_of(conn: &Connection, candidate_id: &str) -> CandidateState {
+    conn.query_row(
+        "SELECT review_state FROM pending_memory_candidate WHERE candidate_id = ?1",
+        params![candidate_id],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|raw| CandidateState::from_db(&raw).expect("valid review_state"))
+    .expect("candidate exists")
 }
