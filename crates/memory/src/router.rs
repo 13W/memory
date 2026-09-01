@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 
 use local_rag_core::config::DataPolicy;
 use local_rag_core::identity::UuidSource;
-use local_rag_embed::{GenError, GenMessage, GenRequest, GenRole, GeneratorPool};
+use local_rag_embed::{FinishReason, GenError, GenMessage, GenRequest, GenRole, GeneratorPool};
 use local_rag_store::{
     ClassifiedFailure, ConsolidationWindow, GeneratedOp, MemoryEntrySummary, StateDb,
     WindowObservation, effective_data_policy,
@@ -27,12 +27,6 @@ use local_rag_store::{
 
 use crate::budget::PromptBudget;
 use crate::{guard, parse, plan, prompt, recall, schema};
-
-/// `[SPEC]` placeholder upper bound on generated tokens per router call —
-/// large enough for a multi-op window's JSON array, small enough that a
-/// looping/malformed generation cannot run unbounded. Revisit once Phase 5's
-/// real end-to-end run measures actual response sizes.
-pub const MAX_GENERATION_TOKENS: u32 = 1024;
 
 /// D-057: `pool.generate`'s own failure classifier. A deterministic context
 /// overflow (the request will never fit the model's context no matter how
@@ -147,7 +141,7 @@ pub async fn route(
     let existing = fit_conflict_set(pool, policy, &window, existing, &budget)?;
 
     let messages = prompt::initial_messages(&window, &existing);
-    let request = GenRequest::new(messages.clone(), MAX_GENERATION_TOKENS)
+    let request = GenRequest::new(messages.clone(), budget.answer_reserve_tokens)
         .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
     let response = pool
         .generate(policy, request)
@@ -160,8 +154,8 @@ pub async fn route(
     // has a valid prefix worth keeping, and a live incident's own corrective
     // retry reproduced an identical truncation byte-for-byte (re-asking does
     // not fix a deterministic, greedy-decoded generation budget overrun).
-    let outcome = match parse::parse_ops(&response.text) {
-        Ok(outcome) => outcome,
+    let (outcome, finish_reason) = match parse::parse_ops(&response.text) {
+        Ok(outcome) => (outcome, response.finish_reason),
         Err(first_error) => {
             let mut retry_messages = messages;
             retry_messages.push(GenMessage {
@@ -172,20 +166,52 @@ pub async fn route(
                 role: GenRole::User,
                 content: prompt::correction_prompt(&first_error.to_string()),
             });
-            let retry_request = GenRequest::new(retry_messages, MAX_GENERATION_TOKENS)
+            let retry_request = GenRequest::new(retry_messages, budget.answer_reserve_tokens)
                 .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
             let retry_response = pool
                 .generate(policy, retry_request)
                 .map_err(classify_generate_failure)?;
-            parse::parse_ops(&retry_response.text).map_err(|e| {
-                ClassifiedFailure::mechanical(format!(
-                    "router output still malformed after one corrective re-prompt: {e}"
-                ))
-            })?
+            // `T23-06`/`D-122`/`D-129`: name a truncation as a truncation. This
+            // is diagnosis, not reclassification — `FailureKind` stays
+            // `Mechanical` either way (greedy decoding reproduces it
+            // identically), and deciding whether it deserves a different kind
+            // is `T23-10`'s job, not this one's. Without this, a window that
+            // ran out of answer room and one that the model genuinely
+            // mangled produce the identical `serde_json` error text, which is
+            // exactly what made the live incident indistinguishable from
+            // ordinary malformation at the point this match decides.
+            let retry_finish_reason = retry_response.finish_reason.clone();
+            let outcome = parse::parse_ops(&retry_response.text).map_err(|e| {
+                if matches!(retry_finish_reason, FinishReason::Length) {
+                    ClassifiedFailure::mechanical(format!(
+                        "router output still malformed after one corrective re-prompt: {e} \
+                         (the answer reached its {}-token reserve before finishing)",
+                        budget.answer_reserve_tokens
+                    ))
+                } else {
+                    ClassifiedFailure::mechanical(format!(
+                        "router output still malformed after one corrective re-prompt: {e}"
+                    ))
+                }
+            })?;
+            (outcome, retry_finish_reason)
         }
     };
     if let Some(dropped) = &outcome.dropped_tail {
-        trace_dropped_tail(dropped);
+        // `T23-06`/`D-129`: name the cause when it is known. `dropped_tail`
+        // on its own already meant "a valid prefix survived, the rest did
+        // not parse" — this adds *why* for the one cause that is
+        // distinguishable (`finish_reason`), so a look under
+        // `LOCAL_RAG_ROUTER_DEBUG` does not have to guess whether the answer
+        // ran out of room or the model simply trailed off with extra text.
+        if matches!(finish_reason, FinishReason::Length) {
+            trace_dropped_tail(&format!(
+                "{dropped} (the answer reached its {}-token reserve before finishing)",
+                budget.answer_reserve_tokens
+            ));
+        } else {
+            trace_dropped_tail(dropped);
+        }
     }
     let raw_ops = outcome.ops;
 
@@ -252,7 +278,7 @@ fn fit_conflict_set(
     let cost = |entries: &[MemoryEntrySummary]| -> Option<usize> {
         let req = GenRequest::new(
             prompt::initial_messages(window, entries),
-            MAX_GENERATION_TOKENS,
+            budget.answer_reserve_tokens,
         )
         .with_json_schema(schema::ROUTER_OPS_JSON_SCHEMA);
         pool.count_prompt_tokens(policy, &req)
@@ -315,10 +341,16 @@ mod tests {
     /// module is a scripted double that cannot count tokens, so
     /// `fit_conflict_set` is invisible to these tests either way; passing an
     /// unbounded budget says that on purpose rather than by accident.
+    ///
+    /// `answer_reserve_tokens`/`retry_reserve_tokens` are real, non-zero
+    /// values (`T23-06`) even though every double here ignores `max_tokens`
+    /// — `route` now sends `budget.answer_reserve_tokens` as that field, and
+    /// a `0` here would silently claim "ask for one token" is what these
+    /// tests exercise, which is not what they are about.
     const NO_PROMPT_LIMIT: PromptBudget = PromptBudget {
         context_tokens: u32::MAX,
-        answer_reserve_tokens: 0,
-        retry_reserve_tokens: 0,
+        answer_reserve_tokens: crate::budget::ANSWER_RESERVE_TOKENS,
+        retry_reserve_tokens: crate::budget::ANSWER_RESERVE_TOKENS,
         system_tokens: 0,
         conflict_floor_tokens: 0,
         window_tokens: u32::MAX,
@@ -473,6 +505,62 @@ mod tests {
             )]),
             calls,
             last_prompt,
+        )
+    }
+
+    /// `T23-06`: unlike every other double in this module, this one actually
+    /// honours `req.max_tokens` — cutting its scripted answer at
+    /// `max_tokens * 4` characters (the same four-chars-per-token counter
+    /// `CountingGenerator` already uses, so a test's expected cut point is
+    /// arithmetic rather than a number to re-tune) and reporting
+    /// `FinishReason::Length` when it did. Without this, "a window whose
+    /// answer needs more than the old budget completes" is unfalsifiable: a
+    /// generator that ignores the reserve completes identically whatever the
+    /// reserve is.
+    #[derive(Debug, Clone)]
+    struct BudgetedGenerator {
+        /// The unbounded answer this generator would give with no cap at
+        /// all — the truth `max_tokens` is allowed to cut short.
+        full_response: String,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl BudgetedGenerator {
+        fn new(full_response: impl Into<String>) -> Self {
+            Self {
+                full_response: full_response.into(),
+                calls: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl Generator for BudgetedGenerator {
+        fn generate(&self, req: local_rag_embed::GenRequest) -> Result<GenResponse, GenError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let cap_chars = (req.max_tokens as usize).saturating_mul(4);
+            if self.full_response.chars().count() <= cap_chars {
+                return Ok(GenResponse {
+                    text: self.full_response.clone(),
+                    finish_reason: FinishReason::Stop,
+                    tokens_generated: Some((self.full_response.chars().count() as u32).div_ceil(4)),
+                });
+            }
+            let cut: String = self.full_response.chars().take(cap_chars).collect();
+            Ok(GenResponse {
+                text: cut,
+                finish_reason: FinishReason::Length,
+                tokens_generated: Some(req.max_tokens),
+            })
+        }
+    }
+
+    fn budgeted_pool_with(full_response: impl Into<String>) -> (GeneratorPool, Arc<AtomicU64>) {
+        use local_rag_embed::GeneratorEntry;
+        let generator = BudgetedGenerator::new(full_response);
+        let calls = Arc::clone(&generator.calls);
+        (
+            GeneratorPool::new(vec![GeneratorEntry::local("budgeted", Arc::new(generator))]),
+            calls,
         )
     }
 
@@ -872,6 +960,144 @@ mod tests {
             6,
             "all six still reach the model: an unanswerable budget must not \
              silently shrink the prompt"
+        );
+    }
+
+    /// A budget whose only controlled variable is the answer reserve — a
+    /// large context and window so neither can be what decides these tests.
+    fn budget_with_answer_reserve(answer: u32) -> PromptBudget {
+        PromptBudget {
+            context_tokens: u32::MAX,
+            answer_reserve_tokens: answer,
+            retry_reserve_tokens: answer,
+            system_tokens: 0,
+            conflict_floor_tokens: 0,
+            window_tokens: u32::MAX,
+        }
+    }
+
+    /// One JSONL response of `n` `create` lines, each citing `o1` and each
+    /// long enough that the reserve, not the JSON structure, decides how
+    /// many complete.
+    fn many_create_ops(n: usize) -> String {
+        (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"op":"create","kind":"fact","text":"observation number {i} is worth remembering on its own, at some real length, so that this one line alone costs a meaningful number of real generated tokens and the reserve is what decides whether it fits","scope_kind":"global","confidence_signal":"low","importance_signal":"low","cites":["o1"]}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The card's headline acceptance: a plan that needed more than the old
+    /// fixed 1024-token answer now completes. `1024` and `4000` are chosen in
+    /// the test, not read from `budget::ANSWER_RESERVE_TOKENS` — this proves
+    /// the *mechanism* (the reserve `route` actually sends is what decides
+    /// completion), independent of whatever the live measurement sets the
+    /// shipped constant to.
+    #[tokio::test]
+    async fn a_window_whose_answer_needs_more_than_the_old_budget_completes() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let full_response = many_create_ops(14);
+
+        let (pool, calls) = budgeted_pool_with(full_response.clone());
+        let uuids = SeqUuidV7::new();
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            budget_with_answer_reserve(4_000),
+        )
+        .await
+        .expect("routes cleanly once the reserve covers the whole answer");
+        assert_eq!(
+            ops.len(),
+            14,
+            "every op arrives when the reserve covers the full answer: {ops:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no corrective re-prompt needed: nothing was truncated"
+        );
+    }
+
+    /// The in-tree control for the test above: the identical plan, the
+    /// identical generator, under the reserve every window got before this
+    /// card. It must NOT complete — otherwise the acceptance test above would
+    /// be proving nothing about the reserve at all.
+    #[tokio::test]
+    async fn the_same_answer_truncates_under_the_old_fixed_reserve() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let full_response = many_create_ops(14);
+        assert!(
+            full_response.chars().count() > 1_024 * 4,
+            "the fixture must actually exceed the old budget to be a control"
+        );
+
+        let (pool, _calls) = budgeted_pool_with(full_response);
+        let uuids = SeqUuidV7::new();
+        let result = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            budget_with_answer_reserve(1_024),
+        )
+        .await;
+        // Either shape counts as "did not complete": a tier-1 hard failure
+        // (the corrective re-prompt gets the identical truncation, greedy
+        // decoding being deterministic, and fails the window), or a
+        // tier-2 partial recovery that is short of all 12 ops.
+        match result {
+            Err(_) => {}
+            Ok(ops) => assert!(
+                ops.len() < 14,
+                "the old reserve must not quietly fit what the new one is needed for: {ops:?}"
+            ),
+        }
+    }
+
+    /// `D-122`'s live shape: the truncation lands inside the *first* line, so
+    /// there is no valid prefix for tier 2 to keep, and the window fails
+    /// after the one corrective re-prompt reproduces the identical cut
+    /// (greedy decoding). The failure now names the truncation instead of
+    /// reading like an ordinary parse error — diagnosis only, `FailureKind`
+    /// stays `Mechanical` either way; reclassifying it is `T23-10`'s card.
+    #[tokio::test]
+    async fn a_truncated_answer_is_reported_as_truncated_not_as_malformed() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        // One line, long enough that even a one-token reserve cuts inside it
+        // rather than at a line boundary.
+        let full_response = many_create_ops(1);
+
+        let (pool, _calls) = budgeted_pool_with(full_response);
+        let uuids = SeqUuidV7::new();
+        let failure = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            budget_with_answer_reserve(1),
+        )
+        .await
+        .expect_err("a one-token reserve cannot finish even one op line");
+        assert_eq!(failure.kind, FailureKind::Mechanical);
+        assert!(
+            failure.reason.contains("reserve"),
+            "the failure names the truncation rather than reading like an \
+             ordinary parse error: {failure:?}"
         );
     }
 

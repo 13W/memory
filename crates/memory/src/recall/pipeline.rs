@@ -49,10 +49,14 @@
 //!
 //! # Token budget: a heuristic estimate, not a real tokenizer
 //!
-//! No token-count utility exists anywhere in this workspace (the two
-//! "token" constants found elsewhere — `MAX_SEQUENCE_TOKENS`,
-//! `MAX_GENERATION_TOKENS` — bound unrelated ONNX/llama-context subsystems,
-//! not arbitrary text). Spec 08 §6 itself only fixes the number
+//! No token-count utility existed anywhere in this workspace when this rule
+//! was written (`T23-04` since added one, `Generator::count_prompt_tokens`,
+//! for the one path that owns a real tokenizer and can afford the call —
+//! this recall leg is not that path: it runs on the hot query path with no
+//! generator in reach, so the heuristic stays here on purpose). The other
+//! "token" constant found elsewhere, `MAX_SEQUENCE_TOKENS`, bounds an
+//! unrelated ONNX subsystem, not arbitrary text. Spec 08 §6 itself only
+//! fixes the number
 //! (`[SPEC default 1500 tokens, config]`), not an estimation method, so
 //! [`estimate_tokens`] is a plain, documented `chars / 4` heuristic — the
 //! same order of magnitude every "roughly 4 characters per token" rule of

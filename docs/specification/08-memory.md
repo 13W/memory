@@ -340,6 +340,30 @@ when even an empty conflict set will not fit, the window fails as a deterministi
 **without** a generator call: the tokenizer has already answered, and `D-058`'s ladder narrows the
 window on the next tick exactly as it does when `llama.cpp` answers instead.
 
+As-built note (`T23-06`/`D-122`/`D-128`, `[SPEC]`): step 3's answer is bounded by
+`PromptBudget::answer_reserve_tokens` (`crates/memory/src/budget.rs::ANSWER_RESERVE_TOKENS`), a flat
+measured constant, not a quantity derived from the window. `D-122` originally read as "derive the
+answer budget from the window" — measured against real regenerated answers, that premise failed on
+both candidates: row count (a one-row window produced *more* operations on average than a
+twenty-row one) and window character volume (Pearson r ≈ 0.15, r² ≈ 0.02 over historical
+`consolidation_run` data). The measured constant (`6 144` tokens, from 35 real windows regenerated
+with a deliberately oversized `max_tokens = 8192` so today's answer is not censored by the very
+budget being sized; 30 finished on their own — `p50 = 176, p90 = 2098, p95 = 2420, p99 = 4986`,
+mean ≈ 640 — and the other 5 hit the cap) folds into `derive`'s same subtraction chain `T23-04`
+built, so the two cards' answers stay in the one place that sums to `context_length` rather than
+drifting apart.
+
+Raising the reserve past 1 113 tokens crosses a branch this same arithmetic already had:
+`conflict_floor_tokens` stops being the flat `CONFLICT_SET_FLOOR_TOKENS` promise (`D-095`'s
+14 000-token floor) and becomes `available / 2` instead, once the answer reserve exceeds
+`(context_length − retry_overhead − system) / 2 − CONFLICT_SET_FLOOR_TOKENS` (that boundary, at
+`context_length = 32 768`) — registered as `D-128` and closed in the same card, since it is a
+documented consequence of the accepted arithmetic rather than a defect to fix. Separately, the
+measurement surfaced a real decoding failure mode distinct from answer size: greedy decoding can
+degenerate into verbatim repetition of one JSON line for thousands of tokens (`D-130`, open) — no
+finite reserve closes that tail, so the constant above is sized from the answers that finished on
+their own, not from the ones that hit the cap.
+
 `idempotency_key = H(memory_op, run_id, op_index)` is realized as
 `format!("consolidation:{run_id}:{op_index}:{op_kind}")` — a plain deterministic string, mirroring
 `approve_candidate`'s own `"candidate:<id>"` precedent (08 §3's own as-built note), not a
@@ -621,9 +645,11 @@ states less precisely than the shipped code:
   memories, generalizing the "termless query is healthy, not empty" idiom 09 §2/§3 already apply
   to a single leg.
 - **The token budget is a heuristic estimate, `chars.div_ceil(4)` plus a small fixed per-entry
-  overhead**, not a real tokenizer — no token-count utility exists anywhere in this workspace (the
-  two "token" constants found elsewhere, `MAX_SEQUENCE_TOKENS`/`MAX_GENERATION_TOKENS`, bound
-  unrelated ONNX/llama-context subsystems). This section fixes only the number
+  overhead**, not a real tokenizer. `T23-04` since added one, `Generator::count_prompt_tokens`, for
+  the one path that owns a real tokenizer and can afford the call — the consolidation router
+  (08 §4); this recall leg is not that path, running on the hot query path with no generator in
+  reach, so the heuristic stays here on purpose. `MAX_SEQUENCE_TOKENS` bounds an unrelated ONNX
+  subsystem, not this text. This section fixes only the number
   (`recall_token_budget`, `[memory]` config section, 02 §3.1's own T14-08 as-built note), not an
   estimation method. Entries are added in the final deterministic order until the next one would
   overflow the budget, then the walk stops — a ranked prefix, never a skip-ahead search for a

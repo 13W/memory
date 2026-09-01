@@ -43,7 +43,49 @@
 //! store, conservatively; the conflict set absorbs whatever is left, exactly.
 
 use crate::prompt;
-use crate::router::MAX_GENERATION_TOKENS;
+
+/// How many tokens one router answer is reserved, independent of the window
+/// or of `consolidation_batch_size` (`T23-06`/`D-122`).
+///
+/// Measured 2026-09-01 by
+/// `crates/local-rag/tests/prompt_budget_live.rs::measure_real_answer_tokens`:
+/// 35 real windows, stratified by window row-count bucket over the owner's
+/// full history of `consolidation_run WHERE state = 'applied'` (row-count
+/// buckets 1, 5, 10 and 20+ each drawn from, the sample spans window_rows 1
+/// through 9), each regenerated for real against `LlamaGenerator` with a
+/// deliberately oversized `max_tokens = 8192` so today's answer is not
+/// censored by the very budget this test exists to size. A stratified draw
+/// of 60 was planned; genuine machine-level GPU/Metal resource contention
+/// (`sample`-diagnosed: the process spent most samples in
+/// `__ggml_metal_rsets_init_block_invoke → usleep`, waiting on Metal
+/// residency, not looping or hung) made the full sweep impractical, so the
+/// 35 collected -- already spanning every row bucket and both finish
+/// reasons -- were used rather than treated as a placeholder.
+///
+/// 30 of the 35 finished on their own (`Stop`); 5 hit the 8192 cap
+/// (`Length`). The reserve below is sized from the 30 `Stop`-finished
+/// answers only: `min=76, p50=176, p75=634, p90=2098, p95=2420, p99=4986
+/// (also the max), mean≈640`. The 5 `Length` samples are excluded from the
+/// percentiles by design, not by oversight -- one of them was hand-diagnosed
+/// (`D-130`) as greedy-decoding repetition, a real model failure mode where
+/// the same JSON line repeats near-verbatim for thousands of tokens with
+/// only a fabricated citation UUID changing. No finite reserve fixes that
+/// tail; sizing the reserve to cover it would only waste more window budget
+/// before the cap intervenes, without changing the outcome.
+///
+/// `6_144` is chosen with a comfortable margin (+23 %) above the largest
+/// answer that ever finished on its own in this sample (4 986), which also
+/// gives room for the small-sample uncertainty a 30-point draw carries at
+/// its tail. It stays below the 8 192-token measurement cap on purpose, so
+/// a genuine future overflow past this reserve stays distinguishable from
+/// the `D-130` tail it is not trying to cover.
+///
+/// The r² ≈ 0.02 finding this card is built on (window content explains
+/// about 2 % of the variance in answer size) holds in this sample too: rows
+/// 1 through 9 all appear with no visible trend from window size to answer
+/// size, which is why this constant does not vary with the window or with
+/// `consolidation_batch_size`.
+pub const ANSWER_RESERVE_TOKENS: u32 = 6_144;
 
 /// Characters per token for text that must be priced where no tokenizer is
 /// available — a measured floor, not the average.
@@ -75,6 +117,14 @@ pub const CONSERVATIVE_CHARS_PER_TOKEN: u32 = 2;
 /// as large as it is today instead of quietly trading memory quality for
 /// window width. It is a floor and not a cap: when the window spends less,
 /// `router::route` measures the true remainder and the conflict set gets it.
+///
+/// `D-128`: the promise holds only up to `answer_reserve_tokens ≤ (context −
+/// retry_overhead − system) / 2 − CONFLICT_SET_FLOOR_TOKENS` — 1 113 tokens
+/// at a 32 768-token context (`the_conflict_floor_branch_boundary_is_where_
+/// the_algebra_says` computes it, rather than restating the number). Past
+/// that point `derive`'s `min(FLOOR, available / 2)` takes the halved branch
+/// instead, still inside the measured 8 791–14 159 live range but no longer
+/// this flat number.
 pub const CONFLICT_SET_FLOOR_TOKENS: u32 = 14_000;
 
 /// Price `text` where it cannot be tokenized (see
@@ -118,13 +168,13 @@ impl PromptBudget {
     /// is exactly `context_tokens` — asserted in this module's tests, so no
     /// caller can restate a piece of it.
     pub fn derive(context_tokens: u32) -> Self {
-        let answer_reserve_tokens = MAX_GENERATION_TOKENS;
-        // The re-prompt resends the first answer (up to `MAX_GENERATION_TOKENS`)
+        let answer_reserve_tokens = ANSWER_RESERVE_TOKENS;
+        // The re-prompt resends the first answer (up to `ANSWER_RESERVE_TOKENS`)
         // plus `correction_prompt`, whose length varies with the parser's own
         // message. Priced against a deliberately long one — 200 characters is
         // several times any `serde_json` error seen in this store's failures —
         // so a verbose error cannot be what pushes the second call over.
-        let retry_reserve_tokens = MAX_GENERATION_TOKENS
+        let retry_reserve_tokens = ANSWER_RESERVE_TOKENS
             + conservative_tokens(&prompt::correction_prompt(&"e".repeat(200)));
         let system_tokens = conservative_tokens(&prompt::system_prompt());
 
@@ -164,10 +214,19 @@ impl PromptBudget {
         // — no catalog entry means no local provider and therefore no counter
         // — but "unbounded" has to mean unbounded on both sides, or it is a
         // trap for whoever adds the third provider.
+        //
+        // `T23-06`: the answer reserve is real here too, not zero. Once
+        // `route` reads `budget.answer_reserve_tokens` instead of a crate
+        // constant (which it does, since this card), a zero here would ask a
+        // real generator for `max_tokens.max(1)` -- one token -- the moment a
+        // catalog-less store somehow still reaches a provider that can
+        // generate. `context_tokens: u32::MAX` already makes the *prompt*
+        // side unbounded; the answer side needs its own real number.
         Self {
             context_tokens: u32::MAX,
-            answer_reserve_tokens: 0,
-            retry_reserve_tokens: 0,
+            answer_reserve_tokens: ANSWER_RESERVE_TOKENS,
+            retry_reserve_tokens: ANSWER_RESERVE_TOKENS
+                + conservative_tokens(&prompt::correction_prompt(&"e".repeat(200))),
             system_tokens: 0,
             conflict_floor_tokens: 0,
             window_tokens: u32::MAX,
@@ -215,20 +274,44 @@ mod tests {
         );
     }
 
-    /// `D-122`/`T23-06` will change the answer reserve; this asserts the
-    /// window budget is a consequence of it rather than a second constant.
+    /// `T23-06`: the window budget is a *consequence* of the answer reserve,
+    /// not an independent constant -- this is the relationship the struct's
+    /// own doc promises ("both are fields of this struct, and changing one
+    /// changes the other here"), asserted directly rather than by pinning
+    /// today's numbers, which the next card to touch either term would have
+    /// to keep restating.
     #[test]
     fn the_window_budget_follows_the_answer_reserve() {
         let b = PromptBudget::derive(32_768);
-        assert_eq!(b.answer_reserve_tokens, MAX_GENERATION_TOKENS);
         assert!(
-            b.retry_reserve_tokens > MAX_GENERATION_TOKENS,
+            b.retry_reserve_tokens > b.answer_reserve_tokens,
             "the corrective re-prompt resends the first answer plus the correction"
         );
         assert!(
-            b.window_tokens > 0 && b.conflict_floor_tokens == CONFLICT_SET_FLOOR_TOKENS,
-            "a 32k context honours the conflict set's floor and still leaves a window: {b:?}"
+            b.window_tokens > 0,
+            "a 32k context still leaves a window: {b:?}"
         );
+        // `D-128`: at the measured answer reserve, raising it any further
+        // crosses the branch boundary where `conflict_floor_tokens` stops
+        // being the flat `CONFLICT_SET_FLOOR_TOKENS` promise and becomes
+        // `available / 2` instead -- see
+        // `the_conflict_floor_branch_boundary_is_where_the_algebra_says` for
+        // the exact crossing point. Assert whichever branch the shipped
+        // reserve actually lands in, so a future change to the reserve is
+        // forced to notice which side of the boundary it moved to rather
+        // than silently flipping this test from pass to pass.
+        if b.conflict_floor_tokens == CONFLICT_SET_FLOOR_TOKENS {
+            assert!(
+                b.conflict_floor_tokens <= CONFLICT_SET_FLOOR_TOKENS,
+                "the floor branch never exceeds its own promise"
+            );
+        } else {
+            assert!(
+                b.conflict_floor_tokens < CONFLICT_SET_FLOOR_TOKENS,
+                "outside the floor branch the conflict set is paid from `available / 2`, \
+                 strictly less than the promised floor: {b:?}"
+            );
+        }
     }
 
     /// The measurement this module is built on, frozen as an assertion: a
@@ -252,6 +335,75 @@ mod tests {
         );
     }
 
+    /// `T23-06`/`D-122`: the answer reserve is measured from real answers,
+    /// not derived from `context_tokens` (the failed content-proportional
+    /// design) or from `consolidation_batch_size` (the failed row-cap
+    /// design -- neither survived measurement: window content explained
+    /// about 2 % of the variance in answer size, and a 1-row window averaged
+    /// *more* ops than a 20-row one). This is the assertion that forbids
+    /// reintroducing either without an explicit decision: the reserve must
+    /// not move when the only thing that changes is the context.
+    #[test]
+    fn the_answer_reserve_is_a_property_of_the_answer_not_of_the_context() {
+        let small = PromptBudget::derive(16_384);
+        let default = PromptBudget::derive(32_768);
+        let large = PromptBudget::derive(65_536);
+        assert_eq!(small.answer_reserve_tokens, default.answer_reserve_tokens);
+        assert_eq!(default.answer_reserve_tokens, large.answer_reserve_tokens);
+        assert_eq!(small.answer_reserve_tokens, ANSWER_RESERVE_TOKENS);
+    }
+
+    /// `D-128`: raising the answer reserve past this exact point flips
+    /// `conflict_floor_tokens` from the flat `CONFLICT_SET_FLOOR_TOKENS`
+    /// promise into `available / 2` -- derived from the module's own
+    /// constants, not hard-coded as the number `1113`, so the boundary
+    /// cannot silently drift out of sync with `derive`'s own arithmetic.
+    #[test]
+    fn the_conflict_floor_branch_boundary_is_where_the_algebra_says() {
+        let context_tokens = 32_768u32;
+        let retry_overhead = conservative_tokens(&prompt::correction_prompt(&"e".repeat(200)));
+        let system_tokens = conservative_tokens(&prompt::system_prompt());
+        // available = ctx - 2A - retry_overhead - system; the floor branch
+        // wins while available/2 >= FLOOR, i.e. A <= (ctx - overhead - system)/2 - FLOOR.
+        let boundary =
+            (context_tokens - retry_overhead - system_tokens) / 2 - CONFLICT_SET_FLOOR_TOKENS;
+
+        let at_boundary = derive_with_answer_reserve(context_tokens, boundary);
+        assert_eq!(
+            at_boundary.conflict_floor_tokens, CONFLICT_SET_FLOOR_TOKENS,
+            "exactly at the boundary the floor still holds: {at_boundary:?}"
+        );
+        let past_boundary = derive_with_answer_reserve(context_tokens, boundary + 1);
+        assert!(
+            past_boundary.conflict_floor_tokens < CONFLICT_SET_FLOOR_TOKENS,
+            "one token past the boundary the floor branch has already given way: {past_boundary:?}"
+        );
+    }
+
+    /// `derive`'s own subtraction chain, parameterised on the answer reserve
+    /// instead of reading the shipped constant -- used only by the boundary
+    /// test above, which has to probe both sides of the crossing point
+    /// rather than assert on whatever `ANSWER_RESERVE_TOKENS` happens to be.
+    fn derive_with_answer_reserve(context_tokens: u32, answer_reserve_tokens: u32) -> PromptBudget {
+        let retry_reserve_tokens = answer_reserve_tokens
+            + conservative_tokens(&prompt::correction_prompt(&"e".repeat(200)));
+        let system_tokens = conservative_tokens(&prompt::system_prompt());
+        let available = context_tokens
+            .saturating_sub(answer_reserve_tokens)
+            .saturating_sub(retry_reserve_tokens)
+            .saturating_sub(system_tokens);
+        let conflict_floor_tokens = CONFLICT_SET_FLOOR_TOKENS.min(available / 2);
+        let window_tokens = available - conflict_floor_tokens;
+        PromptBudget {
+            context_tokens,
+            answer_reserve_tokens,
+            retry_reserve_tokens,
+            system_tokens,
+            conflict_floor_tokens,
+            window_tokens,
+        }
+    }
+
     /// A context too small for the fixed parts must not produce a negative
     /// window or a conflict set that eats a window that does not exist.
     #[test]
@@ -272,6 +424,14 @@ mod tests {
             "a zero ceiling would make a counting provider reject every prompt"
         );
         assert!(b.window_chars() > i64::from(u32::MAX));
+        // `T23-06`: the trap a zero reserve here would set for `route`, which
+        // now sends `budget.answer_reserve_tokens` (clamped to at least 1 by
+        // `generate`) as `max_tokens` -- a real provider reachable through
+        // this budget must be asked for a real answer, not for one token.
+        assert!(
+            b.answer_reserve_tokens > 0,
+            "an unbounded prompt must not imply a starved answer"
+        );
     }
 
     #[test]

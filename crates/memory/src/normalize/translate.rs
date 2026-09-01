@@ -86,7 +86,12 @@ pub const MAX_SOURCE_CHARS: usize = 8_000;
 
 /// Ceiling on generated tokens, whatever the source length suggests — the same
 /// "a looping or malformed generation must not run unbounded" reasoning as
-/// [`crate::router::MAX_GENERATION_TOKENS`].
+/// [`crate::budget::ANSWER_RESERVE_TOKENS`], the router's own answer reserve
+/// (`T23-06`). The two are sized independently: this one scales with its
+/// input by construction (`max_tokens_for`, below), because a translation
+/// *is* a transformation of its source; the router's answer is a selection
+/// of what a window is worth saying, which measured to have no such relation
+/// to the window's size.
 pub const MAX_TRANSLATE_TOKENS: u32 = 2_048;
 
 /// Hard ceiling on an accepted translation, in bytes. Exceeding it is a

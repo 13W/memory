@@ -34,10 +34,13 @@ use local_rag_store::{
 use local_rag_test_support::TempHome;
 
 const NO_BUDGET_LIMIT: u32 = u32::MAX;
+// `T23-06`: real, non-zero reserves even though `Scripted::generate` ignores
+// `max_tokens` — see `router.rs`'s own `NO_PROMPT_LIMIT` for why zero here
+// would be a silent lie about what these tests exercise.
 const NO_PROMPT_LIMIT: PromptBudget = PromptBudget {
     context_tokens: u32::MAX,
-    answer_reserve_tokens: 0,
-    retry_reserve_tokens: 0,
+    answer_reserve_tokens: local_rag_memory::budget::ANSWER_RESERVE_TOKENS,
+    retry_reserve_tokens: local_rag_memory::budget::ANSWER_RESERVE_TOKENS,
     system_tokens: 0,
     conflict_floor_tokens: 0,
     window_tokens: u32::MAX,

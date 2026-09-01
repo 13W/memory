@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use local_rag_core::paths::StoreLayout;
-use local_rag_embed::{GenMessage, GenRequest, GenRole, Generator};
+use local_rag_embed::{FinishReason, GenMessage, GenRequest, GenRole, Generator};
 use local_rag_generate::{DEFAULT_MODEL_ID, LlamaGenerator};
 use local_rag_store::{ConsolidationWindow, EvidenceKind, TrustLevel, WindowObservation};
 use rusqlite::{Connection, OpenFlags};
@@ -290,6 +290,206 @@ fn measure_real_prompt_cost() {
     }
 }
 
+/// `T23-06`/`D-122`/`D-130`: the uncensored real-answer distribution
+/// `ANSWER_RESERVE_TOKENS` is chosen from.
+///
+/// Everything the store already holds is CENSORED at the old `MAX_GENERATION_
+/// TOKENS = 1024` -- a proposal the model would have made past that point was
+/// never written, so it cannot be read back out of `memory_entry`/`pending_
+/// memory_candidate` and used to size the very budget that cut it off. The
+/// only honest measurement re-generates real answers with the cap raised far
+/// out of the way (8192) and records what the model actually stops at on its
+/// own (`FinishReason::Stop`) versus where the raised cap itself had to
+/// intervene (`FinishReason::Length`).
+///
+/// **The two are not the same population, and this test does not pretend
+/// they are.** A hand inspection of one `Length` case (kept in this card's
+/// evidence, not reproduced by this test) found verbatim repetition -- the
+/// same op, the same text, a fresh fabricated citation id each time -- which
+/// is a known greedy-decoding degeneracy (`D-130`), not a legitimately long
+/// answer. No finite reserve fixes that class; a larger one only burns more
+/// tokens and wall-clock before the cap steps in. So the percentiles below
+/// are computed over `Stop`-finished samples only, `truncated_at_cap` is
+/// reported as its own count rather than folded into them, and the constant
+/// this measurement justifies is chosen to cover the `Stop` distribution
+/// generously -- not to chase covering `Length` samples that a bigger number
+/// cannot actually help.
+///
+/// Greedy decoding (`GenRequest::new`'s default `Sampling::Greedy`) makes one
+/// exact prompt's answer deterministic, but this is a live, continuously
+/// consolidating store: the conflict set for a given window can differ
+/// between two calls minutes apart, so re-running this test does not
+/// reproduce byte-identical numbers, only the same shape of distribution.
+///
+/// Slow by design: a real generation per window, not a token count -- budget
+/// tens of minutes, not seconds, for the live default sample size, more when
+/// a `Length` sample spends its whole 8192-token cap.
+#[test]
+#[ignore = "needs LOCAL_RAG_LIVE_ROOT: an installed model and a real store; slow (real generation)"]
+fn measure_real_answer_tokens() {
+    let Some(root) = live_root() else {
+        panic!("set LOCAL_RAG_LIVE_ROOT to a store root");
+    };
+    let conn = open_live_read_only(&root);
+    let model = open_model(&root);
+    let entry = local_rag_generate::find(DEFAULT_MODEL_ID).expect("default model in the catalog");
+    let conflict_budget =
+        local_rag_core::config::MemoryConfig::default().router_conflict_token_budget;
+
+    const OVERSIZED_ANSWER_CAP: u32 = 8_192;
+    let sample_limit: usize = std::env::var("LOCAL_RAG_ANSWER_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+
+    // The current backlog is a handful of sessions on a store this far along
+    // (T23-04/T23-05 already drained most of it) -- nowhere near enough for a
+    // distribution. The real source is history: every window that has ever
+    // actually applied still has its exact `[from, to]` in `consolidation_run`,
+    // and replaying it with the cap raised measures what the model would have
+    // written without the very ceiling under design. Stratified across row
+    // counts (1, 5, 10, 20 -- the shapes `D-058`'s ladder and `open_window`'s
+    // batch cap actually produce) rather than newest-first, so the sample
+    // is not dominated by whatever shape happens to be running today.
+    let mut stmt = conn
+        .prepare(
+            "WITH sized AS ( \
+               SELECT run_id, session_id, from_received_seq, to_received_seq, \
+                      (to_received_seq - from_received_seq + 1) AS seq_span, \
+                      CASE \
+                        WHEN (to_received_seq - from_received_seq + 1) <= 2 THEN 1 \
+                        WHEN (to_received_seq - from_received_seq + 1) <= 6 THEN 5 \
+                        WHEN (to_received_seq - from_received_seq + 1) <= 12 THEN 10 \
+                        ELSE 20 \
+                      END AS bucket \
+                 FROM consolidation_run WHERE state = 'applied' \
+             ), \
+             ranked AS ( \
+               SELECT run_id, session_id, from_received_seq, to_received_seq, bucket, \
+                      ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY run_id) AS rn \
+                 FROM sized WHERE seq_span <= 400 \
+             ) \
+             SELECT run_id, session_id, from_received_seq, to_received_seq \
+               FROM ranked \
+              WHERE rn <= ?1 \
+              ORDER BY bucket, run_id",
+        )
+        .expect("prepare applied runs");
+    // Per-bucket cap, not a total: `ORDER BY bucket LIMIT n` would return
+    // only the smallest bucket if it alone has more than `n` rows -- which
+    // it does here (595 one/two-row windows against a sample of 60) -- so
+    // every previous run of this test silently measured only the smallest
+    // window shape. `ROW_NUMBER() OVER (PARTITION BY bucket ...)` above is
+    // what makes this an actual stratified sample across row counts (1, 5,
+    // 10, 20) rather than a sort order that happens to look like one.
+    let per_bucket = (sample_limit / 4).max(1);
+    let runs: Vec<(String, String, i64, i64)> = stmt
+        .query_map(rusqlite::params![per_bucket as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .expect("query applied runs")
+        .map(|r| r.expect("run row"))
+        .collect();
+
+    // Only `Stop`-finished samples feed the percentiles -- see the module
+    // doc's `D-130` note for why a `Length` sample is a different population
+    // (degenerate repetition) that a larger reserve does not fix.
+    let mut stopped_tokens: Vec<u32> = Vec::new();
+    let mut truncated_at_cap = 0usize;
+    let mut checked = 0usize;
+
+    for (run_id, session_id, from, to) in runs {
+        // The exact window that already applied -- not re-derived, so the
+        // sample is real consolidation history, not a hypothetical reshaping
+        // of it under today's window budget (`T23-04` postdates most of this
+        // history, so re-deriving would silently narrow older, wider windows).
+        let window = load_window(&conn, &session_id, from, to);
+        if window.observations.is_empty() {
+            continue;
+        }
+        let conflicts = local_rag_memory::recall::candidate_conflict_set(
+            &conn,
+            &window.observations,
+            conflict_budget,
+        )
+        .expect("conflict set");
+        let messages = local_rag_memory::prompt::initial_messages(&window, &conflicts);
+        let prompt_tokens_used = model
+            .count_prompt_tokens(&GenRequest::new(messages.clone(), 1))
+            .expect("local model counts");
+        // Leave real headroom so the oversized cap itself cannot be the
+        // reason for a ContextOverflow -- that would measure the model's
+        // context, not its answer.
+        if prompt_tokens_used + OVERSIZED_ANSWER_CAP as usize + 64 > entry.context_length as usize {
+            println!(
+                "run {} session {} [{from}..={to}] skipped: prompt alone is \
+                 {prompt_tokens_used} tokens, no room for an {OVERSIZED_ANSWER_CAP}-token answer",
+                &run_id[..8],
+                &session_id[..8]
+            );
+            continue;
+        }
+
+        let window_chars: usize = window
+            .observations
+            .iter()
+            .map(|o| {
+                o.short_evidence_excerpt
+                    .as_deref()
+                    .unwrap_or("(no excerpt)")
+                    .chars()
+                    .count()
+            })
+            .sum();
+        let request = GenRequest::new(messages, OVERSIZED_ANSWER_CAP)
+            .with_json_schema(local_rag_memory::schema::ROUTER_OPS_JSON_SCHEMA);
+        let response = model.generate(request).expect("local generation succeeds");
+        let tokens = response.tokens_generated.unwrap_or(0);
+        let chars = response.text.chars().count();
+        checked += 1;
+        if matches!(response.finish_reason, FinishReason::Length) {
+            truncated_at_cap += 1;
+        } else {
+            stopped_tokens.push(tokens);
+        }
+        println!(
+            "run {} session {} [{from}..={to}] window_rows={} window_chars={window_chars} \
+             answer_tokens={tokens} answer_chars={chars} finish={:?}",
+            &run_id[..8],
+            &session_id[..8],
+            window.observations.len(),
+            response.finish_reason,
+        );
+    }
+
+    stopped_tokens.sort_unstable();
+    let pct_u32 = |p: f64| -> u32 {
+        if stopped_tokens.is_empty() {
+            return 0;
+        }
+        let idx = ((p / 100.0) * (stopped_tokens.len() as f64 - 1.0)).round() as usize;
+        stopped_tokens[idx.min(stopped_tokens.len() - 1)]
+    };
+    println!(
+        "checked {checked} windows; {} finished on their own (`Stop`), {truncated_at_cap} were \
+         still writing at {OVERSIZED_ANSWER_CAP} tokens (`Length`, excluded from the \
+         percentiles below -- see the module doc's `D-130` note)\n\
+         Stop-finished answer tokens: min={:?} p50={} p90={} p95={} p99={} max={:?}",
+        stopped_tokens.len(),
+        stopped_tokens.first(),
+        pct_u32(50.0),
+        pct_u32(90.0),
+        pct_u32(95.0),
+        pct_u32(99.0),
+        stopped_tokens.last(),
+    );
+    assert!(checked > 0, "the store produced no window to measure");
+    assert!(
+        !stopped_tokens.is_empty(),
+        "every sample hit the cap -- no `Stop`-finished answer to size a reserve from"
+    );
+}
+
 /// `T23-04`'s acceptance, offline: with the window budget applied, no window
 /// this store can produce overflows the model's context.
 ///
@@ -383,10 +583,10 @@ fn a_budgeted_window_never_overflows_the_context() {
         .expect("conflict set");
         let req = GenRequest::new(
             local_rag_memory::prompt::initial_messages(&window, &conflicts),
-            local_rag_memory::router::MAX_GENERATION_TOKENS,
+            budget.answer_reserve_tokens,
         );
         let needed = model.count_prompt_tokens(&req).expect("local model counts")
-            + local_rag_memory::router::MAX_GENERATION_TOKENS as usize;
+            + budget.answer_reserve_tokens as usize;
         worst = worst.max(needed);
         checked += 1;
         assert!(

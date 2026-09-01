@@ -233,13 +233,27 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
 - **Specification:** spec 08 §4 step 3 (two-tier malformed-output handling); ADR-0006.
 - **Result:** the generator is not asked to describe a window in fewer tokens than the answer needs.
 - **In scope:** `MAX_GENERATION_TOKENS = 1024` (`crates/memory/src/router.rs`) is a constant
-  against a window of up to 20
-  observations; the live failure truncated a string at 4430 characters and then failed the whole
-  window after its one corrective re-prompt. The budget is derived from the window, and the
-  interaction with `T23-04`'s window budget is stated in one place rather than two.
-- **Not in scope:** the corrective re-prompt itself, which stays.
-- **Tests:** a window that legitimately needs a long answer completes; the derivation is asserted.
-- **Acceptance:** truncation stops being a window-failing class.
+  against a window of up to 20 observations; the live failure truncated a string at 4430
+  characters and then failed the whole window after its one corrective re-prompt. This card first
+  read the fix as "derive the answer from the window" — **measured while executing `T23-06`, that
+  premise does not hold**: window content explains roughly 2 % of the variance in real answer
+  size, and a one-observation window has produced more operations on average than a
+  twenty-observation one. The fix is a flat reserve measured from real regenerated answers
+  (`crates/local-rag/tests/prompt_budget_live.rs::measure_real_answer_tokens`), independent of the
+  window and of `consolidation_batch_size`, derived in the same `PromptBudget::derive` function
+  `T23-04` built — the interaction stays stated in one place, it is just not the interaction this
+  card first expected. The measurement also found a second, independent reason the tail of the
+  answer-size distribution is large: greedy decoding can degenerate into verbatim repetition for
+  a real window, reproducibly, which no finite reserve fixes (`D-130`) — the reserve is sized from
+  the distribution of answers that finish on their own, not from that tail.
+- **Not in scope:** the corrective re-prompt itself, which stays; `FailureKind` classification of a
+  truncated answer, which is `T23-10`'s card.
+- **Tests:** a window that legitimately needs a long answer completes under the new reserve, and
+  the same plan truncates under the old fixed one (an in-tree control, not a mutation nobody
+  re-runs); the derivation is asserted, not hardcoded twice.
+- **Acceptance:** truncation stops being a window-failing class — not eliminated outright (a
+  single sufficiently verbose operation can still exceed any finite reserve; that residual is
+  `T23-10`'s to make recoverable, not this card's to close).
 - **Evidence:** the `T23-06` row.
 
 ## T23-07 — Deterministic candidate dedup in the store

@@ -838,10 +838,11 @@ normalization_batch = 4
 
     /// `D-095`: the router's conflict-set budget is a real, overridable knob.
     ///
-    /// The default is arithmetic, not taste — 32 768 context, 1024 reserved for
-    /// the answer, ~1500 for system prompt and schema — and it exists because a
-    /// count-only cap let 50 entries averaging 2501 characters fill 97 % of the
-    /// model's context on a real store, which stopped consolidation entirely.
+    /// It exists because a count-only cap let 50 entries averaging 2501
+    /// characters fill 97 % of the model's context on a real store, which
+    /// stopped consolidation entirely. The default's own arithmetic no
+    /// longer lives here — see `local_rag_memory::budget::PromptBudget`
+    /// (`T23-04`/`T23-06`) for the current derivation.
     #[test]
     fn memory_config_defaults_and_overrides_the_router_conflict_budget() {
         assert_eq!(MemoryConfig::default().router_conflict_token_budget, 12_000);

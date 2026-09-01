@@ -16,9 +16,10 @@
 //!    deterministically-broken response cannot livelock.
 //! 2. **Partial recovery** — one or more leading lines parse cleanly, then a
 //!    later line does not (trailing prose/garbage after an otherwise
-//!    complete response, or a truncated final line at the
-//!    `MAX_GENERATION_TOKENS` boundary — both observed live incidents, D-050's
-//!    own evidence). [`parse_ops`] returns `Ok(`[`ParseOutcome`]`)` with the
+//!    complete response, or a truncated final line at the router's answer
+//!    reserve boundary (`local_rag_memory::budget::PromptBudget::
+//!    answer_reserve_tokens`, `T23-06`) — both observed live incidents,
+//!    D-050's own evidence). [`parse_ops`] returns `Ok(`[`ParseOutcome`]`)` with the
 //!    successfully parsed *prefix* and `dropped_tail` naming why recovery
 //!    stopped there — this is the whole reason JSONL replaced a single JSON
 //!    array (D-051): under the old array framing, one bad trailing element
@@ -242,7 +243,7 @@ mod tests {
     }
 
     /// An opening fence with no matching close (e.g. the close itself got
-    /// truncated by `MAX_GENERATION_TOKENS`) still has its opening line
+    /// truncated at the router's answer reserve) still has its opening line
     /// stripped -- only the *closing* fence is optional, since a missing
     /// close is exactly the truncation shape D-051 exists to tolerate. The
     /// content on the lines that follow is then parsed on its own merits.
