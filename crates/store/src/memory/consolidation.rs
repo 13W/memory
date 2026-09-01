@@ -1053,13 +1053,15 @@ pub enum AbandonOutcome {
 /// `consolidation_run.last_failure_kind` (D-050's retry-storm circuit
 /// breaker): whether a `failed` run's most recent failure is expected to
 /// reproduce **identically** on an unchanged rebuild (`Mechanical` — a
-/// router/schema/prompt code defect, or a fixed generation token budget too
-/// small for this window's content; retrying with the same code changes
-/// nothing) or might resolve on its own by simply waiting (`Transient` — the
-/// generator/model unavailable, an infra error, a concurrent-write race).
-/// [`stale_runs`] uses this to stop retrying a `Mechanical` failure every
-/// tick forever — dead-lettered until the build fingerprint changes — while
-/// still backing off-and-retrying a `Transient` one on a timer.
+/// router/schema/prompt code defect; retrying with the same code changes
+/// nothing) or might resolve on its own by simply waiting or resampling
+/// (`Transient` — the generator/model unavailable, an infra error, a
+/// concurrent-write race, or — `T23-10`/`D-124` — a generation truncated at
+/// its token reserve, since what the model emits inside that reserve is not
+/// fixed by the code and a later attempt can complete where an earlier one
+/// did not). [`stale_runs`] uses this to stop retrying a `Mechanical` failure
+/// every tick forever — dead-lettered until the build fingerprint changes —
+/// while still backing off-and-retrying a `Transient` one on a timer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     Mechanical,

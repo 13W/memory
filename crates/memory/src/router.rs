@@ -106,13 +106,26 @@ fn trace_collapsed(before: usize, after: usize) {
 /// on an unchanged retry — **except** a deterministic context overflow
 /// (D-057, see [`classify_generate_failure`]), which is a third case that
 /// *is* about the request, not transient infra, and is folded into
-/// `Mechanical` at both `pool.generate` call sites below. The two other
-/// failure points that are actually *about the model's output content* —
-/// the corrective-re-prompt's parse still failing, and a per-op
-/// materialization rejection — are also `Mechanical`: greedy decoding makes
-/// the model's response to the *same* window deterministic, so these two
-/// reproduce byte-for-byte on every retry until the code (schema, prompt, or
-/// generation budget) actually changes.
+/// `Mechanical` at both `pool.generate` call sites below. Of the two
+/// remaining failure points that are actually *about the model's output
+/// content*, only one still reproduces byte-for-byte on every retry: a per-op
+/// materialization rejection (a genuine schema/prompt defect — the model's
+/// response to the *same* window is deterministic, so this is `Mechanical`
+/// until the code changes). The corrective re-prompt's own parse still
+/// failing is `Mechanical` too, **unless** that failure is a truncation —
+/// `FinishReason::Length` on the retry — in which case it is `Transient`
+/// (`T23-10`/`D-124`): the answer depends on what the model happened to emit
+/// inside the reserve, and a live incident proved a second sampling can fit
+/// where the first did not (a retry moved a session's backlog 287 → 277
+/// after being parked as an unrecoverable dead-letter for a day). This does
+/// sweep in a second, unrelated cause that also ends in `FinishReason::Length`
+/// — greedy decoding degenerating into verbatim repetition for the rest of
+/// the reserve (D-130, open, byte-identical on retry unlike D-124's case) —
+/// but that is a bounded, accepted cost: `record_run_failure` (D-069)
+/// escalates any `Transient` failure that has not resolved in
+/// `TRANSIENT_ATTEMPT_CAP` attempts into an ordinary fingerprinted
+/// `Mechanical` dead-letter, the same terminal state D-130's case reaches
+/// today, just after up to seven extra real generations.
 pub async fn route(
     state_db: &StateDb,
     pool: &GeneratorPool,
@@ -171,19 +184,21 @@ pub async fn route(
             let retry_response = pool
                 .generate(policy, retry_request)
                 .map_err(classify_generate_failure)?;
-            // `T23-06`/`D-122`/`D-129`: name a truncation as a truncation. This
-            // is diagnosis, not reclassification — `FailureKind` stays
-            // `Mechanical` either way (greedy decoding reproduces it
-            // identically), and deciding whether it deserves a different kind
-            // is `T23-10`'s job, not this one's. Without this, a window that
-            // ran out of answer room and one that the model genuinely
-            // mangled produce the identical `serde_json` error text, which is
-            // exactly what made the live incident indistinguishable from
-            // ordinary malformation at the point this match decides.
+            // `T23-06`/`D-122`/`D-129` named a truncation as a truncation
+            // without yet reclassifying it: a window that ran out of answer
+            // room and one that the model genuinely mangled produce the
+            // identical `serde_json` error text, which is exactly what made
+            // the live incident indistinguishable from ordinary malformation
+            // at the point this match decides. `T23-10`/`D-124`: a truncation
+            // is `Transient`, not `Mechanical` — greedy decoding does not make
+            // this one reproduce identically, because the answer depends on
+            // what the model happened to emit inside the reserve, and a live
+            // retry proved a second sampling can fit where the first did not.
+            // Every other malformation here stays `Mechanical`, unchanged.
             let retry_finish_reason = retry_response.finish_reason.clone();
             let outcome = parse::parse_ops(&retry_response.text).map_err(|e| {
                 if matches!(retry_finish_reason, FinishReason::Length) {
-                    ClassifiedFailure::mechanical(format!(
+                    ClassifiedFailure::transient(format!(
                         "router output still malformed after one corrective re-prompt: {e} \
                          (the answer reached its {}-token reserve before finishing)",
                         budget.answer_reserve_tokens
@@ -1113,9 +1128,11 @@ mod tests {
     /// `D-122`'s live shape: the truncation lands inside the *first* line, so
     /// there is no valid prefix for tier 2 to keep, and the window fails
     /// after the one corrective re-prompt reproduces the identical cut
-    /// (greedy decoding). The failure now names the truncation instead of
-    /// reading like an ordinary parse error — diagnosis only, `FailureKind`
-    /// stays `Mechanical` either way; reclassifying it is `T23-10`'s card.
+    /// (greedy decoding). `T23-10`/`D-124`: unlike an ordinary parse error,
+    /// this one is `Transient`, not `Mechanical` — a live retry on the
+    /// owner's store found a session parked on exactly this shape recovered
+    /// on its very next attempt (backlog 287 → 277), because a second
+    /// sampling fit inside the same reserve where the first did not.
     #[tokio::test]
     async fn a_truncated_answer_is_reported_as_truncated_not_as_malformed() {
         let (_home, db) = open_state();
@@ -1137,7 +1154,11 @@ mod tests {
         )
         .await
         .expect_err("a one-token reserve cannot finish even one op line");
-        assert_eq!(failure.kind, FailureKind::Mechanical);
+        assert_eq!(
+            failure.kind,
+            FailureKind::Transient,
+            "a truncation may resolve on a later sampling — not a dead-letter on the first attempt"
+        );
         assert!(
             failure.reason.contains("reserve"),
             "the failure names the truncation rather than reading like an \

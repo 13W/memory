@@ -476,6 +476,29 @@ columns (`last_failure_kind`/`last_failure_reason`/`last_failure_fingerprint`/`a
 `next_retry_at`, schema v11): a pre-existing `failed` row with none of them set is never classified
 `Mechanical`, so it stays retry-eligible — the safe default, not a special case.
 
+As-built note (`T23-10`/`D-124`, `[SPEC]`): D-050's own classification above ("the corrective-
+re-prompt's parse still failing… reproduces identically on an unchanged retry") turned out to be
+false for one specific sub-case, found the same way D-069 found its own gap — a live retry
+falsifying a written prediction. A session parked since 2026-08-30 on `router output still malformed
+after one corrective re-prompt: … EOF while parsing a string at line 1 column 4430` was retried
+**once**, by `T23-03`'s operator verb, expecting the identical failure D-050's contract promises. It
+**applied** instead: the backlog moved 287 → 277. A generation truncated at its `answer_reserve_tokens`
+reserve (`T23-06`) depends on what the model happened to emit inside that budget, and a second
+sampling fit where the first did not — greedy decoding does not make *this* failure reproduce
+byte-for-byte, only a genuine schema/prompt defect does. `local_rag_memory::router::route` already
+carried the exact signal needed (`FinishReason::Length` on the corrective re-prompt's own response,
+threaded through since `T23-06`/`D-122`/`D-129` for diagnosis only); the fix is that one branch now
+constructs `ClassifiedFailure::transient(...)` instead of `::mechanical(...)`. Every other
+malformed-output failure — a non-truncated parse failure, and a per-op materialization rejection —
+is unchanged and stays `Mechanical`. This does sweep a second, unrelated cause into `Transient` too:
+greedy decoding degenerating into verbatim repetition of one JSON line for the rest of the reserve
+(`D-130`, open, byte-identical on retry unlike this case) also ends in `FinishReason::Length`, and
+nothing in the generator distinguishes *why* the reserve was exhausted. That is a bounded, accepted
+cost rather than a new retry-storm: `record_run_failure` (D-069) already escalates any `Transient`
+failure that has not resolved in `TRANSIENT_ATTEMPT_CAP` (8) attempts into an ordinary fingerprinted
+`Mechanical` dead-letter — the same terminal state D-130's case reaches today, just after up to
+seven extra real generations (D-130 measured ~149s each) rather than one.
+
 As-built note (D-051, `[SPEC]`): D-050 stopped a *deterministically*-failing window from
 retry-storming forever; it did not fix why those windows failed in the first place — live
 verification right after D-050 shipped confirmed all 4 incident windows failed **again**, byte-for-
