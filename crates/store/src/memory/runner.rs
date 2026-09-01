@@ -97,8 +97,8 @@ use super::consolidation::{
 };
 use super::op::{EvidenceInput, MemoryOpOutcome, apply_noop};
 use super::review::{
-    ProposedOperation, ReviewError, apply_proposed_operation, observation_evidence_source,
-    propose_candidate,
+    ProposeCandidateOutcome, ProposedOperation, ReviewError, apply_proposed_operation,
+    observation_evidence_source, propose_candidate,
 };
 use crate::observation::{EvidenceKind, TrustLevel, envelopes_in_range};
 use crate::{OpenError, StateDb, WriteError};
@@ -181,6 +181,13 @@ pub struct ApplyReport {
     pub replayed: usize,
     pub noop: usize,
     pub proposed: usize,
+    /// A `ProposeCandidate` op whose exact proposal already had a home —
+    /// pending or an active entry — and so wrote no
+    /// `pending_memory_candidate` row (`T23-07`, ADR-0014 Decision 2). Makes
+    /// the card's own acceptance criterion ("re-running a window that
+    /// previously produced a duplicate produces none") directly observable
+    /// rather than inferred from an unchanged row count.
+    pub deduped: usize,
 }
 
 /// Why [`apply_run`] rejected a batch — always **zero mutation** (the whole
@@ -395,20 +402,32 @@ fn apply_run(
             } => {
                 // Idempotent retry guard: candidates have no idempotency_key
                 // mechanism of their own (no audit_event row), so an
-                // already-proposed candidate_id is simply left alone.
+                // already-proposed candidate_id is simply left alone. A
+                // different concern from `T23-07`'s content dedup below: this
+                // one keys on the caller-minted `candidate_id` and exists
+                // only for crash-and-retry, so it always counts as
+                // `proposed` — the run already wrote (or, on retry, already
+                // had written) exactly this row.
                 if candidate_state(tx, candidate_id)?.is_none() {
                     let conflict_refs: Vec<&str> = conflicts.iter().map(String::as_str).collect();
                     let evidence_refs = dedup_evidence_ids(evidence_observation_ids);
-                    propose_candidate(
+                    match propose_candidate(
                         tx,
                         candidate_id,
                         operation,
                         &conflict_refs,
                         &evidence_refs,
                         now_ms,
-                    )?;
+                    )? {
+                        ProposeCandidateOutcome::Proposed => report.proposed += 1,
+                        ProposeCandidateOutcome::DuplicateOfPending { .. }
+                        | ProposeCandidateOutcome::AlreadyAnEntry { .. } => {
+                            report.deduped += 1;
+                        }
+                    }
+                } else {
+                    report.proposed += 1;
                 }
-                report.proposed += 1;
             }
         }
     }

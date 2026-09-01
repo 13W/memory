@@ -10,6 +10,14 @@
 //! through the very same `guard::materialize` calls `route` makes — an in-tree
 //! control rather than a mutation nobody will re-run.
 //!
+//! `T23-07`/`D-118`/`D-127` is the same class, offline the same way: a window
+//! whose plan names one *not-yet-stored* claim twice — as a `create`, or as a
+//! `propose_candidate` — must leave exactly one row, not two. The card's own
+//! Result sentence ("a proposal identical to something already pending, or
+//! already an entry, does not create another row") is asserted here as a row
+//! count against the real `commit_apply_run` path, the same way `T23-05`'s
+//! headline test asserts its own.
+//!
 //! Determinism: a temporary `LOCAL_RAG_HOME`, literal `now_ms`, seeded UUIDs,
 //! a scripted generator. No clock, no network, no home directory.
 
@@ -177,6 +185,36 @@ fn duplicate_proposal_response() -> String {
         )
     };
     format!("{}\n{}", line("o1"), line("o2"))
+}
+
+/// `T23-07`/`D-127`: the two `create` lines one window produces when the
+/// model proposes the same **not-yet-stored** text twice — no entry is
+/// seeded for this one, unlike [`duplicate_proposal_response`].
+fn duplicate_new_text_response() -> String {
+    let line = |cite: &str| {
+        format!(
+            r#"{{"op":"create","kind":"decision","text":"a brand new claim","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["{cite}"]}}"#
+        )
+    };
+    format!("{}\n{}", line("o1"), line("o2"))
+}
+
+/// `T23-07`/`D-118`: the two `propose_candidate` lines one window produces
+/// when the model proposes the same claim twice, both needing human review.
+fn duplicate_candidate_proposal_response() -> String {
+    let line = |cite: &str| {
+        format!(
+            r#"{{"op":"propose_candidate","kind":"fact","text":"a proposed claim","scope_kind":"global","confidence_signal":"low","importance_signal":"low","cites":["{cite}"]}}"#
+        )
+    };
+    format!("{}\n{}", line("o1"), line("o2"))
+}
+
+fn count_rows(db: &StateDb, table: &str) -> i64 {
+    db.open_read()
+        .expect("read conn")
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .expect("count")
 }
 
 fn entry_version(db: &StateDb, memory_id: &str) -> i64 {
@@ -546,4 +584,103 @@ async fn an_outside_writer_still_conflicts_and_only_re_planning_converges() {
     .expect("a re-planned window applies");
     assert_eq!(report.applied, 1);
     assert_eq!(entry_version(&db, &memory_id), 5);
+}
+
+/// `T23-07`/`D-118`, the card's own Result sentence as an assertion: one
+/// window's plan naming one not-yet-pending claim twice, both as
+/// `propose_candidate`, leaves exactly one `pending_memory_candidate` row.
+/// `propose_candidate` never participates in `plan::collapse`
+/// (`route`'s own ops count below is 2, unlike the `create` case), so this
+/// is `local_rag_store::memory::propose_candidate`'s own transactional check
+/// doing the work, inside `commit_apply_run`.
+#[tokio::test]
+async fn one_windows_two_identical_proposals_leave_exactly_one_candidate_row() {
+    let (_home, db) = open_state();
+    let uuids = SeqUuids(AtomicU64::new(0));
+    seed_observations(&db, &["o1", "o2"]).await;
+
+    let pool = pool_with(vec![&duplicate_candidate_proposal_response()]);
+    let w = window("sess-1", &["o1", "o2"]);
+    let ops = router::route(
+        &db,
+        &pool,
+        DataPolicy::LocalOnly,
+        &uuids,
+        w.clone(),
+        NO_BUDGET_LIMIT,
+        NO_PROMPT_LIMIT,
+    )
+    .await
+    .expect("routes cleanly");
+    assert_eq!(
+        ops.len(),
+        2,
+        "propose_candidate never participates in plan::collapse: {ops:?}"
+    );
+
+    let run = open_window(&db, &uuidv7_from(1_600, [0xCC; 10]).to_string(), "sess-1").await;
+    let report = commit_apply_run(
+        &db,
+        run,
+        w.observations.clone(),
+        1_000 + LEASE_DURATION_MS,
+        ops,
+        2_000,
+    )
+    .await
+    .expect("applies cleanly");
+
+    assert_eq!(report.proposed, 1);
+    assert_eq!(report.deduped, 1);
+    assert_eq!(
+        count_rows(&db, "pending_memory_candidate"),
+        1,
+        "one candidate, not two"
+    );
+}
+
+/// `T23-07`/`D-127`, the card's own Result sentence for the `create` half:
+/// one window's plan naming one not-yet-stored claim twice leaves exactly
+/// one `memory_entry` row. Here `plan::collapse` does the work before the
+/// plan ever reaches `commit_apply_run` (`route`'s own ops count below is 1,
+/// unlike the `propose_candidate` case above).
+#[tokio::test]
+async fn one_windows_two_identical_creates_leave_exactly_one_entry() {
+    let (_home, db) = open_state();
+    let uuids = SeqUuids(AtomicU64::new(0));
+    seed_observations(&db, &["o1", "o2"]).await;
+
+    let pool = pool_with(vec![&duplicate_new_text_response()]);
+    let w = window("sess-1", &["o1", "o2"]);
+    let ops = router::route(
+        &db,
+        &pool,
+        DataPolicy::LocalOnly,
+        &uuids,
+        w.clone(),
+        NO_BUDGET_LIMIT,
+        NO_PROMPT_LIMIT,
+    )
+    .await
+    .expect("routes cleanly");
+    assert_eq!(
+        ops.len(),
+        1,
+        "plan::collapse folds two creates of one new text: {ops:?}"
+    );
+
+    let run = open_window(&db, &uuidv7_from(1_600, [0xCC; 10]).to_string(), "sess-1").await;
+    let report = commit_apply_run(
+        &db,
+        run,
+        w.observations.clone(),
+        1_000 + LEASE_DURATION_MS,
+        ops,
+        2_000,
+    )
+    .await
+    .expect("applies cleanly");
+
+    assert_eq!(report.applied, 1);
+    assert_eq!(count_rows(&db, "memory_entry"), 1, "one entry, not two");
 }

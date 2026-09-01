@@ -113,8 +113,13 @@ section states less precisely than the code fixes:
 
   The rewrite looks the text up in the **store**, not in the plan it is building, so a window that
   proposes one stored text twice produces two reinforces of one entry — the shape §4's collapse
-  exists to fold (`T23-05`/`D-121`). `D-078` stops the store accumulating copies; the collapse
-  stops one window's plan contradicting itself.
+  exists to fold (`T23-05`/`D-121`). `D-078` stops the store accumulating copies across windows;
+  the collapse stops one window's plan contradicting itself about an *existing* entry. A window
+  proposing one **not-yet-stored** text twice was the same blind spot one op kind later: `D-078`'s
+  lookup has nothing to find, so both creates minted their own entry (`T23-07`/`D-127`, measured:
+  14 live runs did, leaving 11 active entries over 4 shared texts). `local_rag_memory::plan::
+  collapse` now also folds sibling `create` ops that agree on scope and text, the same way it
+  already folds sibling `reinforce`/`resolve`/`retract`/`supersede` ops that agree on a target.
 
   This is a mechanical guard rather than a prompt rule for a measured reason: the router cannot
   see the duplicate. §4 step 3's candidate set is capped, and past the cap the model is blind to
@@ -126,8 +131,12 @@ section states less precisely than the code fixes:
   Exact text, not similarity, and deliberately: "is this the same claim?" asked loosely is a
   judgement that belongs to the model and to review; asked as byte equality it is a fact, and a
   fact is what a guard may act on silently. Near-duplicates are left alone. `propose_candidate`
-  is left alone too — it creates no entry, so it cannot duplicate one, and turning a request for
-  human review into an automatic write is not a guard's decision to make.
+  is **no longer** fully left alone (`T23-07`, ADR-0014 Decision 2, `D-118`): a proposal
+  byte-identical to one already pending, or to an already-active entry, is declined — no
+  `pending_memory_candidate` row is written. That check lives one layer down, in
+  `local_rag_store::memory::propose_candidate` itself, and this guard's own boundary is unchanged:
+  it still never turns a candidate into an automatic write, because declining to enqueue a
+  duplicate *request* is not answering it.
 - **`noop` writes nothing at all** — no `memory_entry` mutation, no `memory_evidence`, no
   `audit_event`. The op envelope in §4 below lists `target/kind/text/scope/canonical_key/
   confidence inputs` for the op list generally; `noop` needs none of them, unlike every other
@@ -380,7 +389,22 @@ per observation): a negation only makes sense read against an earlier claim in t
 matching this section's own "ordered ops list" wording. The model never emits a raw `confidence`/
 `importance` float (§2's own as-built note) and never addresses an existing entry by
 `canonical_key` — only by the `memory_id` `local_rag_memory::recall::candidate_conflict_set` shows
-it in the prompt, since the same key text can legitimately exist in more than one scope. Two-tier
+it in the prompt, since the same key text can legitimately exist in more than one scope.
+
+As-built note (`T23-07`, `[SPEC]`, ADR-0014 Decision 2): step 3's "recall of plausibly related
+existing entries (candidate conflict set)" now also carries the distinct `create`-shaped proposals
+already pending review in scopes the window touches — "show the router what it is supposed to
+notice," the soft half of the candidate-dedup decision, whose hard half is the deterministic check
+named in §3's `D-078` bullet above. A pending row is folded into the same
+`local_rag_store::MemoryEntrySummary` shape real entries use, tail-appended after them so a tight
+token budget cuts it first, and rendered with **`"memory_id":null`** — never its `candidate_id`,
+never an entry's — precisely so it stays what the `canonical_key` sentence above already
+establishes the pattern for: something the model can read but never name as a `target_memory_id`.
+Deduplicated by the same exact-proposal identity the deterministic check uses
+(`local_rag_store::candidate_dedup_key`) before it ever reaches the prompt, so a claim proposed
+hundreds of times over (measured live: one claim 475 times) arrives as one row, not hundreds.
+
+Two-tier
 malformed-output handling: a structurally invalid response (bad JSON, an unknown enum value) gets
 one bounded corrective re-prompt before the whole window fails (the "router/LLM error ⇒ failed
 (retryable)" edge, 04 §4); a semantically-valid but referentially-hallucinated value (an unknown
@@ -488,14 +512,30 @@ text more than once inside a single transaction.
 The plan is therefore collapsed above the store, by `local_rag_memory::plan::collapse`, before
 `run_once` is handed it — the same "dedup at the untrusted-input boundary" move `D-069` made one
 level down, and the sentence above about cross-op duplication stays true of `apply_run` itself,
-which is unchanged. The rules: ops group by the entry they version-check; `reinforce` yields to
-`supersede`/`resolve`/`retract`; among those three the last in plan order wins, plan order being
-the only evidence about which the model stated second; citations are unioned in plan order with the
-first occurrence winning; a merged `reinforce` keeps the last stated confidence, which is what
-`COALESCE(?2, confidence)` would have left; and `create`, `noop` and `propose_candidate` never
-participate — the first two carry no `expected_version`, and a candidate is a request for human
-review that no guard may answer by merging. `op_index` numbers the collapsed plan, and the shift is
-immaterial for the reason the `idempotency_key` paragraph above already gives.
+which is unchanged. The rules: ops that version-check an entry group by that entry; `reinforce`
+yields to `supersede`/`resolve`/`retract`; among those three the last in plan order wins, plan
+order being the only evidence about which the model stated second; citations are unioned in plan
+order with the first occurrence winning; a merged `reinforce` keeps the last stated confidence,
+which is what `COALESCE(?2, confidence)` would have left; and `noop`/`propose_candidate` never
+participate — `noop` carries no `expected_version` to group on. `op_index` numbers the collapsed
+plan, and the shift is immaterial for the reason the `idempotency_key` paragraph above already
+gives.
+
+As-built note (`T23-07`/`D-127`, `[SPEC]`): `create` was the fourth op this section originally
+said never participates, on the reasoning that it "carries no `expected_version`" — true, and
+beside the point: two `create`s of one **not-yet-stored** text are the same class of self-
+contradiction as two `reinforce`s of one entry, just one op kind earlier, and `D-078`'s store-only
+lookup (above) cannot see it for the identical reason it could not see the `reinforce` case before
+this module existed. Measured: 14 live runs minted two entries for one text inside one transaction.
+`create` now groups by `(scope_kind, scope_owner_id, text)` instead of an entry id — the only
+identity it has, since `guard` mints its `memory_id` fresh per op — and folds the same way, keeping
+the later op's minted id and the union of citations. `propose_candidate` still does not
+participate, but the reason changed: the within-window half of *its* duplicate — two
+`propose_candidate`s of one claim in one plan — is absorbed one layer down, inside the same
+transaction `commit_apply_run` opens, by `local_rag_store::memory::propose_candidate`'s own
+deterministic check (ADR-0014 Decision 2, `D-118`), which sees a sibling's uncommitted insert and
+needs no help from a plan-level fold; merging two review requests before the store has even seen
+either would still decide something a person has not decided yet.
 
 Why the store was not the place, recorded because the alternative looks obvious: `apply_run`
 already reads its own writes (SQLite shows an uncommitted `UPDATE` to later reads on the same

@@ -160,12 +160,16 @@ async fn seed_pending_candidate(
         target_memory_id.to_string(),
         scope_owner_id.to_string(),
     );
+    // `T23-07`: two candidates agreeing on kind/scope/text are the same
+    // proposal, so the text must be distinct per candidate for a fixture
+    // that wants more than one row to survive.
+    let text = format!("candidate-proposed text ({cid})");
     db.writer()
         .transaction(move |tx| {
             let op = ProposedOperation::Create {
                 memory_id: target,
                 kind: "fact".to_string(),
-                text: "candidate-proposed text".to_string(),
+                text,
                 canonical_key: None,
                 scope_kind: "worktree".to_string(),
                 scope_owner_id: owner,

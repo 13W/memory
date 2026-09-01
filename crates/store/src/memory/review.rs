@@ -57,6 +57,32 @@
 //! confirms this is intentional. [`edit_candidate`]'s conflict check is
 //! state-based: legal only while `review_state == pending`; editing an
 //! already-approved/rejected/expired candidate is [`ReviewError::NotPending`].
+//!
+//! # A proposal identical to one already pending, or already an entry, writes no row
+//!
+//! (`T23-07`, ADR-0014 Decision 2, `D-118`/`D-127`.) [`propose_candidate`]
+//! checks the exact proposal — via [`super::dedup::candidate_dedup_key`] —
+//! against every still-`pending` candidate and, for a `create`, against
+//! [`super::entry::active_entry_with_text`] (`D-078`'s own byte-exact rule,
+//! reused rather than restated) before inserting. This is **not** a `UNIQUE`
+//! index the way `canonical_key`'s `memory_canonical` is: the live backlog
+//! this check was measured against already holds one proposal repeated 476
+//! times, so a unique constraint would refuse to build against it, and
+//! reducing that backlog is `T23-08`'s job, not a migration's. Instead this
+//! follows the crate's other stated idiom (`super::op`'s own doc: "a
+//! pre-check `SELECT`, not a caught constraint violation, so a conflict
+//! never touches the table") — a duplicate is declined before any `INSERT`
+//! is attempted, not caught after. A hit on the pending-twin half links the
+//! new proposal's evidence onto the survivor instead of discarding it (the
+//! same "carry the evidence, that is the whole gain over a silent drop"
+//! reasoning `D-078`'s reinforce rewrite already uses); a hit on the
+//! active-entry half writes nothing at all — no evidence, no confidence
+//! change, no entry touched, because a `propose_candidate` that duplicates
+//! an entry has nothing left to review, and materializing anything for it
+//! would be exactly the automatic write [`local_rag_memory::guard`]'s own
+//! `D-078` boundary refuses to make.
+
+use std::collections::HashSet;
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, Error, Transaction, params};
@@ -68,7 +94,8 @@ use super::candidate::{
     candidate_evidence_for, candidate_state, create_candidate, insert_candidate_evidence,
     transition_candidate,
 };
-use super::entry::{MemoryKind, ScopeKind};
+use super::dedup::{CandidateDedupKey, candidate_dedup_key};
+use super::entry::{MemoryKind, ScopeKind, active_entry_with_text};
 use super::op::{
     CreateMemoryOp, EvidenceInput, MemoryOpError, MemoryOpOutcome, ReinforceMemoryOp,
     ResolveMemoryOp, RetractMemoryOp, SupersedeMemoryOp, apply_create, apply_reinforce,
@@ -180,11 +207,28 @@ pub struct CandidateRow {
     pub created_at: i64,
 }
 
+/// What [`propose_candidate`] did (`T23-07`, ADR-0014 Decision 2) — see the
+/// module doc's "A proposal identical to one already pending, or already an
+/// entry, writes no row".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposeCandidateOutcome {
+    /// A new `pending_memory_candidate` row was written.
+    Proposed,
+    /// A still-`pending` candidate already carries this exact proposal. No
+    /// row was written; the new evidence was linked to the survivor.
+    DuplicateOfPending { candidate_id: String },
+    /// A `create` proposal whose exact text is already a non-terminal entry
+    /// in that scope. No row was written; nothing else was touched.
+    AlreadyAnEntry { memory_id: String },
+}
+
 /// Propose a candidate: insert the `pending_memory_candidate` row plus its
-/// `candidate_evidence` FK links, in the caller's transaction. A duplicate
-/// `candidate_id` surfaces as the natural `rusqlite::Error` (PRIMARY KEY) —
-/// no special handling, mirroring this crate's default for a caller-minted,
-/// already-unique id (e.g. `create_repository`).
+/// `candidate_evidence` FK links, in the caller's transaction — unless the
+/// exact proposal already has a home (see the module doc), in which case no
+/// row is written and the outcome says which half caught it. A duplicate
+/// `candidate_id` on the write path surfaces as the natural `rusqlite::Error`
+/// (PRIMARY KEY) — no special handling, mirroring this crate's default for a
+/// caller-minted, already-unique id (e.g. `create_repository`).
 pub fn propose_candidate(
     tx: &Transaction<'_>,
     candidate_id: &str,
@@ -192,7 +236,35 @@ pub fn propose_candidate(
     conflicts: &[&str],
     evidence_observation_ids: &[&str],
     now_ms: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<ProposeCandidateOutcome> {
+    let key = candidate_dedup_key(proposed_operation);
+    if let Some(existing_id) = find_pending_duplicate(tx, proposed_operation, &key)? {
+        let already_linked: HashSet<String> = candidate_evidence_for(tx, &existing_id)?
+            .into_iter()
+            .collect();
+        for observation_id in evidence_observation_ids {
+            if !already_linked.contains(*observation_id) {
+                insert_candidate_evidence(tx, &existing_id, observation_id)?;
+            }
+        }
+        return Ok(ProposeCandidateOutcome::DuplicateOfPending {
+            candidate_id: existing_id,
+        });
+    }
+    if let ProposedOperation::Create {
+        scope_kind,
+        scope_owner_id,
+        text,
+        ..
+    } = proposed_operation
+        && let Some(scope) = ScopeKind::from_db(scope_kind)
+        && let Some(existing) = active_entry_with_text(tx, scope, scope_owner_id, text)?
+    {
+        return Ok(ProposeCandidateOutcome::AlreadyAnEntry {
+            memory_id: existing.memory_id,
+        });
+    }
+
     let proposed_json =
         serde_json::to_string(proposed_operation).expect("ProposedOperation serializes infallibly");
     let conflicts_json = if conflicts.is_empty() {
@@ -212,7 +284,84 @@ pub fn propose_candidate(
     for observation_id in evidence_observation_ids {
         insert_candidate_evidence(tx, candidate_id, observation_id)?;
     }
-    Ok(())
+    Ok(ProposeCandidateOutcome::Proposed)
+}
+
+/// The tag [`ProposedOperation`]'s own `#[serde(tag = "op")]` would produce —
+/// restated here as a plain match (not a serialize-then-extract round trip)
+/// because [`find_pending_duplicate`] needs it as a bind parameter, not JSON.
+fn proposed_operation_tag(op: &ProposedOperation) -> &'static str {
+    match op {
+        ProposedOperation::Create { .. } => "create",
+        ProposedOperation::Reinforce { .. } => "reinforce",
+        ProposedOperation::Resolve { .. } => "resolve",
+        ProposedOperation::Retract { .. } => "retract",
+        ProposedOperation::Supersede { .. } => "supersede",
+    }
+}
+
+/// The oldest still-`pending` candidate whose proposal is identical to
+/// `proposed_operation` under [`candidate_dedup_key`], if any — the
+/// deterministic half of `T23-07`/ADR-0014 Decision 2.
+///
+/// SQL narrows to a small candidate set (`review_state = 'pending'`, the same
+/// `op` tag, and — for the two op shapes that carry one — the same scope
+/// owner) using `json_extract` directly against the stored
+/// `proposed_operation` blob rather than a stored column: measured on the
+/// owner's live 11 204-row backlog, a full-table scan this way costs 73 ms
+/// and one narrowed lookup costs 41 ms, both noise next to a router
+/// generation call (whole seconds to minutes of local decode, `T23-06`) — see
+/// [`super::dedup`]'s own module doc for why that number, not a stored
+/// column, is where this stops. The actual equality check is then exact, in
+/// Rust, by deserializing each narrowed row and recomputing its own key —
+/// the same function both proposals go through, so the SQL filter can be as
+/// coarse as it likes without risking disagreement. A row this binary
+/// cannot deserialize (a future format neither this key version nor this
+/// enum recognizes) is skipped, never a false match.
+///
+/// `review_state = 'pending'` is deliberate, not an oversight: a candidate
+/// the owner already rejected, that the router re-derives from new evidence,
+/// is a legitimate new proposal — rejecting one instance is not blacklisting
+/// the claim forever. `ORDER BY created_at, candidate_id` gives the same
+/// "oldest wins" tie-break [`super::entry::active_entry_with_text`]
+/// documents, so the answer does not move under a caller.
+fn find_pending_duplicate(
+    tx: &Transaction<'_>,
+    proposed_operation: &ProposedOperation,
+    key: &CandidateDedupKey,
+) -> rusqlite::Result<Option<String>> {
+    let op_tag = proposed_operation_tag(proposed_operation);
+    let scope_owner_id = match proposed_operation {
+        ProposedOperation::Create { scope_owner_id, .. } => Some(scope_owner_id.as_str()),
+        ProposedOperation::Supersede {
+            new_scope_owner_id, ..
+        } => Some(new_scope_owner_id.as_str()),
+        ProposedOperation::Reinforce { .. }
+        | ProposedOperation::Resolve { .. }
+        | ProposedOperation::Retract { .. } => None,
+    };
+    let mut stmt = tx.prepare(
+        "SELECT candidate_id, proposed_operation FROM pending_memory_candidate \
+         WHERE review_state = 'pending' \
+           AND json_extract(proposed_operation, '$.op') = ?1 \
+           AND (?2 IS NULL \
+                OR json_extract(proposed_operation, '$.scope_owner_id') = ?2 \
+                OR json_extract(proposed_operation, '$.new_scope_owner_id') = ?2) \
+         ORDER BY created_at, candidate_id",
+    )?;
+    let rows = stmt.query_map(params![op_tag, scope_owner_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (existing_id, existing_json) = row?;
+        let Ok(existing_op) = serde_json::from_str::<ProposedOperation>(&existing_json) else {
+            continue;
+        };
+        if candidate_dedup_key(&existing_op) == *key {
+            return Ok(Some(existing_id));
+        }
+    }
+    Ok(None)
 }
 
 /// Edit a candidate's `proposed_operation`/`conflicts` while it is still

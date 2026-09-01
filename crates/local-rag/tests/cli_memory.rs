@@ -117,14 +117,38 @@ async fn seed_evidence(state: &StateDb, memory_id: &str, observation_id: &str) {
 }
 
 async fn seed_candidate(state: &StateDb, candidate_id: &str, target_memory_id: &str, now_ms: i64) {
-    let (cid, target) = (candidate_id.to_string(), target_memory_id.to_string());
+    seed_candidate_with_text(
+        state,
+        candidate_id,
+        target_memory_id,
+        // `T23-07`: two candidates agreeing on kind/scope/text are the same
+        // proposal, so a caller needing more than one row must give each a
+        // genuinely distinct text via `seed_candidate_with_text` instead.
+        &format!("candidate-proposed text ({candidate_id})"),
+        now_ms,
+    )
+    .await;
+}
+
+async fn seed_candidate_with_text(
+    state: &StateDb,
+    candidate_id: &str,
+    target_memory_id: &str,
+    text: &str,
+    now_ms: i64,
+) {
+    let (cid, target, text) = (
+        candidate_id.to_string(),
+        target_memory_id.to_string(),
+        text.to_string(),
+    );
     state
         .writer()
         .transaction(move |tx| {
             let op = ProposedOperation::Create {
                 memory_id: target,
                 kind: "fact".to_string(),
-                text: "candidate-proposed text".to_string(),
+                text,
                 canonical_key: None,
                 scope_kind: "global".to_string(),
                 scope_owner_id: GLOBAL_SCOPE_OWNER_ID.to_string(),

@@ -12,9 +12,10 @@
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_store::memory::{
-    ApproveCandidateOutcome, CandidateCountRow, CandidateRow, ProposedOperation, ReviewError,
-    approve_candidate, candidate_evidence_for, edit_candidate, list_candidates, memory_entry_state,
-    memory_evidence_for, pending_candidate_counts, propose_candidate, reject_candidate,
+    ApproveCandidateOutcome, CandidateCountRow, CandidateRow, ProposeCandidateOutcome,
+    ProposedOperation, ReviewError, approve_candidate, candidate_evidence_for, edit_candidate,
+    list_candidates, memory_entry_state, memory_evidence_for, pending_candidate_counts,
+    propose_candidate, reject_candidate,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{
@@ -78,7 +79,7 @@ async fn propose(
     conflicts: Vec<String>,
     evidence_observation_ids: Vec<String>,
     now_ms: i64,
-) {
+) -> ProposeCandidateOutcome {
     let (id, op, conflicts, evidence) = (
         candidate_id.to_string(),
         op,
@@ -134,10 +135,27 @@ async fn edit(
 }
 
 fn create_op(memory_id: &str, kind: MemoryKind, scope_owner_id: &str) -> ProposedOperation {
+    create_op_with_text(memory_id, kind, scope_owner_id, "candidate-proposed text")
+}
+
+/// Like [`create_op`], but with a caller-chosen `text` — needed wherever a
+/// test proposes more than one candidate in the same `(kind, scope_owner_id)`
+/// and wants each to survive as its own row: since `T23-07`, two proposals
+/// that agree on kind/scope/text are the same proposal
+/// (`local_rag_store::memory::candidate_dedup_key`) regardless of the
+/// `memory_id` each one happens to carry, so a fixture testing something
+/// else (pagination, counts) must give them genuinely different text or it
+/// will silently collide into one row.
+fn create_op_with_text(
+    memory_id: &str,
+    kind: MemoryKind,
+    scope_owner_id: &str,
+    text: &str,
+) -> ProposedOperation {
     ProposedOperation::Create {
         memory_id: memory_id.to_string(),
         kind: kind.as_str().to_string(),
-        text: "candidate-proposed text".to_string(),
+        text: text.to_string(),
         canonical_key: None,
         scope_kind: ScopeKind::Worktree.as_str().to_string(),
         scope_owner_id: scope_owner_id.to_string(),
@@ -214,7 +232,7 @@ async fn list_candidates_filters_by_review_state() {
     propose(
         &db,
         "cand-a",
-        create_op(&uuid(11), MemoryKind::Fact, &owner),
+        create_op_with_text(&uuid(11), MemoryKind::Fact, &owner, "claim a"),
         vec![],
         vec![],
         1_000,
@@ -223,7 +241,7 @@ async fn list_candidates_filters_by_review_state() {
     propose(
         &db,
         "cand-b",
-        create_op(&uuid(12), MemoryKind::Fact, &owner),
+        create_op_with_text(&uuid(12), MemoryKind::Fact, &owner, "claim b"),
         vec![],
         vec![],
         1_100,
@@ -683,7 +701,12 @@ async fn list_candidates_limit_and_offset_window_the_ordered_result() {
         propose(
             &db,
             &format!("cand-{i}"),
-            create_op(&uuid(190 + seed), MemoryKind::Fact, &owner),
+            create_op_with_text(
+                &uuid(190 + seed),
+                MemoryKind::Fact,
+                &owner,
+                &format!("claim {i}"),
+            ),
             vec![],
             vec![],
             1_000 + i64::from(seed),
@@ -719,7 +742,7 @@ async fn pending_candidate_counts_groups_by_review_state() {
     propose(
         &db,
         "cand-pending-1",
-        create_op(&uuid(182), MemoryKind::Fact, &owner),
+        create_op_with_text(&uuid(182), MemoryKind::Fact, &owner, "claim pending 1"),
         vec![],
         vec![],
         1_000,
@@ -728,7 +751,7 @@ async fn pending_candidate_counts_groups_by_review_state() {
     propose(
         &db,
         "cand-pending-2",
-        create_op(&uuid(183), MemoryKind::Fact, &owner),
+        create_op_with_text(&uuid(183), MemoryKind::Fact, &owner, "claim pending 2"),
         vec![],
         vec![],
         1_100,
@@ -737,7 +760,7 @@ async fn pending_candidate_counts_groups_by_review_state() {
     propose(
         &db,
         "cand-rejected",
-        create_op(&uuid(184), MemoryKind::Fact, &owner),
+        create_op_with_text(&uuid(184), MemoryKind::Fact, &owner, "claim rejected"),
         vec![],
         vec![],
         1_200,
@@ -760,5 +783,240 @@ async fn pending_candidate_counts_groups_by_review_state() {
             },
         ],
         "ordered by review_state; empty buckets are omitted"
+    );
+}
+
+// -----------------------------------------------------------------
+// T23-07 / ADR-0014 Decision 2 / D-118 / D-127: a proposal identical to one
+// already pending, or already an entry, writes no row.
+// -----------------------------------------------------------------
+
+/// The card's own wording, as an assertion.
+#[tokio::test]
+async fn the_same_proposal_twice_yields_one_row() {
+    let (_home, db) = open_state();
+    let owner = uuid(200);
+
+    let first = propose(
+        &db,
+        "cand-first",
+        create_op_with_text(&uuid(201), MemoryKind::Fact, &owner, "the same claim"),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+    assert_eq!(first, ProposeCandidateOutcome::Proposed);
+
+    let second = propose(
+        &db,
+        "cand-second",
+        create_op_with_text(&uuid(202), MemoryKind::Fact, &owner, "the same claim"),
+        vec![],
+        vec![],
+        1_100,
+    )
+    .await;
+    assert_eq!(
+        second,
+        ProposeCandidateOutcome::DuplicateOfPending {
+            candidate_id: "cand-first".to_string()
+        },
+        "the oldest pending twin wins"
+    );
+
+    let read = db.open_read().expect("read conn");
+    let rows = list_candidates(&read, None, i64::MAX, 0).expect("list");
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.candidate_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cand-first"],
+        "one row, not two"
+    );
+}
+
+/// A proposal differing in exactly one of kind/scope_owner_id/text is a
+/// genuinely different claim and is unaffected by the check.
+#[tokio::test]
+async fn a_genuinely_different_proposal_is_unaffected() {
+    for (label, kind, scope_owner, text) in [
+        ("different kind", MemoryKind::Decision, "owner-a", "claim"),
+        (
+            "different scope_owner_id",
+            MemoryKind::Fact,
+            "owner-b",
+            "claim",
+        ),
+        (
+            "different text",
+            MemoryKind::Fact,
+            "owner-a",
+            "a different claim",
+        ),
+    ] {
+        let (_home, db) = open_state();
+        propose(
+            &db,
+            "cand-base",
+            create_op_with_text(&uuid(210), MemoryKind::Fact, "owner-a", "claim"),
+            vec![],
+            vec![],
+            1_000,
+        )
+        .await;
+
+        let outcome = propose(
+            &db,
+            "cand-other",
+            create_op_with_text(&uuid(211), kind, scope_owner, text),
+            vec![],
+            vec![],
+            1_100,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ProposeCandidateOutcome::Proposed,
+            "{label}: a genuinely different proposal must still be proposed"
+        );
+
+        let read = db.open_read().expect("read conn");
+        let rows = list_candidates(&read, None, i64::MAX, 0).expect("list");
+        assert_eq!(rows.len(), 2, "{label}: both rows survive");
+    }
+}
+
+/// Evidence from a dropped duplicate is not lost — it lands on the survivor
+/// (the same "carry the evidence" reasoning D-078's reinforce rewrite uses),
+/// and re-citing an observation the survivor already cites does not trip
+/// `candidate_evidence`'s primary key.
+#[tokio::test]
+async fn the_duplicates_evidence_lands_on_the_survivor() {
+    let (_home, db) = open_state();
+    let owner = uuid(220);
+    let o1 = seed_observation(&db, 221, EvidenceKind::UserStatement, "sess-1").await;
+    let o2 = seed_observation(&db, 222, EvidenceKind::UserStatement, "sess-1").await;
+
+    propose(
+        &db,
+        "cand-first",
+        create_op_with_text(&uuid(223), MemoryKind::Fact, &owner, "claim"),
+        vec![],
+        vec![o1.clone()],
+        1_000,
+    )
+    .await;
+
+    // A second, identical proposal citing the same observation again plus a
+    // new one: the repeat must not be a PK violation, and the new one must
+    // land.
+    let outcome = propose(
+        &db,
+        "cand-second",
+        create_op_with_text(&uuid(224), MemoryKind::Fact, &owner, "claim"),
+        vec![],
+        vec![o1.clone(), o2.clone()],
+        1_100,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ProposeCandidateOutcome::DuplicateOfPending {
+            candidate_id: "cand-first".to_string()
+        }
+    );
+
+    let read = db.open_read().expect("read conn");
+    let mut evidence = candidate_evidence_for(&read, "cand-first").expect("evidence");
+    evidence.sort();
+    let mut expected = vec![o1, o2];
+    expected.sort();
+    assert_eq!(evidence, expected, "the survivor carries the union");
+}
+
+/// A candidate the owner already rejected does not blacklist the claim: the
+/// router re-deriving it from new evidence is a legitimate new proposal.
+#[tokio::test]
+async fn a_rejected_twin_does_not_block_a_new_proposal() {
+    let (_home, db) = open_state();
+    let owner = uuid(230);
+
+    propose(
+        &db,
+        "cand-first",
+        create_op_with_text(&uuid(231), MemoryKind::Fact, &owner, "claim"),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+    reject(&db, "cand-first").await.expect("reject");
+
+    let outcome = propose(
+        &db,
+        "cand-second",
+        create_op_with_text(&uuid(232), MemoryKind::Fact, &owner, "claim"),
+        vec![],
+        vec![],
+        1_100,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ProposeCandidateOutcome::Proposed,
+        "a rejected twin must not block the new proposal"
+    );
+}
+
+/// A `create` proposal whose exact text is already a non-terminal entry in
+/// that scope has nothing left to review: no row, and the entry itself is
+/// left untouched (no evidence, no confidence change).
+#[tokio::test]
+async fn a_proposal_whose_text_is_already_an_active_entry_writes_no_row_and_touches_no_entry() {
+    let (_home, db) = open_state();
+    let owner = uuid(240);
+    let memory_id = uuid(241);
+
+    propose(
+        &db,
+        "cand-materialize",
+        create_op_with_text(&memory_id, MemoryKind::Fact, &owner, "an existing claim"),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+    approve(&db, "cand-materialize", 1_500)
+        .await
+        .expect("materializes");
+
+    let outcome = propose(
+        &db,
+        "cand-duplicate",
+        create_op_with_text(&uuid(242), MemoryKind::Fact, &owner, "an existing claim"),
+        vec![],
+        vec![],
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ProposeCandidateOutcome::AlreadyAnEntry {
+            memory_id: memory_id.clone()
+        }
+    );
+
+    let read = db.open_read().expect("read conn");
+    let rows = list_candidates(&read, None, i64::MAX, 0).expect("list");
+    assert_eq!(
+        rows.len(),
+        1,
+        "no second row -- the only candidate is the one already approved"
+    );
+    assert_eq!(
+        memory_entry_state(&read, &memory_id).expect("state"),
+        Some((MemoryKind::Fact, MemoryState::Active)),
+        "the entry itself is untouched"
     );
 }

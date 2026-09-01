@@ -485,6 +485,7 @@ async fn retry_after_a_rejected_batch_produces_exactly_one_set_of_rows() {
             replayed: 0,
             noop: 0,
             proposed: 0,
+            deduped: 0,
         }
     );
 
@@ -691,6 +692,7 @@ async fn crash_before_cursor_advance_rolls_back_the_whole_apply() {
             replayed: 0,
             noop: 1,
             proposed: 0,
+            deduped: 0,
         }
     );
     let read = db.open_read().expect("read conn");
@@ -857,6 +859,87 @@ async fn a_repeated_citation_inside_one_propose_candidate_op_still_applies() {
     assert_eq!(
         consolidation_run_state(&read, &run_id).expect("state"),
         Some(RunState::Applied)
+    );
+}
+
+/// `T23-07` / ADR-0014 Decision 2 / `D-118`'s within-window half: two
+/// `propose_candidate` ops in one plan agreeing on kind/scope/text write one
+/// row, not two — the same transaction sees its own earlier insert, so this
+/// needs no help from `local_rag_memory::plan::collapse`.
+#[tokio::test]
+async fn two_identical_propose_candidate_ops_in_one_plan_write_one_row() {
+    let _serial = SERIAL.lock().await;
+    let (_home, db) = open_state();
+    let ids = seed_envelopes(&db, "sess-1", 76, 2).await;
+    let run_id = uuid(77);
+    let SnapshotOutcome::Opened(window) = open_run(&db, &run_id, "sess-1", 10, 1_000).await else {
+        panic!("expected Opened");
+    };
+    let lease_until = 1_000 + LEASE_DURATION_MS;
+    let owner = uuid(78);
+
+    let make_op = |memory_id: String| ProposedOperation::Create {
+        memory_id,
+        kind: "fact".to_string(),
+        text: "the same claim, proposed twice in one window".to_string(),
+        canonical_key: None,
+        scope_kind: "worktree".to_string(),
+        scope_owner_id: owner.clone(),
+        confidence: 0.5,
+        importance: 0.5,
+        valid_from_tree: None,
+        last_verified_tree: None,
+    };
+    let ops = vec![
+        GeneratedOp::ProposeCandidate {
+            candidate_id: uuid(79),
+            operation: make_op(uuid(80)),
+            conflicts: vec![],
+            evidence_observation_ids: vec![ids[0].clone()],
+        },
+        GeneratedOp::ProposeCandidate {
+            candidate_id: uuid(81),
+            operation: make_op(uuid(82)),
+            conflicts: vec![],
+            evidence_observation_ids: vec![ids[1].clone()],
+        },
+    ];
+    let outcome = run_once(
+        &db,
+        window,
+        lease_until,
+        LEASE_DURATION_MS,
+        LEASE_RENEW_INTERVAL_MS,
+        1_000,
+        "build-test",
+        move |_w| async move { Ok::<_, ClassifiedFailure>(ops) },
+    )
+    .await
+    .expect("run_once");
+    let RunOutcome::Applied(report) = outcome else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(
+        report,
+        ApplyReport {
+            applied: 0,
+            replayed: 0,
+            noop: 0,
+            proposed: 1,
+            deduped: 1,
+        },
+        "one row proposed, the second op's identical claim deduplicated"
+    );
+
+    let read = db.open_read().expect("read conn");
+    let survivor = uuid(79);
+    let mut evidence = candidate_evidence_for(&read, &survivor).expect("evidence");
+    evidence.sort();
+    let mut expected = vec![ids[0].clone(), ids[1].clone()];
+    expected.sort();
+    assert_eq!(
+        evidence, expected,
+        "the survivor carries both windows' evidence"
     );
 }
 

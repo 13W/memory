@@ -81,13 +81,14 @@ pub use pipeline::{
     recall, scopes_for,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use local_rag_store::rusqlite;
-use local_rag_store::rusqlite::Connection;
+use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{
-    GLOBAL_SCOPE_OWNER_ID, MemoryEntrySummary, ScopeKind, WindowObservation,
-    active_entries_for_scope, memory_entry_summary,
+    GLOBAL_SCOPE_OWNER_ID, MemoryEntrySummary, MemoryKind, MemoryState, ProposedOperation,
+    ScopeKind, WindowObservation, active_entries_for_scope, candidate_dedup_key,
+    memory_entry_summary,
 };
 
 /// `[SPEC]` placeholder cap on how many existing entries [`candidate_conflict_set`]
@@ -146,7 +147,7 @@ pub fn candidate_conflict_set(
     }
 
     let mut out = active_entries_for_scope(conn, ScopeKind::Global, GLOBAL_SCOPE_OWNER_ID, None)?;
-    for repo_id in repo_ids {
+    for repo_id in &repo_ids {
         out.extend(active_entries_for_scope(
             conn,
             ScopeKind::Repository,
@@ -154,7 +155,7 @@ pub fn candidate_conflict_set(
             None,
         )?);
     }
-    for worktree_id in worktree_ids {
+    for worktree_id in &worktree_ids {
         out.extend(active_entries_for_scope(
             conn,
             ScopeKind::Worktree,
@@ -168,7 +169,115 @@ pub fn candidate_conflict_set(
     if out.len() > MAX_PROMPT_CANDIDATES {
         out = select_prompt_candidates(out, observations)?;
     }
+
+    // `T23-07`/ADR-0014 Decision 2: pending candidates take whatever room is
+    // left under the *same* cap real entries already use — no second,
+    // unmeasured constant — and are appended at the tail. `within_token_
+    // budget` below cuts from the end, so a tight budget yields a hint
+    // before it ever touches a targetable entry; see `pending_candidate_
+    // summaries`'s own doc for why this is a tail append and not a second
+    // list.
+    let room = MAX_PROMPT_CANDIDATES.saturating_sub(out.len());
+    let pending = pending_candidate_summaries(conn, &repo_ids, &worktree_ids, observations, room)?;
+    out.extend(pending);
+
     Ok(within_token_budget(out, token_budget))
+}
+
+/// Every distinct `create` proposal already pending review in a scope the
+/// window's observations touch (`T23-07`, ADR-0014 Decision 2: "show the
+/// router what it is supposed to notice"), folded into
+/// [`MemoryEntrySummary`]'s shape with `proposed: true` so
+/// [`crate::prompt`] can render it beside real entries — **without** a
+/// `memory_id`, so the model has nothing to echo back as a
+/// `target_memory_id` ([`local_rag_store::MemoryEntrySummary::proposed`]'s
+/// own doc has the full reasoning).
+///
+/// Deduplicated by [`candidate_dedup_key`] before ranking: without this, a
+/// text proposed 476 times (the measured live worst case, D-118) would fill
+/// the entire cap with 476 copies of one row, reintroducing exactly the
+/// failure this card exists to fix. Ranked by the same D-080 relatedness
+/// rule real entries use ([`select_prompt_candidates`]) only when the
+/// distinct set overflows `limit`; deduplication happens in Rust rather than
+/// SQL `GROUP BY` because a proposal's identity spans five different op
+/// shapes (see [`candidate_dedup_key`]'s own doc) and this scope-bounded
+/// fetch is already small.
+///
+/// Only `create`-shaped proposals are ever shown: `reinforce`/`resolve`/
+/// `retract`/`supersede` name an *existing* entry, which is already in the
+/// conflict set through the ordinary path if it is recall-eligible — showing
+/// it a second time under a different shape would not add information.
+fn pending_candidate_summaries(
+    conn: &Connection,
+    repo_ids: &BTreeSet<&str>,
+    worktree_ids: &BTreeSet<&str>,
+    observations: &[WindowObservation],
+    limit: usize,
+) -> rusqlite::Result<Vec<MemoryEntrySummary>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut scopes: Vec<(ScopeKind, &str)> = vec![(ScopeKind::Global, GLOBAL_SCOPE_OWNER_ID)];
+    scopes.extend(repo_ids.iter().map(|id| (ScopeKind::Repository, *id)));
+    scopes.extend(worktree_ids.iter().map(|id| (ScopeKind::Worktree, *id)));
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (scope_kind, scope_owner_id) in scopes {
+        let mut stmt = conn.prepare(
+            "SELECT candidate_id, proposed_operation FROM pending_memory_candidate \
+             WHERE review_state = 'pending' \
+               AND json_extract(proposed_operation, '$.op') = 'create' \
+               AND json_extract(proposed_operation, '$.scope_kind') = ?1 \
+               AND json_extract(proposed_operation, '$.scope_owner_id') = ?2 \
+             ORDER BY created_at, candidate_id",
+        )?;
+        let rows = stmt.query_map(params![scope_kind.as_str(), scope_owner_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (candidate_id, proposed_json) = row?;
+            let Ok(operation) = serde_json::from_str::<ProposedOperation>(&proposed_json) else {
+                continue;
+            };
+            let ProposedOperation::Create {
+                kind,
+                text,
+                scope_kind: op_scope_kind,
+                scope_owner_id: op_scope_owner_id,
+                ..
+            } = &operation
+            else {
+                continue;
+            };
+            if !seen.insert(candidate_dedup_key(&operation)) {
+                continue;
+            }
+            let (Some(kind), Some(scope_kind)) =
+                (MemoryKind::from_db(kind), ScopeKind::from_db(op_scope_kind))
+            else {
+                continue;
+            };
+            out.push(MemoryEntrySummary {
+                memory_id: candidate_id,
+                kind,
+                state: MemoryState::Active,
+                text: text.clone(),
+                scope_kind,
+                scope_owner_id: op_scope_owner_id.clone(),
+                canonical_key: None,
+                entry_version: 0,
+                proposed: true,
+            });
+        }
+    }
+
+    if out.len() > limit {
+        out = select_prompt_candidates(out, observations)?;
+        out.truncate(limit);
+    }
+    Ok(out)
 }
 
 /// D-080's selection, applied only when the union overflows
@@ -284,7 +393,7 @@ mod tests {
     use local_rag_core::paths::StoreLayout;
     use local_rag_store::{
         EvidenceKind, MemoryKind, MemoryState, NewMemoryEntry, StateDb, TrustLevel,
-        create_memory_entry, transition_memory_entry,
+        create_memory_entry, propose_candidate, transition_memory_entry,
     };
     use local_rag_test_support::TempHome;
 
@@ -374,6 +483,40 @@ mod tests {
             .expect("create memory domain");
     }
 
+    /// A `pending` `create`-shaped candidate in `(scope_kind, scope_owner_id)`
+    /// -- `T23-07`'s visibility half is what `candidate_conflict_set` does
+    /// with rows like this.
+    async fn seed_pending_candidate(
+        db: &StateDb,
+        candidate_id: &str,
+        kind: MemoryKind,
+        scope_kind: ScopeKind,
+        scope_owner_id: &str,
+        text: &str,
+    ) {
+        let (id, owner, text) = (
+            candidate_id.to_string(),
+            scope_owner_id.to_string(),
+            text.to_string(),
+        );
+        let op = ProposedOperation::Create {
+            memory_id: "unused-until-approved".to_string(),
+            kind: kind.as_str().to_string(),
+            text,
+            canonical_key: None,
+            scope_kind: scope_kind.as_str().to_string(),
+            scope_owner_id: owner,
+            confidence: 0.5,
+            importance: 0.5,
+            valid_from_tree: None,
+            last_verified_tree: None,
+        };
+        db.writer()
+            .transaction(move |tx| propose_candidate(tx, &id, &op, &[], &[], 1000))
+            .await
+            .expect("propose candidate tx");
+    }
+
     fn window_observation(repo_id: Option<&str>, worktree_id: Option<&str>) -> WindowObservation {
         WindowObservation {
             observation_id: uuid(1),
@@ -447,6 +590,139 @@ mod tests {
         let read = db.open_read().expect("read conn");
         let found = candidate_conflict_set(&read, &[], NO_BUDGET_LIMIT).expect("query");
         assert!(found.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // T23-07 / ADR-0014 Decision 2: pending candidates in the conflict set
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pending_candidates_in_a_touched_scope_reach_the_prompt_set() {
+        let (_home, db) = open_state();
+        let repo_id = uuid(50);
+        seed_pending_candidate(
+            &db,
+            "cand-1",
+            MemoryKind::Fact,
+            ScopeKind::Repository,
+            &repo_id,
+            "a proposed claim",
+        )
+        .await;
+
+        let read = db.open_read().expect("read conn");
+        let observations = vec![window_observation(Some(&repo_id), None)];
+        let found = candidate_conflict_set(&read, &observations, NO_BUDGET_LIMIT).expect("query");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].proposed, "shown as a pending row, not an entry");
+        assert_eq!(found[0].text, "a proposed claim");
+    }
+
+    #[tokio::test]
+    async fn a_pending_candidate_in_an_untouched_scope_is_not_shown() {
+        let (_home, db) = open_state();
+        let touched = uuid(51);
+        let untouched = uuid(52);
+        seed_pending_candidate(
+            &db,
+            "cand-1",
+            MemoryKind::Fact,
+            ScopeKind::Repository,
+            &untouched,
+            "irrelevant claim",
+        )
+        .await;
+
+        let read = db.open_read().expect("read conn");
+        let observations = vec![window_observation(Some(&touched), None)];
+        let found = candidate_conflict_set(&read, &observations, NO_BUDGET_LIMIT).expect("query");
+        assert!(found.is_empty());
+    }
+
+    /// D-118's measured shape in miniature: many copies of one proposal must
+    /// not each take a slot -- they are one claim, shown once.
+    #[tokio::test]
+    async fn many_copies_of_one_proposal_are_shown_once() {
+        let (_home, db) = open_state();
+        let repo_id = uuid(53);
+        for i in 0u8..20 {
+            seed_pending_candidate(
+                &db,
+                &format!("cand-{i}"),
+                MemoryKind::Fact,
+                ScopeKind::Repository,
+                &repo_id,
+                "the same repeated claim",
+            )
+            .await;
+        }
+
+        let read = db.open_read().expect("read conn");
+        let observations = vec![window_observation(Some(&repo_id), None)];
+        let found = candidate_conflict_set(&read, &observations, NO_BUDGET_LIMIT).expect("query");
+        assert_eq!(
+            found.len(),
+            1,
+            "20 copies of one claim are one row, not twenty: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approved_or_rejected_candidate_is_not_shown_as_pending() {
+        use local_rag_store::reject_candidate;
+
+        let (_home, db) = open_state();
+        let repo_id = uuid(54);
+        seed_pending_candidate(
+            &db,
+            "cand-rejected",
+            MemoryKind::Fact,
+            ScopeKind::Repository,
+            &repo_id,
+            "a claim that was rejected",
+        )
+        .await;
+        db.writer()
+            .transaction(|tx| reject_candidate(tx, "cand-rejected"))
+            .await
+            .expect("reject tx")
+            .expect("reject");
+
+        let read = db.open_read().expect("read conn");
+        let observations = vec![window_observation(Some(&repo_id), None)];
+        let found = candidate_conflict_set(&read, &observations, NO_BUDGET_LIMIT).expect("query");
+        assert!(found.is_empty(), "a rejected candidate is not pending");
+    }
+
+    /// Pending candidates take whatever room is left under the cap real
+    /// entries already fill -- they must never evict an entry the router
+    /// could actually target.
+    #[tokio::test]
+    async fn pending_candidates_never_evict_an_entry_already_at_the_cap() {
+        let (_home, db) = open_state();
+        seed_global_entries(&db, MAX_PROMPT_CANDIDATES as u16, &[]).await;
+        seed_pending_candidate(
+            &db,
+            "cand-1",
+            MemoryKind::Fact,
+            ScopeKind::Global,
+            GLOBAL_SCOPE_OWNER_ID,
+            "a proposed claim",
+        )
+        .await;
+
+        let read = db.open_read().expect("read conn");
+        let found =
+            candidate_conflict_set(&read, &window_with_text(None), NO_BUDGET_LIMIT).expect("query");
+        assert_eq!(
+            found.len(),
+            MAX_PROMPT_CANDIDATES,
+            "every slot is a real, targetable entry"
+        );
+        assert!(
+            found.iter().all(|e| !e.proposed),
+            "no pending row displaced one: {found:?}"
+        );
     }
 
     // -----------------------------------------------------------------

@@ -147,7 +147,7 @@ family whose members differ only in their detection signal.
 | transactional-memory-op | memory | `rememberWrite` | 08 §3 |
 | entry-lifecycle-state-machines | memory | no view | 04 §5 |
 | candidate-lifecycle | memory | `candidateReview` | 04 §6 |
-| candidate-dedup | memory | no view — unbuilt | ADR-0014 |
+| candidate-dedup | memory | `candidateReview` | ADR-0014 |
 | review-verbs | memory | no view | 08 §3, 11 §2 |
 | give-feedback | memory | `giveFeedback` | 11 §2, 07 §1 |
 | recall-pipeline | memory | `recallInjection` | 08 §6 |
@@ -530,7 +530,10 @@ family whose members differ only in their detection signal.
   attempt against a legitimate retry under the same run id.
 - **NOTE** The plan is collapsed above the store because two ops naming one
   entry do not *race* into failing — they are **guaranteed** to fail, since
-  every expected version is captured before any op applies.
+  every expected version is captured before any op applies. T23-07/D-127:
+  two creates of one not-yet-stored text fold the same way, keyed on scope
+  and text instead of a `memory_id` — a fresh create has none yet for
+  anything else in the plan to name.
 - **CODE** `crates/local-rag/src/daemon/consolidation_trigger.rs`, `crates/memory/src/plan.rs`
 
 ### window-and-conflict-set-budgeting · consolidation-failure-classification
@@ -590,25 +593,34 @@ family whose members differ only in their detection signal.
   English, because losing a note to a model failure is not acceptable.
 - **CODE** `crates/store/src/memory/op.rs`, `crates/local-rag/src/daemon/normalization/boundary.rs`
 
-### guard-materialize · candidate-lifecycle
-**view** `candidateReview` · **spec** 08 §3, §4, 04 §6, 12 §4
+### guard-materialize · candidate-lifecycle · candidate-dedup
+**view** `candidateReview` · **spec** 08 §3, §4, 04 §6, 12 §4, ADR-0014
 
 - **TRIGGER** The router proposing an op; a human reviewing a candidate.
 - **STEPS** Downgrade a create or supersede of a durable kind whose every
   citation is a model claim → rewrite a create of already-stored text into a
-  reinforce → capture every expected version once → on approval, materialize the
-  proposed op through the same transactional path, with actor=user, inside the
-  same transaction as the state change.
+  reinforce → capture every expected version once → **propose a candidate:
+  check, in the same transaction, whether the exact proposal already matches
+  a pending twin or an active entry (T23-07/ADR-0014 Decision 2); a hit
+  writes no row, and a pending-twin hit links the new evidence onto the
+  survivor instead** → on approval, materialize the proposed op through the
+  same transactional path, with actor=user, inside the same transaction as
+  the state change.
 - **FAILURE** The model-claim rule is enforced **twice, independently** —
   proactively in the guard, and as a backstop in the op engine that no future
   generator can bypass. Only the second is what the guarantee rests on. Exact
   text rather than similarity, deliberately: asked loosely it is a judgement,
   asked as byte equality it is a fact, and a fact is what a guard may act on
-  silently.
+  silently — the same rule the dedup check reuses for "is this the same
+  proposal", via a deterministic key that excludes a freshly minted id,
+  confidence and importance on purpose.
 - **MEASURED** Past the conflict cap the model is blind to its own recent
   output and re-derives the same claim every window: 136 copies of one sentence,
-  over half the durable memory.
-- **CODE** `crates/memory/src/guard.rs`, `crates/store/src/memory/review.rs`
+  over half the durable memory (entries). Candidates went further before
+  T23-07: 9605 pending rows over 3294 distinct texts, the worst proposed 476
+  times, `conflicts` non-empty on none of them — the router was never shown a
+  pending candidate to notice at all.
+- **CODE** `crates/memory/src/guard.rs`, `crates/store/src/memory/review.rs`, `crates/store/src/memory/dedup.rs`
 
 ### recall-pipeline · recall-additionalcontext-formatting · recall-hook-injection
 **view** `recallInjection` · **spec** 08 §6, 11 §3.2, §5
@@ -846,11 +858,18 @@ direct byte manipulation instead.
 Twelve places where the system stops and cannot restart itself. Each is real,
 each has an owner or an explicit decision, and none is hidden in a happy path.
 
-1. **Duplicate candidates and duplicate entries.** The router is structurally
-   unable to notice a duplicate it is never shown — the conflict set is built
-   from active entries, so a proposal identical to hundreds of pending siblings
-   is invisible. Measured: 9564 candidates over 3294 distinct texts, the worst
-   proposed 476 times, conflicts empty on all of them. *(T23-07, T23-08)*
+1. **Duplicate candidates and duplicate entries — the mechanism is fixed
+   (T23-07), the backlog it left behind is not (T23-08).** The conflict set
+   now also shows the router the distinct proposals already pending in a
+   touched scope, and a deterministic store-side check (candidate-vs-
+   candidate, candidate-vs-entry, and — the sibling gap, D-127 — create-
+   vs-create within one plan) means the answer no longer depends on a 4B
+   model noticing. Measured before the fix: 9605 candidates over 3294
+   distinct texts, the worst proposed 476 times, conflicts empty on all of
+   them; 14 live runs had already minted two entries for one not-yet-stored
+   text. The queue **stops growing by duplication**; it does not shrink on
+   its own — reducing the existing rows, by the same distinct-text
+   invariant, is `T23-08`.
 2. **The payload TTL sweep is scheduled by nothing.** Implemented, exported,
    tested, and reachable only by a human typing `gc`. Measured: 45651 of 46737
    payload rows already past expiry, the oldest by three weeks — a `[FIXED]`

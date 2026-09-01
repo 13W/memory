@@ -724,6 +724,50 @@ mod tests {
         assert_eq!(ops.len(), 2, "two distinct texts stay two ops: {ops:?}");
     }
 
+    /// `T23-07`/`D-127`: the sibling of `a_window_proposing_one_existing_
+    /// text_twice_routes_to_a_single_reinforce`, but for a text that is
+    /// *not yet* stored -- no entry is seeded here. `D-078`'s rewrite cannot
+    /// catch this (both proposals miss the same store lookup), so this is
+    /// `plan::collapse`'s own `GroupKey::NewText` fold, exercised end to end.
+    #[tokio::test]
+    async fn a_window_creating_one_new_text_twice_routes_to_a_single_create() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        seed_observation(&db, "o2").await;
+
+        let line_a = r#"{"op":"create","kind":"decision","text":"use ruff for linting","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o1"]}"#;
+        let line_b = r#"{"op":"create","kind":"decision","text":"use ruff for linting","scope_kind":"global","confidence_signal":"high","importance_signal":"medium","cites":["o2"]}"#;
+        let pool = pool_with(vec![&format!("{line_a}\n{line_b}")]);
+        let uuids = SeqUuidV7::new();
+
+        let ops = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with_two("o1", "o2"),
+            NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
+        )
+        .await
+        .expect("routes cleanly");
+
+        assert_eq!(ops.len(), 1, "one entry, one op: {ops:?}");
+        let GeneratedOp::Materialize {
+            operation: local_rag_store::ProposedOperation::Create { text, .. },
+            evidence_observation_ids,
+        } = &ops[0]
+        else {
+            panic!("D-127's fold should have kept this a single create: {ops:?}");
+        };
+        assert_eq!(text, "use ruff for linting");
+        assert_eq!(
+            evidence_observation_ids,
+            &vec!["o1".to_string(), "o2".to_string()],
+            "and it cites what both proposals cited"
+        );
+    }
+
     #[tokio::test]
     async fn a_well_formed_response_routes_on_the_first_try() {
         let (_home, db) = open_state();

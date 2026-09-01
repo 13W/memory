@@ -88,10 +88,20 @@
 //! atomicity fix this task's design centers on (a mid-batch op rejection
 //! must roll back the *whole* apply, not just stop short) and the
 //! lease-fencing/failed-routing as-built decisions.
+//!
+//! T23-07 adds **[`dedup`]** (ADR-0014 Decision 2, `D-118`/`D-127`):
+//! [`dedup::candidate_dedup_key`] answers "is this the same proposal as one
+//! already seen", computed on demand rather than stored (see that module's
+//! own doc for why). [`review::propose_candidate`] uses it to decline a
+//! `pending_memory_candidate` row byte-identical to one already pending or
+//! already an active entry — the whole reason the write path stays this
+//! crate's, not the router's: "whether a duplicate is created must not
+//! depend on whether a 4B model noticed" (ADR-0014's own wording).
 
 mod audit;
 mod candidate;
 mod consolidation;
+mod dedup;
 mod entry;
 mod evidence;
 mod normalization;
@@ -121,6 +131,7 @@ pub use consolidation::{
     stale_runs, transient_backoff_delay_ms, transition_run, unconsolidatable_sessions,
     upsert_processing_cursor,
 };
+pub use dedup::{CANDIDATE_DEDUP_KEY_VERSION, CandidateDedupKey, candidate_dedup_key};
 pub(crate) use entry::all_memory_entry_ids;
 pub use entry::{
     CreateMemoryEntryError, IllegalMemoryTransition, MemoryEntryRow, MemoryEntrySummary,
@@ -146,9 +157,9 @@ pub use op::{
     apply_noop, apply_reinforce, apply_reject, apply_resolve, apply_retract, apply_supersede,
 };
 pub use review::{
-    ApproveCandidateOutcome, CandidateRow, ProposedOperation, ReviewError, approve_candidate,
-    edit_candidate, list_candidates, observation_evidence_source, propose_candidate,
-    reject_candidate,
+    ApproveCandidateOutcome, CandidateRow, ProposeCandidateOutcome, ProposedOperation, ReviewError,
+    approve_candidate, edit_candidate, list_candidates, observation_evidence_source,
+    propose_candidate, reject_candidate,
 };
 pub use runner::{
     ApplyReport, ConsolidationWindow, GeneratedOp, RunOutcome, RunOutcomeError, RunnerApplyError,

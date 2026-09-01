@@ -59,6 +59,29 @@
 //! remains a conflict, correctly, and the existing retry converges on it
 //! because a retry re-invokes the generator and `guard` re-reads every
 //! version. Convergence there is a property of re-planning, not of waiting.
+//!
+//! # `T23-07`/`D-127`: the same class, one op late
+//!
+//! `D-078`'s create→reinforce rewrite (`local_rag_store::active_entry_with_
+//! text`, called from `crate::guard::handle_create`) looks a proposal's text
+//! up in the **store**, never in the plan being built — the same blind spot
+//! this module was written to close for `Reinforce`/`Resolve`/`Retract`/
+//! `Supersede`, just one op kind later. Two `create`s of a text that is not
+//! *yet* stored both mint a new entry: measured on the live store, 14 runs
+//! did, leaving 11 active entries over 4 shared texts. Not a failed run this
+//! time — a silent duplicate, D-121's mechanism with a different symptom.
+//!
+//! `Create` now gets a real [`GroupKey`]: `NewText`, keyed on
+//! `(scope_kind, scope_owner_id, text)` rather than a `memory_id`, because a
+//! fresh create has none to collide on. The two key variants can never
+//! compare equal — closed by the type, not by a naming convention — so a
+//! `Reinforce` of entry `"abc"` and a `Create` whose text happens to be
+//! `"abc"` can never be mistaken for the same group. `ProposeCandidate` still
+//! never participates (see [`group_key`]'s own doc): the within-window half
+//! of a duplicate *candidate* is absorbed one layer down, inside the same
+//! transaction that would insert it
+//! (`local_rag_store::memory::propose_candidate`'s own dedup check, T23-07),
+//! which sees its own earlier write and needs no help from this module.
 
 use std::collections::HashSet;
 
@@ -68,46 +91,83 @@ use local_rag_store::{GeneratedOp, ProposedOperation};
 ///
 /// `Ord` is the survivor rule: a statement about the entry's fate outranks a
 /// statement that it was observed again. Nothing else about the ordering is
-/// meaningful, and no third level is wanted — `Create`, `Noop` and every
-/// `ProposeCandidate` have no target at all (see [`target_entry`]).
+/// meaningful, and no third level is wanted — `Noop` and every
+/// `ProposeCandidate` have no group at all (see [`group_key`]), and a
+/// `NewText` group can only ever hold `Create`s, all claiming the same
+/// `Fate` level via the `_ =>` arm below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Claim {
     /// `reinforce` — adds evidence, may raise confidence, never changes text
     /// or state.
     Evidence,
-    /// `supersede` / `resolve` / `retract` — each decides what becomes of the
-    /// entry, and they are mutually exclusive statements about it.
+    /// `supersede` / `resolve` / `retract` / `create` — each decides what an
+    /// entry (existing or about to be minted) becomes, and two of them
+    /// naming the same group are mutually exclusive statements about it.
     Fate,
 }
 
-/// Which `memory_entry` this op version-checks, if any.
+/// What one op is *about* — the identity two ops must share before either
+/// may fold into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupKey<'a> {
+    /// An existing `memory_entry` this op version-checks: `Reinforce`/
+    /// `Resolve`/`Retract`'s own `memory_id`, or `Supersede`'s old half.
+    ExistingEntry(&'a str),
+    /// A new claim a `Create` would mint, identified by where it would land
+    /// and what it says — the only identity available, since `guard` mints
+    /// its `memory_id` fresh per op and no other op in the plan can name it
+    /// (`T23-07`/`D-127`).
+    NewText {
+        scope_kind: &'a str,
+        scope_owner_id: &'a str,
+        text: &'a str,
+    },
+}
+
+/// What one op is about, if it can collide with anything else in the plan.
 ///
-/// `None` for the ops that carry no `expected_version` and therefore cannot
-/// collide: `Create` and `Supersede`'s new half mint their `memory_id` inside
-/// `guard`, so no other op in the same plan can name them; `Noop` writes
-/// nothing; and a `ProposeCandidate` writes only `pending_memory_candidate`,
-/// whose own evidence table is keyed by a freshly minted `candidate_id`.
+/// `None` for the ops that cannot: `Supersede`'s *new* half mints its
+/// `memory_id` inside `guard`, so no other op in the same plan can name it
+/// either (unlike its old half, which is a real [`GroupKey::ExistingEntry`]);
+/// `Noop` writes nothing; and a `ProposeCandidate` writes only
+/// `pending_memory_candidate`, whose own within-transaction dedup check
+/// (`local_rag_store::memory::propose_candidate`, `T23-07`) already sees a
+/// sibling proposal's uncommitted insert — the same "read your own writes"
+/// fact that makes this module unnecessary for that op kind.
 ///
-/// `ProposeCandidate` is excluded for a second reason that outlives the first:
-/// a candidate is a request for human review, and merging two such requests
-/// would decide something a person has not decided yet — the same boundary
-/// `guard` draws when it refuses to turn a review request into an automatic
-/// write.
-fn target_entry(op: &GeneratedOp) -> Option<&str> {
+/// `ProposeCandidate` is excluded for a second reason that outlives the
+/// first: a candidate is a request for human review, and merging two such
+/// requests here — before the store has even seen either — would decide
+/// something a person has not decided yet, the same boundary `guard` draws
+/// when it refuses to turn a review request into an automatic write.
+fn group_key(op: &GeneratedOp) -> Option<GroupKey<'_>> {
     match op {
         GeneratedOp::Materialize { operation, .. } => match operation {
             ProposedOperation::Reinforce { memory_id, .. }
             | ProposedOperation::Resolve { memory_id, .. }
-            | ProposedOperation::Retract { memory_id, .. } => Some(memory_id.as_str()),
-            ProposedOperation::Supersede { old_memory_id, .. } => Some(old_memory_id.as_str()),
-            ProposedOperation::Create { .. } => None,
+            | ProposedOperation::Retract { memory_id, .. } => {
+                Some(GroupKey::ExistingEntry(memory_id.as_str()))
+            }
+            ProposedOperation::Supersede { old_memory_id, .. } => {
+                Some(GroupKey::ExistingEntry(old_memory_id.as_str()))
+            }
+            ProposedOperation::Create {
+                scope_kind,
+                scope_owner_id,
+                text,
+                ..
+            } => Some(GroupKey::NewText {
+                scope_kind: scope_kind.as_str(),
+                scope_owner_id: scope_owner_id.as_str(),
+                text: text.as_str(),
+            }),
         },
         GeneratedOp::Noop | GeneratedOp::ProposeCandidate { .. } => None,
     }
 }
 
-/// The claim an op with a target makes. Only called for ops
-/// [`target_entry`] answered `Some` for.
+/// The claim an op with a group makes. Only called for ops [`group_key`]
+/// answered `Some` for.
 fn claim(op: &GeneratedOp) -> Claim {
     match op {
         GeneratedOp::Materialize { operation, .. } => match operation {
@@ -132,14 +192,14 @@ fn citations(op: &GeneratedOp) -> &[String] {
     }
 }
 
-/// Fold every group of ops naming one entry into the single op that survives
-/// it, and give the survivor the group's citations.
+/// Fold every group of ops sharing a [`GroupKey`] into the single op that
+/// survives it, and give the survivor the group's citations.
 ///
 /// The survivor is the op with the highest [`Claim`]; ties go to the **last**
 /// in plan order, because plan order is the only evidence there is about which
 /// of two contradictory statements the model made second. The survivor keeps
 /// its own position, so the result is always a subsequence of the input —
-/// ops are never reordered, and ops with no target are never touched.
+/// ops are never reordered, and ops with no group are never touched.
 ///
 /// Op indices shift, and that is immaterial: `idempotency_key` numbers the
 /// already-collapsed plan, a rejected batch commits nothing for a later
@@ -148,21 +208,21 @@ fn citations(op: &GeneratedOp) -> &[String] {
 /// rejected — it would inflate `ApplyReport.noop` and put an op in the plan
 /// the router never produced.
 pub fn collapse(ops: Vec<GeneratedOp>) -> Vec<GeneratedOp> {
-    // Winner per target: (target, position in `ops`). A `Vec` and not a map:
-    // a plan is at most `consolidation_batch_size` ops, and insertion order is
+    // Winner per group: (key, position in `ops`). A `Vec` and not a map: a
+    // plan is at most `consolidation_batch_size` ops, and insertion order is
     // the order the survivors are visited in below — which keeps the whole
     // function deterministic without sorting anything.
-    let mut winner: Vec<(String, usize)> = Vec::new();
+    let mut winner: Vec<(GroupKey<'_>, usize)> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
-        let Some(target) = target_entry(op) else {
+        let Some(key) = group_key(op) else {
             continue;
         };
         let c = claim(op);
-        match winner.iter_mut().find(|(t, _)| t == target) {
+        match winner.iter_mut().find(|(k, _)| *k == key) {
             // `>=` rather than `>`: a tie goes to the later op.
             Some((_, at)) if c >= claim(&ops[*at]) => *at = i,
             Some(_) => {}
-            None => winner.push((target.to_string(), i)),
+            None => winner.push((key, i)),
         }
     }
     // The citations each winner inherits, in plan order, first occurrence
@@ -176,14 +236,14 @@ pub fn collapse(ops: Vec<GeneratedOp>) -> Vec<GeneratedOp> {
     // `COALESCE(?2, confidence)` would have left after two applies.
     let mut confidence: Vec<Option<f64>> = vec![None; ops.len()];
     for op in ops.iter() {
-        let Some(target) = target_entry(op) else {
+        let Some(key) = group_key(op) else {
             continue;
         };
         let at = winner
             .iter()
-            .find(|(t, _)| t == target)
+            .find(|(k, _)| *k == key)
             .map(|(_, at)| *at)
-            .expect("every targeted op joined a group above");
+            .expect("every grouped op joined a group above");
         merged[at].extend(citations(op).iter().cloned());
         if let GeneratedOp::Materialize {
             operation: ProposedOperation::Reinforce { confidence: c, .. },
@@ -198,7 +258,7 @@ pub fn collapse(ops: Vec<GeneratedOp>) -> Vec<GeneratedOp> {
     let keep: HashSet<usize> = winner.iter().map(|(_, at)| *at).collect();
     ops.into_iter()
         .enumerate()
-        .filter(|(i, op)| target_entry(op).is_none() || keep.contains(i))
+        .filter(|(i, op)| group_key(op).is_none() || keep.contains(i))
         .map(|(i, op)| rebuild(op, std::mem::take(&mut merged[i]), confidence[i]))
         .collect()
 }
@@ -303,20 +363,34 @@ mod tests {
     }
 
     fn create(id: &str, text: &str) -> GeneratedOp {
+        create_in("global", "owner", id, text)
+    }
+
+    fn create_in(scope_kind: &str, scope_owner_id: &str, id: &str, text: &str) -> GeneratedOp {
+        create_full(scope_kind, scope_owner_id, id, text, &["o1"])
+    }
+
+    fn create_full(
+        scope_kind: &str,
+        scope_owner_id: &str,
+        id: &str,
+        text: &str,
+        ids: &[&str],
+    ) -> GeneratedOp {
         GeneratedOp::Materialize {
             operation: ProposedOperation::Create {
                 memory_id: id.to_string(),
                 kind: "fact".to_string(),
                 text: text.to_string(),
                 canonical_key: None,
-                scope_kind: "global".to_string(),
-                scope_owner_id: "owner".to_string(),
+                scope_kind: scope_kind.to_string(),
+                scope_owner_id: scope_owner_id.to_string(),
                 confidence: 0.5,
                 importance: 0.5,
                 valid_from_tree: None,
                 last_verified_tree: None,
             },
-            evidence_observation_ids: cites(&["o1"]),
+            evidence_observation_ids: cites(ids),
         }
     }
 
@@ -488,9 +562,15 @@ mod tests {
         assert_eq!(out, ops, "nothing groups, nothing moves");
     }
 
-    /// A candidate is a request for human review; merging two of them would
-    /// decide something a person has not decided yet. It also writes no
-    /// `memory_entry`, so it cannot conflict in the first place.
+    /// A candidate is a request for human review; merging two of them here,
+    /// before the store has even seen either, would decide something a
+    /// person has not decided yet. Unlike `T23-05`'s original reasoning
+    /// ("it also writes no `memory_entry`, so it cannot conflict in the
+    /// first place"), a within-window duplicate candidate is now a real
+    /// possibility this module deliberately leaves to
+    /// `local_rag_store::memory::propose_candidate`'s own transactional
+    /// check (`T23-07`), which sees a sibling's uncommitted insert and needs
+    /// no help from a plan-level fold.
     #[test]
     fn propose_candidate_never_participates_even_when_it_names_the_same_entry() {
         let ops = vec![
@@ -502,20 +582,64 @@ mod tests {
         assert_eq!(out, ops, "both candidates and the reinforce survive");
     }
 
-    /// `Create` mints its own `memory_id` inside `guard` and carries no
-    /// `expected_version`; `Noop` writes nothing. Neither can collide, and
-    /// keying them on their text would silently merge two distinct new
-    /// entries.
+    /// `T23-07`/`D-127`: the live shape `D-078`'s store-only check misses — a
+    /// window proposing one not-yet-stored text twice must mint one entry,
+    /// not two, and the survivor carries both windows' evidence just like the
+    /// `Reinforce` case above.
     #[test]
-    fn creates_and_noops_carry_no_target_and_are_never_collapsed() {
-        let ops = vec![
-            create("N1", "same text"),
-            GeneratedOp::Noop,
-            create("N2", "same text"),
-            GeneratedOp::Noop,
+    fn two_creates_of_one_text_in_one_scope_become_one_carrying_both_citations() {
+        let out = collapse(vec![
+            create_full("global", "owner", "N1", "same text", &["o1", "o2"]),
+            create_full("global", "owner", "N2", "same text", &["o2", "o3"]),
+        ]);
+        assert_eq!(out.len(), 1, "one entry, one op: {out:?}");
+        assert_eq!(cited(&out[0]), cites(&["o1", "o2", "o3"]));
+        let GeneratedOp::Materialize {
+            operation: ProposedOperation::Create { memory_id, .. },
+            ..
+        } = &out[0]
+        else {
+            panic!("expected a create, got {out:?}");
+        };
+        assert_eq!(
+            memory_id, "N2",
+            "the later op's minted memory_id survives; the earlier one is \
+             discarded harmlessly -- nothing else in the plan could have \
+             named it, since a fresh create's id is not a group key"
+        );
+    }
+
+    /// The control the retired `creates_and_noops_carry_no_target_and_are_
+    /// never_collapsed` test used to carry: a `create` is only the *same*
+    /// claim as another `create` when scope and text both agree. Different
+    /// text, or the same text in a different scope, is a different claim and
+    /// must never merge -- keying on text alone would have silently merged
+    /// two distinct new entries, which is exactly the bug this module is
+    /// careful not to reintroduce.
+    #[test]
+    fn creates_of_different_texts_or_scopes_never_group() {
+        let different_text = vec![create("N1", "text one"), create("N2", "text two")];
+        assert_eq!(collapse(different_text.clone()), different_text);
+
+        let different_scope = vec![
+            create_in("global", "owner-a", "N1", "same text"),
+            create_in("global", "owner-b", "N2", "same text"),
         ];
-        let out = collapse(ops.clone());
-        assert_eq!(out, ops);
+        assert_eq!(collapse(different_scope.clone()), different_scope);
+
+        let different_scope_kind = vec![
+            create_in("global", "owner", "N1", "same text"),
+            create_in("repository", "owner", "N2", "same text"),
+        ];
+        assert_eq!(collapse(different_scope_kind.clone()), different_scope_kind);
+    }
+
+    /// `Noop` writes nothing and carries no group either way -- unchanged by
+    /// `T23-07`.
+    #[test]
+    fn noops_are_never_collapsed() {
+        let ops = vec![GeneratedOp::Noop, GeneratedOp::Noop];
+        assert_eq!(collapse(ops.clone()), ops);
     }
 
     /// The structural invariant: whatever the rules decide, the output is the
@@ -534,12 +658,12 @@ mod tests {
         let out = collapse(ops.clone());
 
         // Every surviving op appears in the input, in the same relative order,
-        // with the same kind and target.
+        // with the same kind and group.
         let mut next = 0usize;
         for survivor in &out {
             let found = (next..ops.len())
                 .find(|i| {
-                    target_entry(&ops[*i]) == target_entry(survivor)
+                    group_key(&ops[*i]) == group_key(survivor)
                         && std::mem::discriminant(&ops[*i]) == std::mem::discriminant(survivor)
                 })
                 .unwrap_or_else(|| panic!("survivor {survivor:?} is not in the input tail"));

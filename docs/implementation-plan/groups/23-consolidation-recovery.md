@@ -266,8 +266,21 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
   builds from `active_entries_for_scope`, so a pending candidate is structurally invisible to the
   router that is supposed to notice it. Both halves matter — show pending candidates to the router,
   *and* keep a deterministic store-side check so the answer does not depend on a 4B model noticing.
-- **Not in scope:** near-duplicate or semantic dedup; exact-text first, measured before anything
-  fuzzier is proposed.
+  A second, adjacent defect is folded in rather than deferred: `D-127` (found while executing
+  `T23-05`) registered this card by name as its home — `D-078`'s create-vs-reinforce rewrite checks
+  the store, never the plan being built, so two `create`s of one not-yet-stored text in one window
+  both mint an entry. The store-side check (candidate-vs-candidate, candidate-vs-entry) lives in
+  `local_rag_store::memory::propose_candidate`'s own transaction, where it also absorbs the
+  within-window candidate-vs-candidate case for free (a later insert sees an earlier one's
+  uncommitted write); the create-vs-create case is `local_rag_memory::plan::collapse`'s, which
+  gains a real grouping key for `create` (keyed on scope + text, since a fresh create has no
+  `memory_id` yet for anything else to name).
+- **Not in scope:** near-duplicate or semantic dedup, exact-text first, measured before anything
+  fuzzier is proposed; and `approve_candidate`'s own blind spot (it never checks a candidate's text
+  against active entries before materializing it, so approving two pre-existing duplicate
+  candidates can still mint two entries) — the card's Result sentence is about a *proposal* not
+  creating another row, i.e. propose-time, not approve-time; registered as `D-131`, open, rather
+  than silently left unrecorded or silently pulled into this card's scope.
 - **Tests:** the same proposal twice yields one row; a genuinely different proposal is unaffected;
   the store-side check is proved by a mutation that removes it while the generator still says
   nothing.

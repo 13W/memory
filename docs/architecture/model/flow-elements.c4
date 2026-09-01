@@ -30,16 +30,19 @@ model {
     }
 
     conflictSet = component 'Candidate conflict set' {
-      #partial
+      #implemented
       #pillar-memory
       description '''
-        The existing entries shown to the router so it can notice a duplicate:
-        lexical matches against the window first, then newest-first, cut to a
-        token budget and cut again by the real tokenizer. It is the term that
-        yields when the prompt will not fit, because a window is a promise to
-        the cursor. Partial: it is built from active entries only, so a
-        proposal identical to hundreds of pending candidates is never shown as
-        a conflict and cannot be named as one.
+        What the router is shown so it can notice a duplicate: active entries
+        (lexical matches against the window first, then newest-first), plus —
+        T23-07, ADR-0014 Decision 2 — the distinct create-shaped proposals
+        already pending review in the same scopes, deduplicated and rendered
+        with no memory_id so the model can read but never target one. Cut to
+        a token budget and cut again by the real tokenizer; pending rows sit
+        last, so a tight budget drops them before it ever touches a
+        targetable entry. This visibility is a hint, not the guarantee — the
+        deterministic half lives in the store's own candidate-review check,
+        not here.
       '''
       metadata {
         spec 'docs/specification/08-memory.md §4'
@@ -78,7 +81,11 @@ model {
         with actor=user, inside the same transaction as the state change — so a
         candidate cannot be marked approved without its operation landing.
         Candidates carry no version, so the edit precondition is state-based:
-        legal only while pending.
+        legal only while pending. T23-07/ADR-0014 Decision 2: proposing a
+        candidate first checks, in the same transaction, whether the exact
+        proposal already matches a pending twin or an active entry — a
+        duplicate writes no row, and a pending-twin hit links the new
+        evidence onto the survivor instead of discarding it.
       '''
       metadata {
         spec 'docs/specification/04-state-machines.md §6'

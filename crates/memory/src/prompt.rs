@@ -51,6 +51,10 @@ Output rules (must follow exactly):
   ids that actually appear in the input.
 - To act on an EXISTING entry (reinforce/resolve/retract/supersede), use its exact
   "memory_id" from the existing_entries list. Never invent one.
+- An entry with "state":"proposed" is already waiting for a human to review -- it has
+  no "memory_id" and can never be a reinforce/resolve/retract/supersede target. If you
+  were about to propose the same claim again, emit "noop" instead: it is already
+  queued.
 - Write "text" and "reason" in English whatever language the observations use; keep
   identifiers, paths, hashes, URLs and code verbatim.
 
@@ -90,6 +94,10 @@ Input observation: {"id":"o7","event_type":"UserPromptSubmit","evidence_kind":"u
 Output (two ops from one observation -- one line each, no separator between them):
 {"op":"create","kind":"decision","text":"Use pytest for testing.","scope_kind":"repository","confidence_signal":"high","importance_signal":"medium","cites":["o7"]}
 {"op":"create","kind":"hypothesis","text":"Mutation testing might be added later.","scope_kind":"repository","confidence_signal":"low","importance_signal":"low","cites":["o7"]}
+
+Input observation: {"id":"o8","event_type":"PostToolUse","evidence_kind":"model_claim","trust":"low","text":"this function is probably the main entry point"}
+Existing entry: {"memory_id":null,"kind":"fact","state":"proposed","canonical_key":null,"text":"This function is probably the main entry point."}
+Output: {"op":"noop","reason":"already proposed and awaiting review, no memory_id to act on"}
 "#
     .to_string()
 }
@@ -105,7 +113,10 @@ struct PromptObservation<'a> {
 
 #[derive(Serialize)]
 struct PromptExistingEntry<'a> {
-    memory_id: &'a str,
+    /// `None` for a pending candidate (`T23-07`) — deliberately, so the
+    /// model has no id to echo back as a `target_memory_id`. See
+    /// [`local_rag_store::MemoryEntrySummary::proposed`]'s own doc.
+    memory_id: Option<&'a str>,
     kind: &'a str,
     state: &'a str,
     canonical_key: Option<&'a str>,
@@ -142,9 +153,13 @@ pub fn user_prompt(window: &ConsolidationWindow, existing: &[MemoryEntrySummary]
     let existing_entries = existing
         .iter()
         .map(|e| PromptExistingEntry {
-            memory_id: &e.memory_id,
+            memory_id: (!e.proposed).then_some(e.memory_id.as_str()),
             kind: e.kind.as_str(),
-            state: e.state.as_str(),
+            state: if e.proposed {
+                "proposed"
+            } else {
+                e.state.as_str()
+            },
             canonical_key: e.canonical_key.as_deref(),
             text: &e.text,
         })
@@ -283,6 +298,7 @@ mod tests {
             scope_owner_id: local_rag_store::GLOBAL_SCOPE_OWNER_ID.to_string(),
             canonical_key: None,
             entry_version: 1,
+            proposed: false,
         }];
 
         let json = user_prompt(&window, &existing);
@@ -290,6 +306,44 @@ mod tests {
         assert_eq!(value["observations"][0]["id"], "o1");
         assert_eq!(value["observations"][0]["text"], "we decided to use pnpm");
         assert_eq!(value["existing_entries"][0]["memory_id"], "m1");
+    }
+
+    /// `T23-07`: the test that closes the `resolve_target` hazard. A row
+    /// carrying `proposed: true` must render with no `memory_id` at all --
+    /// not an empty string, not the candidate's own id -- so the model has
+    /// nothing to echo back as a `target_memory_id`.
+    #[test]
+    fn a_pending_candidate_is_rendered_without_a_memory_id() {
+        let window = ConsolidationWindow {
+            session_id: "sess-1".to_string(),
+            from_received_seq: 1,
+            to_received_seq: 1,
+            observations: vec![],
+        };
+        let existing = vec![MemoryEntrySummary {
+            memory_id: "cand-1".to_string(),
+            kind: MemoryKind::Fact,
+            state: MemoryState::Active,
+            text: "already proposed claim".to_string(),
+            scope_kind: ScopeKind::Global,
+            scope_owner_id: local_rag_store::GLOBAL_SCOPE_OWNER_ID.to_string(),
+            canonical_key: None,
+            entry_version: 0,
+            proposed: true,
+        }];
+
+        let json = user_prompt(&window, &existing);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            value["existing_entries"][0]["memory_id"],
+            serde_json::Value::Null,
+            "a pending candidate must never carry an id the model could echo back"
+        );
+        assert_eq!(value["existing_entries"][0]["state"], "proposed");
+        assert_eq!(
+            value["existing_entries"][0]["text"],
+            "already proposed claim"
+        );
     }
 
     #[test]

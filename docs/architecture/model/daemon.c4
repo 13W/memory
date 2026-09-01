@@ -342,7 +342,10 @@ model {
         no-op for that one op rather than failing the window; downgrades a
         model-claim-only create to a review candidate; rewrites a create of
         already-stored text into a reinforce; then collapses the plan so one
-        window cannot version-conflict with itself.
+        window cannot contradict itself — two ops naming one existing entry
+        cannot version-conflict with each other, and (T23-07/D-127) two
+        creates of one not-yet-stored text cannot silently mint two entries
+        either, both folded by the same rule.
       '''
       metadata {
         spec 'docs/specification/08-memory.md §3'

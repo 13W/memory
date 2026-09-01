@@ -261,10 +261,17 @@ fn handle_create(
     // guarantee, and byte-equality is a fact a guard may act on silently
     // where a model's judgement is not.
     //
-    // Deliberately below the review gate, not above it: `propose_candidate`
-    // creates no entry, so it cannot duplicate one, and turning a request for
-    // human review into an automatic write would be a policy change this
-    // guard has no business making.
+    // Deliberately below the review gate, not above it: turning a request
+    // for human review into an automatic write would be a policy change this
+    // guard has no business making, and that boundary is unchanged. What
+    // *is* no longer true is the sentence that used to justify skipping this
+    // check for `propose_candidate` outright ("it creates no entry, so it
+    // cannot duplicate one") -- it duplicates a *pending row* instead, 476
+    // copies of one text on the owner's live backlog, and that half is
+    // caught one layer down: `local_rag_store::memory::propose_candidate`'s
+    // own transactional check declines a proposal identical to one already
+    // pending, or to an active entry, before it ever reaches this rewrite
+    // (`T23-07`, ADR-0014 Decision 2, `D-118`/`D-127`).
     //
     // `confidence: None` leaves the stored value alone. The signal the model
     // produced was its opinion of a *new* entry; letting one window's opinion
@@ -973,10 +980,13 @@ mod tests {
         );
     }
 
-    /// The review gate is not bypassed. `propose_candidate` creates no entry,
-    /// so it cannot duplicate one; turning a request for human review into an
-    /// automatic write would be a policy change this guard has no business
-    /// making.
+    /// The review gate is not bypassed: a `propose_candidate` whose text
+    /// already matches an active entry is never rewritten into an automatic
+    /// `reinforce` by this guard -- that would be exactly the policy change
+    /// it has no business making. (Whether the *candidate* still gets
+    /// proposed is a different question, decided one layer down by
+    /// `local_rag_store::memory::propose_candidate`'s own check, `T23-07`;
+    /// this test is about the guard's boundary, not that one.)
     #[tokio::test]
     async fn a_candidate_proposal_is_never_turned_into_a_reinforce() {
         let (_home, db) = open_state();

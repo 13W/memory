@@ -441,6 +441,16 @@ pub struct MemoryEntrySummary {
     pub scope_owner_id: String,
     pub canonical_key: Option<String>,
     pub entry_version: i64,
+    /// `true` for a row that is not a `memory_entry` at all, but a pending
+    /// review candidate folded into this shape so
+    /// `local_rag_memory::recall::candidate_conflict_set` can show it beside
+    /// real entries in the router prompt (`T23-07`, ADR-0014 Decision 2).
+    /// `memory_id` then holds the candidate's own id, `state`/`entry_version`
+    /// are inert placeholders, and `local_rag_memory::prompt` renders such a
+    /// row **without** an id — deliberately, so the router can never name it
+    /// as a `target_memory_id`. Always `false` for anything this module
+    /// itself reads out of `memory_entry`.
+    pub proposed: bool,
 }
 
 fn read_summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntrySummary> {
@@ -477,6 +487,7 @@ fn read_summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntrySummar
         scope_owner_id: r.get(5)?,
         canonical_key: r.get(6)?,
         entry_version: r.get(7)?,
+        proposed: false,
     })
 }
 
