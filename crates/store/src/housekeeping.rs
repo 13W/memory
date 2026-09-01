@@ -80,7 +80,10 @@ use std::path::Path;
 
 use local_rag_core::paths::StoreLayout;
 
-use crate::memory::{CandidateState, pending_candidate_ages, transition_candidate};
+use crate::memory::{
+    AUDIT_ENTITY_CANDIDATE, AUDIT_OP_EXPIRE, Actor, CandidateState, NewAuditEvent, candidate_state,
+    insert_audit_event, next_candidate_audit_version, pending_candidate_ages, transition_candidate,
+};
 use crate::observation::{all_cursors, delete_cursor, known_spool_sessions, read_cursor};
 use crate::registry::{
     WorktreeState, WorktreeStateClock, all_worktree_ids, referenced_model_space_ids,
@@ -719,6 +722,18 @@ pub fn candidate_expiry_due(now_ms: i64, expiry_ms: i64, created_at: i64) -> boo
 /// sweep failure: [`crate::memory::transition_candidate`]'s domain rejection
 /// for that row is swallowed, matching the read-then-write race every other
 /// sweep in this module already accepts.
+///
+/// `T23-11`/`D-132`: a real `pending → expired` transition writes one
+/// `audit_event`, `op = "expire"`, `actor = Actor::System` — the one
+/// candidate-machine act with no operator behind it, the same actor
+/// ADR-0011 introduced for exactly this shape. Guarded the same way
+/// [`crate::memory::reject_candidate`] is: [`candidate_state`] is read fresh
+/// inside this same write transaction (the outer read pass above is already
+/// stale by the time this runs) and the audit only fires when that read was
+/// `Pending` — never on the race this doc paragraph already accepts, whether
+/// against a concurrent approve/reject or a second, overlapping sweep pass
+/// that already expired the same row first. `dry_run` never reaches this
+/// transaction at all, so it writes no audit row either.
 pub async fn run_candidate_expiry_sweep(
     db: &StateDb,
     now_ms: i64,
@@ -744,7 +759,39 @@ pub async fn run_candidate_expiry_sweep(
                 .writer()
                 .transaction({
                     let candidate_id = candidate_id.clone();
-                    move |tx| transition_candidate(tx, &candidate_id, CandidateState::Expired)
+                    move |tx| {
+                        let was_pending =
+                            candidate_state(tx, &candidate_id)? == Some(CandidateState::Pending);
+                        match transition_candidate(tx, &candidate_id, CandidateState::Expired)? {
+                            Ok(()) => {
+                                if was_pending {
+                                    let payload = serde_json::json!({
+                                        "created_at": created_at,
+                                        "expiry_ms": expiry_ms,
+                                    })
+                                    .to_string();
+                                    insert_audit_event(
+                                        tx,
+                                        &NewAuditEvent {
+                                            entity_kind: AUDIT_ENTITY_CANDIDATE,
+                                            entity_id: &candidate_id,
+                                            entity_version: next_candidate_audit_version(
+                                                tx,
+                                                &candidate_id,
+                                            )?,
+                                            op: AUDIT_OP_EXPIRE,
+                                            actor: Actor::System,
+                                            idempotency_key: None,
+                                            payload: Some(&payload),
+                                        },
+                                        now_ms,
+                                    )?;
+                                }
+                                Ok(Ok(()))
+                            }
+                            Err(e) => Ok(Err(e)),
+                        }
+                    }
                 })
                 .await
                 .map_err(HousekeepingError::Write)?;

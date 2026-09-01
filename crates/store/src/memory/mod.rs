@@ -163,6 +163,7 @@ pub use review::{
     ReviewError, approve_candidate, edit_candidate, fold_pending_duplicates, list_candidates,
     observation_evidence_source, pending_candidate_groups, propose_candidate, reject_candidate,
 };
+pub(crate) use review::{AUDIT_OP_EXPIRE, next_candidate_audit_version};
 pub use runner::{
     ApplyReport, ConsolidationWindow, GeneratedOp, RunOutcome, RunOutcomeError, RunnerApplyError,
     RunnerError, WindowObservation, commit_apply_run, run_once,

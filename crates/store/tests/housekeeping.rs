@@ -25,10 +25,11 @@ use local_rag_store::registry::{
     create_worktree, insert_projection_state, transition_worktree_state,
 };
 use local_rag_store::{
-    CANDIDATE_EXPIRY_MS, CandidateState, NewCandidate, SHARD_DESTROY_GRACE_MS,
-    SPOOL_SESSION_ABSENCE_MS, StateDb, candidate_state, create_candidate, import_session_tail,
-    run_candidate_expiry_sweep, run_expired_shard_sweep, run_orphan_shard_sweep,
-    run_spool_session_sweep, run_unreferenced_space_sweep,
+    AUDIT_ENTITY_CANDIDATE, Actor, CANDIDATE_EXPIRY_MS, CandidateState, NewCandidate,
+    SHARD_DESTROY_GRACE_MS, SPOOL_SESSION_ABSENCE_MS, StateDb, candidate_state, create_candidate,
+    import_session_tail, read_audit_events_for_entity, run_candidate_expiry_sweep,
+    run_expired_shard_sweep, run_orphan_shard_sweep, run_spool_session_sweep,
+    run_unreferenced_space_sweep,
 };
 use local_rag_test_support::TempHome;
 
@@ -886,6 +887,15 @@ async fn candidate_past_expiry_budget_is_expired() {
         candidate_state(&read, "cand-old").expect("state"),
         Some(CandidateState::Expired),
     );
+
+    // `T23-11`/`D-132`: one `audit_event`, `op = "expire"`, `actor = "system"`
+    // — the one candidate-machine act with no operator behind it.
+    let events =
+        read_audit_events_for_entity(&read, AUDIT_ENTITY_CANDIDATE, "cand-old").expect("audit");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].op, "expire");
+    assert_eq!(events[0].actor, Actor::System);
+    assert_eq!(events[0].entity_version, 1);
 }
 
 /// One millisecond short of the expiry budget, the candidate is retained.
@@ -905,6 +915,12 @@ async fn candidate_just_short_of_expiry_budget_is_retained() {
     assert_eq!(
         candidate_state(&read, "cand-recent").expect("state"),
         Some(CandidateState::Pending),
+    );
+    assert!(
+        read_audit_events_for_entity(&read, AUDIT_ENTITY_CANDIDATE, "cand-recent")
+            .expect("audit")
+            .is_empty(),
+        "not due, no transition, no audit row"
     );
 }
 
@@ -927,6 +943,12 @@ async fn candidate_expiry_sweep_dry_run_then_idempotent_real_run() {
         Some(CandidateState::Pending),
         "dry run must not transition",
     );
+    assert!(
+        read_audit_events_for_entity(&read, AUDIT_ENTITY_CANDIDATE, "cand-old")
+            .expect("audit")
+            .is_empty(),
+        "a dry run never reaches the write transaction, so it writes no audit row either"
+    );
     drop(read);
 
     let first = run_candidate_expiry_sweep(&db, now, CANDIDATE_EXPIRY_MS, false)
@@ -938,6 +960,19 @@ async fn candidate_expiry_sweep_dry_run_then_idempotent_real_run() {
         .await
         .expect("second real run");
     assert!(second.is_empty(), "second sweep is a no-op: {second:?}");
+
+    // `T23-11`: the second, no-op run must not write a false second "expire"
+    // row — it reads `cand-old` as already `Expired` (not `Pending`) before
+    // ever calling `transition_candidate`, the same guard `reject_candidate`
+    // uses against its own retry.
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        read_audit_events_for_entity(&read, AUDIT_ENTITY_CANDIDATE, "cand-old")
+            .expect("audit")
+            .len(),
+        1,
+        "exactly one expire row, from the first real run only"
+    );
 }
 
 /// A candidate already moved out of `pending` (approved here) is never a

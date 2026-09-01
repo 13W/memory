@@ -218,7 +218,7 @@ async fn dedup_resumes_after_a_partial_group_collapse() {
 
     let id = "twin-a".to_string();
     db.writer()
-        .transaction(move |tx| reject_candidate(tx, &id))
+        .transaction(move |tx| reject_candidate(tx, &id, 1_000))
         .await
         .expect("reject tx (infra)")
         .expect("reject twin-a by hand first");
@@ -245,11 +245,16 @@ async fn dedup_resumes_after_a_partial_group_collapse() {
         candidate_state_of(&read, "twin-b"),
         CandidateState::Rejected
     );
+    // `T23-11`: an operator's own reject now writes its own audit row too —
+    // one, tagged `"reject"`, never the fold's own `"fold_duplicate"`.
+    let twin_a_events =
+        read_audit_events_for_entity(&read, AUDIT_ENTITY_CANDIDATE, "twin-a").expect("audit rows");
     assert_eq!(
-        audit_row_count(&read, "twin-a"),
-        0,
-        "an operator's own reject writes no fold audit row"
+        twin_a_events.len(),
+        1,
+        "an operator's own reject writes exactly one audit row"
     );
+    assert_eq!(twin_a_events[0].op, "reject", "not the fold's own op");
     assert_eq!(audit_row_count(&read, "twin-b"), 1);
 }
 

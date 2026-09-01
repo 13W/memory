@@ -92,12 +92,14 @@
 //! is that reduction, one exact-duplicate group at a time: every member but
 //! the group's oldest ("the survivor") is transitioned `pending → rejected`,
 //! exactly like a lone [`reject_candidate`] call — except this is **not**
-//! [`reject_candidate`]. `reject_candidate`/[`transition_candidate`] write no
-//! `audit_event` at all (there is nothing on `pending_memory_candidate` for
-//! them to version), so reusing that function for a machine-driven fold
-//! would leave a `rejected` row indistinguishable from an operator's own
-//! considered "no" — forever, since `rejected` is terminal. A fold instead
-//! writes one `audit_event` per folded twin, under [`AUDIT_ENTITY_CANDIDATE`]
+//! [`reject_candidate`]. `T23-11` gave `reject_candidate` its own
+//! `audit_event`, tagged `op = "reject"` — the right tag for an operator's own
+//! considered "no", and the wrong one for a machine-driven fold, which is
+//! precisely why a fold does not simply call `reject_candidate` and stop
+//! there: doing so would leave a `rejected` row indistinguishable from an
+//! operator's own judgment — forever, since `rejected` is terminal. A fold
+//! instead writes its own `audit_event` per folded twin, under
+//! [`AUDIT_ENTITY_CANDIDATE`]
 //! (the second `entity_kind` in that table besides `memory_entry`, following
 //! [`super::consolidation::AUDIT_ENTITY_CONSOLIDATION_RUN`]'s precedent —
 //! ADR-0014 named that extension in advance for exactly this situation),
@@ -456,12 +458,23 @@ fn candidates_narrowed_by(
 /// Edit a candidate's `proposed_operation`/`conflicts` while it is still
 /// `pending` (spec 11 §2 `edit_memory_candidate(id, patch)`). `None` leaves
 /// that field unchanged. Editing a non-`pending` candidate is
-/// [`ReviewError::NotPending`] — no mutation.
+/// [`ReviewError::NotPending`] — no mutation, no audit.
+///
+/// `T23-11`/`D-132`: a real edit (at least one field actually requested)
+/// writes one `audit_event` — spec 08 §3 names `edit` "from review tools"
+/// among the operations its transactional contract governs, the same
+/// authority `T23-08`'s own `fold_duplicate` act already relies on.
+/// `payload: None`, matching `apply_edit`'s own precedent for a memory-entry
+/// edit exactly: neither stores an old-value diff, and this does not either.
+/// Repeatable while `pending` (unlike `reject`/`expire`, which are terminal),
+/// so its version comes from [`next_candidate_audit_version`], not a
+/// hard-coded constant — see that function's own doc for why.
 pub fn edit_candidate(
     tx: &Transaction<'_>,
     candidate_id: &str,
     new_proposed_operation: Option<&ProposedOperation>,
     new_conflicts: Option<&[&str]>,
+    now_ms: i64,
 ) -> rusqlite::Result<Result<(), ReviewError>> {
     let Some(state) = candidate_state(tx, candidate_id)? else {
         return Ok(Err(ReviewError::UnknownCandidate));
@@ -470,12 +483,14 @@ pub fn edit_candidate(
         return Ok(Err(ReviewError::NotPending));
     }
 
+    let mut edited = false;
     if let Some(op) = new_proposed_operation {
         let json = serde_json::to_string(op).expect("ProposedOperation serializes infallibly");
         tx.execute(
             "UPDATE pending_memory_candidate SET proposed_operation = ?2 WHERE candidate_id = ?1",
             params![candidate_id, json],
         )?;
+        edited = true;
     }
     if let Some(conflicts) = new_conflicts {
         let json = if conflicts.is_empty() {
@@ -487,18 +502,63 @@ pub fn edit_candidate(
             "UPDATE pending_memory_candidate SET conflicts = ?2 WHERE candidate_id = ?1",
             params![candidate_id, json],
         )?;
+        edited = true;
+    }
+
+    if edited {
+        insert_audit_event(
+            tx,
+            &NewAuditEvent {
+                entity_kind: AUDIT_ENTITY_CANDIDATE,
+                entity_id: candidate_id,
+                entity_version: next_candidate_audit_version(tx, candidate_id)?,
+                op: AUDIT_OP_EDIT,
+                actor: Actor::User,
+                idempotency_key: None,
+                payload: None,
+            },
+            now_ms,
+        )?;
     }
     Ok(Ok(()))
 }
 
 /// Reject a candidate (spec 04 §6): `pending → rejected`. Never touches the
 /// op engine — "rejected never materializes."
+///
+/// `T23-11`/`D-132`: a real `pending → rejected` transition writes one
+/// `audit_event`, `op = "reject"`, `actor = Actor::User` (every caller —
+/// MCP, CLI, TUI — is an operator's own act). A retry against an
+/// already-`rejected` candidate is [`transition_candidate`]'s own legal
+/// self-transition no-op (`Ok(Ok(()))`, no `UPDATE`) and must stay exactly
+/// that — no second, false audit row — so this reads [`candidate_state`]
+/// *before* transitioning and only audits when that read was `Pending`,
+/// i.e. when this call is the one that actually moved it.
 pub fn reject_candidate(
     tx: &Transaction<'_>,
     candidate_id: &str,
+    now_ms: i64,
 ) -> rusqlite::Result<Result<(), ReviewError>> {
+    let was_pending = candidate_state(tx, candidate_id)? == Some(CandidateState::Pending);
     match transition_candidate(tx, candidate_id, CandidateState::Rejected)? {
-        Ok(()) => Ok(Ok(())),
+        Ok(()) => {
+            if was_pending {
+                insert_audit_event(
+                    tx,
+                    &NewAuditEvent {
+                        entity_kind: AUDIT_ENTITY_CANDIDATE,
+                        entity_id: candidate_id,
+                        entity_version: next_candidate_audit_version(tx, candidate_id)?,
+                        op: AUDIT_OP_REJECT,
+                        actor: Actor::User,
+                        idempotency_key: None,
+                        payload: None,
+                    },
+                    now_ms,
+                )?;
+            }
+            Ok(Ok(()))
+        }
         Err(CandidateTransitionError::UnknownCandidate) => Ok(Err(ReviewError::UnknownCandidate)),
         Err(CandidateTransitionError::Illegal(e)) => Ok(Err(ReviewError::IllegalTransition(e))),
     }
@@ -513,6 +573,49 @@ pub const AUDIT_ENTITY_CANDIDATE: &str = "candidate";
 /// `"reject"`: see the module doc's "Folding a pre-existing duplicate group
 /// is a recorded act, not a rejection".
 pub const AUDIT_OP_FOLD_DUPLICATE: &str = "fold_duplicate";
+
+/// `audit_event.op` for [`reject_candidate`] (`T23-11`, `D-132`) — spec 08
+/// §3's own name for the review-tool verb.
+const AUDIT_OP_REJECT: &str = "reject";
+
+/// `audit_event.op` for [`edit_candidate`] (`T23-11`, `D-132`) — spec 08 §3's
+/// own name for the review-tool verb.
+const AUDIT_OP_EDIT: &str = "edit";
+
+/// `audit_event.op` for [`crate::housekeeping::run_candidate_expiry_sweep`]
+/// (`T23-11`, `D-132`) — not named by spec 08 §3's list (that list is
+/// operator-tool verbs; expiry has no operator behind it), but the same
+/// self-explanatory-string convention [`AUDIT_OP_FOLD_DUPLICATE`] already
+/// set.
+pub(crate) const AUDIT_OP_EXPIRE: &str = "expire";
+
+/// The next `audit_event.entity_version` for `entity_kind = "candidate"`,
+/// `entity_id = candidate_id` (`T23-11`, `D-132`): `1 + ` the highest version
+/// already recorded, or `1` if none exists yet.
+///
+/// A candidate has no version column of its own to borrow (unlike
+/// `consolidation_run`'s `attempt_count`, [`super::consolidation::
+/// abandon_run`]'s own non-versioned-entity precedent) — so this derives the
+/// next slot from the trail already in `audit_event` itself, the same "read
+/// it back rather than store a redundant counter" move [`super::dedup::
+/// candidate_dedup_key`] makes for its own identity. Before `T23-11`,
+/// [`fold_pending_duplicates`] alone wrote this `entity_kind`, at most once
+/// per candidate (a fold is a terminal transition), so a hard-coded `1` was
+/// equivalent to this — a candidate now edited one or more times while still
+/// `pending` (each edit itself audited, `T23-11`) needs a real allocator
+/// before it can be folded, rejected, or expired without a `UNIQUE
+/// (entity_kind, entity_id, entity_version)` collision.
+pub(crate) fn next_candidate_audit_version(
+    tx: &Transaction<'_>,
+    candidate_id: &str,
+) -> rusqlite::Result<i64> {
+    tx.query_row(
+        "SELECT COALESCE(MAX(entity_version), 0) + 1 FROM audit_event \
+         WHERE entity_kind = ?1 AND entity_id = ?2",
+        params![AUDIT_ENTITY_CANDIDATE, candidate_id],
+        |r| r.get(0),
+    )
+}
 
 /// Why [`fold_pending_duplicates`] left a twin `pending` instead of folding
 /// it.
@@ -572,13 +675,15 @@ pub struct FoldDuplicatesOutcome {
 /// because its predicate is `created_at`, which cannot change) would be
 /// exposed to.
 ///
-/// `entity_version` is always `1`: a candidate has no version column and
-/// exactly one terminal transition ever reaches it (states past `pending`
-/// are terminal), so `UNIQUE (entity_kind, entity_id, entity_version)`
-/// becomes a free "at most one fold audit row per candidate" guarantee —
-/// the same reasoning [`super::consolidation::abandon_run`] documents for
-/// its own non-versioned entity, applied to a genuinely constant value here
-/// rather than a borrowed counter.
+/// `entity_version` comes from [`next_candidate_audit_version`] (`T23-11`):
+/// a candidate has no version column of its own, and — since `edit_candidate`
+/// (`T23-11`) may already have audited one or more edits on a twin before it
+/// is folded — a fold is no longer provably the *first* `candidate` audit row
+/// for that id, only the next one. Before `T23-11` this was a hard-coded `1`,
+/// safe only because nothing else ever wrote this `entity_kind` first; that
+/// assumption is exactly what `T23-11`'s own new writes break, so this
+/// function is retrofit onto the same allocator every other candidate-review
+/// site now uses.
 pub fn fold_pending_duplicates(
     tx: &Transaction<'_>,
     survivor_candidate_id: &str,
@@ -664,7 +769,7 @@ pub fn fold_pending_duplicates(
             &NewAuditEvent {
                 entity_kind: AUDIT_ENTITY_CANDIDATE,
                 entity_id: &twin_id,
-                entity_version: 1,
+                entity_version: next_candidate_audit_version(tx, &twin_id)?,
                 op: AUDIT_OP_FOLD_DUPLICATE,
                 actor: Actor::User,
                 idempotency_key: None,

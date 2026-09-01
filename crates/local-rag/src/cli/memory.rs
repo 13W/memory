@@ -528,12 +528,13 @@ fn run_reject(id: String) -> ExitCode {
         Ok(s) => s,
         Err(e) => return fail(BIN, &e),
     };
+    let now_ms = system_now_ms();
     let outcome = block_on({
         let id = id.clone();
         async move {
             state
                 .writer()
-                .transaction(move |tx| reject_candidate(tx, &id))
+                .transaction(move |tx| reject_candidate(tx, &id, now_ms))
                 .await
         }
     });

@@ -110,10 +110,10 @@ async fn approve(
         .expect("approve tx (infrastructure)")
 }
 
-async fn reject(db: &StateDb, candidate_id: &str) -> Result<(), ReviewError> {
+async fn reject(db: &StateDb, candidate_id: &str, now_ms: i64) -> Result<(), ReviewError> {
     let id = candidate_id.to_string();
     db.writer()
-        .transaction(move |tx| reject_candidate(tx, &id))
+        .transaction(move |tx| reject_candidate(tx, &id, now_ms))
         .await
         .expect("reject tx (infrastructure)")
 }
@@ -136,6 +136,7 @@ async fn edit(
     candidate_id: &str,
     new_op: Option<ProposedOperation>,
     new_conflicts: Option<Vec<String>>,
+    now_ms: i64,
 ) -> Result<(), ReviewError> {
     let id = candidate_id.to_string();
     db.writer()
@@ -143,7 +144,7 @@ async fn edit(
             let conflict_refs: Option<Vec<&str>> = new_conflicts
                 .as_ref()
                 .map(|c| c.iter().map(String::as_str).collect());
-            edit_candidate(tx, &id, new_op.as_ref(), conflict_refs.as_deref())
+            edit_candidate(tx, &id, new_op.as_ref(), conflict_refs.as_deref(), now_ms)
         })
         .await
         .expect("edit tx (infrastructure)")
@@ -262,7 +263,7 @@ async fn list_candidates_filters_by_review_state() {
         1_100,
     )
     .await;
-    reject(&db, "cand-b").await.expect("reject");
+    reject(&db, "cand-b", 1_000).await.expect("reject");
 
     let read = db.open_read().expect("read conn");
     let pending =
@@ -572,7 +573,7 @@ async fn rejected_candidate_never_materializes() {
     )
     .await;
 
-    reject(&db, "cand-1").await.expect("reject");
+    reject(&db, "cand-1", 1_000).await.expect("reject");
 
     let read = db.open_read().expect("read conn");
     assert_eq!(
@@ -581,6 +582,65 @@ async fn rejected_candidate_never_materializes() {
         "rejected never materializes"
     );
     assert_eq!(memory_entry_state(&read, &memory_id).expect("state"), None,);
+}
+
+/// `T23-11`/`D-132`: an operator's own reject now leaves the same kind of
+/// trace a fold already did.
+#[tokio::test]
+async fn reject_candidate_writes_one_audit_event() {
+    let (_home, db) = open_state();
+    let owner = uuid(103);
+    propose(
+        &db,
+        "cand-1",
+        create_op(&uuid(104), MemoryKind::Fact, &owner),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+
+    reject(&db, "cand-1", 2_000).await.expect("reject");
+
+    let read = db.open_read().expect("read conn");
+    let rows = audit_rows_for_candidate(&read, "cand-1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].op, "reject");
+    assert_eq!(rows[0].actor, Actor::User);
+    assert_eq!(rows[0].entity_version, 1);
+    assert_eq!(rows[0].created_at, 2_000);
+}
+
+/// `T23-11`: `transition_candidate`'s own self-transition-is-legal no-op
+/// (`reject_memory_candidate_retry_on_the_same_already_rejected_is_a_success_no_op`,
+/// `crates/local-rag/tests/mcp_memory_write_tools.rs`) must stay a silent
+/// no-op at the audit layer too — a retried reject must not write a second,
+/// false "reject happened again" row.
+#[tokio::test]
+async fn a_retried_reject_writes_no_second_audit_row() {
+    let (_home, db) = open_state();
+    let owner = uuid(105);
+    propose(
+        &db,
+        "cand-1",
+        create_op(&uuid(106), MemoryKind::Fact, &owner),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+
+    reject(&db, "cand-1", 2_000).await.expect("first reject");
+    reject(&db, "cand-1", 3_000)
+        .await
+        .expect("retried reject is a success no-op, not an error");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(
+        audit_rows_for_candidate(&read, "cand-1").len(),
+        1,
+        "the retry must not write a second audit row"
+    );
 }
 
 #[tokio::test]
@@ -605,6 +665,7 @@ async fn edit_while_pending_updates_proposal_and_conflicts() {
         "cand-1",
         Some(new_op.clone()),
         Some(vec!["conflict-1".to_string()]),
+        1_000,
     )
     .await
     .expect("edit");
@@ -616,6 +677,65 @@ async fn edit_while_pending_updates_proposal_and_conflicts() {
     let round_tripped: ProposedOperation =
         serde_json::from_str(&rows[0].proposed_operation).expect("parse");
     assert_eq!(round_tripped, new_op);
+
+    // `T23-11`/`D-132`: the edit itself now leaves a trace too.
+    let events = audit_rows_for_candidate(&read, "cand-1");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].op, "edit");
+    assert_eq!(events[0].actor, Actor::User);
+    assert_eq!(events[0].entity_version, 1);
+    assert_eq!(
+        events[0].payload, None,
+        "matching apply_edit's own precedent"
+    );
+}
+
+/// `T23-11`: `edit_candidate` is legally repeatable while `pending` (unlike
+/// `reject`/`expire`, which are terminal) — so its `entity_version` must come
+/// from [`next_candidate_audit_version`], not a constant, or a second edit on
+/// one candidate would collide with the first's own row under
+/// `UNIQUE (entity_kind, entity_id, entity_version)`.
+#[tokio::test]
+async fn two_edits_on_one_pending_candidate_write_two_ordered_audit_rows() {
+    let (_home, db) = open_state();
+    let owner = uuid(107);
+    propose(
+        &db,
+        "cand-1",
+        create_op(&uuid(108), MemoryKind::Fact, &owner),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+
+    edit(
+        &db,
+        "cand-1",
+        Some(create_op(&uuid(109), MemoryKind::Fact, &owner)),
+        None,
+        2_000,
+    )
+    .await
+    .expect("first edit");
+    edit(
+        &db,
+        "cand-1",
+        Some(create_op(&uuid(110), MemoryKind::Decision, &owner)),
+        None,
+        3_000,
+    )
+    .await
+    .expect("second edit");
+
+    let read = db.open_read().expect("read conn");
+    let events = audit_rows_for_candidate(&read, "cand-1");
+    assert_eq!(events.len(), 2, "two edits, two rows, no collision");
+    assert_eq!(events[0].entity_version, 1);
+    assert_eq!(events[0].created_at, 2_000);
+    assert_eq!(events[1].entity_version, 2);
+    assert_eq!(events[1].created_at, 3_000);
+    assert!(events.iter().all(|e| e.op == "edit"));
 }
 
 #[tokio::test]
@@ -632,10 +752,10 @@ async fn edit_non_pending_candidate_is_conflicting_edit_with_no_mutation() {
         1_000,
     )
     .await;
-    reject(&db, "cand-1").await.expect("reject");
+    reject(&db, "cand-1", 1_000).await.expect("reject");
 
     let attempted_op = create_op(&uuid(102), MemoryKind::Fact, &owner);
-    let result = edit(&db, "cand-1", Some(attempted_op), None).await;
+    let result = edit(&db, "cand-1", Some(attempted_op), None, 1_000).await;
     assert_eq!(result, Err(ReviewError::NotPending));
 
     let read = db.open_read().expect("read conn");
@@ -651,6 +771,13 @@ async fn edit_non_pending_candidate_is_conflicting_edit_with_no_mutation() {
         round_tripped,
         create_op(&memory_id, MemoryKind::Fact, &owner),
         "proposal untouched by the rejected edit attempt",
+    );
+    // `T23-11`: the one row is the reject's own — the rejected edit attempt
+    // added no second one.
+    assert_eq!(
+        audit_rows_for_candidate(&read, "cand-1").len(),
+        1,
+        "a NotPending edit writes no audit row of its own"
     );
 }
 
@@ -668,7 +795,7 @@ async fn approve_unknown_candidate_is_typed_error() {
 #[tokio::test]
 async fn reject_unknown_candidate_is_typed_error() {
     let (_home, db) = open_state();
-    let result = reject(&db, "does-not-exist").await;
+    let result = reject(&db, "does-not-exist", 1_000).await;
     assert_eq!(result, Err(ReviewError::UnknownCandidate));
 }
 
@@ -686,7 +813,7 @@ async fn approve_already_rejected_candidate_is_illegal_transition() {
         1_000,
     )
     .await;
-    reject(&db, "cand-1").await.expect("reject");
+    reject(&db, "cand-1", 1_000).await.expect("reject");
 
     let result = approve(&db, "cand-1", 2_000).await;
     assert_eq!(
@@ -781,7 +908,7 @@ async fn pending_candidate_counts_groups_by_review_state() {
         1_200,
     )
     .await;
-    reject(&db, "cand-rejected").await.expect("reject");
+    reject(&db, "cand-rejected", 1_000).await.expect("reject");
 
     let read = db.open_read().expect("read conn");
     let counts = pending_candidate_counts(&read).expect("counts");
@@ -966,7 +1093,7 @@ async fn a_rejected_twin_does_not_block_a_new_proposal() {
         1_000,
     )
     .await;
-    reject(&db, "cand-first").await.expect("reject");
+    reject(&db, "cand-first", 1_000).await.expect("reject");
 
     let outcome = propose(
         &db,
@@ -1259,16 +1386,56 @@ async fn folding_writes_one_candidate_audit_row_per_twin_naming_the_survivor() {
     );
 }
 
+/// `T23-11`: the one scenario that would have collided under the old
+/// hard-coded `entity_version: 1` in [`fold_pending_duplicates`] — a twin
+/// edited (and thus already audited) once while still `pending`, then later
+/// folded. Proves the fold's retrofit onto [`next_candidate_audit_version`]
+/// is load-bearing, not cosmetic: without it this would abort the fold's own
+/// transaction with a `UNIQUE (entity_kind, entity_id, entity_version)`
+/// violation instead of writing a clean second row.
+#[tokio::test]
+async fn an_edited_then_folded_candidate_accumulates_two_ordered_audit_rows() {
+    let (_home, db) = open_state();
+    let owner = uuid(111);
+    let op = create_op_with_text(&uuid(112), MemoryKind::Fact, &owner, "claim");
+    duplicate_group(&db, &["survivor", "twin-a"], &op, 1_000).await;
+
+    // An edit that changes nothing about the proposal's identity (same op,
+    // same dedup key) — it still counts as a real edit request and is still
+    // audited, the same "the caller asked, regardless of old vs. new" rule
+    // `apply_edit` already uses for a memory entry.
+    edit(&db, "twin-a", Some(op.clone()), None, 2_000)
+        .await
+        .expect("edit twin-a while still pending");
+
+    fold(&db, "survivor", 5_000).await.expect("fold");
+
+    let read = db.open_read().expect("read conn");
+    let events = audit_rows_for_candidate(&read, "twin-a");
+    assert_eq!(events.len(), 2, "the edit and the fold, not a collision");
+    assert_eq!(events[0].entity_version, 1);
+    assert_eq!(events[0].op, "edit");
+    assert_eq!(events[1].entity_version, 2);
+    assert_eq!(events[1].op, AUDIT_OP_FOLD_DUPLICATE);
+    assert_eq!(
+        candidate_state_of(&read, "twin-a"),
+        CandidateState::Rejected,
+        "the edit did not change the dedup key, so the fold still finds it"
+    );
+}
+
 /// The sharpest test in the set: an operator's own rejection and a
-/// machine-driven fold both leave `review_state = 'rejected'`, and the audit
-/// trail is the only thing that can still tell them apart.
+/// machine-driven fold both leave `review_state = 'rejected'`, and — since
+/// `T23-11` gave `reject_candidate` its own audit row too — the only thing
+/// that still tells them apart is the `op` each one carries, `"reject"`
+/// versus `"fold_duplicate"`, never their mere presence.
 #[tokio::test]
 async fn an_operator_reject_and_a_fold_are_distinguishable_in_the_audit() {
     let (_home, db) = open_state();
     let owner = uuid(94);
     let judged_op = create_op_with_text(&uuid(95), MemoryKind::Fact, &owner, "judged claim");
     propose(&db, "judged", judged_op, vec![], vec![], 1_000).await;
-    reject(&db, "judged").await.expect("operator reject");
+    reject(&db, "judged", 1_000).await.expect("operator reject");
 
     let folded_op = create_op_with_text(&uuid(96), MemoryKind::Fact, &owner, "folded claim");
     duplicate_group(&db, &["survivor", "folded"], &folded_op, 2_000).await;
@@ -1283,14 +1450,22 @@ async fn an_operator_reject_and_a_fold_are_distinguishable_in_the_audit() {
         candidate_state_of(&read, "folded"),
         CandidateState::Rejected
     );
-    assert!(
-        audit_rows_for_candidate(&read, "judged").is_empty(),
-        "an operator's own reject writes no audit row — it needs none to be itself"
-    );
+    let judged_events = audit_rows_for_candidate(&read, "judged");
     assert_eq!(
-        audit_rows_for_candidate(&read, "folded").len(),
+        judged_events.len(),
+        1,
+        "an operator's own reject now writes exactly one audit row"
+    );
+    assert_eq!(judged_events[0].op, "reject", "not the fold's own op");
+    let folded_events = audit_rows_for_candidate(&read, "folded");
+    assert_eq!(
+        folded_events.len(),
         1,
         "a fold writes exactly one, naming the survivor it was folded into"
+    );
+    assert_eq!(
+        folded_events[0].op, AUDIT_OP_FOLD_DUPLICATE,
+        "not an operator's own reject"
     );
 }
 
@@ -1470,7 +1645,7 @@ async fn folding_a_non_pending_candidate_is_typed_not_pending() {
     let owner = uuid(134);
     let op = create_op_with_text(&uuid(135), MemoryKind::Fact, &owner, "claim");
     duplicate_group(&db, &["already-rejected"], &op, 1_000).await;
-    reject(&db, "already-rejected")
+    reject(&db, "already-rejected", 1_000)
         .await
         .expect("reject it first");
 
@@ -1592,7 +1767,9 @@ async fn groups_never_include_a_non_pending_candidate() {
     approve(&db, "approved-c", 2_000)
         .await
         .expect("approve one twin out of band");
-    reject(&db, "rejected-d").await.expect("reject another");
+    reject(&db, "rejected-d", 1_000)
+        .await
+        .expect("reject another");
 
     let read = db.open_read().expect("read conn");
     let groups = pending_candidate_groups(&read).expect("groups");

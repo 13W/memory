@@ -129,7 +129,7 @@ async fn reject_seeded_candidate(layout: &StoreLayout, candidate_id: &str) {
     let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
     let cid = candidate_id.to_string();
     db.writer()
-        .transaction(move |tx| reject_candidate(tx, &cid))
+        .transaction(move |tx| reject_candidate(tx, &cid, 1_000))
         .await
         .expect("reject tx (infrastructure)")
         .expect("reject (domain)");

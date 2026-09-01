@@ -530,7 +530,7 @@ async fn candidates_mode_with_state_filter() {
 
     let db = StateDb::open(layout.state_db()).expect("open state.sqlite");
     db.writer()
-        .transaction(|tx| local_rag_store::reject_candidate(tx, "cand-other"))
+        .transaction(|tx| local_rag_store::reject_candidate(tx, "cand-other", 1_000))
         .await
         .expect("reject tx (infrastructure)")
         .expect("reject (domain)");

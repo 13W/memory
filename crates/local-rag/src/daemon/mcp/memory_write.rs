@@ -487,6 +487,7 @@ pub async fn approve_memory_candidate(
 pub async fn reject_memory_candidate(
     ctx: &MemoryContext,
     args: &Map<String, Value>,
+    now_ms: i64,
 ) -> Result<CallToolResult, String> {
     reject_unknown_keys(args, &["id"])?;
     let id = require_string(args, "id")?;
@@ -495,7 +496,7 @@ pub async fn reject_memory_candidate(
     let outcome = ctx
         .state
         .writer()
-        .transaction(move |tx| reject_candidate(tx, &id))
+        .transaction(move |tx| reject_candidate(tx, &id, now_ms))
         .await;
     match outcome {
         Ok(Ok(())) => Ok(content::ok(&IdWire { id: id_for_wire })),
@@ -507,6 +508,7 @@ pub async fn reject_memory_candidate(
 pub async fn edit_memory_candidate(
     ctx: &MemoryContext,
     args: &Map<String, Value>,
+    now_ms: i64,
 ) -> Result<CallToolResult, String> {
     reject_unknown_keys(args, &["id", "patch"])?;
     let id = require_string(args, "id")?;
@@ -559,6 +561,7 @@ pub async fn edit_memory_candidate(
                 &id,
                 proposed_operation.as_ref(),
                 conflict_refs.as_deref(),
+                now_ms,
             )
         })
         .await;

@@ -219,10 +219,10 @@ async fn route_tools_call(
             super::memory_write::approve_memory_candidate(memory, &call.arguments, ctx.now_ms).await
         }
         "reject_memory_candidate" => {
-            super::memory_write::reject_memory_candidate(memory, &call.arguments).await
+            super::memory_write::reject_memory_candidate(memory, &call.arguments, ctx.now_ms).await
         }
         "edit_memory_candidate" => {
-            super::memory_write::edit_memory_candidate(memory, &call.arguments).await
+            super::memory_write::edit_memory_candidate(memory, &call.arguments, ctx.now_ms).await
         }
         "edit_memory" => {
             super::memory_write::edit_memory(memory, &call.arguments, ctx.now_ms).await

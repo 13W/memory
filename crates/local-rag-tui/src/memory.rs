@@ -1329,7 +1329,7 @@ pub fn execute_memory_action(layout: &StoreLayout, action: MemoryAction) -> Memo
                 async move {
                     state
                         .writer()
-                        .transaction(move |tx| reject_candidate(tx, &candidate_id))
+                        .transaction(move |tx| reject_candidate(tx, &candidate_id, now_ms))
                         .await
                 }
             });

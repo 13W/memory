@@ -359,6 +359,34 @@ A group that means to move numbers has to state them first. Measured 2026-08-31:
 - **Acceptance:** a session parked on a truncated answer recovers without an operator command.
 - **Evidence:** the `T23-10` row.
 
+## T23-11 — The candidate review machine's own transitions get an audit trail
+
+- **Depends on:** `T23-08` (the `fold_pending_duplicates` precedent this card extends and, in one
+  place, must retrofit).
+- **Specification:** `D-132`; spec 08 §3's `[FIXED]` transactional contract ("edit"/"reject" "from
+  review tools"); spec 04 §6.
+- **Result:** `reject_candidate`, `edit_candidate`, and the candidate-expiry sweep each leave the
+  same kind of trace `fold_pending_duplicates` already does — a `rejected`/`expired` candidate is no
+  longer indistinguishable from an operator's own considered judgment.
+- **In scope:** one `audit_event` row per real transition on all three sites, `entity_kind =
+  "candidate"`, distinguishable `op` (`reject`/`edit`/`expire`); a versioning scheme for that
+  `entity_kind` that survives more than one audited act per candidate (today's hard-coded
+  `entity_version: 1` in `fold_pending_duplicates` only works because nothing else ever writes one
+  first); retrofitting `fold_pending_duplicates` onto that same scheme, since this card's own new
+  writes are what breaks its current assumption.
+- **Not in scope:** `D-131` (`approve_candidate`'s separate duplicate-text gap — a different fix
+  shape, untouched here); a retry of an already-terminal transition must keep succeeding as a
+  silent no-op (existing MCP contract) — it must not gain a false second audit row, and must not
+  start erroring.
+- **Tests:** each of the three sites writes exactly one row for a real transition and none for a
+  no-op/illegal one; two edits on one still-`pending` candidate get two distinct, ordered versions;
+  an edited-then-folded candidate accumulates two ordered rows without a constraint violation.
+  Proved by mutation: omitting the audit write, omitting the pre-transition state guard, and
+  reverting the `fold_pending_duplicates` retrofit each fail a different test.
+- **Acceptance:** `an_operator_reject_and_a_fold_are_distinguishable_in_the_audit` passes with both
+  sides now auditing, distinguished by `op` alone.
+- **Evidence:** the `T23-11` row.
+
 ## G23 — Consolidation and candidate review gate
 
 - **Depends on:** every card of the group.

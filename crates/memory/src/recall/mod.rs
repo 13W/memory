@@ -683,7 +683,7 @@ mod tests {
         )
         .await;
         db.writer()
-            .transaction(|tx| reject_candidate(tx, "cand-rejected"))
+            .transaction(|tx| reject_candidate(tx, "cand-rejected", 1_000))
             .await
             .expect("reject tx")
             .expect("reject");
