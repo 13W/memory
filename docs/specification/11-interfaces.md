@@ -271,6 +271,30 @@ are synchronous, single-process black boxes with no inter-process channel a sepa
 invocation could read — `T20-07`'s own card is annotated with the field (`in_progress_since`) a
 future indexing-progress consumer will need, rather than fabricating indexing data here.
 
+As-built note (`T23-02`/`D-119`, `[SPEC]`). `pending_backlog_total` above is a single number with
+no shape: it says the backlog is large, never which sessions are behind or why. A live measurement
+found 1386 observations, 100 % of them behind four sessions, obtainable only by hand-written SQL —
+the same gap `D-096` closed for file accounting. `stats()` gains `backlog_by_session`
+(`local_rag_store::memory::pending_backlog_by_session`, one module owning the computation so
+`cli::stats`, `cli::doctor`, and the MCP `stats` tool cannot disagree about the number, the
+`cli::coverage.rs`/`D-096` shape): one row per session carrying a backlog, worst first, each with a
+`blocker` naming what `open_next_run` would find in its way — `none` (nothing blocking, just not
+yet picked up), `in_progress` (a `pending`/`running` run), `retryable` (a `failed` run whose
+fingerprint does not match the running build, or whose kind is not `Mechanical`), `parked` (a
+`Mechanical`, build-fingerprint-matching dead-letter that is not a context overflow — the class
+`T23-03`'s `retry`/`abandon` exists for), `shrinking` (an overflow dead-letter `D-058`'s ladder will
+still halve), or `floored` (an overflow dead-letter already at one observation, `D-058`'s floor).
+**The verdict is relative to the build printing it, and every surface now says so**
+(`blocker_build_id`): a report run against a locally rebuilt binary can correctly call a row
+`retryable` while the running daemon's own build would call the identical row `parked`, because the
+fingerprint comparison in `stale_runs`/`dead_letter_shrink_decision` is against the *running*
+build, not the reporting one — a defect the live store surfaced during `T23-02`'s own acceptance
+pass, inherited silently from `stuck_consolidation_runs`/`unconsolidatable_sessions` since `D-071`/
+`D-058` and said here for the first time, at the surface where it is actually consumed.
+`is_clean` (`doctor`) is deliberately unchanged by this: a parked session already reaches `doctor`
+through `stuck_runs` and already fails it, so the new breakdown widens what an operator can see,
+not what already makes the daemon unhealthy.
+
 As-built note (T15-05, `[SPEC]`): the eight memory-write/candidate-review tools this section's
 table names — `remember`, `approve_memory_candidate`, `reject_memory_candidate`,
 `edit_memory_candidate`, `edit_memory`, `retract_memory`, `merge_memories`, `give_feedback` — are

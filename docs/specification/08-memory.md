@@ -153,18 +153,35 @@ section states less precisely than the code fixes:
   `consolidation retry|abandon`.
 
   This section's own contract — every operation in its list gets a single tx containing "the
-  entry mutation, `memory_evidence` rows, `audit_event`" — was, and outside this one new act still
-  is, unmet for the candidate machine's own transitions: `reject_candidate`/`edit_candidate` (both
-  named here as "review tools" `reject`/`edit`) and the candidate-expiry sweep all write no
-  `audit_event` at all (`D-132`, open — a pre-existing gap this task's own fold act cannot silently
-  inherit, not one it was asked to retrofit onto the other three). A fold's twins therefore get
-  what an operator's own `reject_candidate` call still does not: one `audit_event` per folded twin,
-  under a new `entity_kind = "candidate"` (`AUDIT_ENTITY_CANDIDATE`, `op = "fold_duplicate"`, the
-  second `entity_kind` in that table besides `memory_entry`, following `consolidation_run`'s own
-  precedent), naming the survivor. Without it a fold's `rejected` row would be byte-identical to an
-  operator's own considered "no" — `rejected` is terminal, so that distinction, once lost, is lost
-  for good; the audit row is what lets a later reader tell "a human judged this claim" from "this
-  was a byte-identical copy of a claim still awaiting judgement" apart.
+  entry mutation, `memory_evidence` rows, `audit_event`" — was unmet, at this task's own time, for
+  the candidate machine's own transitions: `reject_candidate`/`edit_candidate` (both named here as
+  "review tools" `reject`/`edit`) and the candidate-expiry sweep all wrote no `audit_event` at all
+  (`D-132`, a pre-existing gap this task's own fold act could not silently inherit, not one it was
+  asked to retrofit onto the other three — **closed by `T23-11`, below**). A fold's twins get one
+  `audit_event` per folded twin, under a new `entity_kind = "candidate"` (`AUDIT_ENTITY_CANDIDATE`,
+  `op = "fold_duplicate"`, the second `entity_kind` in that table besides `memory_entry`, following
+  `consolidation_run`'s own precedent), naming the survivor. Without it a fold's `rejected` row
+  would be byte-identical to an operator's own considered "no" — `rejected` is terminal, so that
+  distinction, once lost, is lost for good; the audit row is what lets a later reader tell "a human
+  judged this claim" from "this was a byte-identical copy of a claim still awaiting judgement"
+  apart.
+
+  As-built note (`T23-11`, `D-132`, `[SPEC]`): the other three candidate-machine transitions now
+  audit too, closing the gap the paragraph above named. `reject_candidate` and the expiry sweep
+  (`local_rag_store::housekeeping::run_candidate_expiry_sweep`) each read `candidate_state` before
+  calling `transition_candidate`, and write one row (`op = "reject"`/`op = "expire"`) only when that
+  pre-read state was `Pending` — the same act's own self-transition-is-legal convention already
+  makes a retry of an already-terminal transition a silent no-op, and this guard is what keeps that
+  no-op from also gaining a second, false audit row. `edit_candidate` audits whenever the caller
+  actually supplied a new `proposed_operation` or `conflicts` (`op = "edit"`), the same
+  "the caller asked, so it's audited" rule `apply_edit` already uses for a memory entry. All four
+  acts — `reject`, `edit`, `expire`, `fold_duplicate` — now share one versioning scheme,
+  `next_candidate_audit_version` (`COALESCE(MAX(entity_version), 0) + 1` over this candidate's own
+  `audit_event` rows): `pending_memory_candidate` carries no version column of its own (04 §6), and
+  a hard-coded `entity_version: 1` — safe only while `fold_duplicate` was the sole writer — would
+  collide with an editable, still-`pending` candidate's own earlier row. An operator's own
+  `reject_candidate` and a fold's `rejected` row are now distinguishable exactly as `fold_duplicate`
+  always was: by `op`, never by "one wrote a row and the other did not."
 - **`noop` writes nothing at all** — no `memory_entry` mutation, no `memory_evidence`, no
   `audit_event`. The op envelope in §4 below lists `target/kind/text/scope/canonical_key/
   confidence inputs` for the op list generally; `noop` needs none of them, unlike every other
@@ -545,10 +562,33 @@ covers it; (3) `consolidation::record_run_failure` escalates a `Transient` failu
 `TRANSIENT_ATTEMPT_CAP` (8 attempts — the backoff has been pinned at its 4s cap for three of them)
 into an ordinary fingerprinted `Mechanical` dead-letter, so no failure class can retry unboundedly
 any more. Duplication *across* two ops of one batch is not deduplicated (a semantically different
-batch); it is bounded by (2) instead. Knowingly accepted cost of (3): a genuinely long generator
-outage parks the runs it hits until the binary is rebuilt — a daemon restart does not revive them
-— and `open_next_run` blocks that session's whole backlog meanwhile. D-071 is the observability
-half that surfaces such a row in `stats`/`doctor`.
+batch); it is bounded by (2) instead. Knowingly accepted cost of (3), **superseded by `G23`/`D-117`
+below**: a genuinely long generator outage parks the runs it hits until the binary is rebuilt — a
+daemon restart does not revive them — and `open_next_run` blocks that session's whole backlog
+meanwhile. D-071 is the observability half that surfaces such a row in `stats`/`doctor`.
+
+As-built note (`G23`, `D-117`, `[SPEC]`): the paragraph above stopped being true the moment `0.1.0`
+was published, and this note is what makes it true again. A rebuild is not a recovery path for
+anyone who did not build the binary themselves: a released `BUILD_ID` is fixed for the life of the
+release (the literal string `"0.1.0"`), so the first `Mechanical` dead-letter that is not a context
+overflow parked a session **forever**, with the specification's own escape unavailable. Measured on
+the owner's live store at the moment this was found: two sessions held 1368 of 1373 backlogged
+observations this way. The supported recovery is now an operator's, deliberately not a schedule's
+(ADR-0014 Decision 1, `T23-03`): `local-rag consolidation retry <session-id>` re-enters the same
+`failed` row into `running` under an already-expired lease — the exact row `stale_runs` selects, so
+the next trigger tick executes it, and nothing about the failure kind, reason, or fingerprint is
+erased, so `D-050`'s guard applies again unchanged if it fails the same way twice — or
+`local-rag consolidation abandon <session-id>` declares the window unconsolidatable and advances
+`processing_cursor` past it, `T23-10`'s own reclassification of a truncated answer (below) already
+made the storm's most common trigger `Transient` and self-healing rather than needing this path at
+all; retry/abandon exists for what a rewritten prompt or answer budget still cannot fix on its own
+— a genuine schema/prompt-contract defect that reproduces identically until the code changes. Both
+verbs write an `audit_event` under the run's own id (`AUDIT_ENTITY_CONSOLIDATION_RUN =
+"consolidation_run"`, the first `entity_kind` in that table besides `memory_entry`); `abandon`'s is
+not decoration; it names the observations skipped and is bounded by `observation_payload`'s TTL —
+`T23-09` closed the gap that TTL enforcement depended on a human remembering to type
+`local-rag gc`, and its own card fixed the ordering: rescuing a backlog must run before that sweep
+ever executes against a store, since a payload the sweep has removed cannot be re-consolidated.
 
 As-built note (`T23-05`/`D-121`, `[SPEC]`): step 3's "ordered ops list" may legitimately name one
 entry more than once, and step 4's `expected_version` for **every** op is captured once, by
