@@ -94,6 +94,22 @@ still held to the determinism and byte-span goldens of
 [spec 14 §5](../specification/14-acceptance-and-testing.md) in T04-04/T04-05. This
 limitation is recorded here deliberately rather than left implicit.
 
+> **Amended 2026-09-04 by [ADR-0015](0015-post-v0-language-expansion.md).** The set decided here
+> is the set that shipped **v0**, and it stays that. For the releases after it, ADR-0015 adds
+> **python**, **go**, **bash**, **yaml** and **toml** — five grammars verified to load on the
+> pinned `tree-sitter 0.24` core at language ABI 14. That is the additive path this decision's
+> Consequences section promised ("a new language is a new adapter + query set + goldens, with no
+> schema or identity change"), taken by the route ADR-0012 named: a new ADR amending this one.
+>
+> The "no benchmark corpus" limitation below **widens** rather than lapses: the 49-query corpus
+> is still TypeScript-only, so retrieval quality is now unmeasured for six of the seven languages
+> in the set, not two of three. Each added adapter is still held to the determinism and
+> byte-span goldens of [spec 14 §5](../specification/14-acceptance-and-testing.md).
+>
+> The `[FIXED]` "2–3 languages" bound of [idea.md §16](../idea.md) is **not** rewritten by that:
+> it describes the v0 MVP, which this decision still records faithfully. ADR-0015 §"The
+> `[FIXED]` bound" carries the reasoning in full.
+
 ## Consequences
 
 - The downstream language tasks are unblocked with concrete targets: **T04-03**

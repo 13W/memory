@@ -122,6 +122,15 @@ silently" `[FIXED]`); **unknown TOML keys are ignored** (lenient/forward-compati
 keys default per section. The `[OPEN]` numbers (`storage.retired_generations_keep`/`_ttl_h`) are
 parsed as the provisional defaults shown here — T02-05 does not close those open questions.
 `index.languages` is now the closed set fixed by ADR-0001 (O4), not a provisional placeholder.
+
+As-built note (T24-00, `[SPEC]`): that set is **extended post-v0** by
+[ADR-0015](../adr/0015-post-v0-language-expansion.md), which adds `python`, `go`, `bash`,
+`yaml` and `toml`. The array above is the v0 set and grows **one language per card** in group
+24, in the same commit that adds the `LanguageId` variant and its adapter — the array,
+`Config::default().index.languages` and `LanguageId::ALL` are asserted identical by
+`crates/index/tests/language_coverage.rs` and `parse_identity.rs`, so they can never drift
+apart even transiently. `index.languages` remains **declarative**: it is documentation under
+test, not a runtime filter — the selector is the extension table in `parse::select_language`.
 `Config::load` takes only the resolved `<config_dir>`; there is no API that
 consults a worktree or repository tree, which is the structural form of §3.2's "never via files
 inside the repository".

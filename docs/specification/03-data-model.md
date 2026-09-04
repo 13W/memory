@@ -554,6 +554,19 @@ As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
   `CHUNK_POLICY_VERSION = 1` means "fallback chunks only for outermost ERROR/MISSING spans, no
   size-based splitting". The FIXED key set, the sort, extension-based language selection, and the
   `.c`/`.cpp` consequence are unchanged.
+- Post-v0 extension `[SPEC]` (T24-00, [ADR-0015](../adr/0015-post-v0-language-expansion.md)):
+  the `lang=` domain grows beyond the v0 three with `python`, `go`, `bash`, `yaml` and `toml`.
+  Each is pinned at its `0.23.x`/ABI-14 line for the reason recorded above — `tree-sitter 0.24`
+  supports language ABI 14 at most, and an ABI-15 grammar is not refused loudly but degrades to a
+  file-only parse — and each reconciles to `grammar=@1`/`queries=1` on the same terms as the v0
+  three. The format is untouched: a new language is a new **token in an existing field**, not a
+  new field, which is why this is additive with no identity or schema change. Two consequences
+  follow mechanically and are stated so they are not rediscovered: a file whose extension moves
+  from the universal path to a grammar gets a **different `parser_fingerprint`**, so it misses the
+  structural-sharing pre-check on `UNIQUE (content_hash, parser_fingerprint)` and is re-parsed and
+  re-embedded; and `yaml`/`toml` units keep `unit_kind = config_section` — the adapter chooses the
+  kind (`CaptureRole::Decl`), so a grammar replaces the line scanner without a key becoming a
+  `symbol`.
 
 ### 2.4 Generation membership (path-dependent)
 
