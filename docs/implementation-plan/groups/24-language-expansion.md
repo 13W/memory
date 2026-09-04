@@ -164,7 +164,14 @@ Stated once here; each card below names only what is specific to it.
   rather than quietly reporting an unmeasured success.
 - **Tests:** the shared template; a `method_declaration` yields its `field_identifier` name (not
   an ordinal anchor) — this is the specific regression the widened allowlist exists for.
-- **Acceptance:** fixtures and goldens green; no live figure claimed.
+- **Also in scope — `D-134`.** `non_corpus_languages_are_acknowledged_in_adr`
+  (`crates/index/tests/language_coverage.rs`) matches each language name against ADR-0001 by
+  lowercase **substring**. `"go"` is a substring of `goldens`, `going` and `algorithm`, all of
+  which ADR-0001 already contains, so the assertion becomes **vacuous the moment `go` joins the
+  set** — a test that claims to enforce the ADR acknowledgment and silently stops. Fix it in this
+  card (word-boundary match, or match the backticked canonical token) and resolve the row.
+- **Acceptance:** fixtures and goldens green; no live figure claimed. `D-134` resolved, with the
+  corrected assertion demonstrated to fail on an ADR-0001 that omits a language name.
 - **Evidence:** the `T24-03` row, stating explicitly that live evidence is absent and why.
 
 ## T24-04 — TOML adapter
@@ -176,6 +183,19 @@ Stated once here; each card below names only what is specific to it.
   top-level `pair`, all emitting **`UnitKind::ConfigSection`**, named by `bare_key`; removal of
   `toml` from `CONFIG_EXTENSIONS` in the same commit, plus the group's test that no extension
   appears in both selectors.
+- **Also in scope — the parent seam, because this is the card that first needs it.** `finalize`
+  admits only `UnitKind::Symbol` as a parent (`adapter/mod.rs`), so `config_section` units come out
+  flat and `table:dependencies/key:serde` is unreachable. Open it as a defaulted `LanguageSpec`
+  method (`parent_unit_kinds`, in the style of `file_lang_kind`/`fallback_lang_kind`) rather than
+  by widening the predicate in place. It has no observable result of its own, which is why it
+  lives in the card that consumes it rather than in one of its own — and its inertness is proved
+  by the three existing signature goldens and the 25 existing fixtures staying byte-identical.
+- **Also in scope — the `[SPEC]` amendment to spec 06 §2.1.** "Chunking takes on **no dependency**
+  — no YAML, JSON or Markdown parser" and "One rule then serves YAML (column 0) …" both stop being
+  true once TOML and YAML leave the universal path. Scope the sentences to the *universal chunker*
+  and re-exemplify the Config rule with JSON/INI. `ADR-0015` Decision 3 carries the reasoning: the
+  paragraph's own justification (a real parser returns a value tree, not byte offsets) is exactly
+  what does not apply to tree-sitter.
 - **Not in scope:** changing `config_key`'s behavior for the extensions that stay on the universal
   path.
 - **Tests:** the shared template; a `Cargo.toml` fixture yields sections named `package`,
@@ -197,6 +217,12 @@ Stated once here; each card below names only what is specific to it.
 - **Not in scope:** schema-aware naming (`Deployment/my-app`). That is a naming rule over this
   adapter's output, deliberately a separate change — `ADR-0015` §5 records why it is not a grammar
   question.
+- **Also in scope — two tests that go silently vacuous.** `crates/index/tests/reconcile.rs` writes
+  `conf/values.yaml  // config` under the comment "One file per route the builder can take", and
+  `deploy/values.yaml  // universal: config` in a second test. Once `.yaml` takes the *language*
+  route, both keep passing while covering nothing: the config route stops being exercised and the
+  comments become false. Switch those fixtures to an extension that stays universal (`.ini`), or
+  add one alongside. A test that passes for the wrong reason is worse than one that fails.
 - **Tests:** the shared template; a three-document manifest yields three document units, not one
   flat key list; the query is anchored so a nested key (`name: app`) does **not** become a
   top-level section; and a key containing `/` (e.g. `nginx.ingress.kubernetes.io/rewrite-target`)

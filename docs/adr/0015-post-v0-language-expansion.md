@@ -124,6 +124,27 @@ indexed*, never which file produces which kind. `parsed_unit.unit_kind`'s `CHECK
 kinds (`crates/store/src/code/mod.rs`) is likewise untouched — **no language may invent a sixth
 kind.**
 
+This decision has a price, and it is an engine change rather than an adapter one. The parent
+rule in `finalize` admits only `UnitKind::Symbol` as a parent candidate
+(`crates/index/src/parse/adapter/mod.rs`: `if candidate.is_file || candidate.unit_kind !=
+UnitKind::Symbol { continue; }`), so `config_section` units would come out **flat** and a nested
+route such as `key:spec/key:containers` would be unreachable. The first config card opens that
+seam — preferably as a defaulted `LanguageSpec` method (`parent_unit_kinds`, in the style of the
+existing `file_lang_kind`/`fallback_lang_kind` hooks) rather than by widening the predicate in
+place, so the rule stays *declared by the adapter* instead of becoming global. Either shape is
+provably inert for the v0 three, which emit only `File`, `Symbol` and `FallbackChunk`, and the
+existing signature goldens are what proves it.
+
+It also has a **`[SPEC]` cost that must be paid by the card, not left implicit.** Spec 06 §2.1
+says verbatim that "Chunking takes on **no dependency** — no YAML, JSON or Markdown parser", and
+names YAML as the Config rule's own exemplar ("One rule then serves YAML (column 0), pretty-printed
+JSON … and INI/`.env` alike"). Both sentences become false for YAML and TOML once they leave the
+universal path. The amendment is a **scoping clarification, not a reversal**: that paragraph's
+stated reason is that "a real parser returns a value tree rather than byte offsets into the text
+it consumed" — which is exactly what a tree-sitter grammar does *not* do. The universal chunker
+keeps its no-dependency rule and keeps serving JSON, INI and `.env`; the grammar path is simply
+not what that sentence was about.
+
 ### 4. Grammars are pinned at ABI 14, and the pin is load-bearing
 
 Every grammar is pinned to its `0.23.x`/ABI-14 line, for the reason the three existing pins
