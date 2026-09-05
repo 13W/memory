@@ -19,8 +19,8 @@ use serde::Deserialize;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
-    JavaScriptParser, LanguageId, LanguageParser, RustParser, SourceDialect, SyntaxAnchor,
-    TypeScriptParser, parser_fingerprint, persist_parse_output,
+    JavaScriptParser, LanguageId, LanguageParser, PythonParser, RustParser, SourceDialect,
+    SyntaxAnchor, TypeScriptParser, parser_fingerprint, persist_parse_output,
 };
 use local_rag_store::StateDb;
 use local_rag_store::code::{
@@ -106,6 +106,7 @@ fn parser_for(language: &str) -> Box<dyn LanguageParser> {
         "typescript" => Box::new(TypeScriptParser::new()),
         "javascript" => Box::new(JavaScriptParser::new()),
         "rust" => Box::new(RustParser::new()),
+        "python" => Box::new(PythonParser::new()),
         other => panic!("no parser for fixture language {other:?}"),
     }
 }
@@ -166,9 +167,9 @@ fn parser_fixtures_match_expected_units_and_refs() {
         );
         *per_language.entry(case.language.clone()).or_default() += 1;
     }
-    // Every v0 language must be exercised (TypeScript T04-03, JavaScript T04-04,
-    // Rust T04-05).
-    for lang in ["typescript", "javascript", "rust"] {
+    // Every language must be exercised (TypeScript T04-03, JavaScript T04-04,
+    // Rust T04-05, Python T24-01).
+    for lang in ["typescript", "javascript", "rust", "python"] {
         assert!(
             per_language.get(lang).copied().unwrap_or(0) >= 4,
             "expected the authored {lang} cases"
@@ -206,6 +207,11 @@ fn fingerprints_are_reconciled_after_linking_the_grammars() {
     assert_eq!(
         parser_fingerprint(LanguageId::Rust),
         "chunk=1;grammar=tree-sitter-rust@1;lang=rust;norm=1;queries=1"
+    );
+    // ADR-0015 (T24-01): the same reconciliation for the first post-v0 grammar.
+    assert_eq!(
+        parser_fingerprint(LanguageId::Python),
+        "chunk=1;grammar=tree-sitter-python@1;lang=python;norm=1;queries=1"
     );
 }
 

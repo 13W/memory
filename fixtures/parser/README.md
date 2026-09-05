@@ -24,6 +24,9 @@ Rust integration test `crates/index/tests/parse_fixtures.rs`.
 - **Rust** — authored in **T04-05** (`tree-sitter-rust` adapter, ADR-0002),
   covering the same categories. This completes the v0 language set and closes
   **GAP-01** (`../manifest.json`).
+- **Python** — authored in **T24-01** (`tree-sitter-python` adapter, ADR-0015 —
+  the first post-v0 language), covering the same categories plus a case pinning
+  the decorated-definition decision (`parser.py.decorated`).
 
 v1 had no golden tree-sitter chunking fixtures (the v1 parser `src/indexer/parser.ts`
 was exercised only through the 49-query benchmark), so these are authored, not

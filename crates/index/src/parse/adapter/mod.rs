@@ -4,11 +4,13 @@
 //! a [`LanguageSpec`]. The engine owns everything language-independent — running
 //! the query, collecting units, the file unit, the error/fallback pass, canonical
 //! ordering, parent inference, and the `syntax_path`/ordinal anchor derivation —
-//! so a new language (T04-04 JavaScript, T04-05 Rust) supplies only a
-//! [`LanguageSpec`] (grammar, query, capture map, name/signature/reference hooks),
-//! honoring ADR-0001 ("the choice lives in data/config, not the parser core").
+//! so a new language (T04-04 JavaScript, T04-05 Rust, T24-01 Python) supplies only
+//! a [`LanguageSpec`] (grammar, query, capture map, name/signature/reference
+//! hooks), honoring ADR-0001 ("the choice lives in data/config, not the parser
+//! core").
 
 pub mod javascript;
+pub mod python;
 pub mod rust;
 pub mod typescript;
 
@@ -360,12 +362,19 @@ fn finalize(raws: &[Raw]) -> Vec<ParsedUnitDraft> {
 // These extract structural facts from a tree-sitter node in a language-independent
 // way, so each adapter's `LanguageSpec` composes them instead of re-deriving the
 // same primitives. A helper's node-kind/token/field vocabulary is a *superset*
-// across the v0 languages: kinds/tokens that a given grammar never produces simply
-// never match, so a shared helper stays correct per language (e.g. `type_identifier`
-// exists only in TypeScript, the TS accessibility modifiers never appear in a JS
-// tree).
+// across the supported languages: kinds/tokens that a given grammar never produces
+// simply never match, so a shared helper stays correct per language (e.g.
+// `type_identifier` exists only in TypeScript, the TS accessibility modifiers never
+// appear in a JS tree).
 
 /// Identifier-family node kinds whose text is a safe path segment.
+///
+/// The v0 five plus the group-24 vocabulary (ADR-0015, widened once in T24-01):
+/// Go method names are `field_identifier` and package names `package_identifier`,
+/// Bash function names are `word`, TOML keys are `bare_key`, YAML keys are
+/// `flow_node`, Python import paths are `dotted_name`. Inert for the v0 three: their
+/// adapters only consult this on `name` fields that are `identifier`/
+/// `type_identifier`/`property_identifier`, which the goldens and fixtures pin.
 pub(crate) fn is_identifier_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -374,6 +383,12 @@ pub(crate) fn is_identifier_kind(kind: &str) -> bool {
             | "property_identifier"
             | "private_property_identifier"
             | "shorthand_property_identifier"
+            | "field_identifier"
+            | "package_identifier"
+            | "word"
+            | "bare_key"
+            | "flow_node"
+            | "dotted_name"
     )
 }
 
@@ -475,4 +490,54 @@ fn named_route(i: usize, raws: &[Raw], parent: &[Option<usize>]) -> Option<Strin
         segments.push(format!("{kind}:{name}"));
     }
     Some(segments.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_identifier_kind_admits_the_group_24_vocabulary() {
+        // The widening T24-01 did once for the whole group (ADR-0015); each later
+        // card's adapter relies on its own kind being here.
+        for kind in [
+            "identifier",
+            "type_identifier",
+            "property_identifier",
+            "private_property_identifier",
+            "shorthand_property_identifier",
+            "field_identifier",
+            "package_identifier",
+            "word",
+            "bare_key",
+            "flow_node",
+            "dotted_name",
+        ] {
+            assert!(is_identifier_kind(kind), "{kind} must be identifier-family");
+        }
+        // Non-name kinds stay out: a literal, a body, an error, a string fragment.
+        for kind in [
+            "string",
+            "string_fragment",
+            "integer",
+            "block",
+            "ERROR",
+            "argument_list",
+            "",
+        ] {
+            assert!(
+                !is_identifier_kind(kind),
+                "{kind} must not be identifier-family"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_segment_rejects_locator_delimiters() {
+        assert!(is_safe_segment("dotted.name"));
+        assert!(is_safe_segment("café"));
+        for bad in ["", "a b", "a/b", "a:b", "a=b", "a;b", "tab\there"] {
+            assert!(!is_safe_segment(bad), "{bad:?} must not be a safe segment");
+        }
+    }
 }

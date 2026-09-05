@@ -100,7 +100,7 @@ data_policy = "local_only"        # local_only | metadata_only_remote |
                                   # allow_remote_with_redaction | allow_remote_full  [FIXED default]
 
 [index]
-languages = ["typescript", "javascript", "rust"]   # ADR-0001 (closes O4)
+languages = ["typescript", "javascript", "rust", "python"]   # ADR-0001 (closes O4) + ADR-0015 (T24-01)
 max_file_size_kb = 1024
 
 [spool]

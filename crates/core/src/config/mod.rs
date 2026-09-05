@@ -26,7 +26,8 @@
 //! compatible). The `[OPEN]` numbers in spec 02 §3.1
 //! (`storage.retired_generations_keep`/`_ttl_h`) are parsed as provisional
 //! defaults matching the spec text — this module does not close those open
-//! questions. `index.languages` is the closed set fixed by ADR-0001 (O4).
+//! questions. `index.languages` is the closed set fixed by ADR-0001 (O4) and
+//! extended post-v0 by ADR-0015 (group 24, one language per card).
 //!
 //! Per-repository overrides (spec 02 §3.2, the `repo_settings` table) and the
 //! effective-policy merge across repos live in `local-rag-store`
@@ -208,8 +209,11 @@ impl Default for ModelsConfig {
 
 /// `[index]` section of `config.toml` (spec 02 §3.1).
 ///
-/// `languages` is the first-release language set fixed by ADR-0001 (O4):
-/// TypeScript, JavaScript, Rust.
+/// `languages` is the first-release language set fixed by ADR-0001 (O4) —
+/// TypeScript, JavaScript, Rust — extended post-v0 by ADR-0015 (Python in T24-01).
+/// Declarative: documentation under test (`crates/index/tests/language_coverage.rs`,
+/// `parse_identity.rs`), not a runtime filter — the selector is the extension table
+/// in `parse::select_language`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
@@ -226,6 +230,7 @@ impl Default for IndexConfig {
                 "typescript".to_string(),
                 "javascript".to_string(),
                 "rust".to_string(),
+                "python".to_string(),
             ],
             max_file_size_kb: 1024,
         }
@@ -641,7 +646,7 @@ default_model_space = \"default\"
 data_policy = \"local_only\"
 
 [index]
-languages = [\"typescript\", \"javascript\", \"rust\"]
+languages = [\"typescript\", \"javascript\", \"rust\", \"python\"]
 max_file_size_kb = 1024
 
 [spool]

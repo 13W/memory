@@ -534,7 +534,9 @@ As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
 - `lang` is the canonical `LanguageId` string (= the `index.languages` token). The
   language-by-path selector (`parse::select_language`) realizes ADR-0001's deferred
   "precise selector is T04-02": extension-only, case-insensitive
-  (`.ts/.tsx/.mts/.cts`→typescript, `.js/.jsx/.mjs/.cjs`→javascript, `.rs`→rust).
+  (`.ts/.tsx/.mts/.cts`→typescript, `.js/.jsx/.mjs/.cjs`→javascript, `.rs`→rust; post-v0,
+  ADR-0015: `.py/.pyi`→python as of T24-01, the remaining group-24 rows land one card at a
+  time).
 - Version realization: `chunk=CHUNK_POLICY_VERSION`, `norm=BOUNDARY_NORM_VERSION`,
   `grammar=<grammar_name>@<grammar_version>`, `queries=<query_version>`; all `1` in v0.
   `BOUNDARY_NORM_VERSION` is **distinct** from `content_blob`'s `normalization_version`

@@ -13,12 +13,14 @@ use std::path::Path;
 
 use local_rag_store::code::UnitKind;
 
-/// The first-release language set (ADR-0001, closes O4) `[FIXED]`.
+/// The supported language set: the first-release set (ADR-0001, closes O4)
+/// `[FIXED]`, extended post-v0 by ADR-0015 (one variant per group-24 card).
 ///
 /// A closed enum — not an open string — so the selector, the fingerprint, and the
-/// descriptor table all range over exactly the languages the project supports in
-/// v0. Adding a language after v0 is additive (a new variant + adapter + goldens),
-/// with no schema or identity change (spec 03 §2.3.1 keys on `lang`/`grammar`).
+/// descriptor table all range over exactly the languages the project supports.
+/// Adding a language after v0 is additive (a new variant + adapter + goldens),
+/// with no schema or identity change (spec 03 §2.3.1 keys on `lang`/`grammar`);
+/// the v0 three keep their meaning as the set that shipped v0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
     /// TypeScript (`.ts` `.tsx` `.mts` `.cts`).
@@ -27,14 +29,18 @@ pub enum LanguageId {
     JavaScript,
     /// Rust (`.rs`).
     Rust,
+    /// Python (`.py` `.pyi`) — ADR-0015, T24-01.
+    Python,
 }
 
 impl LanguageId {
-    /// Every language in the closed v0 set, in a stable order.
-    pub const ALL: [LanguageId; 3] = [
+    /// Every language in the closed set, in a stable order (the v0 three first,
+    /// then the ADR-0015 additions in card order).
+    pub const ALL: [LanguageId; 4] = [
         LanguageId::TypeScript,
         LanguageId::JavaScript,
         LanguageId::Rust,
+        LanguageId::Python,
     ];
 
     /// The canonical language id string (spec 02 §3.1; the `lang=` fingerprint
@@ -47,6 +53,7 @@ impl LanguageId {
             LanguageId::TypeScript => "typescript",
             LanguageId::JavaScript => "javascript",
             LanguageId::Rust => "rust",
+            LanguageId::Python => "python",
         }
     }
 
@@ -61,15 +68,16 @@ impl LanguageId {
             "typescript" => Some(LanguageId::TypeScript),
             "javascript" => Some(LanguageId::JavaScript),
             "rust" => Some(LanguageId::Rust),
+            "python" => Some(LanguageId::Python),
             _ => None,
         }
     }
 }
 
 /// Select the language for a file by its extension (spec 03 §2.3.1, 06 §2.1;
-/// ADR-0001 extension table) `[FIXED]`.
+/// ADR-0001 extension table, extended by ADR-0015's) `[FIXED]`.
 ///
-/// Extension-only and case-insensitive. A path outside the v0 set — an unknown
+/// Extension-only and case-insensitive. A path outside the set — an unknown
 /// extension, a dotfile, an extensionless name — yields `None`; the caller routes
 /// `None` to the language-agnostic / skip path (`config_section | text_section |
 /// fallback_chunk`, spec 06 §2.1), which is specified by a later task. Uses
@@ -81,6 +89,7 @@ pub fn select_language(path: &Path) -> Option<LanguageId> {
         "ts" | "tsx" | "mts" | "cts" => Some(LanguageId::TypeScript),
         "js" | "jsx" | "mjs" | "cjs" => Some(LanguageId::JavaScript),
         "rs" => Some(LanguageId::Rust),
+        "py" | "pyi" => Some(LanguageId::Python),
         _ => None,
     }
 }
@@ -259,6 +268,9 @@ mod tests {
             ("a.rs", LanguageId::Rust),
             ("nested/dir/module.rs", LanguageId::Rust),
             ("types/foo.d.ts", LanguageId::TypeScript),
+            // ADR-0015 (T24-01).
+            ("a.py", LanguageId::Python),
+            ("stubs/typed.pyi", LanguageId::Python),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -276,6 +288,10 @@ mod tests {
             Some(LanguageId::TypeScript)
         );
         assert_eq!(select_language(Path::new("M.Rs")), Some(LanguageId::Rust));
+        assert_eq!(
+            select_language(Path::new("app.PY")),
+            Some(LanguageId::Python)
+        );
         assert_eq!(
             select_language(Path::new("x.JsX")),
             Some(LanguageId::JavaScript)

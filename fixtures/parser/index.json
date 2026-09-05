@@ -1,7 +1,7 @@
 {
   "family": "parser",
   "version": "1.0.0",
-  "description": "Golden parser fixtures (T04-03/T04-04, ADR-0002): multi-language source -> expected units {unit_kind, byte span, local_name, kind, anchor, parent} and classified unresolved references. Each case declares its `language` (TypeScript in T04-03, JavaScript in T04-04). Implementation-specific sig hashes / full serialized locators are pinned in crate-local goldens, not here (neutrality for cross-language reuse).",
+  "description": "Golden parser fixtures (T04-03/T04-04, ADR-0002): multi-language source -> expected units {unit_kind, byte span, local_name, kind, anchor, parent} and classified unresolved references. Each case declares its `language` (TypeScript in T04-03, JavaScript in T04-04, Rust in T04-05, Python in T24-01 per ADR-0015). Implementation-specific sig hashes / full serialized locators are pinned in crate-local goldens, not here (neutrality for cross-language reuse).",
   "cases": [
     {
       "id": "parser.ts.declarations",
@@ -1067,6 +1067,352 @@
           "unit_kind": "symbol",
           "span_start": 28,
           "span_end": 41,
+          "local_name": "café",
+          "kind": "function",
+          "anchor": "p:function:café",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.py.declarations",
+      "title": "Core Python declaration kinds each become a symbol unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)"
+      },
+      "language": "python",
+      "category": "syntax",
+      "source": "def foo(a):\n    return a\nasync def bar():\n    pass\nclass Baz:\n    pass\nX = 1\nY: int = 2\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 88,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 24,
+          "local_name": "foo",
+          "kind": "function",
+          "anchor": "p:function:foo",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 25,
+          "span_end": 50,
+          "local_name": "bar",
+          "kind": "function",
+          "anchor": "p:function:bar",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 51,
+          "span_end": 70,
+          "local_name": "Baz",
+          "kind": "class",
+          "anchor": "p:class:Baz",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 71,
+          "span_end": 76,
+          "local_name": "X",
+          "kind": "variable",
+          "anchor": "p:variable:X",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 77,
+          "span_end": 87,
+          "local_name": "Y",
+          "kind": "variable",
+          "anchor": "p:variable:Y",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.py.nesting",
+      "title": "Methods are parented to their class and nested defs to their enclosing def",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)"
+      },
+      "language": "python",
+      "category": "syntax",
+      "source": "class Host:\n    def method(self):\n        pass\n\ndef outer():\n    def inner():\n        pass\n    return inner\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 108,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 46,
+          "local_name": "Host",
+          "kind": "class",
+          "anchor": "p:class:Host",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 16,
+          "span_end": 46,
+          "local_name": "method",
+          "kind": "function",
+          "anchor": "p:class:Host/function:method",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 48,
+          "span_end": 107,
+          "local_name": "outer",
+          "kind": "function",
+          "anchor": "p:function:outer",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 65,
+          "span_end": 90,
+          "local_name": "inner",
+          "kind": "function",
+          "anchor": "p:function:outer/function:inner",
+          "parent": 3
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.py.decorated",
+      "title": "A decorated definition is one unit that owns the decorators' span",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)",
+        "note": "T24-01 decision: the unit is the decorated_definition wrapper (span starts at the first `@`), its kind and route are the definition's, and the inner definition is not a second unit."
+      },
+      "language": "python",
+      "category": "syntax",
+      "source": "@dataclass\nclass Point:\n    @property\n    def norm(self):\n        return 0\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 75,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 74,
+          "local_name": "Point",
+          "kind": "class",
+          "anchor": "p:class:Point",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 28,
+          "span_end": 74,
+          "local_name": "norm",
+          "kind": "function",
+          "anchor": "p:class:Point/function:norm",
+          "parent": 1
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.py.imports",
+      "title": "Import specifiers become one classified unresolved reference each",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)"
+      },
+      "language": "python",
+      "category": "syntax",
+      "source": "import os, sys\nimport numpy as np\nfrom pkg.mod import a, b\nfrom . import sibling\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 81,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": [
+        {
+          "source_unit": 0,
+          "reference_text": "os",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "sys",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "numpy",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "pkg.mod",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": ".",
+          "reference_kind": "import"
+        }
+      ]
+    },
+    {
+      "id": "parser.py.empty",
+      "title": "An empty Python file is a single empty file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)"
+      },
+      "language": "python",
+      "category": "empty",
+      "source": "",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 0,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.py.whitespace",
+      "title": "A whitespace-only Python file is a single file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)"
+      },
+      "language": "python",
+      "category": "empty",
+      "source": "   \n\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 5,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.py.error",
+      "title": "Malformed Python recovers symbols and yields a fallback chunk",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)"
+      },
+      "language": "python",
+      "category": "error",
+      "source": "def ok():\n    pass\ndef @@@ broken(\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 35,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 18,
+          "local_name": "ok",
+          "kind": "function",
+          "anchor": "p:function:ok",
+          "parent": null
+        },
+        {
+          "unit_kind": "fallback_chunk",
+          "span_start": 19,
+          "span_end": 34,
+          "local_name": null,
+          "kind": "error",
+          "anchor": "o:2",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.py.unicode",
+      "title": "Python byte spans are byte offsets across multi-byte characters",
+      "status": "active",
+      "provenance": {
+        "source": "T24-01 (authored); Python adapter over tree-sitter-python (ADR-0015)"
+      },
+      "language": "python",
+      "category": "unicode",
+      "source": "S = \"café☕\"\ndef café():\n    pass\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 37,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 14,
+          "local_name": "S",
+          "kind": "variable",
+          "anchor": "p:variable:S",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 15,
+          "span_end": 36,
           "local_name": "café",
           "kind": "function",
           "anchor": "p:function:café",

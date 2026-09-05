@@ -11,6 +11,7 @@
 //! unresolved references — is defined in [`crate::parse::output`] (T04-03).
 
 use crate::parse::adapter::javascript::JavaScriptParser;
+use crate::parse::adapter::python::PythonParser;
 use crate::parse::adapter::rust::RustParser;
 use crate::parse::adapter::typescript::TypeScriptParser;
 use crate::parse::fingerprint;
@@ -51,5 +52,6 @@ pub fn parser_for(language: LanguageId) -> Box<dyn LanguageParser> {
         LanguageId::TypeScript => Box::new(TypeScriptParser::new()),
         LanguageId::JavaScript => Box::new(JavaScriptParser::new()),
         LanguageId::Rust => Box::new(RustParser::new()),
+        LanguageId::Python => Box::new(PythonParser::new()),
     }
 }
