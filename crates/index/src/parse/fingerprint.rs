@@ -97,6 +97,13 @@ pub const fn descriptor(language: LanguageId) -> LanguageDescriptor {
             grammar_version: 1,
             query_version: 1,
         },
+        // ADR-0015 (T24-02): reconciled to the pinned `tree-sitter-bash 0.23`
+        // on the same terms.
+        LanguageId::Bash => LanguageDescriptor {
+            grammar_name: "tree-sitter-bash",
+            grammar_version: 1,
+            query_version: 1,
+        },
     }
 }
 
@@ -238,6 +245,15 @@ mod tests {
     }
 
     #[test]
+    fn bash_fingerprint_is_exact_golden() {
+        // ADR-0015 (T24-02): a new token in the existing `lang=` field, nothing else.
+        assert_eq!(
+            parser_fingerprint(LanguageId::Bash),
+            "chunk=1;grammar=tree-sitter-bash@1;lang=bash;norm=1;queries=1"
+        );
+    }
+
+    #[test]
     fn all_languages_have_distinct_fingerprints() {
         let fps: Vec<String> = LanguageId::ALL
             .iter()
@@ -347,6 +363,7 @@ mod tests {
             (LanguageId::JavaScript, "tree-sitter-javascript"),
             (LanguageId::Rust, "tree-sitter-rust"),
             (LanguageId::Python, "tree-sitter-python"),
+            (LanguageId::Bash, "tree-sitter-bash"),
         ];
         // Completeness: a language added without a row here would otherwise pass
         // silently (group 24 adds one language per card).

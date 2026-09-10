@@ -31,16 +31,19 @@ pub enum LanguageId {
     Rust,
     /// Python (`.py` `.pyi`) — ADR-0015, T24-01.
     Python,
+    /// Bash (`.sh` `.bash`) — ADR-0015, T24-02.
+    Bash,
 }
 
 impl LanguageId {
     /// Every language in the closed set, in a stable order (the v0 three first,
     /// then the ADR-0015 additions in card order).
-    pub const ALL: [LanguageId; 4] = [
+    pub const ALL: [LanguageId; 5] = [
         LanguageId::TypeScript,
         LanguageId::JavaScript,
         LanguageId::Rust,
         LanguageId::Python,
+        LanguageId::Bash,
     ];
 
     /// The canonical language id string (spec 02 §3.1; the `lang=` fingerprint
@@ -54,6 +57,7 @@ impl LanguageId {
             LanguageId::JavaScript => "javascript",
             LanguageId::Rust => "rust",
             LanguageId::Python => "python",
+            LanguageId::Bash => "bash",
         }
     }
 
@@ -69,6 +73,7 @@ impl LanguageId {
             "javascript" => Some(LanguageId::JavaScript),
             "rust" => Some(LanguageId::Rust),
             "python" => Some(LanguageId::Python),
+            "bash" => Some(LanguageId::Bash),
             _ => None,
         }
     }
@@ -90,6 +95,7 @@ pub fn select_language(path: &Path) -> Option<LanguageId> {
         "js" | "jsx" | "mjs" | "cjs" => Some(LanguageId::JavaScript),
         "rs" => Some(LanguageId::Rust),
         "py" | "pyi" => Some(LanguageId::Python),
+        "sh" | "bash" => Some(LanguageId::Bash),
         _ => None,
     }
 }
@@ -271,6 +277,9 @@ mod tests {
             // ADR-0015 (T24-01).
             ("a.py", LanguageId::Python),
             ("stubs/typed.pyi", LanguageId::Python),
+            // ADR-0015 (T24-02).
+            ("deploy.sh", LanguageId::Bash),
+            ("scripts/ci.bash", LanguageId::Bash),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -291,6 +300,10 @@ mod tests {
         assert_eq!(
             select_language(Path::new("app.PY")),
             Some(LanguageId::Python)
+        );
+        assert_eq!(
+            select_language(Path::new("Deploy.SH")),
+            Some(LanguageId::Bash)
         );
         assert_eq!(
             select_language(Path::new("x.JsX")),

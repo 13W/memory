@@ -9,6 +9,7 @@
 //! hooks), honoring ADR-0001 ("the choice lives in data/config, not the parser
 //! core").
 
+pub mod bash;
 pub mod javascript;
 pub mod python;
 pub mod rust;
@@ -57,6 +58,10 @@ pub trait LanguageSpec {
     /// (⇒ the engine uses an ordinal anchor).
     fn local_name(&self, decl: Node, src: &[u8]) -> Option<String>;
     /// The canonical signature descriptor of a declaration (hashed into `sig`).
+    ///
+    /// As built, every adapter returns [`SignatureDescriptor::fingerprint`] here
+    /// rather than the raw field list, and the engine hashes that again — `sig` is
+    /// the hash of an opaque, deterministic descriptor either way (spec 03 §1.2).
     fn signature_descriptor(
         &self,
         decl: Node,
@@ -369,12 +374,14 @@ fn finalize(raws: &[Raw]) -> Vec<ParsedUnitDraft> {
 
 /// Identifier-family node kinds whose text is a safe path segment.
 ///
-/// The v0 five plus the group-24 vocabulary (ADR-0015, widened once in T24-01):
-/// Go method names are `field_identifier` and package names `package_identifier`,
-/// Bash function names are `word`, TOML keys are `bare_key`, YAML keys are
-/// `flow_node`, Python import paths are `dotted_name`. Inert for the v0 three: their
-/// adapters only consult this on `name` fields that are `identifier`/
-/// `type_identifier`/`property_identifier`, which the goldens and fixtures pin.
+/// The v0 five plus the group-24 vocabulary (ADR-0015, widened in T24-01 and once
+/// more in T24-02): Go method names are `field_identifier` and package names
+/// `package_identifier`, Bash function names are `word` and Bash *declaration*
+/// names `variable_name` (measured in T24-02, which the T24-01 survey missed),
+/// TOML keys are `bare_key`, YAML keys are `flow_node`, Python import paths are
+/// `dotted_name`. Inert for the v0 three: their adapters only consult this on
+/// `name` fields that are `identifier`/`type_identifier`/`property_identifier`,
+/// which the goldens and fixtures pin.
 pub(crate) fn is_identifier_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -386,6 +393,7 @@ pub(crate) fn is_identifier_kind(kind: &str) -> bool {
             | "field_identifier"
             | "package_identifier"
             | "word"
+            | "variable_name"
             | "bare_key"
             | "flow_node"
             | "dotted_name"
@@ -498,8 +506,9 @@ mod tests {
 
     #[test]
     fn is_identifier_kind_admits_the_group_24_vocabulary() {
-        // The widening T24-01 did once for the whole group (ADR-0015); each later
-        // card's adapter relies on its own kind being here.
+        // The widening T24-01 did for the whole group (ADR-0015), plus
+        // `variable_name`, which T24-02 measured as the node kind of every Bash
+        // declaration name; each later card's adapter relies on its own kind here.
         for kind in [
             "identifier",
             "type_identifier",
@@ -509,6 +518,7 @@ mod tests {
             "field_identifier",
             "package_identifier",
             "word",
+            "variable_name",
             "bare_key",
             "flow_node",
             "dotted_name",

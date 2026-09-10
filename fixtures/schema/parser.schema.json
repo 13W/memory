@@ -41,7 +41,7 @@
               "note": { "type": "string" }
             }
           },
-          "language": { "type": "string", "enum": ["typescript", "javascript", "rust", "python"] },
+          "language": { "type": "string", "enum": ["typescript", "javascript", "rust", "python", "bash"] },
           "category": { "type": "string", "enum": ["syntax", "error", "empty", "unicode"] },
           "source": { "type": "string" },
           "expected_units": {

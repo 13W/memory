@@ -25,7 +25,8 @@
         "T04-03 authored TypeScript goldens (tree-sitter tsx adapter, ADR-0002)",
         "T04-04 authored JavaScript goldens (tree-sitter-javascript adapter, ADR-0002)",
         "T04-05 authored Rust goldens (tree-sitter-rust adapter, ADR-0002)",
-        "T24-01 authored Python goldens (tree-sitter-python adapter, ADR-0015)"
+        "T24-01 authored Python goldens (tree-sitter-python adapter, ADR-0015)",
+        "T24-02 authored Bash goldens (tree-sitter-bash adapter, ADR-0015)"
       ],
       "gaps": []
     },

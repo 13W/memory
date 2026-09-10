@@ -65,6 +65,12 @@ it. All of it is reproducible.
    `is_identifier_kind` (`crates/index/src/parse/adapter/mod.rs`), so without widening it those
    declarations degrade to ordinal anchors silently.
 
+   *Corrected by measurement in `T24-02`:* this survey missed Bash **declaration** names, which
+   are `variable_name` (`local x=1` is `declaration_command → variable_assignment → name:
+   variable_name`), not `word`. `T24-02` adds that token, so the widening happened in two steps
+   rather than the one `T24-01` planned. A later card should measure its own name nodes rather
+   than trust the list above.
+
 ## The shape every language card shares
 
 Stated once here; each card below names only what is specific to it.
@@ -150,6 +156,11 @@ Stated once here; each card below names only what is specific to it.
   **not** produce references.
 - **Acceptance:** a shell function is findable by name on a fixture store.
 - **Evidence:** the `T24-02` row.
+- **As built:** the declaration rows are **not** restricted by parent, unlike `python.scm`'s.
+  A `function_definition` has sixteen possible parents in `grammar.json`, so enumerating them
+  would be a transcription with no benefit — parents come from span containment in the engine,
+  not from the query. Matching at any depth is also what makes a definition recovered inside an
+  `ERROR` region keep its name, which for bash is **observed**, not insurance.
 
 ## T24-03 — Go adapter
 

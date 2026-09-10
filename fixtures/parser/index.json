@@ -1420,6 +1420,364 @@
         }
       ],
       "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.declarations",
+      "title": "Both function forms and the declaration commands each become a symbol unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "syntax",
+      "source": "greet() {\n  echo hi\n}\nfunction other {\n  :\n}\nexport API=1\nlocal Z\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 66,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 21,
+          "local_name": "greet",
+          "kind": "function",
+          "anchor": "p:function:greet",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 22,
+          "span_end": 44,
+          "local_name": "other",
+          "kind": "function",
+          "anchor": "p:function:other",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 45,
+          "span_end": 57,
+          "local_name": "API",
+          "kind": "variable",
+          "anchor": "p:variable:API",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 58,
+          "span_end": 65,
+          "local_name": "Z",
+          "kind": "variable",
+          "anchor": "p:variable:Z",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.nesting",
+      "title": "A declaration inside a function body nests under it (captured at any depth)",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "syntax",
+      "source": "outer() {\n  local x=1\n  inner() {\n    local y=2\n  }\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 54,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 53,
+          "local_name": "outer",
+          "kind": "function",
+          "anchor": "p:function:outer",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 12,
+          "span_end": 21,
+          "local_name": "x",
+          "kind": "variable",
+          "anchor": "p:function:outer/variable:x",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 24,
+          "span_end": 51,
+          "local_name": "inner",
+          "kind": "function",
+          "anchor": "p:function:outer/function:inner",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 38,
+          "span_end": 47,
+          "local_name": "y",
+          "kind": "variable",
+          "anchor": "p:function:outer/function:inner/variable:y",
+          "parent": 3
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.imports",
+      "title": "Only source/. produce references, and only from their first argument",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "syntax",
+      "source": "source lib.sh\n. ./other.sh\necho hi\nls -la\nsource extra.sh arg1\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 63,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": [
+        {
+          "source_unit": 0,
+          "reference_text": "lib.sh",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "./other.sh",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "extra.sh",
+          "reference_kind": "import"
+        }
+      ]
+    },
+    {
+      "id": "parser.sh.declaration-command",
+      "title": "One unit per declaration command; an operand-less or plain assignment is none",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "syntax",
+      "source": "declare a=1 b=2\ndeclare -p\nPLAIN=1\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 35,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 15,
+          "local_name": "a",
+          "kind": "variable",
+          "anchor": "p:variable:a",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.collision",
+      "title": "Two indistinguishable declarations of one name demote to ordinal anchors",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "syntax",
+      "source": "f() {\n  local x=1\n  local x=2\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 32,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 0,
+          "span_end": 31,
+          "local_name": "f",
+          "kind": "function",
+          "anchor": "p:function:f",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 8,
+          "span_end": 17,
+          "local_name": "x",
+          "kind": "variable",
+          "anchor": "o:0",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 20,
+          "span_end": 29,
+          "local_name": "x",
+          "kind": "variable",
+          "anchor": "o:1",
+          "parent": 1
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.empty",
+      "title": "An empty Bash file is a single empty file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "empty",
+      "source": "",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 0,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.whitespace",
+      "title": "A whitespace-only Bash file is a single file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "empty",
+      "source": "\n\n   \n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 6,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.error",
+      "title": "Malformed Bash yields a fallback chunk and still names the definition inside it",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "error",
+      "source": "f() {\n  echo unclosed\n\ng() { :; }\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 34,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "fallback_chunk",
+          "span_start": 1,
+          "span_end": 34,
+          "local_name": null,
+          "kind": "error",
+          "anchor": "o:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 23,
+          "span_end": 33,
+          "local_name": "g",
+          "kind": "function",
+          "anchor": "p:function:g",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.sh.unicode",
+      "title": "Bash byte spans are byte offsets across multi-byte characters",
+      "status": "active",
+      "provenance": {
+        "source": "T24-02 (authored); Bash adapter over tree-sitter-bash (ADR-0015)"
+      },
+      "language": "bash",
+      "category": "unicode",
+      "source": "S=\"café☕\"\ncafé() {\n  :\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 29,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 13,
+          "span_end": 28,
+          "local_name": "café",
+          "kind": "function",
+          "anchor": "p:function:café",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
     }
   ]
 }

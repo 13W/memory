@@ -20,14 +20,15 @@ fn language_ids_match_config_language_set() {
     let config_set: BTreeSet<String> = Config::default().index.languages.into_iter().collect();
 
     // ADR-0001's v0 three plus ADR-0015's additions, one per group-24 card.
-    let expected: BTreeSet<String> = ["typescript", "javascript", "rust", "python"]
+    let expected: BTreeSet<String> = ["typescript", "javascript", "rust", "python", "bash"]
         .into_iter()
         .map(String::from)
         .collect();
 
     assert_eq!(
         code_set, expected,
-        "LanguageId set diverged from ADR-0001 + ADR-0015 (typescript, javascript, rust, python)"
+        "LanguageId set diverged from ADR-0001 + ADR-0015 \
+         (typescript, javascript, rust, python, bash)"
     );
     assert_eq!(
         config_set, code_set,

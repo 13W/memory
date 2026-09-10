@@ -19,8 +19,8 @@ use serde::Deserialize;
 use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
-    JavaScriptParser, LanguageId, LanguageParser, PythonParser, RustParser, SourceDialect,
-    SyntaxAnchor, TypeScriptParser, parser_fingerprint, persist_parse_output,
+    BashParser, JavaScriptParser, LanguageId, LanguageParser, PythonParser, RustParser,
+    SourceDialect, SyntaxAnchor, TypeScriptParser, parser_fingerprint, persist_parse_output,
 };
 use local_rag_store::StateDb;
 use local_rag_store::code::{
@@ -107,6 +107,7 @@ fn parser_for(language: &str) -> Box<dyn LanguageParser> {
         "javascript" => Box::new(JavaScriptParser::new()),
         "rust" => Box::new(RustParser::new()),
         "python" => Box::new(PythonParser::new()),
+        "bash" => Box::new(BashParser::new()),
         other => panic!("no parser for fixture language {other:?}"),
     }
 }
@@ -168,8 +169,8 @@ fn parser_fixtures_match_expected_units_and_refs() {
         *per_language.entry(case.language.clone()).or_default() += 1;
     }
     // Every language must be exercised (TypeScript T04-03, JavaScript T04-04,
-    // Rust T04-05, Python T24-01).
-    for lang in ["typescript", "javascript", "rust", "python"] {
+    // Rust T04-05, Python T24-01, Bash T24-02).
+    for lang in ["typescript", "javascript", "rust", "python", "bash"] {
         assert!(
             per_language.get(lang).copied().unwrap_or(0) >= 4,
             "expected the authored {lang} cases"
@@ -208,10 +209,14 @@ fn fingerprints_are_reconciled_after_linking_the_grammars() {
         parser_fingerprint(LanguageId::Rust),
         "chunk=1;grammar=tree-sitter-rust@1;lang=rust;norm=1;queries=1"
     );
-    // ADR-0015 (T24-01): the same reconciliation for the first post-v0 grammar.
+    // ADR-0015 (T24-01/T24-02): the same reconciliation for the post-v0 grammars.
     assert_eq!(
         parser_fingerprint(LanguageId::Python),
         "chunk=1;grammar=tree-sitter-python@1;lang=python;norm=1;queries=1"
+    );
+    assert_eq!(
+        parser_fingerprint(LanguageId::Bash),
+        "chunk=1;grammar=tree-sitter-bash@1;lang=bash;norm=1;queries=1"
     );
 }
 

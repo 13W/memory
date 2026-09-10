@@ -51,6 +51,14 @@ tree-sitter-rust = "0.23"
 # tree, shared with `tree-sitter`), so it adds no new transitive crate. See the
 # dependency allowlist in CONTRIBUTING.md.
 tree-sitter-python = "0.23"
+# The second post-v0 language grammar (ADR-0015, T24-02). Pinned at 0.23 (ABI 14)
+# for the same reason as every grammar before it: an ABI-15 parser is refused by
+# `tree-sitter 0.24` (max supported language ABI 14) and would silently degrade to
+# a file-only parse; 0.23.3 is ABI 14 (verified against the pinned core). Its only
+# runtime dependency is `tree-sitter-language` (already in the tree, shared with
+# `tree-sitter`), so it adds no new transitive crate. See the dependency allowlist
+# in CONTRIBUTING.md.
+tree-sitter-bash = "0.23"
 streaming-iterator = "0.1"
 
 # Runtime primitives for the reconcile scheduler/driver (T05-04, spec 06 §1): the

@@ -27,6 +27,12 @@ Rust integration test `crates/index/tests/parse_fixtures.rs`.
 - **Python** — authored in **T24-01** (`tree-sitter-python` adapter, ADR-0015 —
   the first post-v0 language), covering the same categories plus a case pinning
   the decorated-definition decision (`parser.py.decorated`).
+- **Bash** — authored in **T24-02** (`tree-sitter-bash` adapter, ADR-0015),
+  covering the same categories plus the two decisions the card had to take: one
+  unit per declaration *command* at any depth (`parser.sh.declarations`,
+  `parser.sh.nesting`) and only the first argument of `source`/`.` as a reference
+  (`parser.sh.imports`). Upstream ships no `tags.scm` for bash, so the query set
+  behind these goldens is hand-authored.
 
 v1 had no golden tree-sitter chunking fixtures (the v1 parser `src/indexer/parser.ts`
 was exercised only through the 49-query benchmark), so these are authored, not
