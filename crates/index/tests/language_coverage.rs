@@ -62,7 +62,7 @@ fn parse_languages_array(text: &str) -> BTreeSet<String> {
 
 /// ADR-0001's v0 three plus ADR-0015's additions (one per group-24 card).
 fn expected_set() -> BTreeSet<String> {
-    ["typescript", "javascript", "rust", "python", "bash"]
+    ["typescript", "javascript", "rust", "python", "bash", "go"]
         .into_iter()
         .map(String::from)
         .collect()
@@ -123,10 +123,66 @@ fn non_corpus_languages_are_acknowledged_in_adr() {
     );
     for lang in non_corpus {
         assert!(
-            adr.to_lowercase().contains(&lang),
+            adr_names_language(&adr, &lang),
             "ADR-0001 must name the non-corpus language `{lang}`"
         );
     }
+}
+
+/// Whether `adr` names `lang` as a **word**, not as a fragment of a longer one
+/// (`D-134`).
+///
+/// The former predicate was `adr.to_lowercase().contains(lang)`, which goes
+/// vacuous for a short token: ADR-0001 contains `goldens`, `going` and
+/// `algorithm`, every one of which contains `go`, so the guard would have passed
+/// for Go while proving only that the ADR is written in English — and the same
+/// trap waits for any future `c`, `r`, `d` or `ml`. A character continues a token
+/// when it is ASCII alphanumeric or `_`; both neighbours of a hit must fail that
+/// test. Hand-written rather than a regex: this file is deliberately
+/// dependency-free.
+fn adr_names_language(adr: &str, lang: &str) -> bool {
+    let haystack = adr.to_lowercase();
+    let needle = lang.to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let is_token_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    haystack.match_indices(&needle).any(|(start, hit)| {
+        let end = start + hit.len();
+        let before_ok = start == 0 || !is_token_byte(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_token_byte(bytes[end]);
+        before_ok && after_ok
+    })
+}
+
+/// `D-134`: the corrected acknowledgment predicate must be demonstrable as a
+/// guard — a test that cannot be shown to fail is not one.
+#[test]
+fn adr_acknowledgment_predicate_rejects_a_fragment_match() {
+    // The exact text the old `contains` predicate accepted: three words that
+    // contain `go`, and no standalone `go` anywhere.
+    let without = "The set is TypeScript, JavaScript and Rust. \
+                   A new adapter + query set + goldens; the algorithm is going to stay.";
+    assert!(
+        without.to_lowercase().contains("go"),
+        "the former substring predicate accepted this text — that is what D-134 is"
+    );
+    assert!(
+        !adr_names_language(without, "go"),
+        "a fragment of `goldens`/`going`/`algorithm` must not count as naming Go"
+    );
+    // The same text once the ADR actually names the language, in the amendment's
+    // own bold form — `*` is not a token character, so the word boundary holds.
+    let with = format!("{without} ADR-0015 adds **python**, **go** and **bash**.");
+    assert!(adr_names_language(&with, "go"));
+
+    // Longer names are unaffected, and a fragment of one still does not count.
+    assert!(adr_names_language("… rust …", "rust"));
+    assert!(!adr_names_language("rustacean", "rust"));
+    assert!(!adr_names_language("go_lang", "go"));
+    assert!(adr_names_language("`go`, `bash`", "bash"));
+    assert!(!adr_names_language("", "go"));
 }
 
 #[test]
@@ -138,9 +194,11 @@ fn coverage_string_helpers_are_correct() {
     );
     assert_eq!(json_string_value(manifest, "missing"), None);
 
-    let toml = "  languages = [\"typescript\", \"javascript\", \"rust\", \"python\", \"bash\"]\n";
+    let toml =
+        "  languages = [\"typescript\", \"javascript\", \"rust\", \"python\", \"bash\", \"go\"]\n";
     assert_eq!(parse_languages_array(toml), expected_set());
     // Reordering does not change the parsed set.
-    let reordered = "languages = [\"rust\",\"bash\",\"python\",\"typescript\" , \"javascript\"]";
+    let reordered =
+        "languages = [\"rust\",\"go\",\"bash\",\"python\",\"typescript\" , \"javascript\"]";
     assert_eq!(parse_languages_array(reordered), expected_set());
 }

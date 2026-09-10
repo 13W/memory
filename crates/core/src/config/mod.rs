@@ -211,7 +211,7 @@ impl Default for ModelsConfig {
 ///
 /// `languages` is the first-release language set fixed by ADR-0001 (O4) —
 /// TypeScript, JavaScript, Rust — extended post-v0 by ADR-0015 (Python in T24-01,
-/// Bash in T24-02).
+/// Bash in T24-02, Go in T24-03).
 /// Declarative: documentation under test (`crates/index/tests/language_coverage.rs`,
 /// `parse_identity.rs`), not a runtime filter — the selector is the extension table
 /// in `parse::select_language`.
@@ -233,6 +233,7 @@ impl Default for IndexConfig {
                 "rust".to_string(),
                 "python".to_string(),
                 "bash".to_string(),
+                "go".to_string(),
             ],
             max_file_size_kb: 1024,
         }
@@ -648,7 +649,7 @@ default_model_space = \"default\"
 data_policy = \"local_only\"
 
 [index]
-languages = [\"typescript\", \"javascript\", \"rust\", \"python\", \"bash\"]
+languages = [\"typescript\", \"javascript\", \"rust\", \"python\", \"bash\", \"go\"]
 max_file_size_kb = 1024
 
 [spool]

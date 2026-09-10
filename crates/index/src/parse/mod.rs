@@ -16,8 +16,8 @@
 //!   parents, unresolved references), T04-03.
 //! - [`signature`] — the `signature_fingerprint` descriptor/derivation (ADR-0002).
 //! - [`adapter`] — the shared tree-sitter engine and the per-language adapters
-//!   (TypeScript in T04-03; JS/Rust in T04-04/05; Python/Bash in T24-01/02,
-//!   ADR-0015).
+//!   (TypeScript in T04-03; JS/Rust in T04-04/05; Python/Bash/Go in
+//!   T24-01/02/03, ADR-0015).
 //!
 //! # Scope
 //!
@@ -37,6 +37,7 @@ pub mod signature;
 pub mod universal;
 
 pub use adapter::bash::BashParser;
+pub use adapter::go::GoParser;
 pub use adapter::javascript::JavaScriptParser;
 pub use adapter::python::PythonParser;
 pub use adapter::rust::RustParser;

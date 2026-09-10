@@ -184,6 +184,16 @@ Stated once here; each card below names only what is specific to it.
 - **Acceptance:** fixtures and goldens green; no live figure claimed. `D-134` resolved, with the
   corrected assertion demonstrated to fail on an ADR-0001 that omits a language name.
 - **Evidence:** the `T24-03` row, stating explicitly that live evidence is absent and why.
+- **As built:** the **spec** is the unit, not the declaration (owner decision) — a grouped
+  `type (…)`/`const (…)`/`var (…)` block yields one named unit per spec, at the cost of the
+  keyword falling outside the span. A spec that declares several names is one unit named by the
+  first, the rule `T24-02` settled for Bash; the grammar labels a multi-name spec's separating
+  comma `name:` too, so name fields are filtered by node kind. A method is `lang_kind = "method"`
+  with a flat route — Go methods are top-level nodes — and the receiver is a descriptor field, so
+  `func (a A) Do()` and `func (b B) Do()` both keep `method:Do` and are separated by `sig`.
+  `body_member_count` does not see a `type_spec`'s members (they live under
+  `type: (struct_type (field_declaration_list …))`), so the adapter has its own `member_count`;
+  without it a struct's `sig` would not move when the struct gained a field.
 
 ## T24-04 — TOML adapter
 

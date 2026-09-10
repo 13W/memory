@@ -33,17 +33,20 @@ pub enum LanguageId {
     Python,
     /// Bash (`.sh` `.bash`) — ADR-0015, T24-02.
     Bash,
+    /// Go (`.go`) — ADR-0015, T24-03.
+    Go,
 }
 
 impl LanguageId {
     /// Every language in the closed set, in a stable order (the v0 three first,
     /// then the ADR-0015 additions in card order).
-    pub const ALL: [LanguageId; 5] = [
+    pub const ALL: [LanguageId; 6] = [
         LanguageId::TypeScript,
         LanguageId::JavaScript,
         LanguageId::Rust,
         LanguageId::Python,
         LanguageId::Bash,
+        LanguageId::Go,
     ];
 
     /// The canonical language id string (spec 02 §3.1; the `lang=` fingerprint
@@ -58,6 +61,7 @@ impl LanguageId {
             LanguageId::Rust => "rust",
             LanguageId::Python => "python",
             LanguageId::Bash => "bash",
+            LanguageId::Go => "go",
         }
     }
 
@@ -74,6 +78,7 @@ impl LanguageId {
             "rust" => Some(LanguageId::Rust),
             "python" => Some(LanguageId::Python),
             "bash" => Some(LanguageId::Bash),
+            "go" => Some(LanguageId::Go),
             _ => None,
         }
     }
@@ -96,6 +101,7 @@ pub fn select_language(path: &Path) -> Option<LanguageId> {
         "rs" => Some(LanguageId::Rust),
         "py" | "pyi" => Some(LanguageId::Python),
         "sh" | "bash" => Some(LanguageId::Bash),
+        "go" => Some(LanguageId::Go),
         _ => None,
     }
 }
@@ -280,6 +286,9 @@ mod tests {
             // ADR-0015 (T24-02).
             ("deploy.sh", LanguageId::Bash),
             ("scripts/ci.bash", LanguageId::Bash),
+            // ADR-0015 (T24-03).
+            ("main.go", LanguageId::Go),
+            ("internal/server/handler.go", LanguageId::Go),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -305,6 +314,7 @@ mod tests {
             select_language(Path::new("Deploy.SH")),
             Some(LanguageId::Bash)
         );
+        assert_eq!(select_language(Path::new("Main.GO")), Some(LanguageId::Go));
         assert_eq!(
             select_language(Path::new("x.JsX")),
             Some(LanguageId::JavaScript)

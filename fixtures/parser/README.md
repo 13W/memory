@@ -33,6 +33,14 @@ Rust integration test `crates/index/tests/parse_fixtures.rs`.
   `parser.sh.nesting`) and only the first argument of `source`/`.` as a reference
   (`parser.sh.imports`). Upstream ships no `tags.scm` for bash, so the query set
   behind these goldens is hand-authored.
+- **Go** — authored in **T24-03** (`tree-sitter-go` adapter, ADR-0015), covering
+  the same categories plus the decisions the card had to take: one unit per
+  *spec*, so a grouped `type (…)` block yields one unit per type
+  (`parser.go.grouping`), a spec declaring several names is one unit named by the
+  first (`parser.go.multiname`), and identically named methods on different
+  receivers both keep the named route (`parser.go.methods`). These cases are
+  validated by fixtures alone — no enrolled worktree contains a `.go` file, so
+  there is no live acceptance behind them.
 
 v1 had no golden tree-sitter chunking fixtures (the v1 parser `src/indexer/parser.ts`
 was exercised only through the 49-query benchmark), so these are authored, not

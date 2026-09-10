@@ -11,6 +11,7 @@
 //! unresolved references — is defined in [`crate::parse::output`] (T04-03).
 
 use crate::parse::adapter::bash::BashParser;
+use crate::parse::adapter::go::GoParser;
 use crate::parse::adapter::javascript::JavaScriptParser;
 use crate::parse::adapter::python::PythonParser;
 use crate::parse::adapter::rust::RustParser;
@@ -55,5 +56,6 @@ pub fn parser_for(language: LanguageId) -> Box<dyn LanguageParser> {
         LanguageId::Rust => Box::new(RustParser::new()),
         LanguageId::Python => Box::new(PythonParser::new()),
         LanguageId::Bash => Box::new(BashParser::new()),
+        LanguageId::Go => Box::new(GoParser::new()),
     }
 }

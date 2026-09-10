@@ -104,6 +104,13 @@ pub const fn descriptor(language: LanguageId) -> LanguageDescriptor {
             grammar_version: 1,
             query_version: 1,
         },
+        // ADR-0015 (T24-03): reconciled to the pinned `tree-sitter-go 0.23`
+        // on the same terms.
+        LanguageId::Go => LanguageDescriptor {
+            grammar_name: "tree-sitter-go",
+            grammar_version: 1,
+            query_version: 1,
+        },
     }
 }
 
@@ -254,6 +261,15 @@ mod tests {
     }
 
     #[test]
+    fn go_fingerprint_is_exact_golden() {
+        // ADR-0015 (T24-03): a new token in the existing `lang=` field, nothing else.
+        assert_eq!(
+            parser_fingerprint(LanguageId::Go),
+            "chunk=1;grammar=tree-sitter-go@1;lang=go;norm=1;queries=1"
+        );
+    }
+
+    #[test]
     fn all_languages_have_distinct_fingerprints() {
         let fps: Vec<String> = LanguageId::ALL
             .iter()
@@ -364,6 +380,7 @@ mod tests {
             (LanguageId::Rust, "tree-sitter-rust"),
             (LanguageId::Python, "tree-sitter-python"),
             (LanguageId::Bash, "tree-sitter-bash"),
+            (LanguageId::Go, "tree-sitter-go"),
         ];
         // Completeness: a language added without a row here would otherwise pass
         // silently (group 24 adds one language per card).

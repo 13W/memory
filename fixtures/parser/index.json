@@ -1778,6 +1778,455 @@
         }
       ],
       "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.declarations",
+      "title": "Each Go declaration kind becomes a named symbol unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "syntax",
+      "source": "package main\n\nfunc Run(a int) error {\n\treturn nil\n}\n\nfunc (s *Server) Start() {\n}\n\ntype Foo struct {\n\tA int\n}\n\nconst K = 1\n\nvar V string\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 137,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 14,
+          "span_end": 51,
+          "local_name": "Run",
+          "kind": "function",
+          "anchor": "p:function:Run",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 53,
+          "span_end": 81,
+          "local_name": "Start",
+          "kind": "method",
+          "anchor": "p:method:Start",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 88,
+          "span_end": 109,
+          "local_name": "Foo",
+          "kind": "type",
+          "anchor": "p:type:Foo",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 117,
+          "span_end": 122,
+          "local_name": "K",
+          "kind": "const",
+          "anchor": "p:const:K",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 128,
+          "span_end": 136,
+          "local_name": "V",
+          "kind": "variable",
+          "anchor": "p:variable:V",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.grouping",
+      "title": "A grouped type/const/var block yields one named unit per spec",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "syntax",
+      "source": "package main\n\ntype (\n\tServer struct{ A int }\n\tClient interface{ Do() }\n)\n\nconst (\n\tA = iota\n\tB\n)\n\nvar (\n\tX int\n\tY string\n)\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 123,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 22,
+          "span_end": 44,
+          "local_name": "Server",
+          "kind": "type",
+          "anchor": "p:type:Server",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 46,
+          "span_end": 70,
+          "local_name": "Client",
+          "kind": "type",
+          "anchor": "p:type:Client",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 83,
+          "span_end": 91,
+          "local_name": "A",
+          "kind": "const",
+          "anchor": "p:const:A",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 93,
+          "span_end": 94,
+          "local_name": "B",
+          "kind": "const",
+          "anchor": "p:const:B",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 105,
+          "span_end": 110,
+          "local_name": "X",
+          "kind": "variable",
+          "anchor": "p:variable:X",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 112,
+          "span_end": 120,
+          "local_name": "Y",
+          "kind": "variable",
+          "anchor": "p:variable:Y",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.multiname",
+      "title": "A spec declaring several names is one unit named by the first",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "syntax",
+      "source": "package main\n\nconst C, D = 3, 4\n\nvar a, b int\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 46,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 20,
+          "span_end": 31,
+          "local_name": "C",
+          "kind": "const",
+          "anchor": "p:const:C",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 37,
+          "span_end": 45,
+          "local_name": "a",
+          "kind": "variable",
+          "anchor": "p:variable:a",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.nesting",
+      "title": "A type or var declared in a function body routes under it",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "syntax",
+      "source": "package main\n\nfunc Outer() {\n\ttype Local struct{}\n\tvar z int\n\t_ = z\n}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 70,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 14,
+          "span_end": 69,
+          "local_name": "Outer",
+          "kind": "function",
+          "anchor": "p:function:Outer",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 35,
+          "span_end": 49,
+          "local_name": "Local",
+          "kind": "type",
+          "anchor": "p:function:Outer/type:Local",
+          "parent": 1
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 55,
+          "span_end": 60,
+          "local_name": "z",
+          "kind": "variable",
+          "anchor": "p:function:Outer/variable:z",
+          "parent": 1
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.imports",
+      "title": "Every import spec is one reference to its path, never to its alias",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "syntax",
+      "source": "package main\n\nimport \"fmt\"\n\nimport (\n\t\"os\"\n\tf \"path/filepath\"\n\t_ \"embed\"\n)\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 75,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": [
+        {
+          "source_unit": 0,
+          "reference_text": "fmt",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "os",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "path/filepath",
+          "reference_kind": "import"
+        },
+        {
+          "source_unit": 0,
+          "reference_text": "embed",
+          "reference_kind": "import"
+        }
+      ]
+    },
+    {
+      "id": "parser.go.methods",
+      "title": "Identically named methods on different receivers both keep the named route",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "syntax",
+      "source": "package main\n\nfunc (a A) Do() {}\n\nfunc (b B) Do() {}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 53,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 14,
+          "span_end": 32,
+          "local_name": "Do",
+          "kind": "method",
+          "anchor": "p:method:Do",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 34,
+          "span_end": 52,
+          "local_name": "Do",
+          "kind": "method",
+          "anchor": "p:method:Do",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.empty",
+      "title": "An empty Go file is a single empty file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "empty",
+      "source": "",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 0,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.whitespace",
+      "title": "A whitespace-only Go file is a single file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "empty",
+      "source": "\n\n   \n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 6,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.error",
+      "title": "Malformed Go yields a fallback chunk and the following declaration is still named",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "error",
+      "source": "package main\n\ntype = = =\n\nfunc Ok() {}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 39,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "fallback_chunk",
+          "span_start": 14,
+          "span_end": 24,
+          "local_name": null,
+          "kind": "error",
+          "anchor": "o:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 26,
+          "span_end": 38,
+          "local_name": "Ok",
+          "kind": "function",
+          "anchor": "p:function:Ok",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.go.unicode",
+      "title": "Go byte spans are byte offsets across multi-byte characters",
+      "status": "active",
+      "provenance": {
+        "source": "T24-03 (authored); Go adapter over tree-sitter-go (ADR-0015)"
+      },
+      "language": "go",
+      "category": "unicode",
+      "source": "package main\n\nvar S = \"café☕\"\n\nfunc café() {}\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 50,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 18,
+          "span_end": 32,
+          "local_name": "S",
+          "kind": "variable",
+          "anchor": "p:variable:S",
+          "parent": null
+        },
+        {
+          "unit_kind": "symbol",
+          "span_start": 34,
+          "span_end": 49,
+          "local_name": "café",
+          "kind": "function",
+          "anchor": "p:function:café",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
     }
   ]
 }
