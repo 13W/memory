@@ -536,7 +536,7 @@ As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
   "precise selector is T04-02": extension-only, case-insensitive
   (`.ts/.tsx/.mts/.cts`→typescript, `.js/.jsx/.mjs/.cjs`→javascript, `.rs`→rust; post-v0,
   ADR-0015: `.py/.pyi`→python as of T24-01, `.sh/.bash`→bash as of T24-02, `.go`→go as of T24-03
-  `.toml`→toml as of T24-04 and `.yaml`/`.yml`→yaml as of T24-05 — the last two of which also
+  `.toml`→toml as of T24-04, and `.yaml`/`.yml`→yaml as of T24-05 — the last two of which also
   **left** `CONFIG_EXTENSIONS`, so an extension is claimed by exactly one selector).
 - Version realization: `chunk=CHUNK_POLICY_VERSION`, `norm=BOUNDARY_NORM_VERSION`,
   `grammar=<grammar_name>@<grammar_version>`, `queries=<query_version>`; all `1` in v0.
@@ -559,10 +559,14 @@ As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
   `.c`/`.cpp` consequence are unchanged.
 - Post-v0 extension `[SPEC]` (T24-00, [ADR-0015](../adr/0015-post-v0-language-expansion.md)):
   the `lang=` domain grows beyond the v0 three with `python`, `go`, `bash`, `yaml` and `toml`.
-  Each is pinned at its `0.23.x`/ABI-14 line for the reason recorded above — `tree-sitter 0.24`
+  Each is pinned at an **ABI-14** line for the reason recorded above — `tree-sitter 0.24`
   supports language ABI 14 at most, and an ABI-15 grammar is not refused loudly but degrades to a
   file-only parse — and each reconciles to `grammar=@1`/`queries=1` on the same terms as the v0
-  three. The format is untouched: a new language is a new **token in an existing field**, not a
+  three. As built (`G24`) that line is `0.23.x` for `tree-sitter-python`/`-bash`/`-go` and `0.7.x`
+  for `tree-sitter-toml-ng`/`-yaml`, whose own numbering never reached 0.23; the ABI is what the
+  pin is chosen for, not the crate version. The TOML grammar is the maintained `-ng` fork, and
+  `grammar_name` records the crate that is actually linked
+  (`grammar=tree-sitter-toml-ng@1`). The format is untouched: a new language is a new **token in an existing field**, not a
   new field, which is why this is additive with no identity or schema change. Two consequences
   follow mechanically and are stated so they are not rediscovered: a file whose extension moves
   from the universal path to a grammar gets a **different `parser_fingerprint`**, so it misses the
@@ -650,6 +654,23 @@ offset-free). The parse output is a pure, DB-free function `bytes -> {units, unr
 `unit_id`/`blob_id` are minted at persistence, T04-06). Units are emitted in a canonical order
 (`span.start` asc, `span.end` desc, `unit_kind`, `lang_kind`, `local_name`, `sig`). The graph
 half of O7 (`resolved_graph_edge.edge_kind`, `find_usages`/`get_dependencies`) remains `[OPEN]`.
+
+As-built ancestry `[SPEC]` (`G24`; `T24-04` and `D-135` in group 24): "enclosing declaration
+ancestors" is derived from **span containment**, not from the parse tree's own parent links —
+`finalize` (`crates/index/src/parse/adapter/mod.rs`) picks the nearest enclosing candidate. Two
+executable details that had no home in this section until the group needed them. First, which unit
+kinds may be an ancestor is **declared by the adapter**, through the defaulted
+`LanguageSpec::parent_unit_kinds`: the default is `Symbol` alone, and the TOML and YAML adapters
+return `ConfigSection` so a section may parent a section (`table:dependencies/key:serde`). The file
+unit and fallback chunks are never ancestors. Second, a candidate whose span is byte-for-byte
+**equal** to the unit's is an ancestor too, but only as a fallback when nothing strictly larger
+encloses it, and only backwards in canonical order — `D-135`, without which a YAML document whose
+single top-level key spans the whole document dropped out of its own keys' routes. Backwards-only
+keeps the parent index strictly smaller, so a cycle is impossible, and the fallback is additive: a
+unit that already had an ancestor keeps the one it had. A consequence worth stating rather than
+rediscovering: two units may serialize to the same `anchor` when their shared ancestor was itself
+demoted to an ordinal; they stay distinct rows because `parsed_unit`'s natural key carries the
+spans and the locator's own `blob` differs whenever the text does.
 
 As-built parse-output **persistence** `[SPEC]` (realized by T04-06 in
 `crates/index/src/parse/persist.rs::persist_parse_output`, over new `create_or_reuse_parsed_unit`

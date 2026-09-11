@@ -127,8 +127,9 @@ parsed as the provisional defaults shown here — T02-05 does not close those op
 
 As-built note (T24-00, `[SPEC]`): that set is **extended post-v0** by
 [ADR-0015](../adr/0015-post-v0-language-expansion.md), which adds `python`, `go`, `bash`,
-`yaml` and `toml`. The array above is the v0 set and grows **one language per card** in group
-24, in the same commit that adds the `LanguageId` variant and its adapter — the array,
+`yaml` and `toml`. The array above grew **one language per card** in group 24, each in the same
+commit that added the `LanguageId` variant and its adapter, and as of `T24-05` it holds all eight:
+the v0 three plus ADR-0015's five. The array,
 `Config::default().index.languages` and `LanguageId::ALL` are asserted identical by
 `crates/index/tests/language_coverage.rs` and `parse_identity.rs`, so they can never drift
 apart even transiently. `index.languages` remains **declarative**: it is documentation under
