@@ -35,18 +35,21 @@ pub enum LanguageId {
     Bash,
     /// Go (`.go`) — ADR-0015, T24-03.
     Go,
+    /// TOML (`.toml`) — ADR-0015, T24-04. Sections, not symbols.
+    Toml,
 }
 
 impl LanguageId {
     /// Every language in the closed set, in a stable order (the v0 three first,
     /// then the ADR-0015 additions in card order).
-    pub const ALL: [LanguageId; 6] = [
+    pub const ALL: [LanguageId; 7] = [
         LanguageId::TypeScript,
         LanguageId::JavaScript,
         LanguageId::Rust,
         LanguageId::Python,
         LanguageId::Bash,
         LanguageId::Go,
+        LanguageId::Toml,
     ];
 
     /// The canonical language id string (spec 02 §3.1; the `lang=` fingerprint
@@ -62,6 +65,7 @@ impl LanguageId {
             LanguageId::Python => "python",
             LanguageId::Bash => "bash",
             LanguageId::Go => "go",
+            LanguageId::Toml => "toml",
         }
     }
 
@@ -79,6 +83,7 @@ impl LanguageId {
             "python" => Some(LanguageId::Python),
             "bash" => Some(LanguageId::Bash),
             "go" => Some(LanguageId::Go),
+            "toml" => Some(LanguageId::Toml),
             _ => None,
         }
     }
@@ -102,6 +107,7 @@ pub fn select_language(path: &Path) -> Option<LanguageId> {
         "py" | "pyi" => Some(LanguageId::Python),
         "sh" | "bash" => Some(LanguageId::Bash),
         "go" => Some(LanguageId::Go),
+        "toml" => Some(LanguageId::Toml),
         _ => None,
     }
 }
@@ -201,7 +207,6 @@ const CONFIG_EXTENSIONS: &[&str] = &[
     "json",
     "jsonc",
     "json5",
-    "toml",
     "ini",
     "cfg",
     "conf",
@@ -289,6 +294,9 @@ mod tests {
             // ADR-0015 (T24-03).
             ("main.go", LanguageId::Go),
             ("internal/server/handler.go", LanguageId::Go),
+            // ADR-0015 (T24-04): `toml` left `CONFIG_EXTENSIONS` in the same commit.
+            ("Cargo.toml", LanguageId::Toml),
+            ("crates/index/Cargo.toml", LanguageId::Toml),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -316,6 +324,10 @@ mod tests {
         );
         assert_eq!(select_language(Path::new("Main.GO")), Some(LanguageId::Go));
         assert_eq!(
+            select_language(Path::new("Cargo.TOML")),
+            Some(LanguageId::Toml)
+        );
+        assert_eq!(
             select_language(Path::new("x.JsX")),
             Some(LanguageId::JavaScript)
         );
@@ -340,5 +352,70 @@ mod tests {
                 "expected no language for {path}"
             );
         }
+    }
+
+    /// ADR-0015 Decision 1: an extension belongs to **exactly one** selector.
+    ///
+    /// `select_dialect` consults `select_language` before `universal_kind`, so an
+    /// extension listed in both would be silently shadowed — the language would win
+    /// and the universal table would be a lie. Group 24 moves one extension per
+    /// card (`toml` in T24-04, `yaml`/`yml` in T24-05), and this is the standing
+    /// guard over every row of both tables, not just the row a card touches.
+    #[test]
+    fn no_extension_is_claimed_by_both_selectors() {
+        for ext in CONFIG_EXTENSIONS.iter().chain(TEXT_EXTENSIONS) {
+            let path = format!("sample.{ext}");
+            assert_eq!(
+                select_language(Path::new(&path)),
+                None,
+                "`{ext}` is in a universal table AND in select_language"
+            );
+            // …and the universal side still claims it, so the row is not orphaned.
+            assert_ne!(
+                universal_kind(Path::new(&path)),
+                UniversalKind::Fallback,
+                "`{ext}` is listed but classifies as Fallback"
+            );
+        }
+        // The converse direction, stated on the extensions the languages own: each
+        // resolves to a language dialect, never to a universal one.
+        for path in [
+            "a.ts", "a.tsx", "a.mts", "a.cts", "a.js", "a.jsx", "a.mjs", "a.cjs", "a.rs", "a.py",
+            "a.pyi", "a.sh", "a.bash", "a.go", "a.toml",
+        ] {
+            assert!(
+                matches!(select_dialect(Path::new(path)), SourceDialect::Language(_)),
+                "{path} must select a language dialect"
+            );
+        }
+    }
+
+    /// `toml` left `CONFIG_EXTENSIONS` in T24-04 (ADR-0015 Decision 1), while the
+    /// formats that stay on the universal path are untouched.
+    #[test]
+    fn toml_left_the_universal_config_table() {
+        assert!(!CONFIG_EXTENSIONS.contains(&"toml"));
+        assert_eq!(
+            select_dialect(Path::new("Cargo.toml")),
+            SourceDialect::Language(LanguageId::Toml)
+        );
+        for ext in [
+            "json",
+            "jsonc",
+            "json5",
+            "ini",
+            "cfg",
+            "conf",
+            "properties",
+            "env",
+        ] {
+            assert!(
+                CONFIG_EXTENSIONS.contains(&ext),
+                "`{ext}` must stay on the universal Config path"
+            );
+        }
+        // YAML is next (T24-05) and has not moved yet.
+        assert!(CONFIG_EXTENSIONS.contains(&"yaml"));
+        assert!(CONFIG_EXTENSIONS.contains(&"yml"));
     }
 }

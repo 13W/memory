@@ -953,6 +953,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn indexing_a_toml_file_makes_its_table_searchable_by_name() {
+        // T24-04 acceptance (ADR-0015): `search_code` finds a TOML table by name on a
+        // fixture store. Before this card `.toml` went through the universal line
+        // scanner, which never treats `[dependencies]` as a section start — the file
+        // was sectioned by its first keys instead. The hit is a `config_section`,
+        // not a `symbol` (ADR-0015 Decision 3).
+        let home = TempHome::new().expect("temp home");
+        let layout = StoreLayout::new(home.join("local-rag"));
+        layout.ensure().expect("ensure store tree");
+        let root = home.join("repo");
+        std::fs::create_dir_all(&root).expect("repo dir");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .expect("seed file");
+
+        let ctx = open_ctx(&layout);
+        let now_ms = 1_000;
+        register_code_raw(&ctx, now_ms).await;
+
+        let repo_id = ctx.uuids.next_uuid();
+        let worktree_id = ctx.uuids.next_uuid();
+        let facts = facts_for(&root);
+        register_new_worktree(&ctx.state, repo_id, worktree_id, &facts, now_ms)
+            .await
+            .expect("register worktree");
+
+        let meta = load_worktree_meta(
+            &ctx.state,
+            &worktree_id.to_string(),
+            CaseSensitivity::Sensitive,
+        )
+        .expect("load meta")
+        .expect("worktree exists");
+        let mut stat_cache = StatCache::new();
+        let scanner = Scanner::new();
+        let locks = Arc::new(WorktreeLockRegistry::new());
+        let outcome = write_locked(
+            &locks,
+            &worktree_id.to_string(),
+            index_worktree(
+                &ctx,
+                &meta,
+                &mut stat_cache,
+                &ctx.classifier,
+                &scanner,
+                now_ms,
+            ),
+        )
+        .await
+        .expect("index");
+        assert_eq!(outcome.reconcile.expect_built().files_indexed, 1);
+
+        let query_embedder: Arc<dyn QueryEmbedder> =
+            Arc::new(crate::daemon::EmbedderQueryAdapter::new(Arc::new(
+                HashingEmbedder::new(RepresentationKind::CodeRaw),
+            )));
+        let engine = crate::daemon::search::build_search_engine(
+            ctx.state.clone(),
+            ctx.cache.clone(),
+            ctx.layout.clone(),
+            ctx.uuids.clone(),
+            query_embedder,
+            8,
+            locks,
+        );
+        let response = engine
+            .search_code(
+                SearchRequest {
+                    query_degraded: None,
+                    root: RequestRoot {
+                        worktree_root: Some(facts),
+                        repo_hint: None,
+                    },
+                    query: "dependencies".to_string(),
+                    mode: SearchMode::Hybrid,
+                    limit: 5,
+                    name_pattern: None,
+                },
+                now_ms,
+            )
+            .await
+            .expect("no infra error")
+            .expect("no domain error");
+        assert!(
+            response.results.iter().any(|r| {
+                r.path.ends_with("Cargo.toml")
+                    && r.unit_kind == "config_section"
+                    && r.name == "dependencies"
+                    && r.language == "toml"
+            }),
+            "expected a named toml config_section hit: {:?}",
+            response.results
+        );
+    }
+
     /// T20-08: `register_new_managed_worktree` is `register_new_worktree`
     /// plus enrollment, atomically — both the worktree/repo rows and the
     /// `managed_worktree` row must exist after one call, in one transaction.

@@ -27,7 +27,8 @@
         "T04-05 authored Rust goldens (tree-sitter-rust adapter, ADR-0002)",
         "T24-01 authored Python goldens (tree-sitter-python adapter, ADR-0015)",
         "T24-02 authored Bash goldens (tree-sitter-bash adapter, ADR-0015)",
-        "T24-03 authored Go goldens (tree-sitter-go adapter, ADR-0015)"
+        "T24-03 authored Go goldens (tree-sitter-go adapter, ADR-0015)",
+        "T24-04 authored TOML goldens (tree-sitter-toml-ng adapter, ADR-0015; config_section units)"
       ],
       "gaps": []
     },

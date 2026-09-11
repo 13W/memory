@@ -16,8 +16,8 @@
 //!   parents, unresolved references), T04-03.
 //! - [`signature`] — the `signature_fingerprint` descriptor/derivation (ADR-0002).
 //! - [`adapter`] — the shared tree-sitter engine and the per-language adapters
-//!   (TypeScript in T04-03; JS/Rust in T04-04/05; Python/Bash/Go in
-//!   T24-01/02/03, ADR-0015).
+//!   (TypeScript in T04-03; JS/Rust in T04-04/05; Python/Bash/Go/TOML in
+//!   T24-01…04, ADR-0015 — TOML's units are `config_section`, not `symbol`).
 //!
 //! # Scope
 //!
@@ -41,6 +41,7 @@ pub use adapter::go::GoParser;
 pub use adapter::javascript::JavaScriptParser;
 pub use adapter::python::PythonParser;
 pub use adapter::rust::RustParser;
+pub use adapter::toml::TomlParser;
 pub use adapter::typescript::TypeScriptParser;
 pub use fingerprint::{
     BOUNDARY_NORM_VERSION, CHUNK_POLICY_VERSION, FingerprintComponents, LanguageDescriptor,

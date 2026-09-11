@@ -14,6 +14,7 @@ pub mod go;
 pub mod javascript;
 pub mod python;
 pub mod rust;
+pub mod toml;
 pub mod typescript;
 
 use std::collections::{HashMap, HashSet};
@@ -84,6 +85,18 @@ pub trait LanguageSpec {
     /// The language-level kind label used for a fallback (error) unit.
     fn fallback_lang_kind(&self) -> &'static str {
         "error"
+    }
+    /// The unit kinds this language admits as a **parent** (ADR-0015 Decision 3).
+    ///
+    /// The engine assigns parents by span containment, but only among candidates of
+    /// these kinds — never the file unit and never a fallback chunk. The v0 three
+    /// and the group-24 code languages emit only `Symbol`, so the default is the
+    /// rule they have always had; a config language that emits `ConfigSection`
+    /// overrides it, and that is what makes a nested route like
+    /// `table:dependencies/key:serde` reachable. Declared per adapter rather than
+    /// widened globally, so no language inherits another's nesting rule.
+    fn parent_unit_kinds(&self) -> &'static [UnitKind] {
+        &[UnitKind::Symbol]
     }
 }
 
@@ -159,7 +172,7 @@ pub fn parse_with(spec: &dyn LanguageSpec, source: &[u8]) -> ParseOutput {
     collect_fallbacks(spec, root, &mut raws);
 
     raws.sort_by(canonical_cmp);
-    let units = finalize(&raws);
+    let units = finalize(&raws, spec.parent_unit_kinds());
 
     refs.sort_by(|a, b| {
         a.0.cmp(&b.0)
@@ -206,7 +219,7 @@ fn file_raw(spec: &dyn LanguageSpec, source: &[u8]) -> Raw {
 fn file_only(spec: &dyn LanguageSpec, source: &[u8]) -> ParseOutput {
     let raws = vec![file_raw(spec, source)];
     ParseOutput {
-        units: finalize(&raws),
+        units: finalize(&raws, spec.parent_unit_kinds()),
         unresolved: Vec::new(),
     }
 }
@@ -265,11 +278,14 @@ fn canonical_cmp(a: &Raw, b: &Raw) -> std::cmp::Ordering {
 /// Assign parents (by span containment) and anchors (named route or ordinal),
 /// then materialize the [`ParsedUnitDraft`] list. `raws` is already in canonical
 /// order.
-fn finalize(raws: &[Raw]) -> Vec<ParsedUnitDraft> {
+///
+/// `parent_kinds` is the adapter's [`LanguageSpec::parent_unit_kinds`]: the unit
+/// kinds a parent may have.
+fn finalize(raws: &[Raw], parent_kinds: &[UnitKind]) -> Vec<ParsedUnitDraft> {
     let n = raws.len();
 
-    // Parent = nearest strictly-enclosing `symbol` unit (never the file or a
-    // fallback). Canonical order guarantees a parent's index is smaller.
+    // Parent = nearest strictly-enclosing unit of an admitted kind (never the file
+    // and never a fallback). Canonical order guarantees a parent's index is smaller.
     let mut parent: Vec<Option<usize>> = vec![None; n];
     for i in 0..n {
         if raws[i].is_file {
@@ -281,7 +297,7 @@ fn finalize(raws: &[Raw]) -> Vec<ParsedUnitDraft> {
                 continue;
             }
             let candidate = &raws[j];
-            if candidate.is_file || candidate.unit_kind != UnitKind::Symbol {
+            if candidate.is_file || !parent_kinds.contains(&candidate.unit_kind) {
                 continue;
             }
             if candidate.span == raws[i].span || !candidate.span.encloses(raws[i].span) {
@@ -375,14 +391,16 @@ fn finalize(raws: &[Raw]) -> Vec<ParsedUnitDraft> {
 
 /// Identifier-family node kinds whose text is a safe path segment.
 ///
-/// The v0 five plus the group-24 vocabulary (ADR-0015, widened in T24-01 and once
-/// more in T24-02): Go method names are `field_identifier` and package names
-/// `package_identifier`, Bash function names are `word` and Bash *declaration*
-/// names `variable_name` (measured in T24-02, which the T24-01 survey missed),
-/// TOML keys are `bare_key`, YAML keys are `flow_node`, Python import paths are
-/// `dotted_name`. Inert for the v0 three: their adapters only consult this on
-/// `name` fields that are `identifier`/`type_identifier`/`property_identifier`,
-/// which the goldens and fixtures pin.
+/// The v0 five plus the group-24 vocabulary (ADR-0015, widened in T24-01, T24-02
+/// and T24-04): Go method names are `field_identifier` and package names
+/// `package_identifier`; Bash function names are `word` and Bash *declaration*
+/// names `variable_name` (measured in T24-02, which the T24-01 survey missed);
+/// TOML keys are `bare_key`, `dotted_key` or `quoted_key`, the last of which the
+/// TOML adapter unquotes before naming a unit; YAML keys are `flow_node`; Python
+/// import paths are `dotted_name`. Inert for the v0 three: their adapters only
+/// consult this on `name` fields that are
+/// `identifier`/`type_identifier`/`property_identifier`, which the goldens and
+/// fixtures pin.
 pub(crate) fn is_identifier_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -396,6 +414,8 @@ pub(crate) fn is_identifier_kind(kind: &str) -> bool {
             | "word"
             | "variable_name"
             | "bare_key"
+            | "dotted_key"
+            | "quoted_key"
             | "flow_node"
             | "dotted_name"
     )
@@ -521,6 +541,8 @@ mod tests {
             "word",
             "variable_name",
             "bare_key",
+            "dotted_key",
+            "quoted_key",
             "flow_node",
             "dotted_name",
         ] {

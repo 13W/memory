@@ -225,6 +225,20 @@ Stated once here; each card below names only what is specific to it.
 - **Acceptance:** the misnaming recorded in "What was measured" §2 is gone, demonstrated by the
   fixture.
 - **Evidence:** the `T24-04` row.
+- **As built:** **every** `pair` is a unit, not only a top-level one (owner decision) — the card's
+  "top-level `pair`" wording is resolved against the post-commit review's own
+  `table:dependencies/key:serde`, in the review's favour, which is also what makes the parent seam
+  observable in this card rather than in `T24-05`. A `table` node's span covers its own pairs, so
+  nesting comes from span containment; an inline table's pairs nest one level further
+  (`key:tokio/key:features`). A sub-table is a **sibling** named by its `dotted_key` (`table:a.b`),
+  the grammar's shape rather than a choice. `lang_kind` is `table` / `table_array` / `key`, so
+  `[bin]` and `[[bin]]` say which they are. A `quoted_key` is unquoted before it names a unit —
+  `["café"]` is the only legal non-ASCII TOML key, since `[café]` is a parse error — and a key that
+  is still no safe segment (`["quoted key"]`) takes an ordinal anchor. A value's node **kind** is
+  signature-bearing, its text is not, so a bumped version string does not turn a key into a
+  different unit; two `[[bin]]` elements are therefore indistinguishable by signature and the engine
+  demotes the pair to ordinals. `body_member_count` finds nothing in a TOML section, so the adapter
+  counts members itself.
 
 ## T24-05 — YAML adapter
 

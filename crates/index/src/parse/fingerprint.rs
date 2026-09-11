@@ -111,6 +111,13 @@ pub const fn descriptor(language: LanguageId) -> LanguageDescriptor {
             grammar_version: 1,
             query_version: 1,
         },
+        // ADR-0015 (T24-04): the grammar crate is the maintained `-ng` fork, and the
+        // name recorded here is the crate that is actually linked.
+        LanguageId::Toml => LanguageDescriptor {
+            grammar_name: "tree-sitter-toml-ng",
+            grammar_version: 1,
+            query_version: 1,
+        },
     }
 }
 
@@ -270,6 +277,17 @@ mod tests {
     }
 
     #[test]
+    fn toml_fingerprint_is_exact_golden() {
+        // ADR-0015 (T24-04): a new token in the existing `lang=` field, nothing else.
+        // A `.toml` file's `lang=` moves from `config` (the universal chunker) to
+        // `toml`, which is what makes every `.toml` revision re-parse once.
+        assert_eq!(
+            parser_fingerprint(LanguageId::Toml),
+            "chunk=1;grammar=tree-sitter-toml-ng@1;lang=toml;norm=1;queries=1"
+        );
+    }
+
+    #[test]
     fn all_languages_have_distinct_fingerprints() {
         let fps: Vec<String> = LanguageId::ALL
             .iter()
@@ -381,6 +399,7 @@ mod tests {
             (LanguageId::Python, "tree-sitter-python"),
             (LanguageId::Bash, "tree-sitter-bash"),
             (LanguageId::Go, "tree-sitter-go"),
+            (LanguageId::Toml, "tree-sitter-toml-ng"),
         ];
         // Completeness: a language added without a row here would otherwise pass
         // silently (group 24 adds one language per card).

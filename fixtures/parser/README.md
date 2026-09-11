@@ -41,6 +41,15 @@ Rust integration test `crates/index/tests/parse_fixtures.rs`.
   receivers both keep the named route (`parser.go.methods`). These cases are
   validated by fixtures alone — no enrolled worktree contains a `.go` file, so
   there is no live acceptance behind them.
+- **TOML** — authored in **T24-04** (`tree-sitter-toml-ng` adapter, ADR-0015). The
+  first language whose units are **`config_section`**, not `symbol`, and the first
+  whose sections nest (`table:dependencies/key:serde`). `parser.toml.cargo` is the
+  card's acceptance: the `Cargo.toml` excerpt the universal line scanner used to
+  name `name, version, serde, name`, with `[package]`/`[dependencies]`/`[[bin]]`
+  invisible. The other cases pin the decisions: a sub-table is a sibling
+  (`parser.toml.subtable`), a quoted key is unquoted and an unsafe one takes an
+  ordinal (`parser.toml.keyforms`, `parser.toml.unquotable`), and two `[[bin]]`
+  elements are indistinguishable by signature (`parser.toml.tablearray`).
 
 v1 had no golden tree-sitter chunking fixtures (the v1 parser `src/indexer/parser.ts`
 was exercised only through the 49-query benchmark), so these are authored, not

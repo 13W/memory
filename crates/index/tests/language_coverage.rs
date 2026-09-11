@@ -62,10 +62,18 @@ fn parse_languages_array(text: &str) -> BTreeSet<String> {
 
 /// ADR-0001's v0 three plus ADR-0015's additions (one per group-24 card).
 fn expected_set() -> BTreeSet<String> {
-    ["typescript", "javascript", "rust", "python", "bash", "go"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    [
+        "typescript",
+        "javascript",
+        "rust",
+        "python",
+        "bash",
+        "go",
+        "toml",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 #[test]
@@ -194,11 +202,10 @@ fn coverage_string_helpers_are_correct() {
     );
     assert_eq!(json_string_value(manifest, "missing"), None);
 
-    let toml =
-        "  languages = [\"typescript\", \"javascript\", \"rust\", \"python\", \"bash\", \"go\"]\n";
+    let toml = "  languages = [\"typescript\", \"javascript\", \"rust\", \"python\", \"bash\", \
+                 \"go\", \"toml\"]\n";
     assert_eq!(parse_languages_array(toml), expected_set());
     // Reordering does not change the parsed set.
-    let reordered =
-        "languages = [\"rust\",\"go\",\"bash\",\"python\",\"typescript\" , \"javascript\"]";
+    let reordered = "languages = [\"rust\",\"go\",\"toml\",\"bash\",\"python\",\"typescript\" , \"javascript\"]";
     assert_eq!(parse_languages_array(reordered), expected_set());
 }

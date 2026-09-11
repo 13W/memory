@@ -266,18 +266,18 @@ of a `SyntaxLocator` (03 §2.4). Selection is by extension, case-insensitively, 
 `select_language` applies; `Fallback` is the default rather than a listed set, and that totality is
 the point — a selector that can answer "none" reintroduces the state D-098 removed.
 
-Chunking takes on **no dependency** — no YAML, JSON or Markdown parser. Beyond the T10 guardrail,
-the binding reason is 03 §2.3.1: spans must address the exact `source_blob`, and a real parser
-returns a value tree rather than byte offsets into the text it consumed. Line-oriented scanning
-returns them directly:
+**The universal chunker** takes on **no dependency** — no YAML, JSON or Markdown parser. Beyond
+the T10 guardrail, the binding reason is 03 §2.3.1: spans must address the exact `source_blob`, and
+a real parser returns a value tree rather than byte offsets into the text it consumed.
+Line-oriented scanning returns them directly:
 
 - **Text** — sections are ATX headings (`#`…`######` followed by whitespace, which separates a
   heading from a `#!` shebang or a `#region` marker), named by the heading **trail**
   (`Install/From source`) so a nested heading is never confused with a top-level one of the same
   text; content before the first heading is an unnamed preamble section.
 - **Config** — sections are top-level keys, where "top level" is the **minimum indentation among
-  the file's own key lines**, not column zero. One rule then serves YAML (column 0), pretty-printed
-  JSON (column 2 inside the root object) and INI/`.env` alike.
+  the file's own key lines**, not column zero. One rule then serves pretty-printed JSON (column 2
+  inside the root object), INI/`.env`, and — until T24-05 moves it — YAML (column 0) alike.
 - **Fallback** — line-aligned windows of at most `MAX_SECTION_BYTES = 2048`.
 
 Every universal file also yields a `file` unit spanning the whole content, the same shape the
@@ -286,6 +286,26 @@ section over the cap is split on line boundaries; a single line over the cap is 
 because splitting mid-line would put a span boundary inside a token for no benefit. Anchors stay
 path-free (ADR-0002): a heading trail or a key when the section has structure, a `LocalOrdinal`
 when it does not; a repeated name becomes `Name#2`, so two sections never share an anchor.
+
+**Scoping amendment, T24-04 `[SPEC]` (ADR-0015 Decision 3).** The two statements above are
+scoped to the *universal* chunker, not to indexing as a whole. Post-v0, `.toml` (T24-04) and
+`.yaml`/`.yml` (T24-05) leave this path for real tree-sitter grammars, so a config **section** may
+now come from a grammar. This is a clarification, not a reversal: the paragraph's own justification
+— that a real parser returns a value tree rather than byte offsets — is exactly what does not apply
+to tree-sitter, which reports byte ranges into the bytes it was handed. The `[FIXED]` unit-kind set
+is untouched; those files keep `config_section` and do not become `symbol`, and no language may
+invent a sixth kind. An extension belongs to exactly one selector, so a language card removes its
+extension from the universal Config list in the same commit that adds it to `select_language`
+(ADR-0015 Decision 1), and a test asserts the two never overlap.
+
+One consequence to name rather than discover later: the `Name#2` suffixing above is the
+**universal** path's anchor rule. A grammar-backed config file follows ADR-0002's rule instead — a
+named route while the unit and its ancestors have safe names, an ordinal otherwise — so two
+indistinguishable sections (two `[[bin]]` elements with the same shape) become ordinals rather than
+`bin#2`, and a section under a demoted parent can share an anchor string with its sibling. Those
+rows stay distinct: `parsed_unit`'s natural key is
+`(file_revision_id, unit_kind, syntax_locator, span_start, span_end)`, and the locator's own `blob`
+differs whenever the section text does.
 
 The fingerprint format is untouched: `chunk=1;grammar=universal@1;lang=<config|text|fallback>;
 norm=1;queries=0`. `queries=0` because this path runs no tree-sitter query set at all, which is

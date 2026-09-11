@@ -2227,6 +2227,515 @@
         }
       ],
       "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.cargo",
+      "title": "A Cargo.toml excerpt is sectioned by its table headers, not by its first keys",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "syntax",
+      "source": "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\ntokio = { version = \"1\", features = [\"full\"] }\n\n[[bin]]\nname = \"a\"\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 137,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 43,
+          "local_name": "package",
+          "kind": "table",
+          "anchor": "p:table:package",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 10,
+          "span_end": 23,
+          "local_name": "name",
+          "kind": "key",
+          "anchor": "p:table:package/key:name",
+          "parent": 1
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 24,
+          "span_end": 41,
+          "local_name": "version",
+          "kind": "key",
+          "anchor": "p:table:package/key:version",
+          "parent": 1
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 43,
+          "span_end": 118,
+          "local_name": "dependencies",
+          "kind": "table",
+          "anchor": "p:table:dependencies",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 58,
+          "span_end": 69,
+          "local_name": "serde",
+          "kind": "key",
+          "anchor": "p:table:dependencies/key:serde",
+          "parent": 4
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 70,
+          "span_end": 116,
+          "local_name": "tokio",
+          "kind": "key",
+          "anchor": "p:table:dependencies/key:tokio",
+          "parent": 4
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 80,
+          "span_end": 93,
+          "local_name": "version",
+          "kind": "key",
+          "anchor": "p:table:dependencies/key:tokio/key:version",
+          "parent": 6
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 95,
+          "span_end": 114,
+          "local_name": "features",
+          "kind": "key",
+          "anchor": "p:table:dependencies/key:tokio/key:features",
+          "parent": 6
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 118,
+          "span_end": 137,
+          "local_name": "bin",
+          "kind": "table_array",
+          "anchor": "p:table_array:bin",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 126,
+          "span_end": 136,
+          "local_name": "name",
+          "kind": "key",
+          "anchor": "p:table_array:bin/key:name",
+          "parent": 9
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.preamble",
+      "title": "A key before the first table header is a top-level section",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "syntax",
+      "source": "root = true\n\n[a]\nk = 1\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 23,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 11,
+          "local_name": "root",
+          "kind": "key",
+          "anchor": "p:key:root",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 13,
+          "span_end": 23,
+          "local_name": "a",
+          "kind": "table",
+          "anchor": "p:table:a",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 17,
+          "span_end": 22,
+          "local_name": "k",
+          "kind": "key",
+          "anchor": "p:table:a/key:k",
+          "parent": 2
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.subtable",
+      "title": "A sub-table is a sibling named by its dotted key, not a nested section",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "syntax",
+      "source": "[a]\nx = 1\n\n[a.b]\ny = 2\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 23,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 11,
+          "local_name": "a",
+          "kind": "table",
+          "anchor": "p:table:a",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 4,
+          "span_end": 9,
+          "local_name": "x",
+          "kind": "key",
+          "anchor": "p:table:a/key:x",
+          "parent": 1
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 11,
+          "span_end": 23,
+          "local_name": "a.b",
+          "kind": "table",
+          "anchor": "p:table:a.b",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 17,
+          "span_end": 22,
+          "local_name": "y",
+          "kind": "key",
+          "anchor": "p:table:a.b/key:y",
+          "parent": 3
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.keyforms",
+      "title": "Bare, quoted and dotted keys all name their section",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "syntax",
+      "source": "bare = 1\n\"quoted\" = 2\ndotted.key = 3\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 37,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 8,
+          "local_name": "bare",
+          "kind": "key",
+          "anchor": "p:key:bare",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 9,
+          "span_end": 21,
+          "local_name": "quoted",
+          "kind": "key",
+          "anchor": "p:key:quoted",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 22,
+          "span_end": 36,
+          "local_name": "dotted.key",
+          "kind": "key",
+          "anchor": "p:key:dotted.key",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.unquotable",
+      "title": "A key with a space is no path segment: the section takes an ordinal anchor",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "syntax",
+      "source": "[\"quoted key\"]\nz = 3\n",
+      "expected_units": [
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 21,
+          "local_name": null,
+          "kind": "table",
+          "anchor": "o:0",
+          "parent": null
+        },
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 21,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 15,
+          "span_end": 20,
+          "local_name": "z",
+          "kind": "key",
+          "anchor": "o:0",
+          "parent": 0
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.tablearray",
+      "title": "Two [[bin]] elements are indistinguishable by signature and take ordinals",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "syntax",
+      "source": "[[bin]]\nname = \"a\"\n\n[[bin]]\nname = \"b\"\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 39,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 20,
+          "local_name": "bin",
+          "kind": "table_array",
+          "anchor": "o:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 8,
+          "span_end": 18,
+          "local_name": "name",
+          "kind": "key",
+          "anchor": "p:table_array:bin/key:name",
+          "parent": 1
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 20,
+          "span_end": 39,
+          "local_name": "bin",
+          "kind": "table_array",
+          "anchor": "o:2",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 28,
+          "span_end": 38,
+          "local_name": "name",
+          "kind": "key",
+          "anchor": "p:table_array:bin/key:name",
+          "parent": 3
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.empty",
+      "title": "An empty TOML file is a single empty file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "empty",
+      "source": "",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 0,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.whitespace",
+      "title": "A whitespace-only TOML file is a single file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "empty",
+      "source": "\n\n   \n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 6,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.error",
+      "title": "Malformed TOML yields a fallback chunk and the following table is still named",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "error",
+      "source": "[unclosed\nkey = = =\n\n[ok]\nk = 1\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 32,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "fallback_chunk",
+          "span_start": 0,
+          "span_end": 21,
+          "local_name": null,
+          "kind": "error",
+          "anchor": "o:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 21,
+          "span_end": 32,
+          "local_name": "ok",
+          "kind": "table",
+          "anchor": "p:table:ok",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 26,
+          "span_end": 31,
+          "local_name": "k",
+          "kind": "key",
+          "anchor": "p:table:ok/key:k",
+          "parent": 2
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.toml.unicode",
+      "title": "A non-ASCII TOML key must be quoted, and spans stay byte offsets",
+      "status": "active",
+      "provenance": {
+        "source": "T24-04 (authored); TOML adapter over tree-sitter-toml-ng (ADR-0015)"
+      },
+      "language": "toml",
+      "category": "unicode",
+      "source": "[\"café\"]\ns = \"café☕\"\n",
+      "expected_units": [
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 25,
+          "local_name": "café",
+          "kind": "table",
+          "anchor": "p:table:café",
+          "parent": null
+        },
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 25,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 10,
+          "span_end": 24,
+          "local_name": "s",
+          "kind": "key",
+          "anchor": "p:table:café/key:s",
+          "parent": 0
+        }
+      ],
+      "expected_unresolved": []
     }
   ]
 }

@@ -15,6 +15,7 @@ use crate::parse::adapter::go::GoParser;
 use crate::parse::adapter::javascript::JavaScriptParser;
 use crate::parse::adapter::python::PythonParser;
 use crate::parse::adapter::rust::RustParser;
+use crate::parse::adapter::toml::TomlParser;
 use crate::parse::adapter::typescript::TypeScriptParser;
 use crate::parse::fingerprint;
 use crate::parse::language::LanguageId;
@@ -57,5 +58,6 @@ pub fn parser_for(language: LanguageId) -> Box<dyn LanguageParser> {
         LanguageId::Python => Box::new(PythonParser::new()),
         LanguageId::Bash => Box::new(BashParser::new()),
         LanguageId::Go => Box::new(GoParser::new()),
+        LanguageId::Toml => Box::new(TomlParser::new()),
     }
 }

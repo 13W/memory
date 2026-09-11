@@ -67,6 +67,15 @@ tree-sitter-bash = "0.23"
 # `tree-sitter`), so it adds no new transitive crate. See the dependency allowlist
 # in CONTRIBUTING.md.
 tree-sitter-go = "0.23"
+# The fourth post-v0 language grammar (ADR-0015, T24-04) — note the `-ng` crate,
+# the maintained fork; the unmaintained `tree-sitter-toml` predates the ABI the
+# pinned core needs. Pinned at 0.7, which is ABI 14 (0.7.0 verified against the
+# pinned core); `tree-sitter 0.24` supports language ABI 14 at most and refuses an
+# ABI-15 parser, which would silently degrade to a file-only parse. Its only runtime
+# dependency is `tree-sitter-language` (already in the tree, shared with
+# `tree-sitter`), so it adds no new transitive crate. See the dependency allowlist in
+# CONTRIBUTING.md.
+tree-sitter-toml-ng = "0.7"
 streaming-iterator = "0.1"
 
 # Runtime primitives for the reconcile scheduler/driver (T05-04, spec 06 §1): the
