@@ -264,6 +264,19 @@ Stated once here; each card below names only what is specific to it.
   correctly falls back to an ordinal anchor rather than weakening `is_safe_segment`.
 - **Acceptance:** the misnaming recorded in "What was measured" §2 is gone for YAML.
 - **Evidence:** the `T24-05` row.
+- **As built:** only **structural** keys are sections (owner decision) — a `block_mapping_pair`
+  is a unit when its value is a mapping or a sequence, at any depth. A leaf scalar stays as text
+  inside its enclosing section: YAML nests far deeper than TOML, where `T24-04` made every pair a
+  unit, and on this repository's `release.yml` the rule is ~20 units instead of 143 over 304 lines
+  while ADR-0015's own `key:spec/key:containers` stays reachable. It also satisfies the card's
+  "a nested key must not become a *top-level* section" — nested keys are nested. A `document` is a
+  unit **named by its 1-based index**, the one synthesized name in the group and a forced one: the
+  route derivation requires every ancestor to have a safe name, so an unnamed document would
+  collapse every key beneath it to an ordinal. That is also what separates two documents'
+  identical keys, which is the acceptance. The card's "`document` and the document's own top-level
+  `block_mapping_pair`" is read against ADR-0015's nested example in the ADR's favour, as `T24-04`
+  read its own. `D-135` was found here: `finalize` dropped a parent candidate whose span **equals**
+  the unit's, which is the ordinary shape of a one-root-key `values.yaml`.
 
 ## T24-06 — Live acceptance: the re-index is measured, not assumed
 

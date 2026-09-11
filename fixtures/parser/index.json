@@ -2736,6 +2736,388 @@
         }
       ],
       "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.multidoc",
+      "title": "A three-document manifest yields three documents, not one flat key list",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "syntax",
+      "source": "apiVersion: v1\nkind: Service\nspec:\n  ports:\n    - 80\n---\napiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 2\n---\nkind: Ingress\n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 132,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 52,
+          "local_name": "1",
+          "kind": "document",
+          "anchor": "p:document:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 29,
+          "span_end": 52,
+          "local_name": "spec",
+          "kind": "key",
+          "anchor": "p:document:1/key:spec",
+          "parent": 1
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 37,
+          "span_end": 52,
+          "local_name": "ports",
+          "kind": "key",
+          "anchor": "p:document:1/key:spec/key:ports",
+          "parent": 2
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 53,
+          "span_end": 113,
+          "local_name": "2",
+          "kind": "document",
+          "anchor": "p:document:2",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 94,
+          "span_end": 113,
+          "local_name": "spec",
+          "kind": "key",
+          "anchor": "p:document:2/key:spec",
+          "parent": 4
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 114,
+          "span_end": 132,
+          "local_name": "3",
+          "kind": "document",
+          "anchor": "p:document:3",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.structural",
+      "title": "A key is a section only when its value is a mapping or a sequence",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "syntax",
+      "source": "apiVersion: v1\nmetadata:\n  name: app\nspec:\n  containers:\n    - name: app\n",
+      "expected_units": [
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 73,
+          "local_name": "1",
+          "kind": "document",
+          "anchor": "p:document:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 73,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 15,
+          "span_end": 36,
+          "local_name": "metadata",
+          "kind": "key",
+          "anchor": "p:document:1/key:metadata",
+          "parent": 0
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 37,
+          "span_end": 73,
+          "local_name": "spec",
+          "kind": "key",
+          "anchor": "p:document:1/key:spec",
+          "parent": 0
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 45,
+          "span_end": 73,
+          "local_name": "containers",
+          "kind": "key",
+          "anchor": "p:document:1/key:spec/key:containers",
+          "parent": 3
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.single-key",
+      "title": "A document whose single key spans it all is still the key's ancestor (D-135)",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "syntax",
+      "source": "metadata:\n  name: app\n  labels:\n    app: demo\n",
+      "expected_units": [
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 46,
+          "local_name": "1",
+          "kind": "document",
+          "anchor": "p:document:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 46,
+          "local_name": "metadata",
+          "kind": "key",
+          "anchor": "p:document:1/key:metadata",
+          "parent": 0
+        },
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 46,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 24,
+          "span_end": 46,
+          "local_name": "labels",
+          "kind": "key",
+          "anchor": "p:document:1/key:metadata/key:labels",
+          "parent": 1
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.slash-key",
+      "title": "A key containing `/` takes an ordinal anchor rather than corrupting the route",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "syntax",
+      "source": "metadata:\n  annotations:\n    nginx.ingress.kubernetes.io/config:\n      a: 1\n",
+      "expected_units": [
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 76,
+          "local_name": "1",
+          "kind": "document",
+          "anchor": "p:document:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 76,
+          "local_name": "metadata",
+          "kind": "key",
+          "anchor": "p:document:1/key:metadata",
+          "parent": 0
+        },
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 76,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 12,
+          "span_end": 76,
+          "local_name": "annotations",
+          "kind": "key",
+          "anchor": "p:document:1/key:metadata/key:annotations",
+          "parent": 1
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 29,
+          "span_end": 76,
+          "local_name": null,
+          "kind": "key",
+          "anchor": "o:0",
+          "parent": 3
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.empty",
+      "title": "An empty YAML file is a single empty file unit",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "empty",
+      "source": "",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 0,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.whitespace",
+      "title": "A whitespace-only YAML file has no document at all",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "empty",
+      "source": "\n\n   \n",
+      "expected_units": [
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 6,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.error",
+      "title": "Malformed YAML yields a fallback chunk and the following key is still named",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "error",
+      "source": "a: 1\n\t- broken\n  : :\nb:\n  c: 2\n",
+      "expected_units": [
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 31,
+          "local_name": "1",
+          "kind": "document",
+          "anchor": "p:document:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 31,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        },
+        {
+          "unit_kind": "fallback_chunk",
+          "span_start": 14,
+          "span_end": 20,
+          "local_name": null,
+          "kind": "error",
+          "anchor": "o:0",
+          "parent": 0
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 21,
+          "span_end": 31,
+          "local_name": "b",
+          "kind": "key",
+          "anchor": "p:document:1/key:b",
+          "parent": 0
+        }
+      ],
+      "expected_unresolved": []
+    },
+    {
+      "id": "parser.yaml.unicode",
+      "title": "A YAML key needs no quoting to be non-ASCII, and spans stay byte offsets",
+      "status": "active",
+      "provenance": {
+        "source": "T24-05 (authored); YAML adapter over tree-sitter-yaml (ADR-0015)"
+      },
+      "language": "yaml",
+      "category": "unicode",
+      "source": "café:\n  s: \"café☕\"\n",
+      "expected_units": [
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 23,
+          "local_name": "1",
+          "kind": "document",
+          "anchor": "p:document:1",
+          "parent": null
+        },
+        {
+          "unit_kind": "config_section",
+          "span_start": 0,
+          "span_end": 23,
+          "local_name": "café",
+          "kind": "key",
+          "anchor": "p:document:1/key:café",
+          "parent": 0
+        },
+        {
+          "unit_kind": "file",
+          "span_start": 0,
+          "span_end": 23,
+          "local_name": null,
+          "kind": null,
+          "anchor": "p:file",
+          "parent": null
+        }
+      ],
+      "expected_unresolved": []
     }
   ]
 }

@@ -16,6 +16,7 @@ pub mod python;
 pub mod rust;
 pub mod toml;
 pub mod typescript;
+pub mod yaml;
 
 use std::collections::{HashMap, HashSet};
 
@@ -306,9 +307,36 @@ fn finalize(raws: &[Raw], parent_kinds: &[UnitKind]) -> Vec<ParsedUnitDraft> {
             match best {
                 None => best = Some(j),
                 Some(b) => {
-                    if candidate.span.len() < raws[b].span.len() {
+                    // Nearest wins. `<=` rather than `<` so that among ancestors of
+                    // EQUAL span the later one in canonical order — the inner one —
+                    // is taken (`D-135`). For spans derived from a parse tree,
+                    // equal length implies an equal span: two nodes that both
+                    // contain a third are nested in each other, so this tie-break
+                    // can only fire on the case D-135 is about.
+                    if candidate.span.len() <= raws[b].span.len() {
                         best = Some(j);
                     }
+                }
+            }
+        }
+        // `D-135`: a candidate whose span **equals** this unit's is still an
+        // enclosing ancestor in the parse tree, and spec 03 §2.4 derives the route
+        // from "enclosing declaration ancestors" rather than from strictly larger
+        // spans. The strict rule above drops it, which is right as the primary rule
+        // — two units of equal span must not parent each other — so this is a
+        // fallback taken only when nothing strictly larger was found, and only
+        // backwards in canonical order. That makes the parent index strictly
+        // smaller, so a cycle is impossible, and it is additive: a unit that already
+        // had a parent keeps exactly the one it had.
+        if best.is_none() {
+            for j in 0..i {
+                let candidate = &raws[j];
+                if candidate.is_file || !parent_kinds.contains(&candidate.unit_kind) {
+                    continue;
+                }
+                if candidate.span == raws[i].span {
+                    // Ascending `j`, so the last match is the nearest ancestor.
+                    best = Some(j);
                 }
             }
         }

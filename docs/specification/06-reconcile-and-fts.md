@@ -277,7 +277,8 @@ Line-oriented scanning returns them directly:
   text; content before the first heading is an unnamed preamble section.
 - **Config** — sections are top-level keys, where "top level" is the **minimum indentation among
   the file's own key lines**, not column zero. One rule then serves pretty-printed JSON (column 2
-  inside the root object), INI/`.env`, and — until T24-05 moves it — YAML (column 0) alike.
+  inside the root object) and INI/`.env` alike. It served YAML (column 0) too until T24-05 gave
+  YAML a grammar; the rule is unchanged, its set of extensions is smaller.
 - **Fallback** — line-aligned windows of at most `MAX_SECTION_BYTES = 2048`.
 
 Every universal file also yields a `file` unit spanning the whole content, the same shape the
@@ -287,10 +288,10 @@ because splitting mid-line would put a span boundary inside a token for no benef
 path-free (ADR-0002): a heading trail or a key when the section has structure, a `LocalOrdinal`
 when it does not; a repeated name becomes `Name#2`, so two sections never share an anchor.
 
-**Scoping amendment, T24-04 `[SPEC]` (ADR-0015 Decision 3).** The two statements above are
+**Scoping amendment, T24-04/T24-05 `[SPEC]` (ADR-0015 Decision 3).** The two statements above are
 scoped to the *universal* chunker, not to indexing as a whole. Post-v0, `.toml` (T24-04) and
-`.yaml`/`.yml` (T24-05) leave this path for real tree-sitter grammars, so a config **section** may
-now come from a grammar. This is a clarification, not a reversal: the paragraph's own justification
+`.yaml`/`.yml` (T24-05) **left** this path for real tree-sitter grammars, so a config **section**
+may now come from a grammar. This is a clarification, not a reversal: the paragraph's own justification
 — that a real parser returns a value tree rather than byte offsets — is exactly what does not apply
 to tree-sitter, which reports byte ranges into the bytes it was handed. The `[FIXED]` unit-kind set
 is untouched; those files keep `config_section` and do not become `symbol`, and no language may

@@ -118,6 +118,12 @@ pub const fn descriptor(language: LanguageId) -> LanguageDescriptor {
             grammar_version: 1,
             query_version: 1,
         },
+        // ADR-0015 (T24-05): the last grammar the group adds.
+        LanguageId::Yaml => LanguageDescriptor {
+            grammar_name: "tree-sitter-yaml",
+            grammar_version: 1,
+            query_version: 1,
+        },
     }
 }
 
@@ -288,6 +294,17 @@ mod tests {
     }
 
     #[test]
+    fn yaml_fingerprint_is_exact_golden() {
+        // ADR-0015 (T24-05): a `.yaml`/`.yml` file's `lang=` moves from `config`
+        // (the universal chunker) to `yaml`, which is what makes every such revision
+        // re-parse once.
+        assert_eq!(
+            parser_fingerprint(LanguageId::Yaml),
+            "chunk=1;grammar=tree-sitter-yaml@1;lang=yaml;norm=1;queries=1"
+        );
+    }
+
+    #[test]
     fn all_languages_have_distinct_fingerprints() {
         let fps: Vec<String> = LanguageId::ALL
             .iter()
@@ -400,6 +417,7 @@ mod tests {
             (LanguageId::Bash, "tree-sitter-bash"),
             (LanguageId::Go, "tree-sitter-go"),
             (LanguageId::Toml, "tree-sitter-toml-ng"),
+            (LanguageId::Yaml, "tree-sitter-yaml"),
         ];
         // Completeness: a language added without a row here would otherwise pass
         // silently (group 24 adds one language per card).

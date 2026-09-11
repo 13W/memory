@@ -70,6 +70,7 @@ fn expected_set() -> BTreeSet<String> {
         "bash",
         "go",
         "toml",
+        "yaml",
     ]
     .into_iter()
     .map(String::from)
@@ -203,9 +204,10 @@ fn coverage_string_helpers_are_correct() {
     assert_eq!(json_string_value(manifest, "missing"), None);
 
     let toml = "  languages = [\"typescript\", \"javascript\", \"rust\", \"python\", \"bash\", \
-                 \"go\", \"toml\"]\n";
+                 \"go\", \"toml\", \"yaml\"]\n";
     assert_eq!(parse_languages_array(toml), expected_set());
     // Reordering does not change the parsed set.
-    let reordered = "languages = [\"rust\",\"go\",\"toml\",\"bash\",\"python\",\"typescript\" , \"javascript\"]";
+    let reordered = "languages = [\"rust\",\"go\",\"toml\",\"yaml\",\"bash\",\"python\",\
+                     \"typescript\" , \"javascript\"]";
     assert_eq!(parse_languages_array(reordered), expected_set());
 }

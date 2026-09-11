@@ -28,6 +28,7 @@ fn language_ids_match_config_language_set() {
         "bash",
         "go",
         "toml",
+        "yaml",
     ]
     .into_iter()
     .map(String::from)
@@ -36,7 +37,7 @@ fn language_ids_match_config_language_set() {
     assert_eq!(
         code_set, expected,
         "LanguageId set diverged from ADR-0001 + ADR-0015 \
-         (typescript, javascript, rust, python, bash, go, toml)"
+         (typescript, javascript, rust, python, bash, go, toml, yaml)"
     );
     assert_eq!(
         config_set, code_set,

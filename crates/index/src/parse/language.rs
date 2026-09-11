@@ -37,12 +37,14 @@ pub enum LanguageId {
     Go,
     /// TOML (`.toml`) — ADR-0015, T24-04. Sections, not symbols.
     Toml,
+    /// YAML (`.yaml` `.yml`) — ADR-0015, T24-05. Sections, not symbols.
+    Yaml,
 }
 
 impl LanguageId {
     /// Every language in the closed set, in a stable order (the v0 three first,
     /// then the ADR-0015 additions in card order).
-    pub const ALL: [LanguageId; 7] = [
+    pub const ALL: [LanguageId; 8] = [
         LanguageId::TypeScript,
         LanguageId::JavaScript,
         LanguageId::Rust,
@@ -50,6 +52,7 @@ impl LanguageId {
         LanguageId::Bash,
         LanguageId::Go,
         LanguageId::Toml,
+        LanguageId::Yaml,
     ];
 
     /// The canonical language id string (spec 02 §3.1; the `lang=` fingerprint
@@ -66,6 +69,7 @@ impl LanguageId {
             LanguageId::Bash => "bash",
             LanguageId::Go => "go",
             LanguageId::Toml => "toml",
+            LanguageId::Yaml => "yaml",
         }
     }
 
@@ -84,6 +88,7 @@ impl LanguageId {
             "bash" => Some(LanguageId::Bash),
             "go" => Some(LanguageId::Go),
             "toml" => Some(LanguageId::Toml),
+            "yaml" => Some(LanguageId::Yaml),
             _ => None,
         }
     }
@@ -108,6 +113,7 @@ pub fn select_language(path: &Path) -> Option<LanguageId> {
         "sh" | "bash" => Some(LanguageId::Bash),
         "go" => Some(LanguageId::Go),
         "toml" => Some(LanguageId::Toml),
+        "yaml" | "yml" => Some(LanguageId::Yaml),
         _ => None,
     }
 }
@@ -202,8 +208,6 @@ impl SourceDialect {
 /// rule [`select_language`] applies, so the two selectors cannot disagree about
 /// what a path is.
 const CONFIG_EXTENSIONS: &[&str] = &[
-    "yaml",
-    "yml",
     "json",
     "jsonc",
     "json5",
@@ -297,6 +301,9 @@ mod tests {
             // ADR-0015 (T24-04): `toml` left `CONFIG_EXTENSIONS` in the same commit.
             ("Cargo.toml", LanguageId::Toml),
             ("crates/index/Cargo.toml", LanguageId::Toml),
+            // ADR-0015 (T24-05): and `yaml`/`yml` did the same.
+            ("deploy/values.yaml", LanguageId::Yaml),
+            (".github/workflows/ci.yml", LanguageId::Yaml),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -326,6 +333,10 @@ mod tests {
         assert_eq!(
             select_language(Path::new("Cargo.TOML")),
             Some(LanguageId::Toml)
+        );
+        assert_eq!(
+            select_language(Path::new("Deploy.YML")),
+            Some(LanguageId::Yaml)
         );
         assert_eq!(
             select_language(Path::new("x.JsX")),
@@ -381,7 +392,7 @@ mod tests {
         // resolves to a language dialect, never to a universal one.
         for path in [
             "a.ts", "a.tsx", "a.mts", "a.cts", "a.js", "a.jsx", "a.mjs", "a.cjs", "a.rs", "a.py",
-            "a.pyi", "a.sh", "a.bash", "a.go", "a.toml",
+            "a.pyi", "a.sh", "a.bash", "a.go", "a.toml", "a.yaml", "a.yml",
         ] {
             assert!(
                 matches!(select_dialect(Path::new(path)), SourceDialect::Language(_)),
@@ -390,15 +401,25 @@ mod tests {
         }
     }
 
-    /// `toml` left `CONFIG_EXTENSIONS` in T24-04 (ADR-0015 Decision 1), while the
-    /// formats that stay on the universal path are untouched.
+    /// `toml` left `CONFIG_EXTENSIONS` in T24-04 and `yaml`/`yml` in T24-05
+    /// (ADR-0015 Decision 1), which finishes the move for group 24. The formats
+    /// that stay on the universal path are untouched.
     #[test]
-    fn toml_left_the_universal_config_table() {
-        assert!(!CONFIG_EXTENSIONS.contains(&"toml"));
-        assert_eq!(
-            select_dialect(Path::new("Cargo.toml")),
-            SourceDialect::Language(LanguageId::Toml)
-        );
+    fn the_group_24_extensions_left_the_universal_config_table() {
+        for (ext, path, language) in [
+            ("toml", "Cargo.toml", LanguageId::Toml),
+            ("yaml", "deploy/values.yaml", LanguageId::Yaml),
+            ("yml", ".github/workflows/ci.yml", LanguageId::Yaml),
+        ] {
+            assert!(
+                !CONFIG_EXTENSIONS.contains(&ext),
+                "`{ext}` must have left the universal Config table"
+            );
+            assert_eq!(
+                select_dialect(Path::new(path)),
+                SourceDialect::Language(language)
+            );
+        }
         for ext in [
             "json",
             "jsonc",
@@ -414,8 +435,7 @@ mod tests {
                 "`{ext}` must stay on the universal Config path"
             );
         }
-        // YAML is next (T24-05) and has not moved yet.
-        assert!(CONFIG_EXTENSIONS.contains(&"yaml"));
-        assert!(CONFIG_EXTENSIONS.contains(&"yml"));
+        // The universal Config policy is narrowed, not retired.
+        assert!(!CONFIG_EXTENSIONS.is_empty());
     }
 }

@@ -445,9 +445,16 @@ async fn a_file_with_no_v0_language_is_indexed_universally() {
 async fn every_scanned_file_is_either_indexed_or_skipped() {
     let fx = fixture().await;
     let uuids = SeqUuidV7::new();
-    // One file per route the builder can take.
+    // One file per route the builder can take. `.ini`, not `.yaml`: T24-05 gave
+    // YAML a grammar, so a `.yaml` file now takes the *language* route and would
+    // leave the universal config route uncovered while the test still passed.
     write(&fx.root, "code.rs", b"fn a() {}\n"); // language
-    write(&fx.root, "conf/values.yaml", b"image: x\nport: 8080\n"); // config
+    write(
+        &fx.root,
+        "conf/values.ini",
+        b"[a]\nimage = x\nport = 8080\n",
+    ); // config
+    write(&fx.root, "deploy/app.yaml", b"image: x\n"); // language (T24-05)
     write(&fx.root, "docs/readme.md", b"# Title\n\nprose\n"); // text
     write(&fx.root, "query.gql", b"query Q { a }\n"); // fallback
     write(&fx.root, "logo.svg", b"<svg></svg>\n"); // binary by extension
@@ -714,7 +721,9 @@ async fn the_accounted_set_covers_the_whole_tree() {
     write(&fx.root, "a.rs", b"fn a() {}\n");
     write(&fx.root, "blob.rs", b"fn a() {}\0more"); // skipped: binary
     write(&fx.root, "notes.md", b"# hello\n"); // universal: text
-    write(&fx.root, "deploy/values.yaml", b"image: x\n"); // universal: config
+    // `.ini`, not `.yaml`: YAML took the language route in T24-05, and this test
+    // exists to cover the universal one.
+    write(&fx.root, "deploy/values.ini", b"[a]\nimage = x\n"); // universal: config
 
     let genr = scan_and_build(&fx, &uuids).await;
     assert_eq!(genr.files_indexed, 3);
@@ -727,7 +736,7 @@ async fn the_accounted_set_covers_the_whole_tree() {
         [
             "a.rs".to_string(),
             "blob.rs".to_string(),
-            "deploy/values.yaml".to_string(),
+            "deploy/values.ini".to_string(),
             "notes.md".to_string(),
         ]
         .into_iter()

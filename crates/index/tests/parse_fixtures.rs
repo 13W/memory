@@ -20,7 +20,7 @@ use local_rag_core::identity::uuidv7_from;
 use local_rag_core::paths::StoreLayout;
 use local_rag_index::parse::{
     BashParser, GoParser, JavaScriptParser, LanguageId, LanguageParser, PythonParser, RustParser,
-    SourceDialect, SyntaxAnchor, TomlParser, TypeScriptParser, parser_fingerprint,
+    SourceDialect, SyntaxAnchor, TomlParser, TypeScriptParser, YamlParser, parser_fingerprint,
     persist_parse_output,
 };
 use local_rag_store::StateDb;
@@ -111,6 +111,7 @@ fn parser_for(language: &str) -> Box<dyn LanguageParser> {
         "bash" => Box::new(BashParser::new()),
         "go" => Box::new(GoParser::new()),
         "toml" => Box::new(TomlParser::new()),
+        "yaml" => Box::new(YamlParser::new()),
         other => panic!("no parser for fixture language {other:?}"),
     }
 }
@@ -172,7 +173,7 @@ fn parser_fixtures_match_expected_units_and_refs() {
         *per_language.entry(case.language.clone()).or_default() += 1;
     }
     // Every language must be exercised (TypeScript T04-03, JavaScript T04-04,
-    // Rust T04-05, Python T24-01, Bash T24-02, Go T24-03, TOML T24-04).
+    // Rust T04-05, Python T24-01, Bash T24-02, Go T24-03, TOML T24-04, YAML T24-05).
     for lang in [
         "typescript",
         "javascript",
@@ -181,6 +182,7 @@ fn parser_fixtures_match_expected_units_and_refs() {
         "bash",
         "go",
         "toml",
+        "yaml",
     ] {
         assert!(
             per_language.get(lang).copied().unwrap_or(0) >= 4,
@@ -236,6 +238,10 @@ fn fingerprints_are_reconciled_after_linking_the_grammars() {
     assert_eq!(
         parser_fingerprint(LanguageId::Toml),
         "chunk=1;grammar=tree-sitter-toml-ng@1;lang=toml;norm=1;queries=1"
+    );
+    assert_eq!(
+        parser_fingerprint(LanguageId::Yaml),
+        "chunk=1;grammar=tree-sitter-yaml@1;lang=yaml;norm=1;queries=1"
     );
 }
 

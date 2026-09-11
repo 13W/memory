@@ -50,6 +50,15 @@ Rust integration test `crates/index/tests/parse_fixtures.rs`.
   (`parser.toml.subtable`), a quoted key is unquoted and an unsafe one takes an
   ordinal (`parser.toml.keyforms`, `parser.toml.unquotable`), and two `[[bin]]`
   elements are indistinguishable by signature (`parser.toml.tablearray`).
+- **YAML** — authored in **T24-05** (`tree-sitter-yaml` adapter, ADR-0015), the
+  last language of group 24 and the second whose units are `config_section`.
+  `parser.yaml.multidoc` is the card's acceptance: the three-document manifest the
+  universal line scanner merged into one flat key list, in which two documents'
+  identical `kind` keys were indistinguishable. The rest pin the decisions: only a
+  key whose value is a mapping or a sequence is a section (`parser.yaml.structural`),
+  a document whose single key spans it all is still that key's ancestor
+  (`parser.yaml.single-key`, the `D-135` regression), and a key containing `/` takes
+  an ordinal anchor rather than corrupting the route (`parser.yaml.slash-key`).
 
 v1 had no golden tree-sitter chunking fixtures (the v1 parser `src/indexer/parser.ts`
 was exercised only through the 49-query benchmark), so these are authored, not

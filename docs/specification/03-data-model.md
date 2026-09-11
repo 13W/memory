@@ -536,8 +536,8 @@ As-built format `[SPEC]` (realized by T04-02 in `crates/index/src/parse/`):
   "precise selector is T04-02": extension-only, case-insensitive
   (`.ts/.tsx/.mts/.cts`→typescript, `.js/.jsx/.mjs/.cjs`→javascript, `.rs`→rust; post-v0,
   ADR-0015: `.py/.pyi`→python as of T24-01, `.sh/.bash`→bash as of T24-02, `.go`→go as of T24-03
-  and `.toml`→toml as of T24-04 — the last of which also **left** `CONFIG_EXTENSIONS`, so an
-  extension is claimed by exactly one selector; `.yaml`/`.yml` land in T24-05).
+  `.toml`→toml as of T24-04 and `.yaml`/`.yml`→yaml as of T24-05 — the last two of which also
+  **left** `CONFIG_EXTENSIONS`, so an extension is claimed by exactly one selector).
 - Version realization: `chunk=CHUNK_POLICY_VERSION`, `norm=BOUNDARY_NORM_VERSION`,
   `grammar=<grammar_name>@<grammar_version>`, `queries=<query_version>`; all `1` in v0.
   `BOUNDARY_NORM_VERSION` is **distinct** from `content_blob`'s `normalization_version`
