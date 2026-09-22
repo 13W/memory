@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 #[cfg(unix)]
-use crate::connect::{DEFAULT_BACKOFF, connect_or_spawn};
+use crate::connect::{BackoffPolicy, DEFAULT_BACKOFF, backoff_delay_ms, connect_or_spawn};
 use crate::error::ProxyError;
 use crate::transport::{read_bounded_line, write_message};
 
@@ -212,11 +212,24 @@ pub async fn establish_session(
     params: &SessionParams,
 ) -> Result<EstablishedSession, ProxyError> {
     for round in 1..=MAX_UPGRADE_ROUNDS {
-        let stream = connect_or_spawn(socket_path, daemon_binary, DEFAULT_BACKOFF).await?;
-        let (read_half, write_half) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(read_half);
-        let mut writer = write_half;
-        let welcome = do_handshake(&mut reader, &mut writer, params).await?;
+        let attempt = || async {
+            let stream = connect_or_spawn(socket_path, daemon_binary, DEFAULT_BACKOFF).await?;
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read_half);
+            let mut writer = write_half;
+            let welcome = do_handshake(&mut reader, &mut writer, params).await?;
+            Ok((reader, writer, welcome))
+        };
+        let (mut reader, mut writer, welcome) = if round == 1 {
+            attempt().await?
+        } else {
+            retry_while_old_daemon_leaves(
+                DEFAULT_BACKOFF,
+                Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS),
+                attempt,
+            )
+            .await?
+        };
 
         if welcome.daemon_version == local_rag_core::VERSION {
             return Ok(EstablishedSession {
@@ -238,6 +251,58 @@ pub async fn establish_session(
         wait_for_close(&mut reader, Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS)).await?;
     }
     Err(ProxyError::UpgradeLoopExceeded)
+}
+
+/// D-115: whether `error` is what a connect+handshake produces when it lands
+/// on an old daemon that is still going away after `SHUTDOWN_REQUEST`.
+///
+/// Its client connection is closed by then (that is what `wait_for_close`
+/// observed), but its listener can still be bound while it drains, so the
+/// next connect succeeds against a socket that is about to disappear: the
+/// pending connection is reset when the listener closes (`ECONNRESET` on
+/// Linux) or closed mid-handshake (`HandshakeClosed`). Neither says anything
+/// about the daemon that will answer a moment later.
+#[cfg(unix)]
+fn is_old_daemon_leaving(error: &ProxyError) -> bool {
+    matches!(
+        error,
+        ProxyError::Transport(_) | ProxyError::HandshakeClosed
+    )
+}
+
+/// Run `attempt` until it succeeds, retrying with `policy`'s backoff while it
+/// fails the way a still-departing old daemon makes it fail
+/// ([`is_old_daemon_leaving`]), for at most `budget`. Any other error, or the
+/// budget running out, returns the attempt's own error unchanged.
+///
+/// Used only after `SHUTDOWN_REQUEST` has been sent. A retry here is not an
+/// upgrade round: the version-mismatch budget ([`MAX_UPGRADE_ROUNDS`]) counts
+/// daemons that answered with the wrong version, not connections the old one
+/// dropped on its way out.
+#[cfg(unix)]
+async fn retry_while_old_daemon_leaves<F, Fut, T>(
+    policy: BackoffPolicy,
+    budget: Duration,
+    mut attempt: F,
+) -> Result<T, ProxyError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut next_attempt = 1u32;
+    loop {
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        next_attempt += 1;
+        let delay = Duration::from_millis(backoff_delay_ms(policy, next_attempt));
+        if !is_old_daemon_leaving(&error) || tokio::time::Instant::now() + delay > deadline {
+            return Err(error);
+        }
+        tokio::time::sleep(delay).await;
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +447,83 @@ mod tests {
         let result =
             wait_for_close(&mut reader, Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS)).await;
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    fn reset() -> ProxyError {
+        ProxyError::Transport(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_departing_old_daemon_is_retried_until_the_next_one_answers() {
+        let mut failures = vec![reset(), ProxyError::HandshakeClosed];
+        let mut calls = 0u32;
+        let result = retry_while_old_daemon_leaves(
+            DEFAULT_BACKOFF,
+            Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS),
+            || {
+                calls += 1;
+                let next = failures.pop();
+                async move {
+                    match next {
+                        Some(error) => Err(error),
+                        None => Ok("welcome"),
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), "welcome");
+        assert_eq!(calls, 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_departing_old_daemon_is_retried_only_within_the_budget() {
+        let started = tokio::time::Instant::now();
+        let mut calls = 0u32;
+        let result: Result<(), _> = retry_while_old_daemon_leaves(
+            DEFAULT_BACKOFF,
+            Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS),
+            || {
+                calls += 1;
+                async { Err(reset()) }
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProxyError::Transport(_))),
+            "{result:?}"
+        );
+        assert!(calls > 2, "{calls}");
+        assert!(started.elapsed() <= Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_that_is_not_a_departure_is_returned_without_retrying() {
+        let mut calls = 0u32;
+        let result: Result<(), _> = retry_while_old_daemon_leaves(
+            DEFAULT_BACKOFF,
+            Duration::from_millis(UPGRADE_CLOSE_TIMEOUT_MS),
+            || {
+                calls += 1;
+                async {
+                    Err(ProxyError::Incompatible {
+                        min_proto: 9,
+                        max_proto: 9,
+                        daemon_version: "9.9.9".to_string(),
+                    })
+                }
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProxyError::Incompatible { .. })),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -429,3 +429,17 @@ advanced past the old process's own cap with nothing left pending. This is hones
 artifact configured two ways, not a second historical binary — there is no real second release or
 machine available (no network, no second checkout) — documented as such in the test's own doc
 comment.
+
+As-built note (D-115, `[SPEC]`). "Old daemon drains and exits" is not instantaneous, and the
+proxy's second `connect_or_spawn` can land inside the drain: the old daemon has closed the
+proxy's connection (which is what `wait_for_close` observed) but its listener is still bound, so
+the connect succeeds and the connection is then reset when that listener closes (`ECONNRESET` on
+Linux) or closed mid-handshake. `establish_session` therefore treats `ProxyError::Transport` and
+`ProxyError::HandshakeClosed` on any round after a `SHUTDOWN_REQUEST` as the old daemon still
+leaving, and retries connect + handshake on `DEFAULT_BACKOFF`'s schedule for up to
+`UPGRADE_CLOSE_TIMEOUT_MS` (30 s) — `retry_while_old_daemon_leaves`. Those retries are not upgrade
+rounds: `MAX_UPGRADE_ROUNDS` still counts only daemons that answered with the wrong version. Any
+other error, and any failure on round 1 (before an upgrade was requested), stays fatal exactly
+as before. Proved by `local-rag-proxy/tests/subprocess.rs::a_reset_from_the_departing_old_daemon_
+does_not_fail_the_upgrade`, whose fake accepts the post-upgrade connection and drops it with HELLO
+half-read.

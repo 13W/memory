@@ -441,40 +441,77 @@ fn spawn_fake_mismatched_daemon(
     std::thread::spawn(move || {
         for round in 1..=connections {
             let (stream, _) = listener.accept().expect("accept fake daemon connection");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
-            let mut writer = stream;
-
-            let mut hello_line = String::new();
-            reader.read_line(&mut hello_line).expect("read HELLO");
-
-            let welcome = Message::Welcome(Welcome {
-                proto: local_rag_protocol::PROTO_VERSION,
-                daemon_version: "0.0.0-fake-old".to_string(),
-                store_instance_uuid: "fake-instance".to_string(),
-                capabilities: Vec::new(),
-                mcp_passthrough_version: MCP_PASSTHROUGH_VERSION,
-                spool_max_format_version: local_rag_core::spool::FORMAT_VERSION,
-                mode: "normal".to_string(),
-            });
-            let bytes = encode_message(&welcome).expect("encode WELCOME");
-            writer.write_all(&bytes).expect("write WELCOME");
-
-            if round < MAX_UPGRADE_ROUNDS {
-                let mut shutdown_line = String::new();
-                reader
-                    .read_line(&mut shutdown_line)
-                    .expect("read SHUTDOWN_REQUEST");
-                let msg =
-                    decode_message(shutdown_line.trim_end()).expect("decode SHUTDOWN_REQUEST");
-                assert!(
-                    matches!(msg, Message::ShutdownRequest(ShutdownRequest { .. })),
-                    "expected a ShutdownRequest, got {msg:?}"
-                );
-            }
-            // Dropping `reader`/`writer` here is this fake daemon's own
-            // "drain and exit" — the real loop's `wait_for_close` observes
-            // the resulting EOF.
+            answer_as_a_mismatched_daemon(stream, round < MAX_UPGRADE_ROUNDS);
         }
+    })
+}
+
+/// One connection of [`spawn_fake_mismatched_daemon`]: read HELLO, answer a
+/// mismatched `Welcome`, and — when the real loop is expected to ask —
+/// read its `SHUTDOWN_REQUEST`. Dropping the stream on return is this fake
+/// daemon's own "drain and exit" — the real loop's `wait_for_close` observes
+/// the resulting EOF.
+fn answer_as_a_mismatched_daemon(stream: std::os::unix::net::UnixStream, expect_shutdown: bool) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
+    let mut writer = stream;
+
+    let mut hello_line = String::new();
+    reader.read_line(&mut hello_line).expect("read HELLO");
+
+    let welcome = Message::Welcome(Welcome {
+        proto: local_rag_protocol::PROTO_VERSION,
+        daemon_version: "0.0.0-fake-old".to_string(),
+        store_instance_uuid: "fake-instance".to_string(),
+        capabilities: Vec::new(),
+        mcp_passthrough_version: MCP_PASSTHROUGH_VERSION,
+        spool_max_format_version: local_rag_core::spool::FORMAT_VERSION,
+        mode: "normal".to_string(),
+    });
+    let bytes = encode_message(&welcome).expect("encode WELCOME");
+    writer.write_all(&bytes).expect("write WELCOME");
+
+    if expect_shutdown {
+        let mut shutdown_line = String::new();
+        reader
+            .read_line(&mut shutdown_line)
+            .expect("read SHUTDOWN_REQUEST");
+        let msg = decode_message(shutdown_line.trim_end()).expect("decode SHUTDOWN_REQUEST");
+        assert!(
+            matches!(msg, Message::ShutdownRequest(ShutdownRequest { .. })),
+            "expected a ShutdownRequest, got {msg:?}"
+        );
+    }
+}
+
+/// D-115: an old daemon that is still going away after `SHUTDOWN_REQUEST`.
+///
+/// The first connection is [`spawn_fake_mismatched_daemon`]'s. The second —
+/// the real loop's post-upgrade connect — lands on this listener, which is
+/// still bound, exactly as a draining daemon's is. It is accepted and then
+/// dropped with the proxy's HELLO only partly read: unread data on close is
+/// what makes Linux answer the proxy with `ECONNRESET` (the error CI run
+/// `33408213682` captured); elsewhere the proxy sees the connection close
+/// mid-handshake. Only then does the thread exit and drop the listener, so
+/// the next connect finds nothing listening and spawns the real daemon.
+///
+/// Deterministic by construction: the second connect cannot miss this
+/// listener, because the thread is blocked in `accept` until it arrives.
+fn spawn_fake_mismatched_then_departing_daemon(
+    socket_path: std::path::PathBuf,
+) -> std::thread::JoinHandle<()> {
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept fake daemon connection");
+        answer_as_a_mismatched_daemon(stream, true);
+
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept the post-upgrade connection");
+        let mut first_byte = [0u8; 1];
+        stream
+            .read_exact(&mut first_byte)
+            .expect("read the first byte of HELLO");
+        drop(stream);
     })
 }
 
@@ -514,6 +551,45 @@ fn daemon_version_mismatch_triggers_the_upgrade_flow_and_completes_against_the_n
     let _ = stdout;
 
     fake.join().expect("fake old daemon thread panicked");
+    wait_until_daemon_ready(&layout, Duration::from_secs(5));
+
+    drop(stdin);
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(20));
+    assert!(status.success(), "proxy must exit 0: {status:?}");
+
+    cleanup_daemon(&layout, Duration::from_secs(20));
+}
+
+/// D-115 regression: the post-upgrade connect lands on the old daemon while
+/// it is still going away and is reset (or closed) mid-handshake. That is
+/// not a failed upgrade: the proxy retries until the new daemon answers,
+/// and the reset does not count as a version-mismatch round.
+#[test]
+fn a_reset_from_the_departing_old_daemon_does_not_fail_the_upgrade() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+
+    let fake = spawn_fake_mismatched_then_departing_daemon(layout.socket_path());
+
+    let mut proxy = spawn_proxy(&home, &[("LOCAL_RAG_SESSION_ID", "test-session-departing")]);
+    let mut stdin = proxy.stdin.take().expect("proxy stdin");
+    let stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
+
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    let (stdout, line) = read_line(&mut proxy, stdout, Duration::from_secs(25));
+    let response: serde_json::Value =
+        serde_json::from_str(line.trim_end()).expect("parse response");
+    assert_eq!(
+        response["result"]["serverInfo"]["name"], "local-rag",
+        "the proxy must ride out the departing daemon's reset and complete the \
+         handshake against the newly spawned one: {response}"
+    );
+    let _ = stdout;
+
+    fake.join().expect("fake departing daemon thread panicked");
     wait_until_daemon_ready(&layout, Duration::from_secs(5));
 
     drop(stdin);
