@@ -82,6 +82,20 @@
 //! would be exactly the automatic write [`local_rag_memory::guard`]'s own
 //! `D-078` boundary refuses to make.
 //!
+//! # Approving a duplicate `create` reinforces the entry it duplicates
+//!
+//! (`D-131`, owner decision 2026-09-23.) The check above runs when a row is
+//! written, so it cannot see rows written before it shipped, nor a pair of
+//! pending twins once one of them has been approved. [`approve_candidate`]
+//! therefore looks the text up once more, in its own transaction: a `create`
+//! whose exact text is already a non-terminal entry in its scope is applied
+//! as a `reinforce` of that entry (no confidence change, the candidate's
+//! evidence linked) rather than minting a second copy. Unlike the propose
+//! side this *does* write, because approval is the operator's explicit act
+//! and the evidence behind the candidate is exactly what `D-078`'s rewrite
+//! exists to keep. The candidate still ends `approved`, and the outcome names
+//! the existing entry's `memory_id`.
+//!
 //! # Folding a pre-existing duplicate group is a recorded act, not a rejection
 //!
 //! (`T23-08`, ADR-0014 Decision 2.) [`propose_candidate`]'s check only guards
@@ -818,6 +832,7 @@ pub fn approve_candidate(
         Ok(p) => p,
         Err(e) => return Ok(Err(ReviewError::InvalidProposedOperation(e.to_string()))),
     };
+    let proposed = fold_create_into_existing_entry(tx, proposed)?;
 
     let observation_ids = candidate_evidence_for(tx, candidate_id)?;
     let mut sourced = Vec::with_capacity(observation_ids.len());
@@ -859,6 +874,38 @@ pub fn approve_candidate(
     )?;
 
     Ok(Ok(ApproveCandidateOutcome::Materialized(outcome)))
+}
+
+/// `D-131`: a `create` whose exact text is already a non-terminal entry in
+/// its scope becomes a `reinforce` of that entry — the rule `D-078` applies
+/// to router ops (`local_rag_memory::guard`), applied once more at approval.
+///
+/// `propose_candidate` has refused such proposals since `T23-07`, but rows
+/// written before it (and pairs of pending twins, one of which has since been
+/// approved) still reach this point. `confidence: None` for the same reason
+/// the guard gives: the candidate's number was an opinion of a *new* entry.
+/// Anything else, including an unrecognised `scope_kind` (which the dispatcher
+/// reports as its own typed error), passes through unchanged.
+fn fold_create_into_existing_entry(
+    tx: &Transaction<'_>,
+    proposed: ProposedOperation,
+) -> rusqlite::Result<ProposedOperation> {
+    if let ProposedOperation::Create {
+        scope_kind,
+        scope_owner_id,
+        text,
+        ..
+    } = &proposed
+        && let Some(scope) = ScopeKind::from_db(scope_kind)
+        && let Some(existing) = active_entry_with_text(tx, scope, scope_owner_id, text)?
+    {
+        return Ok(ProposedOperation::Reinforce {
+            memory_id: existing.memory_id,
+            expected_version: existing.entry_version,
+            confidence: None,
+        });
+    }
+    Ok(proposed)
 }
 
 /// Dispatch `proposed` to the matching `op::apply_*` (spec 04 §6/08 §4).

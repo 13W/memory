@@ -15,8 +15,9 @@ use local_rag_store::memory::{
     AUDIT_ENTITY_CANDIDATE, AUDIT_OP_FOLD_DUPLICATE, ApproveCandidateOutcome, CandidateCountRow,
     CandidateRow, FoldDuplicatesOutcome, FoldRetained, ProposeCandidateOutcome, ProposedOperation,
     ReviewError, approve_candidate, candidate_evidence_for, edit_candidate,
-    fold_pending_duplicates, list_candidates, memory_entry_state, memory_evidence_for,
-    pending_candidate_counts, pending_candidate_groups, propose_candidate, reject_candidate,
+    fold_pending_duplicates, list_candidates, memory_entry_by_id, memory_entry_state,
+    memory_evidence_for, pending_candidate_counts, pending_candidate_groups, propose_candidate,
+    reject_candidate,
 };
 use local_rag_store::rusqlite::{Connection, params};
 use local_rag_store::{
@@ -1829,4 +1830,185 @@ fn candidate_state_of(conn: &Connection, candidate_id: &str) -> CandidateState {
     )
     .map(|raw| CandidateState::from_db(&raw).expect("valid review_state"))
     .expect("candidate exists")
+}
+
+// ---------------------------------------------------------------------------
+// D-131: approving a duplicate create reinforces the entry it duplicates
+// ---------------------------------------------------------------------------
+
+/// Write a pending candidate the way rows were written before `T23-07`:
+/// straight through `create_candidate`, with no duplicate check, since
+/// `propose_candidate` now refuses exactly the rows these tests need.
+async fn seed_unchecked_candidate(
+    db: &StateDb,
+    candidate_id: &str,
+    op: &ProposedOperation,
+    evidence_observation_ids: Vec<String>,
+    now_ms: i64,
+) {
+    let (id, json) = (
+        candidate_id.to_string(),
+        serde_json::to_string(op).expect("serialize proposal"),
+    );
+    db.writer()
+        .transaction(move |tx| {
+            create_candidate(
+                tx,
+                &NewCandidate {
+                    candidate_id: &id,
+                    proposed_operation: &json,
+                    conflicts: None,
+                },
+                now_ms,
+            )?;
+            for observation_id in &evidence_observation_ids {
+                insert_candidate_evidence(tx, &id, observation_id)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed unchecked candidate");
+}
+
+fn with_confidence(op: ProposedOperation, value: f64) -> ProposedOperation {
+    let ProposedOperation::Create {
+        memory_id,
+        kind,
+        text,
+        canonical_key,
+        scope_kind,
+        scope_owner_id,
+        importance,
+        valid_from_tree,
+        last_verified_tree,
+        ..
+    } = op
+    else {
+        panic!("with_confidence takes a create")
+    };
+    ProposedOperation::Create {
+        memory_id,
+        kind,
+        text,
+        canonical_key,
+        scope_kind,
+        scope_owner_id,
+        confidence: value,
+        importance,
+        valid_from_tree,
+        last_verified_tree,
+    }
+}
+
+#[tokio::test]
+async fn approving_a_create_whose_text_is_already_an_entry_reinforces_that_entry() {
+    let (_home, db) = open_state();
+    let owner = uuid(230);
+    let first_id = uuid(231);
+    let twin_id = uuid(232);
+    let first_obs = seed_observation(&db, 233, EvidenceKind::TestResult, "sess-a").await;
+    let twin_obs = seed_observation(&db, 234, EvidenceKind::TestResult, "sess-b").await;
+
+    propose(
+        &db,
+        "cand-first",
+        create_op(&first_id, MemoryKind::Fact, &owner),
+        vec![],
+        vec![first_obs.clone()],
+        1_000,
+    )
+    .await;
+    // The twin carries a different confidence, so the assertion below can
+    // tell "left alone" from "overwritten with the candidate's number".
+    seed_unchecked_candidate(
+        &db,
+        "cand-twin",
+        &with_confidence(create_op(&twin_id, MemoryKind::Fact, &owner), 0.9),
+        vec![twin_obs.clone()],
+        1_001,
+    )
+    .await;
+
+    approve(&db, "cand-first", 2_000)
+        .await
+        .expect("approve first");
+    let outcome = approve(&db, "cand-twin", 3_000)
+        .await
+        .expect("approve twin");
+    let ApproveCandidateOutcome::Materialized(MemoryOpOutcome::Applied(result)) = outcome else {
+        panic!("expected Materialized(Applied), got {outcome:?}");
+    };
+    assert_eq!(
+        result.memory_id, first_id,
+        "the twin names the entry it duplicates"
+    );
+    assert_eq!(result.entry_version, 2, "a reinforce bumps the version");
+
+    let read = db.open_read().expect("read conn");
+    assert_eq!(row_count(&read, "memory_entry"), 1, "no second copy");
+    assert_eq!(memory_entry_state(&read, &twin_id).expect("state"), None);
+    let entry = memory_entry_by_id(&read, &first_id)
+        .expect("read entry")
+        .expect("entry exists");
+    assert_eq!(entry.confidence, 0.5, "confidence is left alone");
+    let mut evidence = memory_evidence_for(&read, &first_id).expect("evidence");
+    evidence.sort();
+    let mut expected = vec![first_obs, twin_obs];
+    expected.sort();
+    assert_eq!(evidence, expected, "the twin's evidence is kept");
+    assert_eq!(
+        candidate_state_of(&read, "cand-first"),
+        CandidateState::Approved
+    );
+    assert_eq!(
+        candidate_state_of(&read, "cand-twin"),
+        CandidateState::Approved
+    );
+
+    let again = approve(&db, "cand-twin", 4_000).await.expect("re-approve");
+    assert_eq!(again, ApproveCandidateOutcome::AlreadyApproved);
+    let read = db.open_read().expect("read conn");
+    let entry = memory_entry_by_id(&read, &first_id)
+        .expect("read entry")
+        .expect("entry exists");
+    assert_eq!(
+        entry.entry_version, 2,
+        "a replayed approval changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_same_text_in_another_scope_is_still_a_new_entry() {
+    let (_home, db) = open_state();
+    let (owner_a, owner_b) = (uuid(240), uuid(241));
+    let (id_a, id_b) = (uuid(242), uuid(243));
+
+    propose(
+        &db,
+        "cand-a",
+        create_op(&id_a, MemoryKind::Fact, &owner_a),
+        vec![],
+        vec![],
+        1_000,
+    )
+    .await;
+    propose(
+        &db,
+        "cand-b",
+        create_op(&id_b, MemoryKind::Fact, &owner_b),
+        vec![],
+        vec![],
+        1_001,
+    )
+    .await;
+
+    approve(&db, "cand-a", 2_000).await.expect("approve a");
+    let outcome = approve(&db, "cand-b", 3_000).await.expect("approve b");
+    let ApproveCandidateOutcome::Materialized(MemoryOpOutcome::Applied(result)) = outcome else {
+        panic!("expected Materialized(Applied), got {outcome:?}");
+    };
+    assert_eq!(result.memory_id, id_b);
+    assert_eq!(result.entry_version, 1);
+    let read = db.open_read().expect("read conn");
+    assert_eq!(row_count(&read, "memory_entry"), 2);
 }

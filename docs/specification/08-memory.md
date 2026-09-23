@@ -138,6 +138,13 @@ section states less precisely than the code fixes:
   it still never turns a candidate into an automatic write, because declining to enqueue a
   duplicate *request* is not answering it.
 
+  Approval closes the last path (`D-131`, owner decision 2026-09-23). A candidate written before
+  `T23-07`, or the pending twin of one approved since, can still carry a `create` of text that is
+  now an active entry; `approve_candidate` looks the text up in its own transaction and applies
+  such a `create` as a `reinforce` of that entry, by this bullet's rule — evidence linked,
+  `confidence` untouched (04 §6's as-built note). Here the rewrite *does* write, because approval
+  is the operator's explicit act, not an automatic one.
+
   `T23-07` prevents new duplicates; it does not shrink the backlog that already existed (11 236
   pending `create` rows over 4 393 distinct claims, measured live). `T23-08` is the reduction:
   `local_rag_store::memory::fold_pending_duplicates` collapses one exact-duplicate group at a

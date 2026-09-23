@@ -276,6 +276,14 @@ pending ──▶ approved (materializes its proposed_operation as a normal memo
 Approval executes the proposed operation through the same transactional memory-op path as the
 router (same audit, same idempotency), with `actor='user'`.
 
+As-built note (D-131, `[SPEC]`, owner decision 2026-09-23): "materializes its proposed_operation"
+has one rewrite. A `create` whose exact text is already a non-terminal entry in its scope is
+materialized as a `reinforce` of that entry — no second copy, `confidence` untouched, the
+candidate's evidence linked — the same rule 08 §3 states for router ops (`D-078`). The candidate
+still ends `approved` and the outcome names the existing entry. `approve_candidate` applies it
+itself (`fold_create_into_existing_entry`), because `propose_candidate`'s own check (`T23-07`)
+cannot see rows written before it, nor a pending twin of a candidate approved since.
+
 As-built note (T14-05, `[SPEC]`): `pending_memory_candidate.proposed_operation` (03 §2.5's "JSON:
 op + target + text + …") is a tagged JSON enum, `local_rag_store::memory::ProposedOperation`
 (`#[serde(tag = "op", rename_all = "snake_case")]`), restricted to the five router ops that are
