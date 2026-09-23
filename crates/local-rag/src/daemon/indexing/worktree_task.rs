@@ -1217,7 +1217,7 @@ mod tests {
         let mut stmt = conn
             .prepare(
                 "SELECT g.generation_number, g.generation_id, g.created_at, \
-                        gf.normalized_path, fr.content_hash, fr.source_size \
+                        gf.normalized_path, fr.content_hash, fr.source_size, g.state \
                  FROM generation g \
                  LEFT JOIN generation_file gf ON gf.generation_id = g.generation_id \
                  LEFT JOIN file_revision fr ON fr.file_revision_id = gf.file_revision_id \
@@ -1231,8 +1231,9 @@ mod tests {
             let path: Option<String> = r.get(3)?;
             let hash: Option<String> = r.get(4)?;
             let size: Option<i64> = r.get(5)?;
+            let state: String = r.get(6)?;
             Ok(format!(
-                "  #{number} {id} created_at={created_at} path={} hash={} size={}",
+                "  #{number} {id} state={state} created_at={created_at} path={} hash={} size={}",
                 path.unwrap_or_else(|| "<none>".into()),
                 hash.map(|h| h[..h.len().min(12)].to_string())
                     .unwrap_or_else(|| "<none>".into()),
@@ -1293,12 +1294,19 @@ mod tests {
         .await;
 
         let built = generation_contents(&state);
+        // D-136: CI run `35859662332` failed here with #2 and #3 content-identical,
+        // which the dump above cannot tell apart further: either #2's build failed
+        // after writing its rows (so the skip rightly had no `last_built`, and a
+        // `failed` row is being counted), or #2 succeeded and the skip still missed.
+        // `state=` in the dump and the task status below name which.
         assert_eq!(
             built.len(),
             2,
             "one generation for the cold start and one for the edit; the three \
-             triggers over an unchanged tree must have minted nothing. Built:\n{}",
-            built.join("\n")
+             triggers over an unchanged tree must have minted nothing. Built:\n{}\n\
+             task status: {:?}",
+            built.join("\n"),
+            handle.status()
         );
 
         handle.stop().await;
