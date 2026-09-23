@@ -1018,6 +1018,32 @@ async fn spawn_spool_resume(
     }
 }
 
+/// D-129: the router kept a valid prefix of its answer and dropped the rest.
+///
+/// That is a partial *success* — the run is not `Failed`, so nothing else in
+/// the daemon ever logs it, and until this line the loss was visible only
+/// under `LOCAL_RAG_ROUTER_DEBUG`. Measured at roughly one productive run in
+/// six hitting the answer reserve, which is why this is a `warn`, not a
+/// `debug`: each occurrence is proposals the store will never see.
+fn log_dropped_tail(
+    session_id: &str,
+    from_received_seq: i64,
+    to_received_seq: i64,
+    answer_reserve_tokens: u32,
+    dropped: &local_rag_memory::router::DroppedTail,
+) {
+    let cause = if dropped.reserve_exhausted {
+        format!(" (the answer reached its {answer_reserve_tokens}-token reserve)")
+    } else {
+        String::new()
+    };
+    tracing::warn!(
+        "local-rag: consolidation window {session_id} seq {from_received_seq}..={to_received_seq} \
+         kept a partial answer; the rest was dropped{cause}: {}",
+        dropped.reason
+    );
+}
+
 /// D-024: the continuous consolidation-trigger worker (spec 07 §6).
 ///
 /// This worker is `tokio::spawn`ed independently and so needs a `'static`
@@ -1051,12 +1077,17 @@ async fn spawn_consolidation_trigger(
     let generate = {
         let db = Arc::clone(&db);
         let uuids = Arc::clone(&uuids);
-        move |window| {
+        move |window: local_rag_store::ConsolidationWindow| {
             let db = Arc::clone(&db);
             let pool = Arc::clone(&pool);
             let uuids = Arc::clone(&uuids);
             async move {
-                let ops = local_rag_memory::router::route(
+                let (session_id, from_seq, to_seq) = (
+                    window.session_id.clone(),
+                    window.from_received_seq,
+                    window.to_received_seq,
+                );
+                let output = local_rag_memory::router::route(
                     &db,
                     &pool,
                     data_policy,
@@ -1066,6 +1097,16 @@ async fn spawn_consolidation_trigger(
                     prompt_budget,
                 )
                 .await?;
+                if let Some(dropped) = &output.dropped_tail {
+                    log_dropped_tail(
+                        &session_id,
+                        from_seq,
+                        to_seq,
+                        prompt_budget.answer_reserve_tokens,
+                        dropped,
+                    );
+                }
+                let ops = output.ops;
                 // T21-14: the router's own output crosses the same write
                 // boundary. Since T21-11 its prompt asks for English, so the
                 // detector answers for free and this is a safety net — but it
@@ -1318,6 +1359,55 @@ mod tests {
         assert!(
             !logged.contains("a healthy task"),
             "a clean join must not be logged: {logged}"
+        );
+    }
+
+    /// D-129: a dropped router tail is logged at WARN with enough to find the
+    /// window again, and the reserve is blamed only when it was the cause.
+    #[test]
+    fn log_dropped_tail_names_the_window_and_blames_the_reserve_only_when_it_ran_out() {
+        let buf = SharedBuf(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_dropped_tail(
+                "sess-cut",
+                4,
+                9,
+                4_000,
+                &local_rag_memory::router::DroppedTail {
+                    reason: "EOF while parsing a string".to_string(),
+                    reserve_exhausted: true,
+                },
+            );
+            log_dropped_tail(
+                "sess-trailing",
+                10,
+                10,
+                4_000,
+                &local_rag_memory::router::DroppedTail {
+                    reason: "expected value at line 1 column 1".to_string(),
+                    reserve_exhausted: false,
+                },
+            );
+        });
+
+        let logged = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 2, "{logged}");
+        assert!(lines[0].contains("WARN"), "{logged}");
+        assert!(lines[0].contains("sess-cut seq 4..=9"), "{logged}");
+        assert!(lines[0].contains("4000-token reserve"), "{logged}");
+        assert!(lines[0].contains("EOF while parsing a string"), "{logged}");
+        assert!(lines[1].contains("sess-trailing seq 10..=10"), "{logged}");
+        assert!(
+            !lines[1].contains("reserve"),
+            "trailing text is not a reserve problem: {logged}"
         );
     }
 

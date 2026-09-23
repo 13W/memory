@@ -1,7 +1,9 @@
 //! The router's entry point (T14-07, spec 08 §4 step 3): [`route`] is the
-//! `generate` closure [`local_rag_store::run_once`] is generic over —
-//! composed at the daemon/`xtask` call site as
-//! `|window| route(&state_db, &pool, policy, &uuids, window)`. Nothing here
+//! body of the `generate` closure [`local_rag_store::run_once`] is generic
+//! over — composed at the daemon/`xtask` call site as
+//! `|window| route(&state_db, &pool, policy, &uuids, window)`, which hands
+//! [`RouteOutput::ops`] on and reports [`RouteOutput::dropped_tail`]
+//! (`D-129`) through its own logging. Nothing here
 //! runs inside a transaction ([`local_rag_store::memory::runner`]'s own
 //! module doc requires exactly that); [`route`] only ever opens its own read
 //! connection.
@@ -55,17 +57,28 @@ fn trace_raw_response(text: &str) {
     }
 }
 
-/// Same gate as [`trace_raw_response`] — D-051: a partial [`parse::
-/// ParseOutcome`] (a valid prefix, a trailing line dropped) is not a
-/// failure, so it never reaches this crate's daemon-side caller's own
-/// `tracing`-based failure logging (`daemon::resume::consolidation`/
-/// `daemon::consolidation_trigger`, both of which only log `RunOutcome::
-/// Failed`) — this is the one place that visibility exists, for whoever is
-/// actively tuning the prompt/generation budget.
-fn trace_dropped_tail(reason: &str) {
-    if std::env::var_os("LOCAL_RAG_ROUTER_DEBUG").is_some() {
-        eprintln!("[router debug] dropped trailing content: {reason}");
-    }
+/// What [`route`] could not keep of the model's answer — `D-129`.
+///
+/// A tier-2 partial recovery (`parse::ParseOutcome::dropped_tail`) is a
+/// success: the valid prefix is applied and the run is not `Failed`, so the
+/// daemon's failure logging never sees it. This crate has no `tracing`
+/// (only the daemon does), so the loss travels back to the caller instead,
+/// which logs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedTail {
+    /// Why recovery stopped — the first line that failed to parse.
+    pub reason: String,
+    /// The answer ended at its token reserve (`FinishReason::Length`)
+    /// rather than the model trailing off with unparsable text.
+    pub reserve_exhausted: bool,
+}
+
+/// What [`route`] produced: the ops to apply, plus anything of the answer
+/// that could not be kept.
+#[derive(Debug, Clone)]
+pub struct RouteOutput {
+    pub ops: Vec<GeneratedOp>,
+    pub dropped_tail: Option<DroppedTail>,
 }
 
 /// Same gate again — `D-121`: how many ops of one plan named an entry another
@@ -134,7 +147,7 @@ pub async fn route(
     window: ConsolidationWindow,
     conflict_token_budget: u32,
     budget: PromptBudget,
-) -> Result<Vec<GeneratedOp>, ClassifiedFailure> {
+) -> Result<RouteOutput, ClassifiedFailure> {
     let conn = state_db
         .open_read()
         .map_err(|e| ClassifiedFailure::transient(e.to_string()))?;
@@ -212,22 +225,13 @@ pub async fn route(
             (outcome, retry_finish_reason)
         }
     };
-    if let Some(dropped) = &outcome.dropped_tail {
-        // `T23-06`/`D-129`: name the cause when it is known. `dropped_tail`
-        // on its own already meant "a valid prefix survived, the rest did
-        // not parse" — this adds *why* for the one cause that is
-        // distinguishable (`finish_reason`), so a look under
-        // `LOCAL_RAG_ROUTER_DEBUG` does not have to guess whether the answer
-        // ran out of room or the model simply trailed off with extra text.
-        if matches!(finish_reason, FinishReason::Length) {
-            trace_dropped_tail(&format!(
-                "{dropped} (the answer reached its {}-token reserve before finishing)",
-                budget.answer_reserve_tokens
-            ));
-        } else {
-            trace_dropped_tail(dropped);
-        }
-    }
+    // `T23-06`/`D-129`: name the cause when it is known. `dropped_tail` on its
+    // own means "a valid prefix survived, the rest did not parse"; the one
+    // distinguishable cause is the answer running out of room.
+    let dropped_tail = outcome.dropped_tail.map(|reason| DroppedTail {
+        reason,
+        reserve_exhausted: matches!(finish_reason, FinishReason::Length),
+    });
     let raw_ops = outcome.ops;
 
     let by_id: HashMap<&str, &WindowObservation> = window
@@ -252,7 +256,7 @@ pub async fn route(
     if ops.len() != before {
         trace_collapsed(before, ops.len());
     }
-    Ok(ops)
+    Ok(RouteOutput { ops, dropped_tail })
 }
 
 /// Cut the conflict set to what the model's own tokenizer says will fit
@@ -694,7 +698,8 @@ mod tests {
             NO_PROMPT_LIMIT,
         )
         .await
-        .expect("routes cleanly");
+        .expect("routes cleanly")
+        .ops;
 
         assert_eq!(ops.len(), 1, "one entry, one op: {ops:?}");
         let GeneratedOp::Materialize {
@@ -735,7 +740,8 @@ mod tests {
             NO_PROMPT_LIMIT,
         )
         .await
-        .expect("routes cleanly");
+        .expect("routes cleanly")
+        .ops;
         assert_eq!(ops.len(), 2, "two distinct texts stay two ops: {ops:?}");
     }
 
@@ -765,7 +771,8 @@ mod tests {
             NO_PROMPT_LIMIT,
         )
         .await
-        .expect("routes cleanly");
+        .expect("routes cleanly")
+        .ops;
 
         assert_eq!(ops.len(), 1, "one entry, one op: {ops:?}");
         let GeneratedOp::Materialize {
@@ -801,7 +808,8 @@ mod tests {
             NO_PROMPT_LIMIT,
         )
         .await
-        .expect("routes cleanly");
+        .expect("routes cleanly")
+        .ops;
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], GeneratedOp::Materialize { .. }));
     }
@@ -822,7 +830,8 @@ mod tests {
             NO_PROMPT_LIMIT,
         )
         .await
-        .expect("recovers on the second attempt");
+        .expect("recovers on the second attempt")
+        .ops;
         assert_eq!(ops, vec![GeneratedOp::Noop]);
     }
 
@@ -933,7 +942,8 @@ mod tests {
             budget_with_ceiling(ceiling),
         )
         .await
-        .expect("routes with a cut conflict set");
+        .expect("routes with a cut conflict set")
+        .ops;
         assert_eq!(ops.len(), 1, "the window still routes: {ops:?}");
         assert_eq!(
             calls.load(Ordering::Relaxed),
@@ -1012,7 +1022,8 @@ mod tests {
             budget_with_ceiling(1),
         )
         .await
-        .expect("routes unchanged when the provider cannot count");
+        .expect("routes unchanged when the provider cannot count")
+        .ops;
         assert_eq!(ops.len(), 1);
         assert_eq!(
             entries_shown(&last_prompt.lock().expect("lock")),
@@ -1073,7 +1084,8 @@ mod tests {
             budget_with_answer_reserve(4_000),
         )
         .await
-        .expect("routes cleanly once the reserve covers the whole answer");
+        .expect("routes cleanly once the reserve covers the whole answer")
+        .ops;
         assert_eq!(
             ops.len(),
             14,
@@ -1118,11 +1130,92 @@ mod tests {
         // tier-2 partial recovery that is short of all 12 ops.
         match result {
             Err(_) => {}
-            Ok(ops) => assert!(
-                ops.len() < 14,
-                "the old reserve must not quietly fit what the new one is needed for: {ops:?}"
+            Ok(output) => assert!(
+                output.ops.len() < 14,
+                "the old reserve must not quietly fit what the new one is needed for: {:?}",
+                output.ops
             ),
         }
+    }
+
+    /// `D-129`: an answer cut by its reserve keeps its valid prefix *and*
+    /// says what it lost, so the daemon can log it — before this, the loss
+    /// was visible only under `LOCAL_RAG_ROUTER_DEBUG`.
+    #[tokio::test]
+    async fn an_answer_cut_by_its_reserve_reports_the_dropped_tail() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let full_response = many_create_ops(2);
+        let first_line = full_response.lines().next().expect("two lines");
+        // Cut a few characters into the second line: one whole op survives.
+        let cut_chars = first_line.chars().count() + 1 + 8;
+        let reserve = u32::try_from(cut_chars.div_ceil(4)).expect("fits");
+
+        let (pool, _calls) = budgeted_pool_with(full_response);
+        let uuids = SeqUuidV7::new();
+        let output = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            budget_with_answer_reserve(reserve),
+        )
+        .await
+        .expect("a valid prefix is a partial success");
+        assert_eq!(output.ops.len(), 1, "the whole first op is kept");
+        let dropped = output.dropped_tail.expect("the cut is reported");
+        assert!(dropped.reserve_exhausted, "the cause is named: {dropped:?}");
+        assert!(!dropped.reason.is_empty());
+    }
+
+    /// `D-129`: trailing text the model emitted on its own, with room to
+    /// spare, is still a loss worth reporting — but not as a reserve problem.
+    #[tokio::test]
+    async fn trailing_garbage_is_reported_without_blaming_the_reserve() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let answer = format!("{}\nand that is all I have to say", many_create_ops(1));
+        let pool = pool_with(vec![&answer]);
+        let uuids = SeqUuidV7::new();
+        let output = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
+        )
+        .await
+        .expect("a valid prefix is a partial success");
+        assert_eq!(output.ops.len(), 1);
+        let dropped = output.dropped_tail.expect("the trailing text is reported");
+        assert!(!dropped.reserve_exhausted, "{dropped:?}");
+    }
+
+    /// `D-129`: a clean answer reports nothing.
+    #[tokio::test]
+    async fn a_complete_answer_reports_no_dropped_tail() {
+        let (_home, db) = open_state();
+        seed_observation(&db, "o1").await;
+        let answer = many_create_ops(1);
+        let pool = pool_with(vec![&answer]);
+        let uuids = SeqUuidV7::new();
+        let output = route(
+            &db,
+            &pool,
+            DataPolicy::LocalOnly,
+            &uuids,
+            window_with("o1"),
+            NO_BUDGET_LIMIT,
+            NO_PROMPT_LIMIT,
+        )
+        .await
+        .expect("routes cleanly");
+        assert_eq!(output.ops.len(), 1);
+        assert_eq!(output.dropped_tail, None);
     }
 
     /// `D-122`'s live shape: the truncation lands inside the *first* line, so
@@ -1304,7 +1397,8 @@ mod tests {
             NO_PROMPT_LIMIT,
         )
         .await
-        .expect("empty is valid");
+        .expect("empty is valid")
+        .ops;
         assert!(ops.is_empty());
     }
 
@@ -1330,7 +1424,8 @@ mod tests {
             NO_PROMPT_LIMIT,
         )
         .await
-        .expect("the valid prefix is accepted, not treated as a failure");
+        .expect("the valid prefix is accepted, not treated as a failure")
+        .ops;
         assert_eq!(ops, vec![GeneratedOp::Noop]);
     }
 

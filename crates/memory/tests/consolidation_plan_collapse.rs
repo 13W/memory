@@ -300,7 +300,8 @@ async fn a_plan_naming_one_entry_twice_applies_where_it_used_to_conflict() {
         NO_PROMPT_LIMIT,
     )
     .await
-    .expect("routes cleanly");
+    .expect("routes cleanly")
+    .ops;
     assert_eq!(
         ops.len(),
         1,
@@ -505,7 +506,8 @@ async fn an_outside_writer_still_conflicts_and_only_re_planning_converges() {
         NO_PROMPT_LIMIT,
     )
     .await
-    .expect("routes cleanly");
+    .expect("routes cleanly")
+    .ops;
 
     // The outside writer lands between plan and apply.
     let bumped = memory_id.clone();
@@ -571,7 +573,8 @@ async fn an_outside_writer_still_conflicts_and_only_re_planning_converges() {
         NO_PROMPT_LIMIT,
     )
     .await
-    .expect("routes cleanly");
+    .expect("routes cleanly")
+    .ops;
     let report = commit_apply_run(
         &db,
         run,
@@ -611,7 +614,8 @@ async fn one_windows_two_identical_proposals_leave_exactly_one_candidate_row() {
         NO_PROMPT_LIMIT,
     )
     .await
-    .expect("routes cleanly");
+    .expect("routes cleanly")
+    .ops;
     assert_eq!(
         ops.len(),
         2,
@@ -662,7 +666,8 @@ async fn one_windows_two_identical_creates_leave_exactly_one_entry() {
         NO_PROMPT_LIMIT,
     )
     .await
-    .expect("routes cleanly");
+    .expect("routes cleanly")
+    .ops;
     assert_eq!(
         ops.len(),
         1,

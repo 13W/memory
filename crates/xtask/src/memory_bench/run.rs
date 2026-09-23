@@ -137,8 +137,12 @@ pub async fn run(options: &Options) -> Result<MemoryBenchReport, String> {
         durations_ms.push(start.elapsed().as_secs_f64() * 1000.0);
 
         let (result, tally) = match outcome {
-            Ok(ops) => {
-                let predicted: Vec<String> = ops.iter().map(|op| op_kind(op).to_string()).collect();
+            Ok(output) => {
+                let predicted: Vec<String> = output
+                    .ops
+                    .iter()
+                    .map(|op| op_kind(op).to_string())
+                    .collect();
                 let tally = score_case(&case.expected.op_kinds, &predicted);
                 (
                     CaseResult {

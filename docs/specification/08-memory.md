@@ -549,6 +549,17 @@ to parse at all. Deliberate tradeoff, not an oversight: prefix-stop recovers "go
 suffix" (the two shapes actually observed) but no longer searches for valid content after *leading*
 prose the way the pre-D-051 whole-array recovery did — an unobserved failure shape, not defended.
 
+As-built note (D-129, `[SPEC]`): a dropped tail is no longer silent. `route` returns
+`RouteOutput { ops, dropped_tail }`, where `DroppedTail { reason, reserve_exhausted }` carries
+`ParseOutcome::dropped_tail`'s reason and whether the answer ended at its token reserve
+(`FinishReason::Length`). The daemon's consolidation `generate` closure logs every occurrence at
+WARN (`daemon::lifecycle::log_dropped_tail`: session, `received_seq` range, reason, and the reserve
+size when it was the cause) and hands `ops` on unchanged — what gets applied is exactly as before.
+The report travels back rather than being logged in `local-rag-memory` because only the daemon
+crate depends on `tracing`; `run_once`, `RunOutcome` and `ApplyReport` are untouched, since the
+closure is the one production caller of `route`. The `LOCAL_RAG_ROUTER_DEBUG` trace this replaces
+is gone; the raw-response and collapse traces under that variable remain.
+
 As-built note (D-069, `[SPEC]`): D-050's "`Transient` by default" for apply-time failures had a
 hole neither D-050 nor D-051 closed, found in live dogfooding: an op's `evidence_observation_ids`
 is untrusted model output (12 §4), and both evidence tables are keyed `(owner_id, observation_id)`,
