@@ -303,3 +303,49 @@ Stated once here; each card below names only what is specific to it.
 - **Tests:** the full group set plus `cargo xtask ci`.
 - **Acceptance:** recorded in the Gate results table with reproducible evidence.
 - **Evidence:** the `G24` row.
+
+## Appendix — corrective cards registered after `G24`
+
+These cards are corrective. They reopen no gate and belong to no language card. They sit here
+because this is the latest group file, which is the precedent `D-094`…`D-101` set in group 21.
+
+## D-137 — A proxy with no launch worktree can route each call to its repository
+
+- **Depends on:** `G24` (closed); the `memory-cowork` plugin (commit `fd16781`).
+- **Specification:** spec 02 §3.3 (`[FIXED]` request context, T02-04/T15-02/T15-03 as-built
+  notes); spec 11 §1 (`[FIXED]` pass-through and its T15-02 note), §4 (proxy↔daemon versioning);
+  spec 13 §4 (upgrade flow, the reason no `proto` bump is needed);
+  [ADR-0016](../../adr/0016-per-call-worktree-fallback.md), the owner's design revision.
+- **Result:** a proxy started outside any repository, with `LOCAL_RAG_PER_CALL_WORKTREE=1`, lets
+  each tool call name its repository in a `worktree` argument. A launch worktree that resolves
+  always wins. With the flag unset, Claude Code's bytes do not change.
+- **In scope:**
+  - `local_rag_protocol::RequestContext.worktree_fallback`, serde-defaulted and skipped when
+    `None`.
+  - `local_rag::daemon::gitroot::request_root_with_fallback`, and its use in `mcp::dispatch`. The
+    fallback is consulted only when the launch root resolves to `GlobalOnly`.
+  - `local-rag-proxy`: `SessionParams::per_call_worktree` from the env var, and
+    `per_call::PerCallWorktree`, which adds the property to `tools/list` and lifts `worktree` out
+    of `tools/call` arguments into that request's context. It runs only under the opt-in.
+  - `[SPEC]` notes (spec 02 §3.3, spec 11 §1/§4), ADR-0016, `docs/architecture/`, and
+    `cowork-plugin/` (`.mcp.json` env, skill, README, version 1.1.0).
+- **Not in scope:** any change to the daemon's own tool catalog (`daemon/mcp/tools.rs`); any
+  change to `[FIXED]` text; an error for an unresolvable fallback; `repo_hint` from MCP;
+  observation capture (hooks) for Cowork; the launcher's own repository resolution.
+- **Tests:**
+  - protocol: an old-shape context deserializes, and `None` serializes to the old bytes;
+  - gitroot: no fallback never consults the registry, a resolving launch root ignores the
+    fallback, a `GlobalOnly` launch uses the probed fallback, and an unprobeable fallback yields
+    no root;
+  - daemon, against a real store (`tests/mcp_worktree_fallback.rs`): launch wins, the fallback
+    routes `remember` to repository scope and `project_overview` to its index, an unresolvable
+    fallback (relative, missing, unregistered) stays global without an error, and a `worktree`
+    argument that reaches the daemon is still `-32602`;
+  - proxy: the flag is on only for `1`; flag off relays byte-identical; flag on adds the
+    property and lifts the argument while other requests keep a byte-identical launch context
+    (duplex relay); and a real two-binary subprocess test compares both catalogs and both
+    `tools/call` outcomes.
+- **Acceptance:** the focused tests above, `likec4 validate docs/architecture`,
+  `node docs/architecture/check-refs.mjs`, `node docs/architecture/check-flows.mjs`, and
+  `cargo xtask ci`.
+- **Evidence:** the `D-137` row in `PROGRESS.md`.

@@ -1,7 +1,10 @@
 //! Bidirectional stdio<->UDS relay (spec 11 §1's "thin pass-through", adding
 //! `RequestContext` to every relayed call), the reconnect loop that keeps a
 //! live session across an independently initiated daemon restart (D-038),
-//! and this proxy's own SIGTERM/CTRL-C listener.
+//! and this proxy's own SIGTERM/CTRL-C listener. With the D-137 opt-in
+//! (`SessionParams::per_call_worktree`) each connection also runs
+//! [`crate::per_call::PerCallWorktree`] over the two directions; without it
+//! nothing here parses a relayed message.
 
 use std::path::Path;
 use std::time::Duration;
@@ -18,6 +21,7 @@ use crate::error::ProxyError;
 use crate::handshake::{
     EstablishedSession, MAX_UPGRADE_ROUNDS, SessionParams, establish_session, session_warnings,
 };
+use crate::per_call::PerCallWorktree;
 use crate::transport::{read_bounded_line, write_line, write_message};
 
 /// A bound on consecutive reconnect attempts that never produce a working
@@ -162,8 +166,10 @@ fn transport_error_line(id: &str) -> String {
 /// (D-038: `local-rag restart`, `local-rag stop`, a crash, an OOM kill —
 /// every drop this proxy did not itself request). `context` is fixed for the
 /// whole call, reconnects included — every relayed request carries
-/// byte-identical session_id/worktree_root/repo_hint (spec 02 §3.3, 11 §1):
-/// this proxy holds no per-request state of its own to vary it by.
+/// byte-identical session_id/worktree_root/repo_hint (spec 02 §3.3, 11 §1).
+/// The only per-request field is D-137's `worktree_fallback`, set solely
+/// under the `endpoint.params.per_call_worktree` opt-in, and solely on a
+/// `tools/call` that carried a `worktree` argument.
 #[cfg(unix)]
 pub async fn relay<I, O>(
     mut stdin: I,
@@ -185,6 +191,7 @@ where
             &mut session.reader,
             &mut session.writer,
             &context,
+            endpoint.params.per_call_worktree,
             &mut signal,
         )
         .await?;
@@ -231,6 +238,8 @@ where
 /// One connection's worth of relaying: stdin -> UDS (wrapping each line in a
 /// `RequestEnvelope` carrying `context`) and UDS -> stdout (unwrapping
 /// `ResponseEnvelope`) until either side closes or the shutdown signal fires.
+/// `per_call` is the D-137 opt-in; its state lives and dies with this one
+/// connection.
 #[cfg(unix)]
 async fn relay_connection<I, O, R, W>(
     stdin: &mut I,
@@ -238,6 +247,7 @@ async fn relay_connection<I, O, R, W>(
     daemon_reader: &mut R,
     daemon_writer: &mut W,
     context: &RequestContext,
+    per_call: bool,
     signal: &mut ShutdownSignal,
 ) -> Result<RelayStop, ProxyError>
 where
@@ -248,6 +258,7 @@ where
 {
     let mut pending = PendingRequests::default();
     let mut answered = false;
+    let mut per_call = per_call.then(PerCallWorktree::default);
     loop {
         tokio::select! {
             _ = signal.wait() => return Ok(RelayStop::Done),
@@ -256,8 +267,13 @@ where
                     None => return Ok(RelayStop::Done), // stdin closed: the client disconnected
                     Some(text) => {
                         let mcp = RawValue::from_string(text).map_err(ProxyError::Protocol)?;
+                        let (mcp, worktree_fallback) = match per_call.as_mut() {
+                            Some(per_call) => per_call.outbound(mcp),
+                            None => (mcp, None),
+                        };
                         pending.record(&mcp);
-                        let request = Message::Request(RequestEnvelope { context: context.clone(), mcp });
+                        let context = RequestContext { worktree_fallback, ..context.clone() };
+                        let request = Message::Request(RequestEnvelope { context, mcp });
                         // A write failure here is the same event the read half
                         // reports as EOF, observed from the other side: the
                         // daemon died between its last line and this write.
@@ -279,8 +295,12 @@ where
                     Ok(Some(text)) => {
                         match local_rag_protocol::decode_message(&text).map_err(ProxyError::Protocol)? {
                             Message::Response(resp) => {
-                                pending.resolve(&resp.mcp);
-                                write_line(stdout, resp.mcp.get()).await.map_err(ProxyError::Transport)?;
+                                let mcp = match per_call.as_mut() {
+                                    Some(per_call) => per_call.inbound(resp.mcp),
+                                    None => resp.mcp,
+                                };
+                                pending.resolve(&mcp);
+                                write_line(stdout, mcp.get()).await.map_err(ProxyError::Transport)?;
                                 answered = true;
                             }
                             _ => return Err(ProxyError::UnexpectedMessage),
@@ -325,6 +345,7 @@ mod tests {
             session_id: session_id.to_string(),
             worktree_root: Some("/repo".to_string()),
             repo_hint: None,
+            worktree_fallback: None,
         }
     }
 
@@ -352,6 +373,7 @@ mod tests {
                 &mut reader,
                 &mut writer,
                 &ctx,
+                false,
                 &mut signal,
             )
             .await
@@ -414,6 +436,7 @@ mod tests {
                 &mut reader,
                 &mut writer,
                 &ctx,
+                false,
                 &mut signal,
             )
             .await
@@ -441,6 +464,145 @@ mod tests {
         relay_handle.abort();
     }
 
+    /// D-137: stdin lines and daemon responses through one `relay_connection`
+    /// with the per-call opt-in `per_call`. Each `(stdin line, daemon reply)`
+    /// pair is sent in turn; returns every `RequestEnvelope` the daemon saw
+    /// and every line the client got back on stdout.
+    async fn relay_exchange(
+        per_call: bool,
+        exchanges: &[(&str, Option<&str>)],
+    ) -> (Vec<RequestEnvelope>, Vec<String>) {
+        let (mut stdin_client, stdin_server) = tokio::io::duplex(1 << 16);
+        let (stdout_client, stdout_server) = tokio::io::duplex(1 << 16);
+        let (daemon_client, mut daemon_server) = tokio::io::duplex(1 << 16);
+        let (daemon_read, daemon_write) = tokio::io::split(daemon_client);
+
+        let ctx = context("sess-137");
+        let relay_handle = tokio::spawn(async move {
+            let mut stdin = BufReader::new(stdin_server);
+            let mut stdout = stdout_client;
+            let mut reader = BufReader::new(daemon_read);
+            let mut writer = daemon_write;
+            let mut signal = never_firing_signal();
+            relay_connection(
+                &mut stdin,
+                &mut stdout,
+                &mut reader,
+                &mut writer,
+                &ctx,
+                per_call,
+                &mut signal,
+            )
+            .await
+        });
+
+        let mut daemon_reader = BufReader::new(&mut daemon_server);
+        let mut stdout_reader = BufReader::new(stdout_server);
+        let mut envelopes = Vec::new();
+        let mut replies = Vec::new();
+        for (line, reply) in exchanges {
+            stdin_client
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut received = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut daemon_reader, &mut received)
+                .await
+                .unwrap();
+            match local_rag_protocol::decode_message(received.trim_end()).unwrap() {
+                Message::Request(env) => envelopes.push(env),
+                other => panic!("expected Request, got {other:?}"),
+            }
+            if let Some(reply) = reply {
+                let response = Message::Response(ResponseEnvelope { mcp: raw(reply) });
+                let bytes = local_rag_protocol::encode_message(&response).unwrap();
+                daemon_reader.get_mut().write_all(&bytes).await.unwrap();
+                let mut out = String::new();
+                tokio::io::AsyncBufReadExt::read_line(&mut stdout_reader, &mut out)
+                    .await
+                    .unwrap();
+                replies.push(out.trim_end().to_string());
+            }
+        }
+        drop(stdin_client);
+        relay_handle.abort();
+        (envelopes, replies)
+    }
+
+    const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    const CATALOG: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"recall","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}]}}"#;
+    const CALL_WITH_WORKTREE: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"worktree":"/other"}}}"#;
+    const CALL_WITHOUT_WORKTREE: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{}}}"#;
+
+    /// D-137, flag unset: the catalog comes back byte-identical and a
+    /// `worktree` argument is relayed untouched (for the daemon to reject, as
+    /// before) — the pre-D-137 pass-through, and no request carries a fallback.
+    #[tokio::test]
+    async fn without_the_opt_in_nothing_is_rewritten() {
+        let (envelopes, replies) = relay_exchange(
+            false,
+            &[
+                (TOOLS_LIST, Some(CATALOG)),
+                (CALL_WITH_WORKTREE, None),
+                (CALL_WITHOUT_WORKTREE, None),
+            ],
+        )
+        .await;
+        assert_eq!(replies, [CATALOG]);
+        let relayed: Vec<&str> = envelopes.iter().map(|e| e.mcp.get()).collect();
+        assert_eq!(
+            relayed,
+            [TOOLS_LIST, CALL_WITH_WORKTREE, CALL_WITHOUT_WORKTREE]
+        );
+        for env in &envelopes {
+            assert_eq!(env.context, context("sess-137"));
+        }
+    }
+
+    /// D-137, flag set: the catalog advertises the optional `worktree`, a
+    /// call's `worktree` moves from its arguments into that one request's
+    /// context, and every other request keeps a byte-identical launch
+    /// context.
+    #[tokio::test]
+    async fn with_the_opt_in_the_worktree_argument_becomes_that_calls_fallback() {
+        let (envelopes, replies) = relay_exchange(
+            true,
+            &[
+                (TOOLS_LIST, Some(CATALOG)),
+                (CALL_WITH_WORKTREE, None),
+                (CALL_WITHOUT_WORKTREE, None),
+            ],
+        )
+        .await;
+
+        let catalog: serde_json::Value = serde_json::from_str(&replies[0]).unwrap();
+        let schema = &catalog["result"]["tools"][0]["inputSchema"];
+        assert_eq!(schema["properties"]["worktree"]["type"], "string");
+        assert_eq!(schema["additionalProperties"], false);
+
+        let launch = context("sess-137");
+        assert_eq!(envelopes[0].context, launch);
+        assert_eq!(envelopes[0].mcp.get(), TOOLS_LIST);
+
+        let call: serde_json::Value = serde_json::from_str(envelopes[1].mcp.get()).unwrap();
+        assert_eq!(call["params"]["arguments"], serde_json::json!({}));
+        assert_eq!(
+            envelopes[1].context,
+            RequestContext {
+                worktree_fallback: Some("/other".to_string()),
+                ..launch.clone()
+            }
+        );
+
+        assert_eq!(envelopes[2].mcp.get(), CALL_WITHOUT_WORKTREE);
+        assert_eq!(envelopes[2].context, launch);
+        assert_eq!(
+            serde_json::to_string(&envelopes[0].context).unwrap(),
+            serde_json::to_string(&envelopes[2].context).unwrap(),
+            "requests without the argument carry byte-identical launch context"
+        );
+    }
+
     /// D-038: the daemon vanishing mid-request must terminate that request,
     /// not leave the client waiting on a response nobody is left to send.
     #[tokio::test]
@@ -463,6 +625,7 @@ mod tests {
                 &mut reader,
                 &mut writer,
                 &ctx,
+                false,
                 &mut signal,
             )
             .await

@@ -237,6 +237,7 @@ fn build_request(event: &ParsedEvent) -> (Message, Message) {
             session_id: event.session_id.clone(),
             worktree_root: event.cwd.clone(),
             repo_hint: None,
+            worktree_fallback: None,
         },
         mcp,
     });

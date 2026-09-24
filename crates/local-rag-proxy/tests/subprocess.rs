@@ -1194,3 +1194,144 @@ fn a_real_older_daemon_binary_drains_and_a_real_new_daemon_migrates_the_store_to
 
     cleanup_daemon(&layout, Duration::from_secs(20));
 }
+
+/// One session through a real `local-rag-proxy` started in `cwd` with
+/// `extra_env`: `initialize`, `notifications/initialized`, then each of
+/// `requests` in turn, returning their parsed responses in order.
+fn run_session(
+    home: &TempHome,
+    cwd: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    requests: &[&str],
+) -> Vec<serde_json::Value> {
+    let mut cmd = home.command(env!("CARGO_BIN_EXE_local-rag-proxy"));
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.current_dir(cwd);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut proxy = cmd.spawn().expect("spawn local-rag-proxy");
+    let mut stdin = proxy.stdin.take().expect("proxy stdin");
+    let mut stdout = BufReader::new(proxy.stdout.take().expect("proxy stdout"));
+
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#,
+    );
+    let (next, _) = read_line(&mut proxy, stdout, Duration::from_secs(20));
+    stdout = next;
+    write_line(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    let mut responses = Vec::new();
+    for request in requests {
+        write_line(&mut stdin, request);
+        let (next, line) = read_line(&mut proxy, stdout, Duration::from_secs(20));
+        stdout = next;
+        responses.push(serde_json::from_str(line.trim_end()).expect("parse response"));
+    }
+    drop(stdin);
+    let status = wait_for_exit(&mut proxy, Duration::from_secs(20));
+    assert!(
+        status.success(),
+        "proxy must exit 0 once stdin closes: {status:?}"
+    );
+    responses
+}
+
+/// D-137 (ADR-0016) across both real binaries: without
+/// `LOCAL_RAG_PER_CALL_WORKTREE` the daemon's catalog reaches the client
+/// unmodified and a `worktree` argument reaches the daemon (which rejects it,
+/// as before); with it, the same catalog gains exactly one optional
+/// `worktree` property per tool, and the argument is lifted out before the
+/// daemon's `additionalProperties: false` schema ever sees it.
+#[test]
+fn the_per_call_worktree_opt_in_changes_the_catalog_and_the_arguments_only_when_set() {
+    let home = TempHome::new().expect("temp home");
+    let layout = open_layout(&home);
+    let cwd = home.join("not-a-repository");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+
+    let tools_list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let recall_with_worktree = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"worktree":"/definitely/not/a/repo-137"}}}"#;
+
+    let plain = run_session(&home, &cwd, &[], &[tools_list, recall_with_worktree]);
+    let opted_in = run_session(
+        &home,
+        &cwd,
+        &[("LOCAL_RAG_PER_CALL_WORKTREE", "1")],
+        &[tools_list, recall_with_worktree],
+    );
+
+    // Without the opt-in: the argument reaches the daemon and is rejected.
+    assert_eq!(
+        plain[1]["error"]["code"],
+        serde_json::json!(-32602),
+        "{}",
+        plain[1]
+    );
+    // With it: stripped, so the call runs — in global scope, since neither
+    // the launch directory nor the fallback resolves.
+    assert_eq!(
+        opted_in[1]["result"]["isError"],
+        serde_json::json!(false),
+        "{}",
+        opted_in[1]
+    );
+
+    // The opted-in catalog is the plain one plus exactly the `worktree`
+    // property on every tool.
+    let plain_tools = plain[0]["result"]["tools"].as_array().expect("tools");
+    let mut opted_tools = opted_in[0]["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .clone();
+    assert_eq!(plain_tools.len(), opted_tools.len());
+    for tool in &mut opted_tools {
+        let name = tool["name"].to_string();
+        let properties = tool["inputSchema"]["properties"]
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("{name} has no properties"));
+        let added = properties.remove("worktree").expect("worktree property");
+        assert_eq!(added["type"], "string");
+        assert!(
+            tool["inputSchema"]
+                .get("required")
+                .and_then(|r| r.as_array())
+                .is_none_or(|r| !r.contains(&serde_json::json!("worktree"))),
+            "{}",
+            tool["name"]
+        );
+    }
+    let normalize = |tools: &[serde_json::Value]| {
+        tools
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                // A tool whose schema had no `properties` at all gains an
+                // empty object once the added property is removed again.
+                if let Some(schema) = t["inputSchema"].as_object_mut()
+                    && schema
+                        .get("properties")
+                        .and_then(|p| p.as_object())
+                        .is_some_and(|p| p.is_empty())
+                {
+                    schema.remove("properties");
+                }
+                t
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(normalize(plain_tools), normalize(&opted_tools));
+    assert!(
+        plain_tools
+            .iter()
+            .all(|t| t["inputSchema"]["properties"].get("worktree").is_none()),
+        "the daemon's own catalog never advertises `worktree`"
+    );
+
+    cleanup_daemon(&layout, Duration::from_secs(20));
+}

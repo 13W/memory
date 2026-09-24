@@ -30,16 +30,26 @@ pub const MAX_UPGRADE_ROUNDS: u32 = 2;
 /// `session_id`), consulted before falling back to a fresh id.
 const SESSION_ID_VAR: &str = "LOCAL_RAG_SESSION_ID";
 
+/// The opt-in for the per-call worktree fallback (D-137, ADR-0016): exactly
+/// `1` turns it on; any other value, or none, leaves this proxy a
+/// byte-for-byte pass-through. For hosts that run one proxy for many
+/// sessions from a directory that is not a repository (Claude Cowork).
+pub const PER_CALL_WORKTREE_VAR: &str = "LOCAL_RAG_PER_CALL_WORKTREE";
+
 /// This proxy's own identity for HELLO (spec 02 §3.3, 11 §1) — and the
 /// fixed [`RequestContext`] every relayed call on this connection carries.
 #[derive(Debug, Clone)]
 pub struct SessionParams {
     pub session_id: String,
     pub worktree_root: Option<String>,
+    /// `$LOCAL_RAG_PER_CALL_WORKTREE == "1"` — see [`PER_CALL_WORKTREE_VAR`]
+    /// and `crate::per_call`.
+    pub per_call_worktree: bool,
 }
 
 /// `session_id` from `$LOCAL_RAG_SESSION_ID` if set (and non-empty), else
-/// `uuid_source()`; `worktree_root` from `current_dir()`.
+/// `uuid_source()`; `worktree_root` from `current_dir()`;
+/// `per_call_worktree` from [`PER_CALL_WORKTREE_VAR`].
 ///
 /// The real npm/plugin launch contract that would set `$LOCAL_RAG_SESSION_ID`
 /// does not exist yet in this repository (packaging is a later group) — this
@@ -60,9 +70,13 @@ pub fn resolve_session_params(
     let worktree_root = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
+    let per_call_worktree = env
+        .var(PER_CALL_WORKTREE_VAR)
+        .is_some_and(|v| v.as_os_str() == "1");
     SessionParams {
         session_id,
         worktree_root,
+        per_call_worktree,
     }
 }
 
@@ -311,14 +325,15 @@ mod tests {
     use local_rag_protocol::{Incompatible, MCP_PASSTHROUGH_VERSION};
     use tokio::io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf, split};
 
-    struct MockEnv(Option<String>);
+    /// `(session id, per-call worktree flag)` env values.
+    struct MockEnv(Option<String>, Option<String>);
 
     impl Env for MockEnv {
         fn var(&self, key: &str) -> Option<std::ffi::OsString> {
-            if key == SESSION_ID_VAR {
-                self.0.clone().map(std::ffi::OsString::from)
-            } else {
-                None
+            match key {
+                SESSION_ID_VAR => self.0.clone().map(std::ffi::OsString::from),
+                PER_CALL_WORKTREE_VAR => self.1.clone().map(std::ffi::OsString::from),
+                _ => None,
             }
         }
         fn home_dir(&self) -> Option<std::path::PathBuf> {
@@ -328,29 +343,47 @@ mod tests {
 
     #[test]
     fn session_id_prefers_the_env_var_over_the_uuid_source() {
-        let env = MockEnv(Some("from-env".to_string()));
+        let env = MockEnv(Some("from-env".to_string()), None);
         let params = resolve_session_params(&env, || "from-uuid".to_string());
         assert_eq!(params.session_id, "from-env");
     }
 
     #[test]
     fn an_empty_env_var_falls_back_to_the_uuid_source() {
-        let env = MockEnv(Some(String::new()));
+        let env = MockEnv(Some(String::new()), None);
         let params = resolve_session_params(&env, || "from-uuid".to_string());
         assert_eq!(params.session_id, "from-uuid");
     }
 
     #[test]
     fn a_missing_env_var_falls_back_to_the_uuid_source() {
-        let env = MockEnv(None);
+        let env = MockEnv(None, None);
         let params = resolve_session_params(&env, || "from-uuid".to_string());
         assert_eq!(params.session_id, "from-uuid");
+    }
+
+    /// D-137: the per-call worktree fallback is on for exactly `1`; unset or
+    /// any other value keeps the plain pass-through.
+    #[test]
+    fn the_per_call_worktree_flag_is_on_only_for_exactly_one() {
+        for (value, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("true"), false),
+            (Some("1"), true),
+        ] {
+            let env = MockEnv(None, value.map(str::to_string));
+            let params = resolve_session_params(&env, || "id".to_string());
+            assert_eq!(params.per_call_worktree, expected, "{value:?}");
+        }
     }
 
     fn params() -> SessionParams {
         SessionParams {
             session_id: "sess-1".to_string(),
             worktree_root: Some("/repo".to_string()),
+            per_call_worktree: false,
         }
     }
 

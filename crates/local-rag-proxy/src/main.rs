@@ -8,11 +8,14 @@
 //! sessions even by accident. The only state this binary ever holds is one
 //! open connection, the [`handshake::SessionParams`] it was launched with
 //! (replayed verbatim whenever [`relay`] reconnects after a daemon restart,
-//! D-038), and the ids of requests currently in flight on that connection.
+//! D-038), and the ids of requests currently in flight on that connection
+//! (plus, under D-137's `LOCAL_RAG_PER_CALL_WORKTREE=1` opt-in, the ids of
+//! in-flight `tools/list` requests — [`per_call`]).
 
 mod connect;
 mod error;
 mod handshake;
+mod per_call;
 mod relay;
 mod transport;
 
@@ -145,6 +148,7 @@ async fn run() -> u8 {
         session_id: params.session_id.clone(),
         worktree_root: params.worktree_root.clone(),
         repo_hint: None,
+        worktree_fallback: None,
     };
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

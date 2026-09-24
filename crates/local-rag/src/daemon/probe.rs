@@ -157,6 +157,7 @@ pub fn call_admin(
             session_id: ADMIN_CLIENT_SESSION_ID.to_string(),
             worktree_root: None,
             repo_hint: None,
+            worktree_fallback: None,
         },
         mcp: mcp_raw,
     });

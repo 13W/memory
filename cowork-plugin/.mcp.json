@@ -4,7 +4,8 @@
       "command": "/bin/sh",
       "args": ["${CLAUDE_PLUGIN_ROOT}/launcher/memory-mcp.sh"],
       "env": {
-        "LOCAL_RAG_WORKTREE": ""
+        "LOCAL_RAG_WORKTREE": "",
+        "LOCAL_RAG_PER_CALL_WORKTREE": "1"
       }
     }
   }

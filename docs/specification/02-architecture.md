@@ -250,6 +250,22 @@ there is nothing per-request to vary it by. `repo_hint` is always `None` from th
 launch contract that would set it does not exist yet in this repository (packaging is a later
 group).
 
+As-built note (D-137, `[SPEC]`, [ADR-0016](../adr/0016-per-call-worktree-fallback.md)): the
+premise "one proxy process serves one session" holds for Claude Code but not for Claude Cowork,
+which runs one plugin MCP server for the whole app from a directory that is not a repository.
+`RequestContext` therefore carries one more optional field, `worktree_fallback: Option<String>`
+(`#[serde(default, skip_serializing_if = "Option::is_none")]`, so a context without it is
+byte-identical to the shape above and no `proto` bump is needed). **The launch context keeps
+priority:** the daemon (`local_rag::daemon::gitroot::request_root_with_fallback`, called from
+`mcp::dispatch`) builds the `RequestRoot` from `worktree_root` first. It consults
+`worktree_fallback` only when that root resolves to `Resolution::GlobalOnly`; `Ambiguous` keeps
+the launch root. The fallback goes through the same `probe` and the same registry `resolve`, and
+one that does not resolve either is `GlobalOnly`, never an error. A request without a fallback
+takes exactly the pre-D-137 path, with no extra probe and no registry read. Only a proxy started
+with `LOCAL_RAG_PER_CALL_WORKTREE=1` ever sets the field, and only on the one `tools/call` that
+carried a `worktree` argument (11 §1). Every other request keeps the launch context unchanged.
+Routing stays explicit and per request, with no ambient current project.
+
 As-built note (T15-03, `[SPEC]`): the git probe §3.3's own T02-04 note named as "the daemon's job"
 is `local_rag::daemon::gitroot` (`crates/local-rag/src/daemon/gitroot.rs`). `request_root` is
 total — it never errors — built by shelling out to `git` (the same precedent

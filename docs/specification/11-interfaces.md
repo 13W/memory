@@ -21,6 +21,30 @@ in this crate's dependency graph through which state could accumulate across ses
 accident. See 02 §4.2's as-built note for the handshake mechanics, the wire types, and the
 detached-spawn/backoff/upgrade details this pass-through sits on top of.
 
+As-built note (D-137, `[SPEC]`, [ADR-0016](../adr/0016-per-call-worktree-fallback.md)): an
+**opt-in exception** to the note above, for hosts that run one proxy for many sessions from a
+directory that is not a repository (Claude Cowork). The `[FIXED]` text above describes the default
+and holds whenever the opt-in is off. The proxy env var `LOCAL_RAG_PER_CALL_WORKTREE` is on only
+for the exact value `1`. When it is unset or has any other value, nothing in the relay parses a
+message. When it is `1`, `local-rag-proxy::per_call::PerCallWorktree` (per connection) does two
+things:
+
+- It adds an optional `worktree` string property, described as "Absolute path of the repository
+  to use when this server was not started inside one. Ignored when the server already has a
+  worktree.", to every tool's `inputSchema.properties` in the response to a `tools/list` it
+  relayed. The property is never added to `required`.
+- It removes `worktree` from a `tools/call`'s `params.arguments` before relaying. The daemon's
+  schemas are `additionalProperties: false`, and the daemon's own catalog never advertises the
+  argument. The value goes into that one request's `RequestContext.worktree_fallback`, which the
+  daemon uses only when the launch root is `GlobalOnly` (02 §3.3's D-137 note). Only an absolute
+  path is accepted; any other value is dropped and reported on stderr.
+
+Every other message passes through as its original bytes. A rebuilt message comes out with
+sorted object keys (`serde_json` without `preserve_order`). The unit tests in
+`relay.rs` and `per_call.rs`, plus `tests/subprocess.rs::the_per_call_worktree_opt_in_changes_the_
+catalog_and_the_arguments_only_when_set` (both real binaries), prove the flag-off byte identity and
+the flag-on rewrite.
+
 ## 2. MCP tool surface
 
 Status: **v0** ships in MVP; **v0.x** additive after MVP; **post-v0** benchmark/spike-gated.
@@ -671,6 +695,14 @@ degraded-mode check, with the identical stdout/stderr discipline that check alre
 end-to-end test (`local-rag-proxy/tests/subprocess.rs::a_daemon_advertising_an_older_spool_format_
 produces_a_stderr_warning_and_never_touches_stdout`) proves a real relayed MCP round trip still
 lands cleanly on stdout while the warning appears only on stderr.
+
+As-built note (D-137, `[SPEC]`): `RequestContext.worktree_fallback` (02 §3.3) is an optional,
+skipped-when-absent field. Neither `PROTO_VERSION` nor `MCP_PASSTHROUGH_VERSION` changes. An older
+daemon never receives the key from a proxy that has no fallback to send, and an older proxy's
+envelope deserializes with `None`
+(`local_rag_protocol::handshake::tests::an_old_shape_request_context_without_worktree_fallback_
+still_deserializes`). A mixed pair is short-lived anyway, because proxy and daemon upgrade in
+lockstep (spec 13 §4).
 
 ## 5. `additionalContext` format `[SPEC, deterministic per v1 contract]`
 

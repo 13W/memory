@@ -9,8 +9,16 @@ two separate things, scoped differently — never mix them up:
 
 - **Durable memory** — decisions, conventions, facts. Scoped `repository`, `worktree` or
   `global`. Stored in English whatever language it was written in.
-- **Code index** — the indexed files of **one** repository: the one the launcher resolved
-  (`LOCAL_RAG_WORKTREE`, else `~/.config/local-rag/cowork-root`). It never indexes on demand.
+- **Code index** — the indexed files of the repository the call is routed to. It never
+  indexes on demand.
+
+## Always pass `worktree`
+
+Every tool of this server takes an optional `worktree` argument. On **every** call, pass the
+**absolute path** of this session's connected or working folder (the repository you are
+working in). The server uses it only when it was not started inside a repository itself;
+otherwise it ignores the argument, so passing it is always safe. Never pass a relative path,
+and never guess one. If the session has no folder, omit the argument.
 
 It is **not** Claude's own account memory (the `memory_read` / `memory_write` / `memory_list`
 tools that work on `/profile.md`, `/areas/…`). Those are about the user; this is about a code
@@ -45,8 +53,9 @@ answer rests on it.
 
 1. **Check the scope `remember` reports.** When no repository resolved, it silently falls back
    to `global`, which every project's recall sees. If the response says `global` or carries
-   `degraded`, tell the user and do not keep writing project facts there — the plugin needs
-   `~/.config/local-rag/cowork-root` (see README).
+   `degraded`, tell the user which `worktree` path you passed (or that the session has none),
+   and stop writing project facts there. The folder is probably not a repository local-rag
+   knows (`local-rag project add <path>`); see the plugin README.
 2. `remember` only what the user said or confirmed: a decision taken, a convention stated, a
    fact they gave. Not your own guesses, not plans still being argued. Set
    `confirmed_by_user: true` only when they explicitly confirmed it in this conversation.
@@ -54,6 +63,7 @@ answer rests on it.
    record: state what will change and get a yes before calling them, unless the user already
    asked for exactly that change.
 4. Code tools see the index of the resolved repository only, as of its last indexed
-   generation. If `search_code` reports no worktree or a degraded state, say so instead of
-   answering from guesswork; do not claim a file does not exist because a search missed it.
+   generation. If `search_code` reports no worktree or a degraded state, say so, including the
+   `worktree` path you passed, instead of answering from guesswork. Do not claim a file does
+   not exist because a search missed it.
 5. Never narrate tool plumbing to the user; report what the memory says and what was recorded.

@@ -103,6 +103,63 @@ pub async fn seed_indexed_worktree(home: &TempHome, layout: &StoreLayout) -> See
     seed_indexed_worktree_with_content(home, layout, "fn hello() {}\n").await
 }
 
+/// Register one more worktree/repository — no generation, no content —
+/// rooted at a fresh `git init`'d `home/<dir_name>`, from the same real
+/// probed facts [`seed_indexed_worktree_with_content`] registers from.
+/// Enough for routing (`resolve` answers `Resolved`), which is all D-137's
+/// fallback tests need of a second repository. Ids come from their own
+/// sequence so they never collide with the seeded worktree's.
+///
+/// Like the seeding functions, must run before `DaemonHandle::start`.
+pub async fn register_worktree(
+    home: &TempHome,
+    layout: &StoreLayout,
+    dir_name: &str,
+) -> SeededWorktree {
+    let repo_path = home.join(dir_name);
+    std::fs::create_dir_all(&repo_path).expect("create repo dir");
+    git(&repo_path, &["init", "-q"]);
+    let facts =
+        local_rag::daemon::gitroot::probe(&repo_path).expect("probe the freshly created git repo");
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(2, Ordering::Relaxed);
+    let worktree_id = uuidv7_from(7_000_000 + n, [0x43; 10]).to_string();
+    let repo_id = uuidv7_from(7_000_001 + n, [0x43; 10]).to_string();
+
+    let state = StateDb::open(layout.state_db()).expect("open state.sqlite");
+    {
+        let facts = facts.clone();
+        let worktree_id = worktree_id.clone();
+        let repo_id = repo_id.clone();
+        state
+            .writer()
+            .transaction(move |tx| {
+                create_repository(tx, &repo_id, facts.remote_fingerprint.as_deref(), 1_000)?;
+                create_worktree(tx, &worktree_id, &repo_id, facts.kind, 1_000)?;
+                observe_worktree_path(
+                    tx,
+                    &worktree_id,
+                    &facts.observed_canonical_path,
+                    &facts.display_path,
+                    &facts.path_fingerprint,
+                    1_000,
+                )?;
+                observe_repository_path(tx, &repo_id, &facts.observed_canonical_path, 1_000)?;
+                Ok(())
+            })
+            .await
+            .expect("register worktree");
+    }
+
+    SeededWorktree {
+        repo_path,
+        facts,
+        worktree_id,
+        repo_id,
+    }
+}
+
 /// [`seed_indexed_worktree`] with the single seeded file's content
 /// parameterized — this never runs the real parser (it hand-inserts
 /// `file_revision`/`content_blob`/`parsed_unit`/`occurrence` rows directly),
@@ -715,8 +772,28 @@ impl Client {
             session_id: self.session_id.clone(),
             worktree_root: worktree_root.map(str::to_string),
             repo_hint: None,
+            worktree_fallback: None,
         };
         self.write(&Message::Request(RequestEnvelope { context, mcp }));
+    }
+
+    /// Send one MCP JSON-RPC line wrapped in a caller-built context — the
+    /// only way to set fields [`Client::call`] does not (D-137's
+    /// `worktree_fallback`). `session_id` is always this client's own.
+    pub fn call_with_context_and_read(
+        &mut self,
+        mcp_json: &str,
+        mut context: RequestContext,
+    ) -> serde_json::Value {
+        context.session_id = self.session_id.clone();
+        let mcp = RawValue::from_string(mcp_json.to_string()).expect("valid json");
+        self.write(&Message::Request(RequestEnvelope { context, mcp }));
+        match self.read() {
+            Some(Message::Response(env)) => {
+                serde_json::from_str(env.mcp.get()).expect("valid JSON-RPC response")
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
     }
 
     /// `call` + `read`, unwrapping the MCP JSON-RPC response body.

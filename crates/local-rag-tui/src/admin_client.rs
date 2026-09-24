@@ -213,6 +213,7 @@ async fn run_one_connection(socket_path: &Path, session_id: &str, tx: &mpsc::Sen
         session_id: session_id.to_string(),
         worktree_root: None,
         repo_hint: None,
+        worktree_fallback: None,
     };
     let Ok(Ok((mut reader, mut writer))) = tokio::time::timeout(
         CYCLE_TIMEOUT,
@@ -567,6 +568,7 @@ mod tests {
                 session_id: "test".to_string(),
                 worktree_root: None,
                 repo_hint: None,
+                worktree_fallback: None,
             };
             let (mut reader, mut writer) = connect_and_handshake(&path, "test")
                 .await

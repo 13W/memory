@@ -36,6 +36,37 @@ pub fn request_root(ctx: &RequestContext) -> RequestRoot {
     }
 }
 
+/// [`request_root`] plus the per-call fallback (D-137, ADR-0016): the launch
+/// context wins, and `ctx.worktree_fallback` is consulted only when
+/// `is_global_only` says the launch root resolves to
+/// `Resolution::GlobalOnly`.
+///
+/// The registry lookup is the caller's closure because this module is
+/// store-read-free (git facts only); `mcp::dispatch` passes one over the
+/// state database. The closure is never called when there is no fallback, so
+/// a request without one pays nothing beyond [`request_root`] — exactly the
+/// pre-D-137 path. `Resolution::Ambiguous` is not `GlobalOnly`: the launch
+/// context still owns routing then. The fallback goes through the same
+/// [`probe`] (git probe, toplevel snapping) and keeps `ctx.repo_hint`; one
+/// that does not resolve either is simply what the caller's own `resolve`
+/// turns into `GlobalOnly`, never an error.
+pub fn request_root_with_fallback(
+    ctx: &RequestContext,
+    is_global_only: impl FnOnce(&RequestRoot) -> bool,
+) -> RequestRoot {
+    let launch = request_root(ctx);
+    let Some(fallback) = ctx.worktree_fallback.as_deref() else {
+        return launch;
+    };
+    if !is_global_only(&launch) {
+        return launch;
+    }
+    RequestRoot {
+        worktree_root: probe(Path::new(fallback)),
+        repo_hint: ctx.repo_hint.clone(),
+    }
+}
+
 /// The spool importer's [`RootResolver`] (D-063): git-probes a frame's raw
 /// `worktree_root` through [`probe`], the same way [`request_root`] does for a
 /// live MCP request, memoizing by the raw string.
@@ -272,10 +303,75 @@ mod tests {
             session_id: "sess-1".to_string(),
             worktree_root: None,
             repo_hint: Some("repo-1".to_string()),
+            worktree_fallback: None,
         };
         let root = request_root(&ctx);
         assert_eq!(root.worktree_root, None);
         assert_eq!(root.repo_hint, Some("repo-1".to_string()));
+    }
+
+    fn fallback_context(worktree_root: Option<&str>, fallback: Option<&str>) -> RequestContext {
+        RequestContext {
+            session_id: "sess-1".to_string(),
+            worktree_root: worktree_root.map(str::to_string),
+            repo_hint: Some("repo-1".to_string()),
+            worktree_fallback: fallback.map(str::to_string),
+        }
+    }
+
+    /// D-137: without a fallback the registry is never consulted — the
+    /// default path is exactly [`request_root`].
+    #[test]
+    fn no_fallback_never_consults_the_registry() {
+        let home = TempHome::new().expect("temp home");
+        let launch = home.join("launch");
+        std::fs::create_dir_all(&launch).expect("create dir");
+        let ctx = fallback_context(Some(launch.to_str().unwrap()), None);
+        let root = request_root_with_fallback(&ctx, |_| panic!("must not be called"));
+        assert_eq!(root, request_root(&ctx));
+    }
+
+    /// D-137 rule 1: a launch root that resolves keeps routing, whatever
+    /// the fallback says.
+    #[test]
+    fn a_resolving_launch_root_ignores_the_fallback() {
+        let home = TempHome::new().expect("temp home");
+        let launch = home.join("launch");
+        let other = home.join("other");
+        std::fs::create_dir_all(&launch).expect("create dir");
+        std::fs::create_dir_all(&other).expect("create dir");
+        let ctx = fallback_context(
+            Some(launch.to_str().unwrap()),
+            Some(other.to_str().unwrap()),
+        );
+        let root = request_root_with_fallback(&ctx, |_| false);
+        assert_eq!(root, request_root(&ctx));
+    }
+
+    /// D-137 rule 2: a `GlobalOnly` launch root hands routing to the
+    /// fallback, probed the same way and keeping the request's repo hint.
+    #[test]
+    fn a_global_only_launch_root_uses_the_probed_fallback() {
+        let home = TempHome::new().expect("temp home");
+        let other = home.join("other");
+        std::fs::create_dir_all(&other).expect("create dir");
+        let ctx = fallback_context(None, Some(other.to_str().unwrap()));
+        let root = request_root_with_fallback(&ctx, |launch| {
+            assert_eq!(launch.worktree_root, None);
+            true
+        });
+        assert_eq!(root.worktree_root, probe(&other));
+        assert!(root.worktree_root.is_some());
+        assert_eq!(root.repo_hint, Some("repo-1".to_string()));
+    }
+
+    /// D-137: a fallback that cannot be probed degrades to no root at all —
+    /// `GlobalOnly` downstream, never an error.
+    #[test]
+    fn an_unprobeable_fallback_yields_no_root() {
+        let ctx = fallback_context(None, Some("/definitely/does/not/exist/xyz-123"));
+        let root = request_root_with_fallback(&ctx, |_| true);
+        assert_eq!(root.worktree_root, None);
     }
 
     #[test]

@@ -182,15 +182,26 @@ pub struct RequestContext {
     /// Same value as the connection's [`Hello::session_id`] — routing/
     /// telemetry only (spec 02 §3.3's as-built note), never an identity key.
     pub session_id: String,
-    /// Same value as [`Hello::worktree_root`] in v0 (the MCP proxy has no
-    /// per-call way to change it — every relayed call on one connection
-    /// carries the same context). A future non-MCP caller of this same wire
-    /// protocol (e.g. T15-07's CLI) may vary it per call.
+    /// Same value as [`Hello::worktree_root`]: the MCP proxy sends its launch
+    /// directory unchanged on every relayed call of one connection. A non-MCP
+    /// caller of this same wire protocol (e.g. T15-07's CLI) may vary it per
+    /// call.
     pub worktree_root: Option<String>,
     /// A `repo_id` hint, used only to break a tie between reattach
     /// candidates (spec 02 §3.3). Always `None` from the v0 MCP proxy — no
     /// MCP tool parameter feeds it yet; kept for shape completeness.
     pub repo_hint: Option<String>,
+    /// A per-call root the daemon consults **only** when `worktree_root`
+    /// resolves to `GlobalOnly` (D-137, ADR-0016) — the launch context always
+    /// wins. Set by a proxy running with `LOCAL_RAG_PER_CALL_WORKTREE=1` from
+    /// a `tools/call`'s `worktree` argument; `None` everywhere else.
+    ///
+    /// Defaulted and skipped when `None`, so an envelope without it is
+    /// byte-identical to the pre-D-137 shape in both directions: an older
+    /// daemon never sees the key, and an older proxy's envelope still
+    /// deserializes. No `proto` bump is needed for an optional field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_fallback: Option<String>,
 }
 
 /// proxy → daemon: one relayed MCP call, wrapped with its context.
@@ -352,6 +363,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             worktree_root: Some("/repo".to_string()),
             repo_hint: None,
+            worktree_fallback: None,
         };
         let msg = Message::Request(RequestEnvelope {
             context: context.clone(),
@@ -366,6 +378,49 @@ mod tests {
             }
             other => panic!("expected Request, got {other:?}"),
         }
+    }
+
+    /// D-137: an envelope written before `worktree_fallback` existed — the
+    /// exact shape an older proxy still sends — deserializes, with the field
+    /// absent read as `None`.
+    #[test]
+    fn an_old_shape_request_context_without_worktree_fallback_still_deserializes() {
+        let old = r#"{"session_id":"sess-1","worktree_root":"/repo","repo_hint":null}"#;
+        let context: RequestContext = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            context,
+            RequestContext {
+                session_id: "sess-1".to_string(),
+                worktree_root: Some("/repo".to_string()),
+                repo_hint: None,
+                worktree_fallback: None,
+            }
+        );
+    }
+
+    /// D-137, the other direction: with no fallback the serialized context is
+    /// byte-identical to the pre-D-137 shape, so an older daemon never sees
+    /// the new key; with one, it round-trips.
+    #[test]
+    fn worktree_fallback_is_omitted_when_none_and_round_trips_when_set() {
+        let mut context = RequestContext {
+            session_id: "sess-1".to_string(),
+            worktree_root: Some("/repo".to_string()),
+            repo_hint: None,
+            worktree_fallback: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&context).unwrap(),
+            r#"{"session_id":"sess-1","worktree_root":"/repo","repo_hint":null}"#
+        );
+
+        context.worktree_fallback = Some("/other".to_string());
+        let text = serde_json::to_string(&context).unwrap();
+        assert!(text.contains(r#""worktree_fallback":"/other""#), "{text}");
+        assert_eq!(
+            serde_json::from_str::<RequestContext>(&text).unwrap(),
+            context
+        );
     }
 
     #[test]

@@ -188,6 +188,7 @@ fn call_tool(
                 session_id: session_id.to_string(),
                 worktree_root: None,
                 repo_hint: None,
+                worktree_fallback: None,
             },
             mcp,
         }),

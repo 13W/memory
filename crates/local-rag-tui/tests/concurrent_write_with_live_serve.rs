@@ -154,6 +154,7 @@ async fn remember_call(reader: &mut Reader, writer: &mut Writer, i: usize) -> se
             session_id: "g18-concurrency-test".to_string(),
             worktree_root: None,
             repo_hint: None,
+            worktree_fallback: None,
         },
         mcp,
     });

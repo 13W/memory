@@ -28,7 +28,11 @@ model {
         The per-session stdio MCP proxy. Holds no state beyond the connection
         and the handshake result — structurally, not by discipline: the crate
         depends on no store, index or embed crate at all. The MCP payload rides
-        as an opaque raw value and is never parsed or rebuilt.
+        as an opaque raw value and is never parsed or rebuilt — unless the
+        process runs with LOCAL_RAG_PER_CALL_WORKTREE=1 (D-137, ADR-0016, for a
+        host with no launch worktree): then tools/list gains an optional
+        worktree argument on every tool, and a tools/call's worktree is lifted
+        out of its arguments into that one request's worktree_fallback.
       '''
       metadata {
         spec 'docs/specification/11-interfaces.md §1'
@@ -106,6 +110,23 @@ model {
     }
 
     // --- Shipped artifacts -------------------------------------------------
+
+    coworkPlugin = container 'Claude Cowork plugin (memory-cowork)' {
+      #implemented
+      #post-v0
+      description '''
+        The MCP tools for Claude Cowork, which runs one plugin MCP server for
+        the whole app, from a directory that is not a repository. A POSIX sh
+        launcher finds local-rag-proxy without node and cds into a configured
+        repository when there is one; it sets LOCAL_RAG_PER_CALL_WORKTREE=1 so
+        the model can name each session's folder per call when there is not.
+        Ships no hooks — observation capture stays with the Claude Code plugin.
+      '''
+      metadata {
+        spec 'docs/specification/11-interfaces.md §1'
+        code 'cowork-plugin/.mcp.json'
+      }
+    }
 
     npmInstaller = container '@13w/memory npm package' {
       #implemented
@@ -244,8 +265,10 @@ model {
       description '''
         NDJSON over a unix domain socket (a named pipe on Windows). HELLO/WELCOME
         first, then every request wrapped in an envelope carrying the explicit
-        request context. INCOMPATIBLE is raised only by a proto-range mismatch,
-        never by a version difference.
+        request context — the launch context, plus an optional per-call
+        worktree_fallback under the D-137 opt-in, skipped when absent so the
+        wire shape is unchanged without it. INCOMPATIBLE is raised only by a
+        proto-range mismatch, never by a version difference.
       '''
       metadata {
         spec 'docs/specification/02-architecture.md §4.2'
@@ -373,6 +396,12 @@ model {
   }
 
   claudeCode -[reads]-> localRag.ccPlugin.memorySkill 'on explicit invocation only'
+  localRag.coworkPlugin -[spawns]-> localRag.mcpProxy 'one proxy for the whole app, per-call worktree opt-in' {
+    metadata {
+      spec 'docs/specification/02-architecture.md §3.3'
+      code 'cowork-plugin/launcher/memory-mcp.sh'
+    }
+  }
   multiHarness -[calls]-> localRag.mcpProxy 'would speak the same MCP surface — nothing in the protocol is Claude-specific' {
     #deferred
   }

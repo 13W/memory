@@ -599,6 +599,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 worktree_root: Some("/repo-a".to_string()),
                 repo_hint: None,
+                worktree_fallback: None,
             };
             write_line(
                 &mut stream,
@@ -613,6 +614,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 worktree_root: Some("/repo-b".to_string()),
                 repo_hint: None,
+                worktree_fallback: None,
             };
             write_line(
                 &mut stream,
@@ -693,6 +695,7 @@ mod tests {
                         session_id: "sess-1".to_string(),
                         worktree_root: None,
                         repo_hint: None,
+                        worktree_fallback: None,
                     },
                     mcp: RawValue::from_string("{}".to_string()).unwrap(),
                 }),
@@ -811,6 +814,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 worktree_root: None,
                 repo_hint: None,
+                worktree_fallback: None,
             };
             write_line(
                 &mut stream,
@@ -882,6 +886,7 @@ mod tests {
                         session_id: "sess-1".to_string(),
                         worktree_root: None,
                         repo_hint: None,
+                        worktree_fallback: None,
                     },
                     mcp: RawValue::from_string(
                         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{}}}"#
@@ -941,6 +946,7 @@ mod tests {
                             session_id: "sess-1".to_string(),
                             worktree_root: None,
                             repo_hint: None,
+                            worktree_fallback: None,
                         },
                         mcp: RawValue::from_string(format!(
                             r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#

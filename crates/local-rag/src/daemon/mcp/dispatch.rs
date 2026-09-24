@@ -168,7 +168,17 @@ async fn route_tools_call(
         return Ok(to_value(content::err(&envelope)));
     };
 
-    let root = gitroot::request_root(ctx.request_context);
+    // D-137 (ADR-0016): the launch root owns routing; a per-call fallback is
+    // tried only when it resolves to `GlobalOnly`. A state read that cannot
+    // open keeps the launch root — the tool below reports that same failure.
+    let root = gitroot::request_root_with_fallback(ctx.request_context, |launch| {
+        memory.state.open_read().is_ok_and(|read| {
+            matches!(
+                local_rag_store::resolve(&read, launch),
+                Ok(local_rag_store::Resolution::GlobalOnly)
+            )
+        })
+    });
     let result = match call.name.as_str() {
         "search_code" => {
             // The translator comes from the memory context because that is
@@ -385,6 +395,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             worktree_root: None,
             repo_hint: None,
+            worktree_fallback: None,
         }
     }
 

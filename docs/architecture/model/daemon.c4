@@ -38,7 +38,9 @@ model {
         health, remember, and nine review verbs. Plus initialize, tools/list,
         ping and notifications. In migration-only mode the first three still
         answer and every tools/call short-circuits to INCOMPATIBLE_STORE rather
-        than hanging.
+        than hanging. Routes each tools/call by its own request context: the
+        launch worktree_root first, and a worktree_fallback only when that
+        resolves to GlobalOnly (D-137, ADR-0016).
       '''
       metadata {
         spec 'docs/specification/11-interfaces.md §2'

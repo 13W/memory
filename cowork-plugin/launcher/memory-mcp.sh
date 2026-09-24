@@ -11,7 +11,10 @@
 #   2. The proxy sends current_dir() to the daemon as worktree_root (the daemon
 #      git-probes it). In Cowork that cwd is the app's, not a repository, so code
 #      search has nothing to search and `remember` falls back to global scope.
-#      This launcher resolves the repository and cd's into it before exec.
+#      This launcher resolves the repository and cd's into it before exec. When
+#      nothing resolves, .mcp.json's LOCAL_RAG_PER_CALL_WORKTREE=1 lets each
+#      tool call name its repository in a `worktree` argument instead (D-137);
+#      a repository resolved here always wins over that argument.
 #
 # stdout carries the JSON-RPC stream. Every diagnostic MUST go to stderr.
 
@@ -73,10 +76,13 @@ if [ -n "$WT" ]; then
   cd "$WT"
   log "worktree: $WT"
 else
-  # Not fatal: memory tools still work (global scope), code tools report no worktree.
+  # Not fatal: a call that names its repository in the `worktree` argument
+  # (LOCAL_RAG_PER_CALL_WORKTREE=1) is routed there; one that does not works
+  # in global scope, and code tools report no worktree.
   cd "${HOME:-/}" 2>/dev/null || cd /
-  log "no repository configured — memory falls back to global scope, code search is unavailable."
-  log "Point the plugin at a checkout once:"
+  log "no repository configured — each call must name its repository in the 'worktree' argument,"
+  log "otherwise memory falls back to global scope and code search is unavailable."
+  log "To pin one repository for every call instead:"
   log "  mkdir -p $(dirname "$CONFIG_FILE") && echo /path/to/repo > $CONFIG_FILE"
 fi
 
