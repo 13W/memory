@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "/bin/sh",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/launcher/memory-mcp.sh"],
+      "env": {
+        "LOCAL_RAG_WORKTREE": ""
+      }
+    }
+  }
+}

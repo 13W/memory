@@ -1,0 +1,8 @@
+{
+  "name": "memory-cowork",
+  "description": "local-rag Memory MCP in Cowork: durable project memory (recall/remember/review) and hybrid code search over one configured repository",
+  "version": "1.0.0",
+  "author": {
+    "name": "13w"
+  }
+}

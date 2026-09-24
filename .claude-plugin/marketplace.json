@@ -9,6 +9,11 @@
       "name": "memory",
       "source": "./plugin",
       "description": "Persistent memory, hybrid code search and spool-only observation capture for Claude Code."
+    },
+    {
+      "name": "memory-cowork",
+      "source": "./cowork-plugin",
+      "description": "The same memory MCP for Claude Cowork: POSIX sh launcher (no node on the bare PATH), resolves the repository from ~/.config/local-rag/cowork-root, no hooks."
     }
   ]
 }
