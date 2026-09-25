@@ -1,0 +1,74 @@
+# Publishes `@13w/memory` to npmjs.org from a tagged release (X-013).
+#
+# Not triggered on its own. `release.yml` calls it as a cargo-dist custom
+# publish job (`publish-jobs = ["./publish-npm"]` in `dist-workspace.toml`), so
+# it runs only after `host` has created the GitHub release, and only for a
+# non-prerelease tag. That ordering matters: the package fetches its binaries
+# from `/releases/latest`, which must already name this tag by the time anyone
+# can install this version.
+#
+# A `release: published` trigger would not work here: `host` creates the
+# release with `GITHUB_TOKEN`, and events caused by that token never start
+# another workflow.
+#
+# Authentication is npm trusted publishing (OIDC). There is no `NPM_TOKEN`,
+# and the package on npmjs.com is configured to refuse tokens. The trusted
+# publisher names `release.yml`: the OIDC token of a called workflow carries
+# the caller's workflow, not this file's. Provenance is attached by npm itself.
+name: Publish npm package
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      # Trusted publishing needs npm 11.5.1 or newer; do not depend on which
+      # npm the runner's Node happens to bundle.
+      - name: Install an npm that supports trusted publishing
+        run: npm install --global "npm@^11.5.1"
+      - name: Derive the package version from the tag
+        id: version
+        run: |
+          version="${TAG#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '$TAG' is not a bare X.Y.Z release version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # A re-run of a release that already reached the registry must succeed
+      # without publishing again: npm never accepts the same version twice.
+      - name: Skip a version that is already published
+        id: published
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if npm view "@13w/memory@$VERSION" version >/dev/null 2>&1; then
+            echo "@13w/memory@$VERSION is already on the registry; nothing to publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish
+        if: steps.published.outputs.skip != 'true'
+        working-directory: npm/memory
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm publish

@@ -3,6 +3,10 @@
 npm package for `local-rag` — a local, co-located MCP service for Claude Code (persistent
 memory, hybrid semantic code search, spool-only observation capture).
 
+```sh
+npm install --global @13w/memory
+```
+
 Its job is to **obtain and expose** the native binaries, not to contain them. Installing the
 package fetches the release assets for your platform from the project's own GitHub releases,
 verifies each against the checksum published in the same release, and puts `local-rag`,
@@ -26,6 +30,13 @@ Verification is against the checksum sidecar published beside each asset. That d
 corruption in transit and tampering on the wire; it does not defend against a compromised
 release, because whoever can publish an asset can publish its digest.
 
-See `docs/specification/13-distribution-and-migrations.md` and
-`docs/adr/0013-binary-delivery-via-release-assets.md` in this repository for the full
-specification and the reasoning behind it.
+See the [distribution specification][spec] and [ADR-0013][adr] in the
+[repository](https://github.com/13W/memory) for the full specification and the reasoning behind
+it.
+
+## License
+
+Apache-2.0 — see `LICENSE` and `NOTICE` in this package.
+
+[spec]: https://github.com/13W/memory/blob/master/docs/specification/13-distribution-and-migrations.md
+[adr]: https://github.com/13W/memory/blob/master/docs/adr/0013-binary-delivery-via-release-assets.md

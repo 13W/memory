@@ -70,6 +70,26 @@ to the digest"; the **installer does not verify them** — `D-110` — because d
 `gh` or a sigstore library inside a package whose whole stance is Node built-ins only. A reader can
 verify one by hand with `gh attestation verify`, which `cargo-dist` documents in the release body.
 
+As-built note (X-013, `[SPEC]`). **How `@13w/memory` reaches the registry.** The same tag that
+produces the release assets publishes the npm package: `dist-workspace.toml` declares
+`publish-jobs = ["./publish-npm"]`, so `dist generate` wires `.github/workflows/publish-npm.yml`
+into `release.yml` as a job that runs after `host` has created the GitHub release, and that
+`announce` waits on. The order is the point: the package fetches from `/releases/latest`, which
+already names the new tag by the time the new version can be installed. The package version is
+the tag (`X.Y.Z`, set in the job with `npm version --no-git-tag-version`); a prerelease tag
+publishes nothing, since cargo-dist skips publish jobs for prereleases and `publish-prereleases`
+is unset, and a prerelease on npm would still take the `latest` dist-tag. Authentication is npm
+trusted publishing (OIDC): no `NPM_TOKEN` exists, the package refuses tokens, and the trusted
+publisher names `release.yml`, because a called workflow's OIDC token carries its caller's
+workflow. npm attaches provenance itself and rejects the publish when `package.json`'s
+`repository.url` does not name this repository, which `npm/memory/test/package-contents.test.js`
+holds to the workspace's `repository`. A re-run is idempotent: a version already on the registry
+is skipped, not re-published. The published tarball carries `LICENSE`, `NOTICE` and `README.md`:
+npm packs the first and last by itself, `NOTICE` ships because `files` names it, and both licence
+files are copies held byte-identical to the repository root's by the same test. The only version
+published before this — `0.0.0`, by hand — predates ADR-0013 and the Apache-2.0 licence, and
+carries neither file.
+
 As-built note (T17-03, `[SPEC]`). The npm scope stays `@13w`, but the launcher and platform
 package **names** are `@13w/memory` / `@13w/memory-{darwin-arm64,darwin-x64,linux-x64,
 linux-arm64,win32-x64}` — an owner decision made when `cargo dist generate` needed a real

@@ -84,3 +84,22 @@ auto-includes = false
 # own terms; this line only stops an unshipped crate from being the first to
 # report it.
 precise-builds = true
+
+# Publish the `@13w/memory` npm package from the same tag (X-013). A custom
+# publish job is a reusable workflow, `.github/workflows/publish-npm.yml`, that
+# `dist generate` wires into `release.yml` after `host` — so the GitHub release,
+# and with it `/releases/latest`, exists before the package that downloads from
+# it does — and that `announce` waits on. cargo-dist skips publish jobs for a
+# prerelease tag unless `publish-prereleases` is set, and it is not: a
+# prerelease on npm would still take the `latest` dist-tag.
+#
+# Declared here rather than hand-added to `release.yml`, for the reason
+# `github-attestations` above gives: the next `dist generate` would erase it.
+publish-jobs = ["./publish-npm"]
+# Without this the generated caller grants a custom publish job exactly
+# `id-token: write` and `packages: write`, and a called workflow can never hold
+# more than its caller — so the job's `contents: read`, which its checkout
+# needs, would be `none`. `id-token: write` is what npm trusted publishing
+# exchanges for a publish credential; `packages` is dropped, since nothing here
+# touches GitHub Packages.
+github-custom-job-permissions = { "publish-npm" = { contents = "read", id-token = "write" } }

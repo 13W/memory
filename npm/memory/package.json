@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "local-rag: obtains the native binaries from the project's own GitHub releases and puts them on your PATH — memory, hybrid code search and observation capture for Claude Code.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/13W/memory.git",
+    "directory": "npm/memory"
+  },
+  "homepage": "https://github.com/13W/memory/tree/master/npm/memory#readme",
+  "bugs": {
+    "url": "https://github.com/13W/memory/issues"
+  },
   "type": "commonjs",
   "bin": {
     "local-rag": "bin/local-rag",
@@ -19,7 +28,8 @@
   "files": [
     "bin",
     "src",
-    "scripts"
+    "scripts",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=20.15.0"

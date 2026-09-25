@@ -1,0 +1,14 @@
+local-rag
+Copyright 2026 Vladimir Bulyga
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This file is the attribution notice required by section 4(d) of the License: a
+redistributor of this work, or of a derivative work, must carry a readable copy
+of it. It covers this project's own source only. Third-party dependencies are
+distributed under their own terms; `CONTRIBUTING.md` records the per-dependency
+licence check, and `cargo metadata` is the machine-readable source of truth.

@@ -417,7 +417,7 @@ The repository root carries a `package.json` declaring `"@13w/memory": "file:npm
 It is a developer convenience — `npm install` at the root links the checkout — and nothing in the
 product consults `node_modules`; `/node_modules/` stays gitignored.
 
-Run the suite: `cd npm/memory && node --test test/*.test.js` — **182 tests**, and **not** bare
+Run the suite: `cd npm/memory && node --test test/*.test.js` — **184 tests**, and **not** bare
 `node --test` (Node's default test-file discovery treats every `.js` file under a directory named
 `test` as a test file, which would try to run `test/helpers/fake-binary.js` itself and hang forever
 in its own `setInterval`; the explicit glob scopes discovery to the top-level `*.test.js` files

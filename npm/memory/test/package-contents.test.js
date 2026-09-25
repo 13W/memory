@@ -37,8 +37,16 @@ const PACKAGES = [
     // The exhaustive check — that no module can be added to the checkout and
     // silently not ship — is derived from the directory below rather than
     // maintained here by hand.
+    //
+    // `LICENSE` and `NOTICE` are here because Apache-2.0 §4 makes both a
+    // condition of redistribution, and the registry is a redistribution. npm
+    // packs `LICENSE` by itself; `NOTICE` it does not, and ships only because
+    // `files` names it — so this list is what notices the day it stops.
     expectedFiles: [
       "package.json",
+      "LICENSE",
+      "NOTICE",
+      "README.md",
       "bin/local-rag",
       "bin/local-rag-proxy",
       "bin/local-rag-hook",
@@ -187,4 +195,30 @@ test("the launcher's own README.md is not required for the launcher to run, but 
   // documenting the existing behavior rather than asserting a new rule.
   assert.ok(files.includes("README.md"));
   fs.rmSync(copy, { recursive: true, force: true });
+});
+
+test("the package's LICENSE and NOTICE are the repository's, byte for byte", () => {
+  // They are copies, because npm packs only what sits inside the package
+  // directory. A copy is a second source of truth, and the licence is the one
+  // file where a stale second source would be a legal defect rather than a
+  // cosmetic one — so the copies are held to the originals here.
+  const repoRoot = path.resolve(REPO_NPM_DIR, "..");
+  for (const name of ["LICENSE", "NOTICE"]) {
+    const original = fs.readFileSync(path.join(repoRoot, name));
+    const copy = fs.readFileSync(path.join(REPO_NPM_DIR, "memory", name));
+    assert.ok(copy.equals(original), `npm/memory/${name} has drifted from the repository root's ${name}`);
+  }
+});
+
+test("package.json names the repository the release workflow publishes from", () => {
+  // Publishing is npm trusted publishing from this repository's release
+  // workflow, which attaches provenance, and npm refuses such a publish when
+  // `repository.url` does not name the repository the OIDC token came from.
+  // Held to the workspace's own `repository` so the two cannot disagree.
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO_NPM_DIR, "memory", "package.json"), "utf8"));
+  const cargoToml = fs.readFileSync(path.resolve(REPO_NPM_DIR, "..", "Cargo.toml"), "utf8");
+  const workspaceRepo = /^repository\s*=\s*"([^"]+)"/m.exec(cargoToml);
+  assert.ok(workspaceRepo, "Cargo.toml must declare the workspace repository");
+  assert.equal(pkg.repository?.url, `git+${workspaceRepo[1]}.git`);
+  assert.equal(pkg.repository?.directory, "npm/memory");
 });
